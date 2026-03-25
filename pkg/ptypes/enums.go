@@ -1,7 +1,14 @@
-// Package providence provides the public API for the Providence task dependency
-// tracker. It replaces Beads (bd) as the canonical task tracking library for
-// the Aura Protocol agent system.
-package providence
+// Package ptypes provides the public type definitions for the Providence task
+// dependency tracker. It contains all enum types, ID types, entity structs,
+// supporting types, and sentinel errors.
+//
+// This package has ZERO dependencies on the root providence package or any
+// internal/ package. It is safe to import from anywhere within the module.
+//
+// Consumers of the library should continue to use the root
+// "github.com/dayvidpham/providence" package, which re-exports everything
+// from ptypes via transparent type aliases.
+package ptypes
 
 import "fmt"
 

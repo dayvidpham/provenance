@@ -1,4 +1,4 @@
-package providence_test
+package ptypes_test
 
 import (
 	"errors"
@@ -7,7 +7,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/dayvidpham/providence"
+	"github.com/dayvidpham/providence/pkg/ptypes"
 )
 
 // ---------------------------------------------------------------------------
@@ -15,7 +15,7 @@ import (
 // ---------------------------------------------------------------------------
 
 func TestTaskIDString(t *testing.T) {
-	id := providence.TaskID{
+	id := ptypes.TaskID{
 		Namespace: "aura-plugins",
 		UUID:      uuid.MustParse("018f4b12-3456-7890-abcd-ef0123456789"),
 	}
@@ -26,11 +26,11 @@ func TestTaskIDString(t *testing.T) {
 }
 
 func TestParseTaskIDRoundTrip(t *testing.T) {
-	original := providence.TaskID{
+	original := ptypes.TaskID{
 		Namespace: "aura-plugins",
 		UUID:      uuid.MustParse("018f4b12-3456-7890-abcd-ef0123456789"),
 	}
-	parsed, err := providence.ParseTaskID(original.String())
+	parsed, err := ptypes.ParseTaskID(original.String())
 	if err != nil {
 		t.Fatalf("ParseTaskID unexpected error: %v", err)
 	}
@@ -42,7 +42,7 @@ func TestParseTaskIDRoundTrip(t *testing.T) {
 func TestParseTaskIDNamespaceWithDashes(t *testing.T) {
 	// Namespace that contains "--" — must split on the rightmost "--"
 	raw := "my--fancy--ns--018f4b12-3456-7890-abcd-ef0123456789"
-	id, err := providence.ParseTaskID(raw)
+	id, err := ptypes.ParseTaskID(raw)
 	if err != nil {
 		t.Fatalf("ParseTaskID(%q) unexpected error: %v", raw, err)
 	}
@@ -66,11 +66,11 @@ func TestParseTaskIDErrors(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			_, err := providence.ParseTaskID(c.input)
+			_, err := ptypes.ParseTaskID(c.input)
 			if err == nil {
 				t.Errorf("ParseTaskID(%q) expected error, got nil", c.input)
 			}
-			if !errors.Is(err, providence.ErrInvalidID) {
+			if !errors.Is(err, ptypes.ErrInvalidID) {
 				t.Errorf("ParseTaskID(%q) error should wrap ErrInvalidID, got: %v", c.input, err)
 			}
 		})
@@ -79,7 +79,7 @@ func TestParseTaskIDErrors(t *testing.T) {
 
 func TestParseTaskIDErrorMessage(t *testing.T) {
 	// Error messages should contain the input for actionability.
-	_, err := providence.ParseTaskID("bad-input")
+	_, err := ptypes.ParseTaskID("bad-input")
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -93,7 +93,7 @@ func TestParseTaskIDErrorMessage(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestAgentIDString(t *testing.T) {
-	id := providence.AgentID{
+	id := ptypes.AgentID{
 		Namespace: "my-project",
 		UUID:      uuid.MustParse("018f4b12-3456-7890-abcd-ef0123456789"),
 	}
@@ -104,11 +104,11 @@ func TestAgentIDString(t *testing.T) {
 }
 
 func TestParseAgentIDRoundTrip(t *testing.T) {
-	original := providence.AgentID{
+	original := ptypes.AgentID{
 		Namespace: "my-project",
 		UUID:      uuid.MustParse("018f4b12-3456-7890-abcd-ef0123456789"),
 	}
-	parsed, err := providence.ParseAgentID(original.String())
+	parsed, err := ptypes.ParseAgentID(original.String())
 	if err != nil {
 		t.Fatalf("ParseAgentID unexpected error: %v", err)
 	}
@@ -128,11 +128,11 @@ func TestParseAgentIDErrors(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			_, err := providence.ParseAgentID(c.input)
+			_, err := ptypes.ParseAgentID(c.input)
 			if err == nil {
 				t.Errorf("ParseAgentID(%q) expected error, got nil", c.input)
 			}
-			if !errors.Is(err, providence.ErrInvalidID) {
+			if !errors.Is(err, ptypes.ErrInvalidID) {
 				t.Errorf("ParseAgentID(%q) error should wrap ErrInvalidID, got: %v", c.input, err)
 			}
 		})
@@ -144,7 +144,7 @@ func TestParseAgentIDErrors(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestActivityIDString(t *testing.T) {
-	id := providence.ActivityID{
+	id := ptypes.ActivityID{
 		Namespace: "ns",
 		UUID:      uuid.MustParse("018f4b12-3456-7890-abcd-ef0123456789"),
 	}
@@ -155,11 +155,11 @@ func TestActivityIDString(t *testing.T) {
 }
 
 func TestParseActivityIDRoundTrip(t *testing.T) {
-	original := providence.ActivityID{
+	original := ptypes.ActivityID{
 		Namespace: "ns",
 		UUID:      uuid.MustParse("018f4b12-3456-7890-abcd-ef0123456789"),
 	}
-	parsed, err := providence.ParseActivityID(original.String())
+	parsed, err := ptypes.ParseActivityID(original.String())
 	if err != nil {
 		t.Fatalf("ParseActivityID unexpected error: %v", err)
 	}
@@ -169,11 +169,11 @@ func TestParseActivityIDRoundTrip(t *testing.T) {
 }
 
 func TestParseActivityIDErrors(t *testing.T) {
-	_, err := providence.ParseActivityID("no-double-dash")
+	_, err := ptypes.ParseActivityID("no-double-dash")
 	if err == nil {
 		t.Error("expected error, got nil")
 	}
-	if !errors.Is(err, providence.ErrInvalidID) {
+	if !errors.Is(err, ptypes.ErrInvalidID) {
 		t.Errorf("expected ErrInvalidID, got: %v", err)
 	}
 }
@@ -183,7 +183,7 @@ func TestParseActivityIDErrors(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestCommentIDString(t *testing.T) {
-	id := providence.CommentID{
+	id := ptypes.CommentID{
 		Namespace: "project",
 		UUID:      uuid.MustParse("018f4b12-3456-7890-abcd-ef0123456789"),
 	}
@@ -194,11 +194,11 @@ func TestCommentIDString(t *testing.T) {
 }
 
 func TestParseCommentIDRoundTrip(t *testing.T) {
-	original := providence.CommentID{
+	original := ptypes.CommentID{
 		Namespace: "project",
 		UUID:      uuid.MustParse("018f4b12-3456-7890-abcd-ef0123456789"),
 	}
-	parsed, err := providence.ParseCommentID(original.String())
+	parsed, err := ptypes.ParseCommentID(original.String())
 	if err != nil {
 		t.Fatalf("ParseCommentID unexpected error: %v", err)
 	}
@@ -208,11 +208,11 @@ func TestParseCommentIDRoundTrip(t *testing.T) {
 }
 
 func TestParseCommentIDErrors(t *testing.T) {
-	_, err := providence.ParseCommentID("")
+	_, err := ptypes.ParseCommentID("")
 	if err == nil {
 		t.Error("expected error for empty string, got nil")
 	}
-	if !errors.Is(err, providence.ErrInvalidID) {
+	if !errors.Is(err, ptypes.ErrInvalidID) {
 		t.Errorf("expected ErrInvalidID, got: %v", err)
 	}
 }
@@ -225,10 +225,10 @@ func TestAllParseIDsUseLastIndex(t *testing.T) {
 	// "ns--with--dashes--<uuid>" — rightmost split gives correct namespace.
 	u := uuid.MustParse("018f4b12-3456-7890-abcd-ef0123456789")
 
-	taskID := providence.TaskID{Namespace: "ns--with--dashes", UUID: u}
-	agentID := providence.AgentID{Namespace: "ns--with--dashes", UUID: u}
-	actID := providence.ActivityID{Namespace: "ns--with--dashes", UUID: u}
-	commentID := providence.CommentID{Namespace: "ns--with--dashes", UUID: u}
+	taskID := ptypes.TaskID{Namespace: "ns--with--dashes", UUID: u}
+	agentID := ptypes.AgentID{Namespace: "ns--with--dashes", UUID: u}
+	actID := ptypes.ActivityID{Namespace: "ns--with--dashes", UUID: u}
+	commentID := ptypes.CommentID{Namespace: "ns--with--dashes", UUID: u}
 
 	cases := []struct {
 		name  string
@@ -236,19 +236,19 @@ func TestAllParseIDsUseLastIndex(t *testing.T) {
 		parse func(string) (string, error)
 	}{
 		{"TaskID", taskID.String(), func(s string) (string, error) {
-			id, err := providence.ParseTaskID(s)
+			id, err := ptypes.ParseTaskID(s)
 			return id.Namespace, err
 		}},
 		{"AgentID", agentID.String(), func(s string) (string, error) {
-			id, err := providence.ParseAgentID(s)
+			id, err := ptypes.ParseAgentID(s)
 			return id.Namespace, err
 		}},
 		{"ActivityID", actID.String(), func(s string) (string, error) {
-			id, err := providence.ParseActivityID(s)
+			id, err := ptypes.ParseActivityID(s)
 			return id.Namespace, err
 		}},
 		{"CommentID", commentID.String(), func(s string) (string, error) {
-			id, err := providence.ParseCommentID(s)
+			id, err := ptypes.ParseCommentID(s)
 			return id.Namespace, err
 		}},
 	}
@@ -273,11 +273,11 @@ func TestAllParseIDsUseLastIndex(t *testing.T) {
 func TestSentinelErrors(t *testing.T) {
 	// Just verify they are distinct and non-nil.
 	errs := []error{
-		providence.ErrNotFound,
-		providence.ErrCycleDetected,
-		providence.ErrAlreadyClosed,
-		providence.ErrInvalidID,
-		providence.ErrAgentKindMismatch,
+		ptypes.ErrNotFound,
+		ptypes.ErrCycleDetected,
+		ptypes.ErrAlreadyClosed,
+		ptypes.ErrInvalidID,
+		ptypes.ErrAgentKindMismatch,
 	}
 	for i, e := range errs {
 		if e == nil {

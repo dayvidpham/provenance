@@ -1,4 +1,4 @@
-package providence
+package ptypes
 
 import "errors"
 
