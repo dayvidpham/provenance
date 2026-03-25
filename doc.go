@@ -9,9 +9,3 @@
 //
 // All entity IDs follow the format {Namespace}--{UUIDv7} for scoping and global uniqueness.
 package providence
-
-import (
-	_ "github.com/dominikbraun/graph"
-	_ "github.com/google/uuid"
-	_ "zombiezen.com/go/sqlite"
-)

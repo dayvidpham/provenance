@@ -2,12 +2,19 @@ package providence_test
 
 import (
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/dayvidpham/providence"
 )
 
+// ---------------------------------------------------------------------------
+// Shared test fixtures (M5)
+// ---------------------------------------------------------------------------
+
 // openTestTracker returns a fresh in-memory Tracker for testing.
+// The tracker is closed automatically when the test ends.
 func openTestTracker(t *testing.T) providence.Tracker {
 	t.Helper()
 	tr, err := providence.OpenMemory()
@@ -20,6 +27,17 @@ func openTestTracker(t *testing.T) providence.Tracker {
 		}
 	})
 	return tr
+}
+
+// mustCreateTask creates a task with sensible defaults and fatals on error.
+// Uses TaskTypeTask, PriorityMedium, and PhaseUnscoped as defaults.
+func mustCreateTask(t *testing.T, tr providence.Tracker, namespace string) providence.Task {
+	t.Helper()
+	task, err := tr.Create(namespace, "Test Task", "", providence.TaskTypeTask, providence.PriorityMedium, providence.PhaseUnscoped)
+	if err != nil {
+		t.Fatalf("mustCreateTask(%q): Create() failed: %v", namespace, err)
+	}
+	return task
 }
 
 func TestOpenMemory(t *testing.T) {
@@ -614,5 +632,473 @@ func TestList(t *testing.T) {
 	}
 	if len(byPhase) != 1 {
 		t.Errorf("List(phase=worker_slices) returned %d tasks, want 1", len(byPhase))
+	}
+}
+
+// ===========================================================================
+// Part A: 6 Integration Tests
+// ===========================================================================
+
+// TestRegisterSoftwareAgent registers a software agent, retrieves it via
+// SoftwareAgent(), and verifies all fields match.
+func TestRegisterSoftwareAgent(t *testing.T) {
+	tr := openTestTracker(t)
+
+	sa, err := tr.RegisterSoftwareAgent("ns", "providence-cli", "v0.1.0", "https://github.com/dayvidpham/providence")
+	if err != nil {
+		t.Fatalf("RegisterSoftwareAgent() error: %v", err)
+	}
+
+	// Verify returned fields.
+	if sa.Kind != providence.AgentKindSoftware {
+		t.Errorf("Kind = %v, want AgentKindSoftware", sa.Kind)
+	}
+	if sa.Name != "providence-cli" {
+		t.Errorf("Name = %q, want %q", sa.Name, "providence-cli")
+	}
+	if sa.Version != "v0.1.0" {
+		t.Errorf("Version = %q, want %q", sa.Version, "v0.1.0")
+	}
+	if sa.Source != "https://github.com/dayvidpham/providence" {
+		t.Errorf("Source = %q, want %q", sa.Source, "https://github.com/dayvidpham/providence")
+	}
+	if sa.ID.Namespace != "ns" {
+		t.Errorf("Namespace = %q, want %q", sa.ID.Namespace, "ns")
+	}
+
+	// Retrieve via SoftwareAgent() and verify round-trip.
+	retrieved, err := tr.SoftwareAgent(sa.ID)
+	if err != nil {
+		t.Fatalf("SoftwareAgent() error: %v", err)
+	}
+	if retrieved.Name != sa.Name {
+		t.Errorf("Retrieved Name = %q, want %q", retrieved.Name, sa.Name)
+	}
+	if retrieved.Version != sa.Version {
+		t.Errorf("Retrieved Version = %q, want %q", retrieved.Version, sa.Version)
+	}
+	if retrieved.Source != sa.Source {
+		t.Errorf("Retrieved Source = %q, want %q", retrieved.Source, sa.Source)
+	}
+	if retrieved.Kind != providence.AgentKindSoftware {
+		t.Errorf("Retrieved Kind = %v, want AgentKindSoftware", retrieved.Kind)
+	}
+}
+
+// TestAgent registers agents of each kind and verifies the base Agent()
+// method returns the correct AgentKind.
+func TestAgent(t *testing.T) {
+	tr := openTestTracker(t)
+
+	// Register one of each kind.
+	human, err := tr.RegisterHumanAgent("ns", "Alice", "alice@example.com")
+	if err != nil {
+		t.Fatalf("RegisterHumanAgent() error: %v", err)
+	}
+	ml, err := tr.RegisterMLAgent("ns", providence.RoleReviewer, providence.ProviderAnthropic, "claude_sonnet_4")
+	if err != nil {
+		t.Fatalf("RegisterMLAgent() error: %v", err)
+	}
+	sw, err := tr.RegisterSoftwareAgent("ns", "lint-tool", "v2.0.0", "/usr/local/bin/lint")
+	if err != nil {
+		t.Fatalf("RegisterSoftwareAgent() error: %v", err)
+	}
+
+	// Verify Agent() for each returns the correct Kind.
+	cases := []struct {
+		name     string
+		id       providence.AgentID
+		wantKind providence.AgentKind
+	}{
+		{"human", human.ID, providence.AgentKindHuman},
+		{"ml", ml.ID, providence.AgentKindMachineLearning},
+		{"software", sw.ID, providence.AgentKindSoftware},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			agent, err := tr.Agent(tc.id)
+			if err != nil {
+				t.Fatalf("Agent(%v) error: %v", tc.id, err)
+			}
+			if agent.Kind != tc.wantKind {
+				t.Errorf("Agent(%v).Kind = %v, want %v", tc.id, agent.Kind, tc.wantKind)
+			}
+			if agent.ID != tc.id {
+				t.Errorf("Agent(%v).ID = %v, want %v", tc.id, agent.ID, tc.id)
+			}
+		})
+	}
+}
+
+// TestActivities starts and ends an activity, then calls Activities() to list
+// activities and verifies the returned list contains the activity.
+func TestActivities(t *testing.T) {
+	tr := openTestTracker(t)
+
+	agent, err := tr.RegisterHumanAgent("ns", "Worker", "")
+	if err != nil {
+		t.Fatalf("RegisterHumanAgent() error: %v", err)
+	}
+
+	// Start an activity.
+	act, err := tr.StartActivity(agent.ID, providence.PhaseCodeReview, providence.StageInProgress, "reviewing PR")
+	if err != nil {
+		t.Fatalf("StartActivity() error: %v", err)
+	}
+
+	// End the activity.
+	ended, err := tr.EndActivity(act.ID)
+	if err != nil {
+		t.Fatalf("EndActivity() error: %v", err)
+	}
+	if ended.EndedAt == nil {
+		t.Fatal("EndedAt should be non-nil after EndActivity")
+	}
+
+	// List activities for this agent.
+	activities, err := tr.Activities(&agent.ID)
+	if err != nil {
+		t.Fatalf("Activities() error: %v", err)
+	}
+	if len(activities) != 1 {
+		t.Fatalf("Activities() returned %d, want 1", len(activities))
+	}
+	if activities[0].ID != act.ID {
+		t.Errorf("Activities()[0].ID = %v, want %v", activities[0].ID, act.ID)
+	}
+	if activities[0].Phase != providence.PhaseCodeReview {
+		t.Errorf("Activities()[0].Phase = %v, want PhaseCodeReview", activities[0].Phase)
+	}
+	if activities[0].Notes != "reviewing PR" {
+		t.Errorf("Activities()[0].Notes = %q, want %q", activities[0].Notes, "reviewing PR")
+	}
+	if activities[0].EndedAt == nil {
+		t.Error("Activities()[0].EndedAt should be non-nil")
+	}
+
+	// List all activities (nil filter).
+	all, err := tr.Activities(nil)
+	if err != nil {
+		t.Fatalf("Activities(nil) error: %v", err)
+	}
+	if len(all) != 1 {
+		t.Errorf("Activities(nil) returned %d, want 1", len(all))
+	}
+}
+
+// TestRemoveEdge creates two tasks, adds a blocked-by edge, verifies it exists,
+// removes it, and verifies it is gone.
+func TestRemoveEdge(t *testing.T) {
+	tr := openTestTracker(t)
+
+	parent := mustCreateTask(t, tr, "ns")
+	child := mustCreateTask(t, tr, "ns")
+
+	// Add edge.
+	if err := tr.AddEdge(parent.ID, child.ID.String(), providence.EdgeBlockedBy); err != nil {
+		t.Fatalf("AddEdge() error: %v", err)
+	}
+
+	// Verify edge exists.
+	kind := providence.EdgeBlockedBy
+	edges, err := tr.Edges(parent.ID, &kind)
+	if err != nil {
+		t.Fatalf("Edges() error: %v", err)
+	}
+	if len(edges) != 1 {
+		t.Fatalf("Edges() returned %d, want 1", len(edges))
+	}
+
+	// Remove edge.
+	if err := tr.RemoveEdge(parent.ID, child.ID.String(), providence.EdgeBlockedBy); err != nil {
+		t.Fatalf("RemoveEdge() error: %v", err)
+	}
+
+	// Verify edge is gone.
+	edges2, err := tr.Edges(parent.ID, &kind)
+	if err != nil {
+		t.Fatalf("Edges() after remove error: %v", err)
+	}
+	if len(edges2) != 0 {
+		t.Errorf("Edges() after RemoveEdge returned %d, want 0", len(edges2))
+	}
+
+	// RemoveEdge on non-existent edge is idempotent (no error).
+	if err := tr.RemoveEdge(parent.ID, child.ID.String(), providence.EdgeBlockedBy); err != nil {
+		t.Errorf("RemoveEdge() on non-existent edge: got error %v, want nil", err)
+	}
+}
+
+// TestNonBlockedByEdges verifies that non-BlockedBy edge kinds (EdgeDerivedFrom,
+// EdgeSupersedes) do NOT affect task readiness queries (Blocked/Ready).
+func TestNonBlockedByEdges(t *testing.T) {
+	tr := openTestTracker(t)
+
+	taskA := mustCreateTask(t, tr, "ns")
+	taskB := mustCreateTask(t, tr, "ns")
+
+	// Add a DerivedFrom edge: A derived from B.
+	if err := tr.AddEdge(taskA.ID, taskB.ID.String(), providence.EdgeDerivedFrom); err != nil {
+		t.Fatalf("AddEdge(DerivedFrom) error: %v", err)
+	}
+	// Add a Supersedes edge: A supersedes B.
+	if err := tr.AddEdge(taskA.ID, taskB.ID.String(), providence.EdgeSupersedes); err != nil {
+		t.Fatalf("AddEdge(Supersedes) error: %v", err)
+	}
+
+	// Verify the edges were created.
+	derivedKind := providence.EdgeDerivedFrom
+	derivedEdges, err := tr.Edges(taskA.ID, &derivedKind)
+	if err != nil {
+		t.Fatalf("Edges(DerivedFrom) error: %v", err)
+	}
+	if len(derivedEdges) != 1 {
+		t.Fatalf("Edges(DerivedFrom) returned %d, want 1", len(derivedEdges))
+	}
+	supersedesKind := providence.EdgeSupersedes
+	supersedesEdges, err := tr.Edges(taskA.ID, &supersedesKind)
+	if err != nil {
+		t.Fatalf("Edges(Supersedes) error: %v", err)
+	}
+	if len(supersedesEdges) != 1 {
+		t.Fatalf("Edges(Supersedes) returned %d, want 1", len(supersedesEdges))
+	}
+
+	// Both tasks should still be ready (non-BlockedBy edges don't affect readiness).
+	ready, err := tr.Ready()
+	if err != nil {
+		t.Fatalf("Ready() error: %v", err)
+	}
+	blocked, err := tr.Blocked()
+	if err != nil {
+		t.Fatalf("Blocked() error: %v", err)
+	}
+
+	containsTask := func(tasks []providence.Task, id providence.TaskID) bool {
+		for _, tk := range tasks {
+			if tk.ID == id {
+				return true
+			}
+		}
+		return false
+	}
+
+	if !containsTask(ready, taskA.ID) {
+		t.Errorf("taskA should be in Ready() — non-BlockedBy edges must not affect readiness")
+	}
+	if !containsTask(ready, taskB.ID) {
+		t.Errorf("taskB should be in Ready() — non-BlockedBy edges must not affect readiness")
+	}
+	if containsTask(blocked, taskA.ID) {
+		t.Errorf("taskA should NOT be in Blocked() — non-BlockedBy edges must not affect readiness")
+	}
+	if containsTask(blocked, taskB.ID) {
+		t.Errorf("taskB should NOT be in Blocked() — non-BlockedBy edges must not affect readiness")
+	}
+}
+
+// TestRemoveLabel verifies AddLabel → Labels → RemoveLabel → Labels round-trip,
+// and that RemoveLabel is idempotent (no error on double-remove).
+func TestRemoveLabel(t *testing.T) {
+	tr := openTestTracker(t)
+	task := mustCreateTask(t, tr, "ns")
+
+	// Add labels.
+	if err := tr.AddLabel(task.ID, "priority:high"); err != nil {
+		t.Fatalf("AddLabel() error: %v", err)
+	}
+	if err := tr.AddLabel(task.ID, "team:backend"); err != nil {
+		t.Fatalf("AddLabel() error: %v", err)
+	}
+
+	// Verify both exist.
+	labels, err := tr.Labels(task.ID)
+	if err != nil {
+		t.Fatalf("Labels() error: %v", err)
+	}
+	if len(labels) != 2 {
+		t.Fatalf("Labels() returned %d, want 2", len(labels))
+	}
+
+	// Remove one label.
+	if err := tr.RemoveLabel(task.ID, "priority:high"); err != nil {
+		t.Fatalf("RemoveLabel() error: %v", err)
+	}
+
+	// Verify only one remains.
+	labels2, err := tr.Labels(task.ID)
+	if err != nil {
+		t.Fatalf("Labels() after remove error: %v", err)
+	}
+	if len(labels2) != 1 {
+		t.Fatalf("Labels() after RemoveLabel returned %d, want 1", len(labels2))
+	}
+	if labels2[0] != "team:backend" {
+		t.Errorf("Remaining label = %q, want %q", labels2[0], "team:backend")
+	}
+
+	// Remove the same label again — should be idempotent (no error).
+	if err := tr.RemoveLabel(task.ID, "priority:high"); err != nil {
+		t.Errorf("RemoveLabel() on non-existent label: got error %v, want nil", err)
+	}
+
+	// Verify labels unchanged after idempotent remove.
+	labels3, err := tr.Labels(task.ID)
+	if err != nil {
+		t.Fatalf("Labels() after idempotent remove error: %v", err)
+	}
+	if len(labels3) != 1 {
+		t.Errorf("Labels() after idempotent RemoveLabel returned %d, want 1", len(labels3))
+	}
+}
+
+// ===========================================================================
+// Part B: Minor Cleanups — Tests
+// ===========================================================================
+
+// TestCreateEmptyNamespace verifies that Create rejects an empty namespace (M3).
+func TestCreateEmptyNamespace(t *testing.T) {
+	tr := openTestTracker(t)
+
+	_, err := tr.Create("", "Title", "Desc", providence.TaskTypeTask, providence.PriorityMedium, providence.PhaseUnscoped)
+	if err == nil {
+		t.Fatal("Create() with empty namespace: expected error, got nil")
+	}
+	if !errors.Is(err, providence.ErrInvalidID) {
+		t.Errorf("Create() with empty namespace: got %v, want ErrInvalidID", err)
+	}
+}
+
+// TestConcurrentCreate verifies that 10 goroutines each doing 20 Create
+// operations do not race and all 200 tasks are created successfully (M4).
+func TestConcurrentCreate(t *testing.T) {
+	tr := openTestTracker(t)
+
+	const goroutines = 10
+	const opsPerGoroutine = 20
+	const totalOps = goroutines * opsPerGoroutine
+
+	var wg sync.WaitGroup
+	errs := make(chan error, totalOps)
+
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(gID int) {
+			defer wg.Done()
+			for i := 0; i < opsPerGoroutine; i++ {
+				title := fmt.Sprintf("task-g%d-i%d", gID, i)
+				_, err := tr.Create("concurrent-ns", title, "", providence.TaskTypeTask, providence.PriorityMedium, providence.PhaseUnscoped)
+				if err != nil {
+					errs <- fmt.Errorf("goroutine %d, op %d: %w", gID, i, err)
+				}
+			}
+		}(g)
+	}
+
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Errorf("concurrent Create error: %v", err)
+	}
+
+	// Verify all 200 tasks were created.
+	tasks, err := tr.List(providence.ListFilter{Namespace: "concurrent-ns"})
+	if err != nil {
+		t.Fatalf("List() error: %v", err)
+	}
+	if len(tasks) != totalOps {
+		t.Errorf("List() returned %d tasks, want %d", len(tasks), totalOps)
+	}
+}
+
+// TestListFilterByLabel verifies that ListFilter.Label filters correctly (M6).
+func TestListFilterByLabel(t *testing.T) {
+	tr := openTestTracker(t)
+
+	taskA := mustCreateTask(t, tr, "label-ns")
+	taskB := mustCreateTask(t, tr, "label-ns")
+	_ = mustCreateTask(t, tr, "label-ns") // taskC — no label
+
+	if err := tr.AddLabel(taskA.ID, "urgent"); err != nil {
+		t.Fatalf("AddLabel(A, urgent) error: %v", err)
+	}
+	if err := tr.AddLabel(taskB.ID, "urgent"); err != nil {
+		t.Fatalf("AddLabel(B, urgent) error: %v", err)
+	}
+	if err := tr.AddLabel(taskA.ID, "backend"); err != nil {
+		t.Fatalf("AddLabel(A, backend) error: %v", err)
+	}
+
+	// Filter by label "urgent" — should return A and B.
+	urgentTasks, err := tr.List(providence.ListFilter{Label: "urgent"})
+	if err != nil {
+		t.Fatalf("List(label=urgent) error: %v", err)
+	}
+	if len(urgentTasks) != 2 {
+		t.Errorf("List(label=urgent) returned %d tasks, want 2", len(urgentTasks))
+	}
+
+	// Filter by label "backend" — should return only A.
+	backendTasks, err := tr.List(providence.ListFilter{Label: "backend"})
+	if err != nil {
+		t.Fatalf("List(label=backend) error: %v", err)
+	}
+	if len(backendTasks) != 1 {
+		t.Errorf("List(label=backend) returned %d tasks, want 1", len(backendTasks))
+	}
+
+	// Filter by non-existent label — should return zero.
+	noneTasks, err := tr.List(providence.ListFilter{Label: "nonexistent"})
+	if err != nil {
+		t.Fatalf("List(label=nonexistent) error: %v", err)
+	}
+	if len(noneTasks) != 0 {
+		t.Errorf("List(label=nonexistent) returned %d tasks, want 0", len(noneTasks))
+	}
+}
+
+// TestListFilterByNamespace verifies that ListFilter.Namespace filters correctly (M6).
+func TestListFilterByNamespace(t *testing.T) {
+	tr := openTestTracker(t)
+
+	_ = mustCreateTask(t, tr, "alpha")
+	_ = mustCreateTask(t, tr, "alpha")
+	_ = mustCreateTask(t, tr, "beta")
+
+	// Filter by namespace "alpha" — should return 2.
+	alphaTasks, err := tr.List(providence.ListFilter{Namespace: "alpha"})
+	if err != nil {
+		t.Fatalf("List(namespace=alpha) error: %v", err)
+	}
+	if len(alphaTasks) != 2 {
+		t.Errorf("List(namespace=alpha) returned %d tasks, want 2", len(alphaTasks))
+	}
+
+	// Filter by namespace "beta" — should return 1.
+	betaTasks, err := tr.List(providence.ListFilter{Namespace: "beta"})
+	if err != nil {
+		t.Fatalf("List(namespace=beta) error: %v", err)
+	}
+	if len(betaTasks) != 1 {
+		t.Errorf("List(namespace=beta) returned %d tasks, want 1", len(betaTasks))
+	}
+
+	// Filter by non-existent namespace — should return 0.
+	noneTasks, err := tr.List(providence.ListFilter{Namespace: "gamma"})
+	if err != nil {
+		t.Fatalf("List(namespace=gamma) error: %v", err)
+	}
+	if len(noneTasks) != 0 {
+		t.Errorf("List(namespace=gamma) returned %d tasks, want 0", len(noneTasks))
+	}
+
+	// No namespace filter — should return all 3.
+	allTasks, err := tr.List(providence.ListFilter{})
+	if err != nil {
+		t.Fatalf("List(no filter) error: %v", err)
+	}
+	if len(allTasks) != 3 {
+		t.Errorf("List(no filter) returned %d tasks, want 3", len(allTasks))
 	}
 }

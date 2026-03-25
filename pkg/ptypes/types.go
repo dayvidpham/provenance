@@ -12,6 +12,52 @@ import (
 // ID Types
 // ---------------------------------------------------------------------------
 
+// namespacedID is a type constraint for all ID types that have
+// Namespace and UUID fields. Used by parseID to deduplicate parse logic.
+type namespacedID interface {
+	TaskID | AgentID | ActivityID | CommentID
+}
+
+// parseID is a generic helper that parses "namespace--uuid" into any ID type
+// matching the namespacedID constraint.
+//
+// It splits on the rightmost "--" separator (handles namespaces containing "--"),
+// validates that the namespace is non-empty, and parses the UUID portion.
+// The caller parameter is used in error messages (e.g. "ParseTaskID").
+// Returns ErrInvalidID on any parse failure.
+func parseID[T namespacedID](raw, caller string) (T, error) {
+	var zero T
+	idx := strings.LastIndex(raw, "--")
+	if idx < 0 {
+		return zero, fmt.Errorf("%w: %s — no '--' separator found in %q — "+
+			"expected format is 'namespace--uuidv7'", ErrInvalidID, caller, raw)
+	}
+	ns := raw[:idx]
+	if ns == "" {
+		return zero, fmt.Errorf("%w: %s — empty namespace in %q — "+
+			"namespace must be non-empty, e.g. 'aura-plugins--<uuid>'", ErrInvalidID, caller, raw)
+	}
+	u, err := uuid.Parse(raw[idx+2:])
+	if err != nil {
+		return zero, fmt.Errorf("%w: %s — invalid UUID in %q: %v — "+
+			"the part after the last '--' must be a valid UUID", ErrInvalidID, caller, raw, err)
+	}
+	// Type switch to construct the correct concrete type.
+	// This is safe because T is constrained to our known ID types.
+	var result any
+	switch any(zero).(type) {
+	case TaskID:
+		result = TaskID{Namespace: ns, UUID: u}
+	case AgentID:
+		result = AgentID{Namespace: ns, UUID: u}
+	case ActivityID:
+		result = ActivityID{Namespace: ns, UUID: u}
+	case CommentID:
+		result = CommentID{Namespace: ns, UUID: u}
+	}
+	return result.(T), nil
+}
+
 // TaskID uniquely identifies a task (PROV-O Entity).
 // The Namespace scopes the ID to a project (e.g., "aura-plugins").
 // The UUID is a UUIDv7 (time-sortable, globally unique).
@@ -31,22 +77,7 @@ func (id TaskID) String() string {
 // which correctly handles namespaces that contain "--" themselves.
 // Returns ErrInvalidID if the format is invalid or the UUID is malformed.
 func ParseTaskID(s string) (TaskID, error) {
-	idx := strings.LastIndex(s, "--")
-	if idx < 0 {
-		return TaskID{}, fmt.Errorf("%w: %s — no '--' separator found in %q — "+
-			"expected format is 'namespace--uuidv7'", ErrInvalidID, "ParseTaskID", s)
-	}
-	ns := s[:idx]
-	if ns == "" {
-		return TaskID{}, fmt.Errorf("%w: %s — empty namespace in %q — "+
-			"namespace must be non-empty, e.g. 'aura-plugins--<uuid>'", ErrInvalidID, "ParseTaskID", s)
-	}
-	u, err := uuid.Parse(s[idx+2:])
-	if err != nil {
-		return TaskID{}, fmt.Errorf("%w: %s — invalid UUID in %q: %v — "+
-			"the part after the last '--' must be a valid UUID", ErrInvalidID, "ParseTaskID", s, err)
-	}
-	return TaskID{Namespace: ns, UUID: u}, nil
+	return parseID[TaskID](s, "ParseTaskID")
 }
 
 // AgentID uniquely identifies an agent (PROV-O Agent).
@@ -65,22 +96,7 @@ func (id AgentID) String() string {
 // Uses strings.LastIndex to split on the rightmost "--" separator.
 // Returns ErrInvalidID if the format is invalid or the UUID is malformed.
 func ParseAgentID(s string) (AgentID, error) {
-	idx := strings.LastIndex(s, "--")
-	if idx < 0 {
-		return AgentID{}, fmt.Errorf("%w: %s — no '--' separator found in %q — "+
-			"expected format is 'namespace--uuidv7'", ErrInvalidID, "ParseAgentID", s)
-	}
-	ns := s[:idx]
-	if ns == "" {
-		return AgentID{}, fmt.Errorf("%w: %s — empty namespace in %q — "+
-			"namespace must be non-empty, e.g. 'aura-plugins--<uuid>'", ErrInvalidID, "ParseAgentID", s)
-	}
-	u, err := uuid.Parse(s[idx+2:])
-	if err != nil {
-		return AgentID{}, fmt.Errorf("%w: %s — invalid UUID in %q: %v — "+
-			"the part after the last '--' must be a valid UUID", ErrInvalidID, "ParseAgentID", s, err)
-	}
-	return AgentID{Namespace: ns, UUID: u}, nil
+	return parseID[AgentID](s, "ParseAgentID")
 }
 
 // ActivityID uniquely identifies an activity (PROV-O Activity).
@@ -99,22 +115,7 @@ func (id ActivityID) String() string {
 // Uses strings.LastIndex to split on the rightmost "--" separator.
 // Returns ErrInvalidID if the format is invalid or the UUID is malformed.
 func ParseActivityID(s string) (ActivityID, error) {
-	idx := strings.LastIndex(s, "--")
-	if idx < 0 {
-		return ActivityID{}, fmt.Errorf("%w: %s — no '--' separator found in %q — "+
-			"expected format is 'namespace--uuidv7'", ErrInvalidID, "ParseActivityID", s)
-	}
-	ns := s[:idx]
-	if ns == "" {
-		return ActivityID{}, fmt.Errorf("%w: %s — empty namespace in %q — "+
-			"namespace must be non-empty, e.g. 'aura-plugins--<uuid>'", ErrInvalidID, "ParseActivityID", s)
-	}
-	u, err := uuid.Parse(s[idx+2:])
-	if err != nil {
-		return ActivityID{}, fmt.Errorf("%w: %s — invalid UUID in %q: %v — "+
-			"the part after the last '--' must be a valid UUID", ErrInvalidID, "ParseActivityID", s, err)
-	}
-	return ActivityID{Namespace: ns, UUID: u}, nil
+	return parseID[ActivityID](s, "ParseActivityID")
 }
 
 // CommentID uniquely identifies a comment.
@@ -133,22 +134,7 @@ func (id CommentID) String() string {
 // Uses strings.LastIndex to split on the rightmost "--" separator.
 // Returns ErrInvalidID if the format is invalid or the UUID is malformed.
 func ParseCommentID(s string) (CommentID, error) {
-	idx := strings.LastIndex(s, "--")
-	if idx < 0 {
-		return CommentID{}, fmt.Errorf("%w: %s — no '--' separator found in %q — "+
-			"expected format is 'namespace--uuidv7'", ErrInvalidID, "ParseCommentID", s)
-	}
-	ns := s[:idx]
-	if ns == "" {
-		return CommentID{}, fmt.Errorf("%w: %s — empty namespace in %q — "+
-			"namespace must be non-empty, e.g. 'aura-plugins--<uuid>'", ErrInvalidID, "ParseCommentID", s)
-	}
-	u, err := uuid.Parse(s[idx+2:])
-	if err != nil {
-		return CommentID{}, fmt.Errorf("%w: %s — invalid UUID in %q: %v — "+
-			"the part after the last '--' must be a valid UUID", ErrInvalidID, "ParseCommentID", s, err)
-	}
-	return CommentID{Namespace: ns, UUID: u}, nil
+	return parseID[CommentID](s, "ParseCommentID")
 }
 
 // ---------------------------------------------------------------------------
