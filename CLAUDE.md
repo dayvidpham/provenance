@@ -141,6 +141,8 @@ go test -race ./...
 ```
 The `-race` flag is mandatory for all test runs to detect concurrent access issues.
 
+**Note:** The `-race` flag requires cgo (`CGO_ENABLED=1`). This is only for tests; production binaries are built with `CGO_ENABLED=0`.
+
 ### Test file conventions
 - Test files: `*_test.go` using `package foo_test` (black-box) or `package foo` (white-box).
 - Import the actual production package — never a test-only re-export.
@@ -151,8 +153,8 @@ The `-race` flag is mandatory for all test runs to detect concurrent access issu
 ```bash
 make fmt    # gofmt — fails if any file needs formatting
 make lint   # go vet ./...
-make test   # go test -race ./...
-make build  # CGO_ENABLED=0 go build ./...
+make test   # CGO_ENABLED=1 go test -race ./... (race detector requires cgo)
+make build  # CGO_ENABLED=0 go build ./... (production binaries are cgo-free)
 ```
 
 ## Build
