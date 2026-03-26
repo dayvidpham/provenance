@@ -6,16 +6,22 @@ package helpers
 import (
 	"fmt"
 
-	dbsqlite "github.com/dayvidpham/providence/internal/sqlite"
 	"github.com/dayvidpham/providence/pkg/ptypes"
 	dgraph "github.com/dominikbraun/graph"
 )
+
+// TaskGetter is the minimal interface needed by graph traversal helpers.
+// It allows looking up a single task by ID without coupling to the concrete
+// sqlite.DB type, making helpers independently testable with mocks.
+type TaskGetter interface {
+	GetTask(id ptypes.TaskID) (ptypes.Task, bool, error)
+}
 
 // Ancestors returns all tasks that transitively block the given task.
 // In the blocked-by graph, A->B means "A is blocked by B". Ancestors of A
 // are B and everything B transitively waits for (outgoing adjacency DFS).
 // The given task itself is never included. Returns an empty slice if none.
-func Ancestors(g dgraph.Graph[string, ptypes.Task], db *dbsqlite.DB, id ptypes.TaskID) ([]ptypes.Task, error) {
+func Ancestors(g dgraph.Graph[string, ptypes.Task], db TaskGetter, id ptypes.TaskID) ([]ptypes.Task, error) {
 	adjacency, err := g.AdjacencyMap()
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -58,7 +64,7 @@ func Ancestors(g dgraph.Graph[string, ptypes.Task], db *dbsqlite.DB, id ptypes.T
 // Descendants of B are A and everything that transitively depends on A
 // (predecessor DFS). The given task itself is never included. Returns an
 // empty slice if none.
-func Descendants(g dgraph.Graph[string, ptypes.Task], db *dbsqlite.DB, id ptypes.TaskID) ([]ptypes.Task, error) {
+func Descendants(g dgraph.Graph[string, ptypes.Task], db TaskGetter, id ptypes.TaskID) ([]ptypes.Task, error) {
 	predecessors, err := g.PredecessorMap()
 	if err != nil {
 		return nil, fmt.Errorf(

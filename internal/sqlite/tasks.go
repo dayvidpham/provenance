@@ -242,6 +242,27 @@ func (db *DB) ListTasks(filter ptypes.ListFilter) ([]ptypes.Task, error) {
 	return tasks, nil
 }
 
+// TaskCount returns the total number of tasks via COUNT(*).
+// This is O(1) in SQLite (index scan). Acquires the DB mutex.
+func (db *DB) TaskCount() (int, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	var count int
+	err := sqlitex.Execute(db.conn,
+		`SELECT COUNT(*) FROM tasks`,
+		&sqlitex.ExecOptions{
+			ResultFunc: func(stmt *zs.Stmt) error {
+				count = stmt.ColumnInt(0)
+				return nil
+			},
+		})
+	if err != nil {
+		return 0, fmt.Errorf("sqlite.TaskCount: %w", err)
+	}
+	return count, nil
+}
+
 // ReadyTasks returns tasks that are not closed and have no open blockers.
 // Acquires the DB mutex.
 func (db *DB) ReadyTasks() ([]ptypes.Task, error) {

@@ -89,11 +89,11 @@ func (s *Store) ListVertices() ([]string, error) {
 }
 
 func (s *Store) VertexCount() (int, error) {
-	hashes, err := s.ListVertices()
+	count, err := s.db.TaskCount()
 	if err != nil {
 		return 0, fmt.Errorf("graph.Store.VertexCount: %w", err)
 	}
-	return len(hashes), nil
+	return count, nil
 }
 
 func (s *Store) AddEdge(sourceHash, targetHash string, _ dgraph.Edge[string]) error {

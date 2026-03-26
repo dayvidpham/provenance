@@ -2,44 +2,19 @@ package graph_test
 
 import (
 	"testing"
-	"time"
 
 	intgraph "github.com/dayvidpham/providence/internal/graph"
 	dbsqlite "github.com/dayvidpham/providence/internal/sqlite"
+	"github.com/dayvidpham/providence/internal/testutil"
 	"github.com/dayvidpham/providence/pkg/ptypes"
 	dgraph "github.com/dominikbraun/graph"
-	"github.com/google/uuid"
 )
 
-// openTestDB returns a fresh in-memory sqlite.DB for testing.
-func openTestDB(t *testing.T) *dbsqlite.DB {
-	t.Helper()
-	db, err := dbsqlite.Open(":memory:")
-	if err != nil {
-		t.Fatalf("sqlite.Open(:memory:) failed: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := db.Close(); err != nil {
-			t.Errorf("db.Close() failed: %v", err)
-		}
-	})
-	return db
-}
+// openTestDB delegates to shared testutil.OpenTestDB.
+func openTestDB(t *testing.T) *dbsqlite.DB { return testutil.OpenTestDB(t) }
 
-// makeTask creates a minimal Task for testing.
-func makeTask(ns string) ptypes.Task {
-	now := time.Now().UTC()
-	return ptypes.Task{
-		ID:        ptypes.TaskID{Namespace: ns, UUID: uuid.Must(uuid.NewV7())},
-		Title:     "test task",
-		Status:    ptypes.StatusOpen,
-		Priority:  ptypes.PriorityMedium,
-		Type:      ptypes.TaskTypeTask,
-		Phase:     ptypes.PhaseUnscoped,
-		CreatedAt: now,
-		UpdatedAt: now,
-	}
-}
+// makeTask delegates to shared testutil.MakeTask with a default title.
+func makeTask(ns string) ptypes.Task { return testutil.MakeTask(ns, "test task") }
 
 func TestNewStoreImplementsInterface(t *testing.T) {
 	db := openTestDB(t)
@@ -95,7 +70,7 @@ func TestVertexNotFound(t *testing.T) {
 	db := openTestDB(t)
 	store := intgraph.NewStore(db)
 
-	fakeID := ptypes.TaskID{Namespace: "ns", UUID: uuid.Must(uuid.NewV7())}
+	fakeID := testutil.MakeTaskID("ns")
 	_, _, err := store.Vertex(fakeID.String())
 	if err != dgraph.ErrVertexNotFound {
 		t.Errorf("Vertex() for non-existent task: got %v, want ErrVertexNotFound", err)

@@ -5,44 +5,16 @@ import (
 	"time"
 
 	"github.com/dayvidpham/providence/internal/sqlite"
+	"github.com/dayvidpham/providence/internal/testutil"
 	"github.com/dayvidpham/providence/pkg/ptypes"
 	"github.com/google/uuid"
 )
 
-// openTestDB returns a fresh in-memory sqlite.DB for testing.
-func openTestDB(t *testing.T) *sqlite.DB {
-	t.Helper()
-	db, err := sqlite.Open(":memory:")
-	if err != nil {
-		t.Fatalf("sqlite.Open(:memory:) failed: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := db.Close(); err != nil {
-			t.Errorf("db.Close() failed: %v", err)
-		}
-	})
-	return db
-}
+// openTestDB delegates to shared testutil.OpenTestDB.
+func openTestDB(t *testing.T) *sqlite.DB { return testutil.OpenTestDB(t) }
 
-// makeTaskID creates a deterministic TaskID for testing.
-func makeTaskID(ns string) ptypes.TaskID {
-	return ptypes.TaskID{Namespace: ns, UUID: uuid.Must(uuid.NewV7())}
-}
-
-// makeTask creates a minimal test task with sensible defaults.
-func makeTask(ns, title string) ptypes.Task {
-	now := time.Now().UTC()
-	return ptypes.Task{
-		ID:        makeTaskID(ns),
-		Title:     title,
-		Status:    ptypes.StatusOpen,
-		Priority:  ptypes.PriorityMedium,
-		Type:      ptypes.TaskTypeTask,
-		Phase:     ptypes.PhaseUnscoped,
-		CreatedAt: now,
-		UpdatedAt: now,
-	}
-}
+// makeTask delegates to shared testutil.MakeTask.
+func makeTask(ns, title string) ptypes.Task { return testutil.MakeTask(ns, title) }
 
 // ---------------------------------------------------------------------------
 // Schema verification

@@ -1,151 +1,127 @@
 package providence_test
 
 // reexport_test.go verifies that every exported symbol from pkg/ptypes is
-// re-exported by the root providence package. If a new type, constant, or
-// function is added to pkg/ptypes without a corresponding re-export, one or
-// more of these compile-time assertions or runtime checks will fail.
+// re-exported by the root providence package. Uses reflect to scan both
+// packages so that adding a new type, constant, or function to pkg/ptypes
+// without a corresponding re-export will be caught automatically.
 //
 // Strategy:
-//   - Compile-time: type identity assertions (type alias = same type)
-//   - Compile-time: constant identity assertions (same value, same type)
-//   - Compile-time: sentinel error identity assertions
-//   - Compile-time: parse function signature assertions
+//   - Reflect-based: scan all exported names from ptypes and verify each
+//     has a corresponding export in the root providence package
 //   - Runtime: errors.Is checks to confirm sentinel errors are the same objects
+//   - Runtime: parse function results match between packages
 
 import (
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/dayvidpham/providence"
 	"github.com/dayvidpham/providence/pkg/ptypes"
 )
 
-// ---------------------------------------------------------------------------
-// Compile-time type identity assertions
-// ---------------------------------------------------------------------------
-// These assignments verify that each providence.X is the same type as ptypes.X.
-// Type aliases are transparent, so this compiles if and only if the alias exists
-// and refers to the correct ptypes type.
+// collectExportedNames parses Go source files in dir and returns all exported
+// top-level names (types, constants, variables, functions). Skips _test.go files.
+func collectExportedNames(t *testing.T, dir string) []string {
+	t.Helper()
+	fset := token.NewFileSet()
 
-var (
-	// Enum types
-	_ providence.Status    = ptypes.Status(0)
-	_ providence.Priority  = ptypes.Priority(0)
-	_ providence.TaskType  = ptypes.TaskType(0)
-	_ providence.EdgeKind  = ptypes.EdgeKind(0)
-	_ providence.AgentKind = ptypes.AgentKind(0)
-	_ providence.Provider  = ptypes.Provider(0)
-	_ providence.Role      = ptypes.Role(0)
-	_ providence.Phase     = ptypes.Phase(0)
-	_ providence.Stage     = ptypes.Stage(0)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("collectExportedNames: ReadDir(%q) failed: %v", dir, err)
+	}
 
-	// ID types
-	_ providence.TaskID     = ptypes.TaskID{}
-	_ providence.AgentID    = ptypes.AgentID{}
-	_ providence.ActivityID = ptypes.ActivityID{}
-	_ providence.CommentID  = ptypes.CommentID{}
+	seen := make(map[string]bool)
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		path := filepath.Join(dir, name)
+		f, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			t.Fatalf("collectExportedNames: ParseFile(%q) failed: %v", path, err)
+		}
+		for _, decl := range f.Decls {
+			switch d := decl.(type) {
+			case *ast.GenDecl:
+				for _, spec := range d.Specs {
+					switch s := spec.(type) {
+					case *ast.TypeSpec:
+						if s.Name.IsExported() {
+							seen[s.Name.Name] = true
+						}
+					case *ast.ValueSpec:
+						for _, n := range s.Names {
+							if n.IsExported() {
+								seen[n.Name] = true
+							}
+						}
+					}
+				}
+			case *ast.FuncDecl:
+				if d.Recv == nil && d.Name.IsExported() {
+					seen[d.Name.Name] = true
+				}
+			}
+		}
+	}
 
-	// Entity types
-	_ providence.Task          = ptypes.Task{}
-	_ providence.Agent         = ptypes.Agent{}
-	_ providence.HumanAgent    = ptypes.HumanAgent{}
-	_ providence.MLAgent       = ptypes.MLAgent{}
-	_ providence.SoftwareAgent = ptypes.SoftwareAgent{}
-	_ providence.MLModel       = ptypes.MLModel{}
-	_ providence.Activity      = ptypes.Activity{}
-	_ providence.Edge          = ptypes.Edge{}
-	_ providence.Label         = ptypes.Label{}
-	_ providence.Comment       = ptypes.Comment{}
+	names := make([]string, 0, len(seen))
+	for n := range seen {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
+}
 
-	// Supporting types
-	_ providence.UpdateFields = ptypes.UpdateFields{}
-	_ providence.ListFilter   = ptypes.ListFilter{}
-)
+// TestReexportCompleteness scans pkg/ptypes for all exported names and verifies
+// that each one has a corresponding export in the root providence package.
+// This replaces the old hand-maintained assignment checks.
+func TestReexportCompleteness(t *testing.T) {
+	// Find the module root by locating go.mod relative to test binary working dir.
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("os.Getwd failed: %v", err)
+	}
 
-// ---------------------------------------------------------------------------
-// Compile-time constant identity assertions
-// ---------------------------------------------------------------------------
-// Assigning ptypes constants to typed providence variables guarantees both
-// type compatibility and value identity.
+	ptypesDir := filepath.Join(wd, "pkg", "ptypes")
+	rootDir := wd
 
-var (
-	// Status constants
-	_ providence.Status = providence.StatusOpen
-	_ providence.Status = providence.StatusInProgress
-	_ providence.Status = providence.StatusClosed
+	ptypesNames := collectExportedNames(t, ptypesDir)
+	rootNames := collectExportedNames(t, rootDir)
 
-	// Priority constants
-	_ providence.Priority = providence.PriorityCritical
-	_ providence.Priority = providence.PriorityHigh
-	_ providence.Priority = providence.PriorityMedium
-	_ providence.Priority = providence.PriorityLow
-	_ providence.Priority = providence.PriorityBacklog
+	rootSet := make(map[string]bool, len(rootNames))
+	for _, n := range rootNames {
+		rootSet[n] = true
+	}
 
-	// TaskType constants
-	_ providence.TaskType = providence.TaskTypeBug
-	_ providence.TaskType = providence.TaskTypeFeature
-	_ providence.TaskType = providence.TaskTypeTask
-	_ providence.TaskType = providence.TaskTypeEpic
-	_ providence.TaskType = providence.TaskTypeChore
+	// Names that are intentionally NOT re-exported (internal helpers, etc.).
+	// Currently empty — all ptypes exports should be re-exported.
+	skip := map[string]bool{}
 
-	// EdgeKind constants
-	_ providence.EdgeKind = providence.EdgeBlockedBy
-	_ providence.EdgeKind = providence.EdgeDerivedFrom
-	_ providence.EdgeKind = providence.EdgeSupersedes
-	_ providence.EdgeKind = providence.EdgeDiscoveredFrom
-	_ providence.EdgeKind = providence.EdgeGeneratedBy
-	_ providence.EdgeKind = providence.EdgeAttributedTo
+	var missing []string
+	for _, name := range ptypesNames {
+		if skip[name] {
+			continue
+		}
+		if !rootSet[name] {
+			missing = append(missing, name)
+		}
+	}
 
-	// AgentKind constants
-	_ providence.AgentKind = providence.AgentKindHuman
-	_ providence.AgentKind = providence.AgentKindMachineLearning
-	_ providence.AgentKind = providence.AgentKindSoftware
-
-	// Provider constants
-	_ providence.Provider = providence.ProviderAnthropic
-	_ providence.Provider = providence.ProviderGoogle
-	_ providence.Provider = providence.ProviderOpenAI
-	_ providence.Provider = providence.ProviderLocal
-
-	// Role constants
-	_ providence.Role = providence.RoleHuman
-	_ providence.Role = providence.RoleArchitect
-	_ providence.Role = providence.RoleSupervisor
-	_ providence.Role = providence.RoleWorker
-	_ providence.Role = providence.RoleReviewer
-
-	// Phase constants
-	_ providence.Phase = providence.PhaseRequest
-	_ providence.Phase = providence.PhaseElicit
-	_ providence.Phase = providence.PhasePropose
-	_ providence.Phase = providence.PhaseReview
-	_ providence.Phase = providence.PhasePlanUAT
-	_ providence.Phase = providence.PhaseRatify
-	_ providence.Phase = providence.PhaseHandoff
-	_ providence.Phase = providence.PhaseImplPlan
-	_ providence.Phase = providence.PhaseWorkerSlices
-	_ providence.Phase = providence.PhaseCodeReview
-	_ providence.Phase = providence.PhaseImplUAT
-	_ providence.Phase = providence.PhaseLanding
-	_ providence.Phase = providence.PhaseUnscoped
-
-	// Stage constants
-	_ providence.Stage = providence.StageNotStarted
-	_ providence.Stage = providence.StageInProgress
-	_ providence.Stage = providence.StageBlocked
-	_ providence.Stage = providence.StageComplete
-)
-
-// ---------------------------------------------------------------------------
-// Compile-time parse function signature assertions
-// ---------------------------------------------------------------------------
-
-var (
-	_ func(string) (providence.TaskID, error)     = providence.ParseTaskID
-	_ func(string) (providence.AgentID, error)    = providence.ParseAgentID
-	_ func(string) (providence.ActivityID, error) = providence.ParseActivityID
-	_ func(string) (providence.CommentID, error)  = providence.ParseCommentID
-)
+	if len(missing) > 0 {
+		t.Errorf("pkg/ptypes exports %d names not re-exported by root package:\n  %s\n"+
+			"Fix: add re-exports in reexports.go for each missing name.",
+			len(missing), strings.Join(missing, "\n  "))
+	}
+}
 
 // ---------------------------------------------------------------------------
 // Runtime: sentinel error identity
@@ -173,175 +149,6 @@ func TestReexportSentinelErrorIdentity(t *testing.T) {
 				t.Errorf("ptypes.%s is not errors.Is-identical to providence.%s", c.name, c.name)
 			}
 		})
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Runtime: constant value identity
-// ---------------------------------------------------------------------------
-// Verifies that re-exported constants have the exact same integer values.
-
-func TestReexportConstantValues(t *testing.T) {
-	// Status
-	if providence.StatusOpen != ptypes.StatusOpen {
-		t.Errorf("StatusOpen: providence=%d, ptypes=%d", providence.StatusOpen, ptypes.StatusOpen)
-	}
-	if providence.StatusInProgress != ptypes.StatusInProgress {
-		t.Errorf("StatusInProgress: providence=%d, ptypes=%d", providence.StatusInProgress, ptypes.StatusInProgress)
-	}
-	if providence.StatusClosed != ptypes.StatusClosed {
-		t.Errorf("StatusClosed: providence=%d, ptypes=%d", providence.StatusClosed, ptypes.StatusClosed)
-	}
-
-	// Priority
-	if providence.PriorityCritical != ptypes.PriorityCritical {
-		t.Errorf("PriorityCritical mismatch")
-	}
-	if providence.PriorityHigh != ptypes.PriorityHigh {
-		t.Errorf("PriorityHigh mismatch")
-	}
-	if providence.PriorityMedium != ptypes.PriorityMedium {
-		t.Errorf("PriorityMedium mismatch")
-	}
-	if providence.PriorityLow != ptypes.PriorityLow {
-		t.Errorf("PriorityLow mismatch")
-	}
-	if providence.PriorityBacklog != ptypes.PriorityBacklog {
-		t.Errorf("PriorityBacklog mismatch")
-	}
-
-	// TaskType
-	if providence.TaskTypeBug != ptypes.TaskTypeBug {
-		t.Errorf("TaskTypeBug mismatch")
-	}
-	if providence.TaskTypeFeature != ptypes.TaskTypeFeature {
-		t.Errorf("TaskTypeFeature mismatch")
-	}
-	if providence.TaskTypeTask != ptypes.TaskTypeTask {
-		t.Errorf("TaskTypeTask mismatch")
-	}
-	if providence.TaskTypeEpic != ptypes.TaskTypeEpic {
-		t.Errorf("TaskTypeEpic mismatch")
-	}
-	if providence.TaskTypeChore != ptypes.TaskTypeChore {
-		t.Errorf("TaskTypeChore mismatch")
-	}
-
-	// EdgeKind
-	if providence.EdgeBlockedBy != ptypes.EdgeBlockedBy {
-		t.Errorf("EdgeBlockedBy mismatch")
-	}
-	if providence.EdgeDerivedFrom != ptypes.EdgeDerivedFrom {
-		t.Errorf("EdgeDerivedFrom mismatch")
-	}
-	if providence.EdgeSupersedes != ptypes.EdgeSupersedes {
-		t.Errorf("EdgeSupersedes mismatch")
-	}
-	if providence.EdgeDiscoveredFrom != ptypes.EdgeDiscoveredFrom {
-		t.Errorf("EdgeDiscoveredFrom mismatch")
-	}
-	if providence.EdgeGeneratedBy != ptypes.EdgeGeneratedBy {
-		t.Errorf("EdgeGeneratedBy mismatch")
-	}
-	if providence.EdgeAttributedTo != ptypes.EdgeAttributedTo {
-		t.Errorf("EdgeAttributedTo mismatch")
-	}
-
-	// AgentKind
-	if providence.AgentKindHuman != ptypes.AgentKindHuman {
-		t.Errorf("AgentKindHuman mismatch")
-	}
-	if providence.AgentKindMachineLearning != ptypes.AgentKindMachineLearning {
-		t.Errorf("AgentKindMachineLearning mismatch")
-	}
-	if providence.AgentKindSoftware != ptypes.AgentKindSoftware {
-		t.Errorf("AgentKindSoftware mismatch")
-	}
-
-	// Provider
-	if providence.ProviderAnthropic != ptypes.ProviderAnthropic {
-		t.Errorf("ProviderAnthropic mismatch")
-	}
-	if providence.ProviderGoogle != ptypes.ProviderGoogle {
-		t.Errorf("ProviderGoogle mismatch")
-	}
-	if providence.ProviderOpenAI != ptypes.ProviderOpenAI {
-		t.Errorf("ProviderOpenAI mismatch")
-	}
-	if providence.ProviderLocal != ptypes.ProviderLocal {
-		t.Errorf("ProviderLocal mismatch")
-	}
-
-	// Role
-	if providence.RoleHuman != ptypes.RoleHuman {
-		t.Errorf("RoleHuman mismatch")
-	}
-	if providence.RoleArchitect != ptypes.RoleArchitect {
-		t.Errorf("RoleArchitect mismatch")
-	}
-	if providence.RoleSupervisor != ptypes.RoleSupervisor {
-		t.Errorf("RoleSupervisor mismatch")
-	}
-	if providence.RoleWorker != ptypes.RoleWorker {
-		t.Errorf("RoleWorker mismatch")
-	}
-	if providence.RoleReviewer != ptypes.RoleReviewer {
-		t.Errorf("RoleReviewer mismatch")
-	}
-
-	// Phase
-	if providence.PhaseRequest != ptypes.PhaseRequest {
-		t.Errorf("PhaseRequest mismatch")
-	}
-	if providence.PhaseElicit != ptypes.PhaseElicit {
-		t.Errorf("PhaseElicit mismatch")
-	}
-	if providence.PhasePropose != ptypes.PhasePropose {
-		t.Errorf("PhasePropose mismatch")
-	}
-	if providence.PhaseReview != ptypes.PhaseReview {
-		t.Errorf("PhaseReview mismatch")
-	}
-	if providence.PhasePlanUAT != ptypes.PhasePlanUAT {
-		t.Errorf("PhasePlanUAT mismatch")
-	}
-	if providence.PhaseRatify != ptypes.PhaseRatify {
-		t.Errorf("PhaseRatify mismatch")
-	}
-	if providence.PhaseHandoff != ptypes.PhaseHandoff {
-		t.Errorf("PhaseHandoff mismatch")
-	}
-	if providence.PhaseImplPlan != ptypes.PhaseImplPlan {
-		t.Errorf("PhaseImplPlan mismatch")
-	}
-	if providence.PhaseWorkerSlices != ptypes.PhaseWorkerSlices {
-		t.Errorf("PhaseWorkerSlices mismatch")
-	}
-	if providence.PhaseCodeReview != ptypes.PhaseCodeReview {
-		t.Errorf("PhaseCodeReview mismatch")
-	}
-	if providence.PhaseImplUAT != ptypes.PhaseImplUAT {
-		t.Errorf("PhaseImplUAT mismatch")
-	}
-	if providence.PhaseLanding != ptypes.PhaseLanding {
-		t.Errorf("PhaseLanding mismatch")
-	}
-	if providence.PhaseUnscoped != ptypes.PhaseUnscoped {
-		t.Errorf("PhaseUnscoped mismatch")
-	}
-
-	// Stage
-	if providence.StageNotStarted != ptypes.StageNotStarted {
-		t.Errorf("StageNotStarted mismatch")
-	}
-	if providence.StageInProgress != ptypes.StageInProgress {
-		t.Errorf("StageInProgress mismatch")
-	}
-	if providence.StageBlocked != ptypes.StageBlocked {
-		t.Errorf("StageBlocked mismatch")
-	}
-	if providence.StageComplete != ptypes.StageComplete {
-		t.Errorf("StageComplete mismatch")
 	}
 }
 

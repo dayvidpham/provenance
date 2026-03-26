@@ -2,54 +2,24 @@ package helpers_test
 
 import (
 	"testing"
-	"time"
 
 	intgraph "github.com/dayvidpham/providence/internal/graph"
 	"github.com/dayvidpham/providence/internal/helpers"
 	dbsqlite "github.com/dayvidpham/providence/internal/sqlite"
+	"github.com/dayvidpham/providence/internal/testutil"
 	"github.com/dayvidpham/providence/pkg/ptypes"
 	dgraph "github.com/dominikbraun/graph"
-	"github.com/google/uuid"
 )
 
-// openTestDB returns a fresh in-memory sqlite.DB for testing.
-func openTestDB(t *testing.T) *dbsqlite.DB {
-	t.Helper()
-	db, err := dbsqlite.Open(":memory:")
-	if err != nil {
-		t.Fatalf("sqlite.Open(:memory:) failed: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := db.Close(); err != nil {
-			t.Errorf("db.Close() failed: %v", err)
-		}
-	})
-	return db
-}
+// openTestDB delegates to shared testutil.OpenTestDB.
+func openTestDB(t *testing.T) *dbsqlite.DB { return testutil.OpenTestDB(t) }
 
-// makeTask creates a minimal Task for testing.
-func makeTask(ns, title string) ptypes.Task {
-	now := time.Now().UTC()
-	return ptypes.Task{
-		ID:        ptypes.TaskID{Namespace: ns, UUID: uuid.Must(uuid.NewV7())},
-		Title:     title,
-		Status:    ptypes.StatusOpen,
-		Priority:  ptypes.PriorityMedium,
-		Type:      ptypes.TaskTypeTask,
-		Phase:     ptypes.PhaseUnscoped,
-		CreatedAt: now,
-		UpdatedAt: now,
-	}
-}
+// makeTask delegates to shared testutil.MakeTask.
+func makeTask(ns, title string) ptypes.Task { return testutil.MakeTask(ns, title) }
 
-// containsTask checks if a task with the given ID is in the slice.
+// containsTask delegates to shared testutil.ContainsTask.
 func containsTask(tasks []ptypes.Task, id ptypes.TaskID) bool {
-	for _, t := range tasks {
-		if t.ID == id {
-			return true
-		}
-	}
-	return false
+	return testutil.ContainsTask(tasks, id)
 }
 
 // setupChain creates tasks A, B, C and edges A->B->C (A blocked by B blocked by C).
