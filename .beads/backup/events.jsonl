@@ -184,3 +184,5 @@
 {"actor":"David Huu Pham","comment":null,"created_at":"2026-03-26T02:19:35Z","event_type":"closed","id":185,"issue_id":"providence-rz1","new_value":"Migrated from aura-plugins (completed work)","old_value":""}
 {"actor":"David Huu Pham","comment":null,"created_at":"2026-03-26T02:19:35Z","event_type":"closed","id":186,"issue_id":"providence-ude","new_value":"Migrated from aura-plugins (completed work)","old_value":""}
 {"actor":"David Huu Pham","comment":null,"created_at":"2026-03-26T02:19:35Z","event_type":"closed","id":187,"issue_id":"providence-56a","new_value":"Migrated from aura-plugins (completed work)","old_value":""}
+{"actor":"David Huu Pham","comment":null,"created_at":"2026-03-26T02:34:07Z","event_type":"created","id":188,"issue_id":"providence-izw","new_value":"","old_value":""}
+{"actor":"David Huu Pham","comment":"Added label: aura:epic:providence","created_at":"2026-03-26T02:34:07Z","event_type":"label_added","id":189,"issue_id":"providence-izw","new_value":null,"old_value":null}
