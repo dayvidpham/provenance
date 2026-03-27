@@ -1,0 +1,95 @@
+# Combinatorial Test Fixtures for pkg/ptypes
+# ===========================================
+#
+# Axes are expanded into permutation test cases by the Go test harness.
+# For parseID: id_types × namespaces × uuids → success test cases
+# Error cases are run against all 4 id_types.
+#
+# Total success permutations: 4 id_types × 6 namespaces × 3 uuids = 72
+# Total error permutations:   4 id_types × 8 error_cases            = 32
+# Grand total: 104
+
+# =================================
+# parseID: ID parsing permutations
+# =================================
+
+parse_id:
+
+  # Axis 1: ID types to test (each has its own Parse function)
+  id_types:
+    - name: TaskID
+      parse_func: ParseTaskID
+
+    - name: AgentID
+      parse_func: ParseAgentID
+
+    - name: ActivityID
+      parse_func: ParseActivityID
+
+    - name: CommentID
+      parse_func: ParseCommentID
+
+  # Axis 2: Namespace patterns
+  namespaces:
+    - name: simple
+      value: "test-ns"
+
+    - name: with_dashes
+      value: "my-project-name"
+
+    - name: with_double_dash
+      value: "ns--with--dashes"
+
+    - name: single_char
+      value: "x"
+
+    - name: long_namespace
+      value: "very-long-namespace-with-many-segments"
+
+    - name: uri_style
+      value: "https://github.com/user/repo"
+
+  # Axis 3: UUID patterns
+  uuids:
+    - name: valid_v7
+      value: "018f4b12-3456-7890-abcd-ef0123456789"
+
+    - name: valid_v4
+      value: "550e8400-e29b-41d4-a716-446655440000"
+
+    - name: nil_uuid
+      value: "00000000-0000-0000-0000-000000000000"
+
+  # Error cases (not combinatorial — run against all 4 id_types)
+  error_cases:
+    - name: no_separator
+      input: "noseparatorhere"
+      error: ErrInvalidID
+
+    - name: empty_string
+      input: ""
+      error: ErrInvalidID
+
+    - name: only_separator
+      input: "--"
+      error: ErrInvalidID
+
+    - name: empty_namespace
+      input: "--018f4b12-3456-7890-abcd-ef0123456789"
+      error: ErrInvalidID
+
+    - name: invalid_uuid
+      input: "test-ns--not-a-uuid"
+      error: ErrInvalidID
+
+    - name: uuid_too_short
+      input: "test-ns--12345"
+      error: ErrInvalidID
+
+    - name: trailing_separator
+      input: "test-ns--"
+      error: ErrInvalidID
+
+    - name: single_dash_not_double
+      input: "test-ns-018f4b12-3456-7890-abcd-ef0123456789"
+      error: ErrInvalidID
