@@ -1,11 +1,13 @@
 package provenance
 
-import "github.com/dayvidpham/provenance/pkg/ptypes"
+import (
+	"github.com/dayvidpham/bestiary"
+	"github.com/dayvidpham/provenance/pkg/ptypes"
+)
 
-// defaultRegistry is the built-in model registry with models matching
-// the Anthropic API model identifiers. This is the fallback when no
-// external registry (e.g., bestiary) is provided.
-type defaultRegistry struct {
+// inMemoryRegistry is an in-process model registry backed by a slice of ModelEntry.
+// It is the implementation returned by NewRegistry and DefaultModelRegistry.
+type inMemoryRegistry struct {
 	entries []ModelEntry
 	index   map[registryKey]ModelEntry
 }
@@ -15,36 +17,34 @@ type registryKey struct {
 	name     string
 }
 
-// defaultModels lists the models seeded into ml_models at database creation.
-// Names match the canonical identifiers from models.dev / Anthropic API.
-var defaultModels = []ModelEntry{
-	{Provider: ProviderAnthropic, Name: "claude-opus-4-6", DisplayName: "Claude Opus 4.6", Family: "claude-opus"},
-	{Provider: ProviderAnthropic, Name: "claude-sonnet-4-6", DisplayName: "Claude Sonnet 4.6", Family: "claude-sonnet"},
-	{Provider: ProviderAnthropic, Name: "claude-haiku-4-5", DisplayName: "Claude Haiku 4.5", Family: "claude-haiku"},
-}
-
-// DefaultModelRegistry returns the built-in model registry.
-// It contains the core Anthropic models used by aura agents.
-func DefaultModelRegistry() ptypes.ModelRegistry {
-	idx := make(map[registryKey]ModelEntry, len(defaultModels))
-	for _, m := range defaultModels {
-		idx[registryKey{provider: m.Provider, name: m.Name}] = m
+// NewRegistry creates a ModelRegistry from the given entries.
+// Use this for custom or test registries.
+func NewRegistry(entries []ModelEntry) ptypes.ModelRegistry {
+	idx := make(map[registryKey]ModelEntry, len(entries))
+	for _, m := range entries {
+		idx[registryKey{provider: m.Provider, name: string(m.Name)}] = m
 	}
-	return &defaultRegistry{entries: defaultModels, index: idx}
+	return &inMemoryRegistry{entries: entries, index: idx}
 }
 
-func (r *defaultRegistry) Models() []ModelEntry {
+// DefaultModelRegistry returns the model registry backed by bestiary.
+// It uses bestiary.Models() as the single source of truth.
+func DefaultModelRegistry() ptypes.ModelRegistry {
+	return RegistryFromBestiary(bestiary.Models())
+}
+
+func (r *inMemoryRegistry) Models() []ModelEntry {
 	out := make([]ModelEntry, len(r.entries))
 	copy(out, r.entries)
 	return out
 }
 
-func (r *defaultRegistry) Lookup(provider Provider, name string) (ModelEntry, bool) {
+func (r *inMemoryRegistry) Lookup(provider Provider, name string) (ModelEntry, bool) {
 	e, ok := r.index[registryKey{provider: provider, name: name}]
 	return e, ok
 }
 
-func (r *defaultRegistry) ModelsByProvider(provider Provider) []ModelEntry {
+func (r *inMemoryRegistry) ModelsByProvider(provider Provider) []ModelEntry {
 	var out []ModelEntry
 	for _, m := range r.entries {
 		if m.Provider == provider {

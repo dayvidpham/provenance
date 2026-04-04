@@ -4,6 +4,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/dayvidpham/bestiary"
 	"github.com/dayvidpham/provenance"
 	"github.com/dayvidpham/provenance/pkg/ptypes"
 )
@@ -16,34 +17,22 @@ func TestDefaultModelRegistry_Models(t *testing.T) {
 	reg := provenance.DefaultModelRegistry()
 	models := reg.Models()
 
-	if len(models) != 3 {
-		t.Fatalf("Models() returned %d entries, want 3", len(models))
+	if len(models) == 0 {
+		t.Fatal("Models() returned empty")
 	}
 
-	want := []struct {
-		provider    provenance.Provider
-		name        string
-		displayName string
-		family      string
+	// Verify known models exist (not index-dependent)
+	knownModels := []struct {
+		provider provenance.Provider
+		name     string
 	}{
-		{provenance.ProviderAnthropic, "claude-opus-4-6", "Claude Opus 4.6", "claude-opus"},
-		{provenance.ProviderAnthropic, "claude-sonnet-4-6", "Claude Sonnet 4.6", "claude-sonnet"},
-		{provenance.ProviderAnthropic, "claude-haiku-4-5", "Claude Haiku 4.5", "claude-haiku"},
+		{provenance.ProviderAnthropic, "claude-opus-4-6"},
+		{provenance.ProviderAnthropic, "claude-sonnet-4-6"},
+		{provenance.ProviderAnthropic, "claude-haiku-4-5"},
 	}
-
-	for i, w := range want {
-		got := models[i]
-		if got.Provider != w.provider {
-			t.Errorf("models[%d].Provider = %v, want %v", i, got.Provider, w.provider)
-		}
-		if got.Name != w.name {
-			t.Errorf("models[%d].Name = %q, want %q", i, got.Name, w.name)
-		}
-		if got.DisplayName != w.displayName {
-			t.Errorf("models[%d].DisplayName = %q, want %q", i, got.DisplayName, w.displayName)
-		}
-		if got.Family != w.family {
-			t.Errorf("models[%d].Family = %q, want %q", i, got.Family, w.family)
+	for _, want := range knownModels {
+		if _, ok := reg.Lookup(want.provider, want.name); !ok {
+			t.Errorf("Lookup(%s, %q) should succeed", want.provider, want.name)
 		}
 	}
 }
@@ -97,13 +86,23 @@ func TestDefaultModelRegistry_ModelsByProvider(t *testing.T) {
 	reg := provenance.DefaultModelRegistry()
 
 	anthropic := reg.ModelsByProvider(provenance.ProviderAnthropic)
-	if len(anthropic) != 3 {
-		t.Errorf("ModelsByProvider(Anthropic) = %d entries, want 3", len(anthropic))
+	if len(anthropic) == 0 {
+		t.Error("ModelsByProvider(Anthropic) returned empty")
+	}
+	found := false
+	for _, m := range anthropic {
+		if string(m.Name) == "claude-opus-4-6" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("ModelsByProvider(Anthropic) missing claude-opus-4-6")
 	}
 
-	google := reg.ModelsByProvider(provenance.ProviderGoogle)
-	if len(google) != 0 {
-		t.Errorf("ModelsByProvider(Google) = %d entries, want 0", len(google))
+	local := reg.ModelsByProvider(provenance.ProviderLocal)
+	if len(local) != 0 {
+		t.Errorf("ModelsByProvider(Local) = %d, want 0", len(local))
 	}
 }
 
@@ -124,7 +123,7 @@ func (r *testRegistry) Models() []ptypes.ModelEntry {
 
 func (r *testRegistry) Lookup(provider provenance.Provider, name string) (ptypes.ModelEntry, bool) {
 	for _, m := range r.entries {
-		if m.Provider == provider && m.Name == name {
+		if m.Provider == provider && string(m.Name) == name {
 			return m, true
 		}
 	}
@@ -188,20 +187,19 @@ func TestWithModelRegistry_EmptyRegistry(t *testing.T) {
 
 // TestDefaultRegistry_LookupRejectsBeforeDB verifies that the registry Lookup
 // fires before any DB layer interaction. A tracker opened with the default
-// registry (which seeds 3 Anthropic models) must reject a Google model via
-// the registry's Lookup — returning ErrNotFound — without touching the DB.
+// registry (backed by bestiary) must reject a local model with a nonexistent
+// name via the registry's Lookup — returning ErrNotFound — without touching the DB.
 func TestDefaultRegistry_LookupRejectsBeforeDB(t *testing.T) {
-	tr, err := provenance.OpenMemory() // default registry: 3 Anthropic models seeded
+	tr, err := provenance.OpenMemory()
 	if err != nil {
 		t.Fatalf("OpenMemory: %v", err)
 	}
 	defer tr.Close()
 
-	// ProviderGoogle + "gemini-2.0-flash" is not in the default registry.
-	// The registry Lookup should reject it before any DB insert is attempted.
-	_, err = tr.RegisterMLAgent("ns", provenance.RoleWorker, provenance.ProviderGoogle, "gemini-2.0-flash")
+	_, err = tr.RegisterMLAgent("ns", provenance.RoleWorker,
+		provenance.ProviderLocal, "nonexistent-model")
 	if !errors.Is(err, provenance.ErrNotFound) {
-		t.Errorf("RegisterMLAgent(Google, gemini-2.0-flash) with default registry: got %v, want errors.Is(err, ErrNotFound)", err)
+		t.Errorf("got %v, want ErrNotFound", err)
 	}
 }
 
@@ -220,5 +218,29 @@ func TestWithModelRegistry_NilRegistry(t *testing.T) {
 	}
 	if agent.Model.Name != "claude-opus-4-6" {
 		t.Errorf("Model.Name = %q, want %q", agent.Model.Name, "claude-opus-4-6")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// RegistryFromBestiary — round-trip
+// ---------------------------------------------------------------------------
+
+func TestRegistryFromBestiary_RoundTrip(t *testing.T) {
+	reg := provenance.RegistryFromBestiary(bestiary.Models())
+	models := reg.Models()
+	if len(models) == 0 {
+		t.Fatal("RegistryFromBestiary returned empty registry")
+	}
+
+	// Verify a known Anthropic model round-trips
+	entry, ok := reg.Lookup(provenance.ProviderAnthropic, "claude-opus-4-6")
+	if !ok {
+		t.Fatal("Lookup(Anthropic, claude-opus-4-6) failed after round-trip")
+	}
+	if entry.Provider != provenance.ProviderAnthropic {
+		t.Errorf("Provider = %q, want %q", entry.Provider, provenance.ProviderAnthropic)
+	}
+	if string(entry.Name) != "claude-opus-4-6" {
+		t.Errorf("Name = %q, want %q", entry.Name, "claude-opus-4-6")
 	}
 }

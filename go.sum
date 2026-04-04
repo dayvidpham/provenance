@@ -1,3 +1,5 @@
+github.com/dayvidpham/bestiary v0.1.0 h1:5ovdxMlRgssn3+oJCZqjbhlhX6aQwbYFf981LbMAhII=
+github.com/dayvidpham/bestiary v0.1.0/go.mod h1:Z2/Ax6PmmBqhHomuLDjvf+JQBo0K7TFyrQN7pOCOpKs=
 github.com/dominikbraun/graph v0.23.0 h1:TdZB4pPqCLFxYhdyMFb1TBdFxp8XLcJfTTBQucVPgCo=
 github.com/dominikbraun/graph v0.23.0/go.mod h1:yOjYyogZLY1LSG9E33JWZJiq5k83Qy2C6POAuiViluc=
 github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=
