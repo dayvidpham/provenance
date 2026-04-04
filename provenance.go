@@ -1,6 +1,6 @@
 package provenance
 
-// Tracker is the central API for providence task management.
+// Tracker is the central API for Provenance task management.
 // All methods are safe for concurrent use.
 // Use OpenSQLite or OpenMemory to obtain an implementation.
 type Tracker interface {
