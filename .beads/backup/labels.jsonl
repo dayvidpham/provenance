@@ -21,6 +21,7 @@
 {"issue_id":"providence-3cz","label":"aura:epic:providence"}
 {"issue_id":"providence-3g6","label":"aura:p4-plan:s4-review"}
 {"issue_id":"providence-3zm","label":"aura:epic:providence"}
+{"issue_id":"providence-46j","label":"aura:p11-user:s11-uat"}
 {"issue_id":"providence-4bb","label":"aura:p9-impl:s9-slice"}
 {"issue_id":"providence-4jg","label":"aura:epic:providence"}
 {"issue_id":"providence-4su","label":"aura:epic:providence"}
@@ -118,6 +119,7 @@
 {"issue_id":"providence-rdk","label":"aura:p9-impl:s9-slice"}
 {"issue_id":"providence-rz1","label":"aura:epic:providence"}
 {"issue_id":"providence-sns","label":"aura:p1-user:s1_2-research"}
+{"issue_id":"providence-som","label":"aura:epic-followup"}
 {"issue_id":"providence-st6","label":"aura:epic:providence"}
 {"issue_id":"providence-tnc","label":"aura:epic:providence"}
 {"issue_id":"providence-tul","label":"aura:p2-user:s2_2-urd"}
