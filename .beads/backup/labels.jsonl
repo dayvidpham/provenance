@@ -16,6 +16,7 @@
 {"issue_id":"providence-2us","label":"aura:p9-impl:s9-slice"}
 {"issue_id":"providence-36l","label":"aura:epic:providence"}
 {"issue_id":"providence-3cz","label":"aura:epic:providence"}
+{"issue_id":"providence-3g6","label":"aura:p4-plan:s4-review"}
 {"issue_id":"providence-3zm","label":"aura:epic:providence"}
 {"issue_id":"providence-4jg","label":"aura:epic:providence"}
 {"issue_id":"providence-4su","label":"aura:epic:providence"}
@@ -32,6 +33,9 @@
 {"issue_id":"providence-65f","label":"aura:epic:providence"}
 {"issue_id":"providence-6rv","label":"aura:epic:providence"}
 {"issue_id":"providence-6rv","label":"aura:p9-impl:s9-slice"}
+{"issue_id":"providence-6x2","label":"aura:p4-plan:s4-review"}
+{"issue_id":"providence-77p","label":"aura:p4-plan:s4-review"}
+{"issue_id":"providence-7e7","label":"aura:p5-user:s5-uat"}
 {"issue_id":"providence-7n7","label":"aura:p1-user:s1_1-classify"}
 {"issue_id":"providence-7o3","label":"aura:epic"}
 {"issue_id":"providence-8gw","label":"aura:epic:providence"}
@@ -50,8 +54,10 @@
 {"issue_id":"providence-a97","label":"aura:epic:providence"}
 {"issue_id":"providence-a97","label":"aura:p9-impl:s9-slice"}
 {"issue_id":"providence-avb","label":"aura:epic:providence"}
+{"issue_id":"providence-azj","label":"aura:p4-plan:s4-review"}
 {"issue_id":"providence-cbk","label":"aura:epic:providence"}
 {"issue_id":"providence-cl3","label":"aura:p4-plan:s4-review"}
+{"issue_id":"providence-clf","label":"aura:p4-plan:s4-review"}
 {"issue_id":"providence-cmb","label":"aura:epic:providence"}
 {"issue_id":"providence-cmb","label":"aura:p9-impl:s9-slice"}
 {"issue_id":"providence-d17","label":"aura:epic:providence"}
@@ -62,9 +68,12 @@
 {"issue_id":"providence-ghq","label":"aura:p2-user:s2_1-elicit"}
 {"issue_id":"providence-id1","label":"aura:epic:providence"}
 {"issue_id":"providence-id1","label":"aura:p2-user:s2_1-elicit"}
+{"issue_id":"providence-ik5","label":"aura:p3-plan:s3-propose"}
+{"issue_id":"providence-ik5","label":"aura:superseded"}
 {"issue_id":"providence-izw","label":"aura:epic:providence"}
 {"issue_id":"providence-jiw","label":"aura:epic:providence"}
 {"issue_id":"providence-jte","label":"aura:p3-plan:s3-propose"}
+{"issue_id":"providence-jte","label":"aura:superseded"}
 {"issue_id":"providence-jxx","label":"aura:epic:providence"}
 {"issue_id":"providence-jxx","label":"aura:p9-impl:s9-slice"}
 {"issue_id":"providence-k7k","label":"aura:p9-impl:s9-slice"}
@@ -75,6 +84,7 @@
 {"issue_id":"providence-lyp","label":"aura:p6-plan:s6-ratify"}
 {"issue_id":"providence-lyy","label":"aura:epic:providence"}
 {"issue_id":"providence-lyy","label":"aura:p9-impl:s9-slice"}
+{"issue_id":"providence-mnq","label":"aura:p3-plan:s3-propose"}
 {"issue_id":"providence-ozk","label":"aura:epic:providence"}
 {"issue_id":"providence-pkh","label":"aura:epic:providence"}
 {"issue_id":"providence-plt","label":"aura:p9-impl:s9-slice"}
@@ -95,3 +105,4 @@
 {"issue_id":"providence-wpm","label":"aura:p9-impl:s9-slice"}
 {"issue_id":"providence-xnh","label":"aura:p4-plan:s4-review"}
 {"issue_id":"providence-z6d","label":"aura:epic:providence"}
+{"issue_id":"providence-zin","label":"aura:p4-plan:s4-review"}
