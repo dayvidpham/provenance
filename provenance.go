@@ -155,13 +155,17 @@ type Tracker interface {
 // OpenSQLite creates a Tracker backed by a SQLite database at dbPath.
 // The database file and parent directories are created if they do not exist.
 // The schema is applied on every open (idempotent).
-func OpenSQLite(dbPath string) (Tracker, error) {
-	return openTracker(dbPath)
+//
+// Use WithModelRegistry to override the default model seed data:
+//
+//	tr, err := provenance.OpenSQLite(path, provenance.WithModelRegistry(bestiary.Registry()))
+func OpenSQLite(dbPath string, opts ...Option) (Tracker, error) {
+	return openTracker(dbPath, opts...)
 }
 
 // OpenMemory creates a Tracker backed by an in-memory SQLite database.
 // Useful for tests and ephemeral sessions. The database is destroyed when the
 // Tracker is closed.
-func OpenMemory() (Tracker, error) {
-	return openTracker(":memory:")
+func OpenMemory(opts ...Option) (Tracker, error) {
+	return openTracker(":memory:", opts...)
 }

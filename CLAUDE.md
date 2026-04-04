@@ -137,11 +137,9 @@ func (id TaskID) Hash() string {
 
 ### Mandatory flags
 ```bash
-go test -race ./...
+CGO_ENABLED=0 go test -count=1 ./...
 ```
-The `-race` flag is mandatory for all test runs to detect concurrent access issues.
-
-**Note:** The `-race` flag requires cgo (`CGO_ENABLED=1`). This is only for tests; production binaries are built with `CGO_ENABLED=0`.
+All tests run with `CGO_ENABLED=0` — the entire project is pure Go with no cgo dependencies.
 
 ### Test file conventions
 - Test files: `*_test.go` using `package foo_test` (black-box) or `package foo` (white-box).
@@ -153,15 +151,15 @@ The `-race` flag is mandatory for all test runs to detect concurrent access issu
 ```bash
 make fmt    # gofmt — fails if any file needs formatting
 make lint   # go vet ./...
-make test   # CGO_ENABLED=1 go test -race ./... (race detector requires cgo)
-make build  # CGO_ENABLED=0 go build ./... (production binaries are cgo-free)
+make test   # CGO_ENABLED=0 go test -count=1 ./...
+make build  # CGO_ENABLED=0 go build ./...
 ```
 
 ## Build
 
 ```bash
-make build          # produces bin/providence (if cmd exists)
-make test           # go test -race ./...
+make build          # CGO_ENABLED=0 go build ./...
+make test           # CGO_ENABLED=0 go test -count=1 ./...
 make lint           # go vet ./...
 make fmt            # gofmt -w .
 make clean          # rm -rf bin/

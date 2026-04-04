@@ -416,8 +416,8 @@ func TestRegisterHumanAgent(t *testing.T) {
 func TestRegisterMLAgent(t *testing.T) {
 	tr := openTestTracker(t)
 
-	// "claude_sonnet_4" is a model seeded in the schema at database creation time.
-	agent, err := tr.RegisterMLAgent("ns", provenance.RoleWorker, provenance.ProviderAnthropic, "claude_sonnet_4")
+	// "claude-sonnet-4-6" is a model seeded in the schema at database creation time.
+	agent, err := tr.RegisterMLAgent("ns", provenance.RoleWorker, provenance.ProviderAnthropic, "claude-sonnet-4-6")
 	if err != nil {
 		t.Fatalf("RegisterMLAgent() error: %v", err)
 	}
@@ -427,8 +427,8 @@ func TestRegisterMLAgent(t *testing.T) {
 	if agent.Model.Provider != provenance.ProviderAnthropic {
 		t.Errorf("Provider = %v, want ProviderAnthropic", agent.Model.Provider)
 	}
-	if agent.Model.Name != "claude_sonnet_4" {
-		t.Errorf("ModelName = %q, want %q", agent.Model.Name, "claude_sonnet_4")
+	if agent.Model.Name != "claude-sonnet-4-6" {
+		t.Errorf("ModelName = %q, want %q", agent.Model.Name, "claude-sonnet-4-6")
 	}
 	if agent.Kind != provenance.AgentKindMachineLearning {
 		t.Errorf("Kind = %v, want AgentKindMachineLearning", agent.Kind)
@@ -439,8 +439,8 @@ func TestRegisterMLAgent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MLAgent() error: %v", err)
 	}
-	if retrieved.Model.Name != "claude_sonnet_4" {
-		t.Errorf("Retrieved model name = %q, want %q", retrieved.Model.Name, "claude_sonnet_4")
+	if retrieved.Model.Name != "claude-sonnet-4-6" {
+		t.Errorf("Retrieved model name = %q, want %q", retrieved.Model.Name, "claude-sonnet-4-6")
 	}
 }
 
@@ -695,7 +695,7 @@ func TestAgent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RegisterHumanAgent() error: %v", err)
 	}
-	ml, err := tr.RegisterMLAgent("ns", provenance.RoleReviewer, provenance.ProviderAnthropic, "claude_sonnet_4")
+	ml, err := tr.RegisterMLAgent("ns", provenance.RoleReviewer, provenance.ProviderAnthropic, "claude-sonnet-4-6")
 	if err != nil {
 		t.Fatalf("RegisterMLAgent() error: %v", err)
 	}

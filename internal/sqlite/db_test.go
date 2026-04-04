@@ -25,7 +25,7 @@ func makeTask(ns, title string) ptypes.Task { return testutil.MakeTask(ns, title
 // ---------------------------------------------------------------------------
 
 func TestOpenAndClose(t *testing.T) {
-	db, err := sqlite.Open(":memory:")
+	db, err := sqlite.Open(":memory:", testutil.TestModels())
 	if err != nil {
 		t.Fatalf("sqlite.Open(:memory:) returned error: %v", err)
 	}
@@ -528,7 +528,7 @@ func TestRegisterAndGetHumanAgent(t *testing.T) {
 func TestRegisterAndGetMLAgent(t *testing.T) {
 	db := openTestDB(t)
 
-	mla, err := db.RegisterMLAgent("ns", ptypes.RoleWorker, ptypes.ProviderAnthropic, "claude_opus_4")
+	mla, err := db.RegisterMLAgent("ns", ptypes.RoleWorker, ptypes.ProviderAnthropic, "claude-opus-4-6")
 	if err != nil {
 		t.Fatalf("RegisterMLAgent error: %v", err)
 	}
@@ -543,8 +543,8 @@ func TestRegisterAndGetMLAgent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetMLAgent error: %v", err)
 	}
-	if got.Model.Name != "claude_opus_4" {
-		t.Errorf("Model.Name = %q, want %q", got.Model.Name, "claude_opus_4")
+	if got.Model.Name != "claude-opus-4-6" {
+		t.Errorf("Model.Name = %q, want %q", got.Model.Name, "claude-opus-4-6")
 	}
 }
 
@@ -1214,7 +1214,7 @@ func TestAgentKindMismatch_YAMLPermutations(t *testing.T) {
 				}
 				agentID = a.ID
 			case 1: // ml
-				a, err := db.RegisterMLAgent("test-ns", ptypes.RoleWorker, ptypes.ProviderAnthropic, "claude_opus_4")
+				a, err := db.RegisterMLAgent("test-ns", ptypes.RoleWorker, ptypes.ProviderAnthropic, "claude-opus-4-6")
 				if err != nil {
 					t.Fatalf("RegisterMLAgent error: %v", err)
 				}

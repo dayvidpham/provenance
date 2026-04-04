@@ -12,11 +12,21 @@ import (
 	"github.com/google/uuid"
 )
 
+// TestModels returns the default model entries used for testing.
+// These match the canonical Anthropic API model identifiers.
+func TestModels() []ptypes.ModelEntry {
+	return []ptypes.ModelEntry{
+		{Provider: ptypes.ProviderAnthropic, Name: "claude-opus-4-6", DisplayName: "Claude Opus 4.6", Family: "claude-opus"},
+		{Provider: ptypes.ProviderAnthropic, Name: "claude-sonnet-4-6", DisplayName: "Claude Sonnet 4.6", Family: "claude-sonnet"},
+		{Provider: ptypes.ProviderAnthropic, Name: "claude-haiku-4-5", DisplayName: "Claude Haiku 4.5", Family: "claude-haiku"},
+	}
+}
+
 // OpenTestDB returns a fresh in-memory sqlite.DB for testing.
 // The database is closed automatically when the test ends.
 func OpenTestDB(t *testing.T) *dbsqlite.DB {
 	t.Helper()
-	db, err := dbsqlite.Open(":memory:")
+	db, err := dbsqlite.Open(":memory:", TestModels())
 	if err != nil {
 		t.Fatalf("testutil.OpenTestDB: sqlite.Open(:memory:) failed: %v", err)
 	}

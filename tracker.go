@@ -32,8 +32,13 @@ type sqliteTracker struct {
 
 // openTracker opens (or creates) a SQLite database at dbPath and returns
 // an initialised Tracker. Pass ":memory:" for an in-memory database.
-func openTracker(dbPath string) (Tracker, error) {
-	db, err := dbsqlite.Open(dbPath)
+func openTracker(dbPath string, opts ...Option) (Tracker, error) {
+	o := defaultOptions()
+	for _, opt := range opts {
+		opt(&o)
+	}
+
+	db, err := dbsqlite.Open(dbPath, o.registry.Models())
 	if err != nil {
 		return nil, fmt.Errorf("provenance.openTracker: %w", err)
 	}

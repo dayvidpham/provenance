@@ -52,6 +52,12 @@ type (
 	Comment       = ptypes.Comment
 )
 
+// Model registry types
+type (
+	ModelEntry    = ptypes.ModelEntry
+	ModelRegistry = ptypes.ModelRegistry
+)
+
 // Supporting types
 type (
 	UpdateFields = ptypes.UpdateFields

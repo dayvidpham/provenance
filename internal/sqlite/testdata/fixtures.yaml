@@ -418,10 +418,10 @@ list_tasks:
 # ==========================================
 #
 # Cross-product of roles × providers × model_states.
-# Seeded ml_models (from db.go seedReferenceData):
-#   id=0: provider_id=0 (anthropic), name="claude_opus_4"
-#   id=1: provider_id=0 (anthropic), name="claude_sonnet_4"
-#   id=2: provider_id=0 (anthropic), name="claude_haiku_4"
+# Seeded ml_models (from ModelRegistry via seedMLModels):
+#   provider_id=0 (anthropic), name="claude-opus-4-6"
+#   provider_id=0 (anthropic), name="claude-sonnet-4-6"
+#   provider_id=0 (anthropic), name="claude-haiku-4-5"
 #
 # providers: 0=anthropic, 1=google, 2=openai, 3=local
 # roles: 0=human, 1=architect, 2=supervisor, 3=worker, 4=reviewer
@@ -438,11 +438,11 @@ register_ml_agent:
   # Registering with these must succeed.
   known_models:
     - provider: 0
-      name: "claude_opus_4"
+      name: "claude-opus-4-6"
     - provider: 0
-      name: "claude_sonnet_4"
+      name: "claude-sonnet-4-6"
     - provider: 0
-      name: "claude_haiku_4"
+      name: "claude-haiku-4-5"
 
   # Unknown (provider, model_name) pairs that must return ErrNotFound.
   unknown_models:

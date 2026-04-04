@@ -12,6 +12,7 @@ package sqlite
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,8 +32,9 @@ type DB struct {
 // initialised DB. Pass ":memory:" for an in-memory database.
 //
 // The schema is applied idempotently on every open (CREATE TABLE IF NOT EXISTS).
-// Reference data (enums, seed models) is inserted via INSERT OR IGNORE.
-func Open(dbPath string) (*DB, error) {
+// Reference data (enums) is inserted via INSERT OR IGNORE.
+// The models parameter provides the ML model entries to seed into ml_models.
+func Open(dbPath string, models []ptypes.ModelEntry) (*DB, error) {
 	conn, err := zs.OpenConn(dbPath, zs.OpenReadWrite|zs.OpenCreate|zs.OpenWAL|zs.OpenURI)
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -50,7 +52,7 @@ func Open(dbPath string) (*DB, error) {
 		return nil, fmt.Errorf("sqlite.Open: failed to apply pragmas on %q: %w", dbPath, err)
 	}
 
-	if err := db.ensureSchema(); err != nil {
+	if err := db.ensureSchema(models); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("sqlite.Open: failed to apply schema on %q: %w", dbPath, err)
 	}
@@ -116,7 +118,7 @@ func (db *DB) applyPragmas() error {
 // Schema DDL
 // ---------------------------------------------------------------------------
 
-func (db *DB) ensureSchema() error {
+func (db *DB) ensureSchema(models []ptypes.ModelEntry) error {
 	ddl := []string{
 		`CREATE TABLE IF NOT EXISTS statuses (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT`,
 		`CREATE TABLE IF NOT EXISTS priorities (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT`,
@@ -218,14 +220,14 @@ func (db *DB) ensureSchema() error {
 			return fmt.Errorf("ensureSchema: %w — statement: %s", err, stmt[:min(len(stmt), 80)])
 		}
 	}
-	return db.seedReferenceData()
+	return db.seedReferenceData(models)
 }
 
 // ---------------------------------------------------------------------------
 // Seed data
 // ---------------------------------------------------------------------------
 
-func (db *DB) seedReferenceData() error {
+func (db *DB) seedReferenceData(models []ptypes.ModelEntry) error {
 	seeds := []string{
 		`INSERT OR IGNORE INTO statuses (id, name) VALUES (0,'open'),(1,'in_progress'),(2,'closed')`,
 		`INSERT OR IGNORE INTO priorities (id, name) VALUES (0,'critical'),(1,'high'),(2,'medium'),(3,'low'),(4,'backlog')`,
@@ -236,12 +238,40 @@ func (db *DB) seedReferenceData() error {
 		`INSERT OR IGNORE INTO roles (id, name) VALUES (0,'human'),(1,'architect'),(2,'supervisor'),(3,'worker'),(4,'reviewer')`,
 		`INSERT OR IGNORE INTO phases (id, name) VALUES (0,'request'),(1,'elicit'),(2,'propose'),(3,'review'),(4,'plan_uat'),(5,'ratify'),(6,'handoff'),(7,'impl_plan'),(8,'worker_slices'),(9,'code_review'),(10,'impl_uat'),(11,'landing'),(12,'unscoped')`,
 		`INSERT OR IGNORE INTO stages (id, name) VALUES (0,'not_started'),(1,'in_progress'),(2,'blocked'),(3,'complete')`,
-		`INSERT OR IGNORE INTO ml_models (id, provider_id, name) VALUES (0,0,'claude_opus_4'),(1,0,'claude_sonnet_4'),(2,0,'claude_haiku_4')`,
 	}
 	for _, seed := range seeds {
 		if err := sqlitex.ExecuteTransient(db.conn, seed, nil); err != nil {
 			return fmt.Errorf("seedReferenceData: %w — seed: %s", err, seed[:min(len(seed), 80)])
 		}
+	}
+
+	// Seed ml_models from the provided model registry entries.
+	if err := db.seedMLModels(models); err != nil {
+		return fmt.Errorf("seedReferenceData: %w", err)
+	}
+	return nil
+}
+
+// seedMLModels inserts model entries into the ml_models table.
+// Uses INSERT OR IGNORE so existing rows are preserved on re-open.
+func (db *DB) seedMLModels(models []ptypes.ModelEntry) error {
+	if len(models) == 0 {
+		return nil
+	}
+
+	// Build a single INSERT OR IGNORE statement for all models.
+	var b strings.Builder
+	b.WriteString("INSERT OR IGNORE INTO ml_models (provider_id, name) VALUES ")
+	for i, m := range models {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		// provider_id matches the Provider enum's integer value.
+		fmt.Fprintf(&b, "(%d,'%s')", int(m.Provider), m.Name)
+	}
+
+	if err := sqlitex.ExecuteTransient(db.conn, b.String(), nil); err != nil {
+		return fmt.Errorf("seedMLModels: %w — inserting %d models", err, len(models))
 	}
 	return nil
 }
