@@ -1,6 +1,7 @@
 package provenance_test
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/dayvidpham/provenance"
@@ -69,7 +70,9 @@ type testRegistry struct {
 }
 
 func (r *testRegistry) Models() []ptypes.ModelEntry {
-	return r.entries
+	out := make([]ptypes.ModelEntry, len(r.entries))
+	copy(out, r.entries)
+	return out
 }
 
 func TestWithModelRegistry_CustomRegistry(t *testing.T) {
@@ -96,8 +99,8 @@ func TestWithModelRegistry_CustomRegistry(t *testing.T) {
 
 	// Default models should NOT be seeded.
 	_, err = tr.RegisterMLAgent("ns", provenance.RoleWorker, provenance.ProviderAnthropic, "claude-opus-4-6")
-	if err == nil {
-		t.Error("RegisterMLAgent with default model should fail when custom registry is used")
+	if !errors.Is(err, provenance.ErrNotFound) {
+		t.Errorf("RegisterMLAgent with default model: got %v, want errors.Is(err, ErrNotFound)", err)
 	}
 }
 
@@ -110,9 +113,9 @@ func TestWithModelRegistry_EmptyRegistry(t *testing.T) {
 	}
 	defer tr.Close()
 
-	// No models seeded — any RegisterMLAgent should fail.
+	// No models seeded — any RegisterMLAgent should fail with ErrNotFound.
 	_, err = tr.RegisterMLAgent("ns", provenance.RoleWorker, provenance.ProviderAnthropic, "claude-opus-4-6")
-	if err == nil {
-		t.Error("RegisterMLAgent should fail with empty registry")
+	if !errors.Is(err, provenance.ErrNotFound) {
+		t.Errorf("RegisterMLAgent with empty registry: got %v, want errors.Is(err, ErrNotFound)", err)
 	}
 }
