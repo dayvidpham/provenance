@@ -346,7 +346,7 @@ func TestProviderRoundTrip(t *testing.T) {
 	for _, p := range values {
 		b, err := p.MarshalText()
 		if err != nil {
-			t.Fatalf("Provider(%d).MarshalText(): %v", int(p), err)
+			t.Fatalf("Provider(%q).MarshalText(): %v", string(p), err)
 		}
 		var got ptypes.Provider
 		if err := got.UnmarshalText(b); err != nil {
@@ -370,7 +370,27 @@ func TestProviderStringValues(t *testing.T) {
 	}
 	for _, c := range cases {
 		if got := c.p.String(); got != c.want {
-			t.Errorf("Provider(%d).String() = %q, want %q", int(c.p), got, c.want)
+			t.Errorf("Provider(%q).String() = %q, want %q", string(c.p), got, c.want)
+		}
+	}
+}
+
+func TestProviderIsValidCaseInsensitive(t *testing.T) {
+	cases := []struct {
+		input ptypes.Provider
+		valid bool
+	}{
+		{ptypes.Provider("anthropic"), true},
+		{ptypes.Provider("ANTHROPIC"), true},
+		{ptypes.Provider("Anthropic"), true},
+		{ptypes.Provider("google"), true},
+		{ptypes.Provider("GOOGLE"), true},
+		{ptypes.Provider("unknown"), false},
+		{ptypes.Provider(""), false},
+	}
+	for _, c := range cases {
+		if got := c.input.IsValid(); got != c.valid {
+			t.Errorf("Provider(%q).IsValid() = %v, want %v", string(c.input), got, c.valid)
 		}
 	}
 }
@@ -539,7 +559,7 @@ func TestEnumOutOfRangeFallback(t *testing.T) {
 		{"TaskType(99)", ptypes.TaskType(99).String(), "TaskType(99)"},
 		{"EdgeKind(99)", ptypes.EdgeKind(99).String(), "EdgeKind(99)"},
 		{"AgentKind(99)", ptypes.AgentKind(99).String(), "AgentKind(99)"},
-		{"Provider(99)", ptypes.Provider(99).String(), "Provider(99)"},
+		{"Provider(unknown)", ptypes.Provider("unknown_provider").String(), "unknown_provider"},
 		{"Role(99)", ptypes.Role(99).String(), "Role(99)"},
 		{"Phase(99)", ptypes.Phase(99).String(), fmt.Sprintf("Phase(%d)", 99)},
 		{"Stage(99)", ptypes.Stage(99).String(), "Stage(99)"},

@@ -54,6 +54,7 @@ type (
 
 // Model registry types
 type (
+	ModelID       = ptypes.ModelID
 	ModelEntry    = ptypes.ModelEntry
 	ModelRegistry = ptypes.ModelRegistry
 )

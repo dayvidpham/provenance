@@ -10,7 +10,10 @@
 // from ptypes via transparent type aliases.
 package ptypes
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // ---------------------------------------------------------------------------
 // Status
@@ -292,53 +295,53 @@ func (a AgentKind) IsValid() bool {
 // ---------------------------------------------------------------------------
 
 // Provider identifies the organization behind an ML model.
-type Provider int
+type Provider string
 
 const (
-	ProviderAnthropic Provider = iota // 0
-	ProviderGoogle                    // 1
-	ProviderOpenAI                    // 2
-	ProviderLocal                     // 3
+	ProviderAnthropic Provider = "anthropic"
+	ProviderGoogle    Provider = "google"
+	ProviderOpenAI    Provider = "openai"
+	ProviderLocal     Provider = "local"
 )
 
-var providerStrings = [...]string{
-	ProviderAnthropic: "anthropic",
-	ProviderGoogle:    "google",
-	ProviderOpenAI:    "openai",
-	ProviderLocal:     "local",
+// knownProviders is the set of recognized Provider values.
+var knownProviders = [...]Provider{
+	ProviderAnthropic,
+	ProviderGoogle,
+	ProviderOpenAI,
+	ProviderLocal,
 }
 
 func (p Provider) String() string {
-	if int(p) >= 0 && int(p) < len(providerStrings) {
-		return providerStrings[p]
-	}
-	return fmt.Sprintf("Provider(%d)", int(p))
+	return string(p)
 }
 
 func (p Provider) MarshalText() ([]byte, error) {
 	if !p.IsValid() {
-		return nil, fmt.Errorf("provenance: cannot marshal invalid Provider(%d) — valid range is 0–%d", int(p), len(providerStrings)-1)
+		return nil, fmt.Errorf("provenance: cannot marshal invalid Provider %q — valid values: anthropic, google, openai, local", string(p))
 	}
-	return []byte(p.String()), nil
+	return []byte(p), nil
 }
 
 func (p *Provider) UnmarshalText(b []byte) error {
-	text := string(b)
-	for i, name := range providerStrings {
-		if name == text {
-			*p = Provider(i)
-			return nil
-		}
+	candidate := Provider(strings.ToLower(string(b)))
+	if !candidate.IsValid() {
+		return fmt.Errorf(
+			"provenance: unknown Provider %q — valid values: anthropic, google, openai, local — "+
+				"fix by using one of the listed values",
+			string(b),
+		)
 	}
-	return fmt.Errorf(
-		"provenance: unknown Provider %q — valid values: %v — "+
-			"fix by using one of the listed values",
-		text, providerStrings[:],
-	)
+	*p = candidate
+	return nil
 }
 
 func (p Provider) IsValid() bool {
-	return p >= ProviderAnthropic && p <= ProviderLocal
+	switch Provider(strings.ToLower(string(p))) {
+	case ProviderAnthropic, ProviderGoogle, ProviderOpenAI, ProviderLocal:
+		return true
+	}
+	return false
 }
 
 // ---------------------------------------------------------------------------
