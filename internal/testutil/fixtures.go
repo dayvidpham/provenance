@@ -1,4 +1,4 @@
-// Package testutil provides shared test fixtures and helpers for Providence
+// Package testutil provides shared test fixtures and helpers for Provenance
 // internal packages. Import this package from any _test.go file that needs
 // an in-memory database or pre-built tasks.
 package testutil

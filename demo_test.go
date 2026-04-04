@@ -106,7 +106,7 @@ func TestDemo_DependencyGraph(t *testing.T) {
 	}
 
 	// Close SLICE-1 → IMPL_PLAN becomes ready
-	tr.CloseTask(slice1.ID, "Done")
+	mustCloseTask(t, tr, slice1.ID, "Done")
 	ready2, err := tr.Ready()
 	if err != nil {
 		t.Fatalf("Ready() after close failed: %v", err)
@@ -298,9 +298,9 @@ func TestDemo_LabelsAndComments(t *testing.T) {
 	task := mustCreate(t, tr, "proj", "SLICE-1", "", provenance.TaskTypeTask, provenance.PriorityMedium, provenance.PhaseWorkerSlices)
 
 	// Labels
-	tr.AddLabel(task.ID, "aura:p9-impl:s9-slice")
-	tr.AddLabel(task.ID, "aura:severity:blocker")
-	tr.AddLabel(task.ID, "aura:p9-impl:s9-slice") // idempotent
+	mustAddLabel(t, tr, task.ID, "aura:p9-impl:s9-slice")
+	mustAddLabel(t, tr, task.ID, "aura:severity:blocker")
+	mustAddLabel(t, tr, task.ID, "aura:p9-impl:s9-slice") // idempotent
 
 	labels, err := tr.Labels(task.ID)
 	if err != nil {
@@ -396,8 +396,8 @@ func TestDemo_FullEpochSimulation(t *testing.T) {
 		provenance.TaskTypeFeature, provenance.PriorityHigh, provenance.PhaseRequest)
 	mustAddEdge(t, tr, request.ID, reqActivity.ID.String(), provenance.EdgeGeneratedBy)
 	mustAddEdge(t, tr, request.ID, human.ID.String(), provenance.EdgeAttributedTo)
-	tr.AddLabel(request.ID, "aura:p1-user:s1_1-classify")
-	tr.EndActivity(reqActivity.ID)
+	mustAddLabel(t, tr, request.ID, "aura:p1-user:s1_1-classify")
+	mustEndActivity(t, tr, reqActivity.ID)
 
 	// --- Phase 3: PROPOSAL ---
 	propActivity := mustStartActivity(t, tr, architect.ID, provenance.PhasePropose, provenance.StageInProgress, "Writing proposal")
@@ -406,11 +406,11 @@ func TestDemo_FullEpochSimulation(t *testing.T) {
 	mustAddEdge(t, tr, proposal.ID, propActivity.ID.String(), provenance.EdgeGeneratedBy)
 	mustAddEdge(t, tr, proposal.ID, architect.ID.String(), provenance.EdgeAttributedTo)
 	mustAddEdge(t, tr, request.ID, proposal.ID.String(), provenance.EdgeBlockedBy)
-	tr.AddLabel(proposal.ID, "aura:p3-plan:s3-propose")
-	tr.EndActivity(propActivity.ID)
+	mustAddLabel(t, tr, proposal.ID, "aura:p3-plan:s3-propose")
+	mustEndActivity(t, tr, propActivity.ID)
 
 	// --- Phase 4: REVIEW ---
-	tr.AddComment(proposal.ID, reviewerA.ID, "VOTE: ACCEPT — correctness verified")
+	mustAddComment(t, tr, proposal.ID, reviewerA.ID, "VOTE: ACCEPT — correctness verified")
 
 	// --- Phase 8: IMPL_PLAN ---
 	planActivity := mustStartActivity(t, tr, supervisor.ID, provenance.PhaseImplPlan, provenance.StageInProgress, "Decomposing")
@@ -421,7 +421,7 @@ func TestDemo_FullEpochSimulation(t *testing.T) {
 	slice1 := mustCreate(t, tr, "aura", "SLICE-1: types", "",
 		provenance.TaskTypeTask, provenance.PriorityMedium, provenance.PhaseWorkerSlices)
 	mustAddEdge(t, tr, implPlan.ID, slice1.ID.String(), provenance.EdgeBlockedBy)
-	tr.EndActivity(planActivity.ID)
+	mustEndActivity(t, tr, planActivity.ID)
 
 	// --- Readiness check ---
 	ready, err := tr.Ready()
@@ -438,8 +438,8 @@ func TestDemo_FullEpochSimulation(t *testing.T) {
 	// --- Phase 9: Worker implements ---
 	implActivity := mustStartActivity(t, tr, workerAgent.ID, provenance.PhaseWorkerSlices, provenance.StageInProgress, "Implementing")
 	mustAddEdge(t, tr, slice1.ID, implActivity.ID.String(), provenance.EdgeGeneratedBy)
-	tr.CloseTask(slice1.ID, "Tests pass, committed")
-	tr.EndActivity(implActivity.ID)
+	mustCloseTask(t, tr, slice1.ID, "Tests pass, committed")
+	mustEndActivity(t, tr, implActivity.ID)
 
 	// IMPL_PLAN should now be ready
 	ready2, err := tr.Ready()
@@ -559,6 +559,40 @@ func mustStartActivity(t *testing.T, tr provenance.Tracker, agentID provenance.A
 		t.Fatalf("StartActivity failed: %v", err)
 	}
 	return act
+}
+
+func mustCloseTask(t *testing.T, tr provenance.Tracker, id provenance.TaskID, reason string) provenance.Task {
+	t.Helper()
+	task, err := tr.CloseTask(id, reason)
+	if err != nil {
+		t.Fatalf("CloseTask(%v, %q) failed: %v", id, reason, err)
+	}
+	return task
+}
+
+func mustAddLabel(t *testing.T, tr provenance.Tracker, id provenance.TaskID, label string) {
+	t.Helper()
+	if err := tr.AddLabel(id, label); err != nil {
+		t.Fatalf("AddLabel(%v, %q) failed: %v", id, label, err)
+	}
+}
+
+func mustEndActivity(t *testing.T, tr provenance.Tracker, id provenance.ActivityID) provenance.Activity {
+	t.Helper()
+	act, err := tr.EndActivity(id)
+	if err != nil {
+		t.Fatalf("EndActivity(%v) failed: %v", id, err)
+	}
+	return act
+}
+
+func mustAddComment(t *testing.T, tr provenance.Tracker, taskID provenance.TaskID, authorID provenance.AgentID, body string) provenance.Comment {
+	t.Helper()
+	comment, err := tr.AddComment(taskID, authorID, body)
+	if err != nil {
+		t.Fatalf("AddComment(%v, %v) failed: %v", taskID, authorID, err)
+	}
+	return comment
 }
 
 func mustAddEdge(t *testing.T, tr provenance.Tracker, sourceID provenance.TaskID, targetID string, kind provenance.EdgeKind) {

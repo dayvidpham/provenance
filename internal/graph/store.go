@@ -1,5 +1,5 @@
 // Package graph provides the dominikbraun/graph.Store adapter backed by
-// the Providence SQLite database. It bridges the in-memory graph library
+// the Provenance SQLite database. It bridges the in-memory graph library
 // with persistent storage so that cycle detection and traversal work over
 // the full blocked-by subgraph.
 package graph

@@ -1,4 +1,4 @@
-// Package sqlite provides the SQLite persistence layer for the Providence
+// Package sqlite provides the SQLite persistence layer for the Provenance
 // task dependency tracker. It implements all CRUD operations for tasks, edges,
 // agents, labels, comments, and activities.
 //

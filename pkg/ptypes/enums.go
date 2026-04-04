@@ -1,4 +1,4 @@
-// Package ptypes provides the public type definitions for the Providence task
+// Package ptypes provides the public type definitions for the Provenance task
 // dependency tracker. It contains all enum types, ID types, entity structs,
 // supporting types, and sentinel errors.
 //

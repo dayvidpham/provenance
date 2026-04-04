@@ -1,4 +1,4 @@
-// Package helpers provides graph traversal utilities for the Providence
+// Package helpers provides graph traversal utilities for the Provenance
 // blocked-by dependency graph. These functions perform DFS over the
 // dominikbraun/graph structure and resolve traversed IDs to full Task values.
 package helpers

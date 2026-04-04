@@ -1,6 +1,6 @@
-# Contributing to Providence
+# Contributing to Provenance
 
-This guide covers the development workflow for Providence contributors. For coding standards, see [CLAUDE.md](CLAUDE.md).
+This guide covers the development workflow for Provenance contributors. For coding standards, see [CLAUDE.md](CLAUDE.md).
 
 ## Getting Started
 
@@ -44,7 +44,7 @@ Follow Conventional Commits for branch names:
 
 ### 2. Work in Slices
 
-Providence is organized in vertical slices. Each slice includes:
+Provenance is organized in vertical slices. Each slice includes:
 
 - **L1 (Types):** Define public types, interfaces, and enums
 - **L2 (Tests):** Write integration tests that import production code
@@ -143,7 +143,7 @@ Create a pull request on GitHub with:
 
 ## Package Structure
 
-The Providence package is organized to separate concerns:
+The Provenance package is organized to separate concerns:
 
 | Directory | Purpose |
 |-----------|---------|
@@ -214,7 +214,7 @@ func (s Status) IsValid() bool {
 
 ## Testing Strategy
 
-Providence uses **integration tests** as the primary testing approach:
+Provenance uses **integration tests** as the primary testing approach:
 
 - **Integration tests:** Test the full Tracker interface with real SQLite (via `:memory:`)
 - **Unit tests:** Test SQL operations and graph functions with simple inputs/outputs
@@ -303,7 +303,7 @@ This warning appears when go.mod has dependencies but no source files import the
 
 ### CGO_ENABLED=0 build fails
 
-Ensure you're not importing C libraries or cgo-dependent packages. Providence dependencies must all be pure Go:
+Ensure you're not importing C libraries or cgo-dependent packages. Provenance dependencies must all be pure Go:
 - ✓ `zombiezen.com/go/sqlite` (pure Go)
 - ✗ `github.com/mattn/go-sqlite3` (CGo)
 

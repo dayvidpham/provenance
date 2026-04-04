@@ -196,7 +196,7 @@ git agent-commit -m "feat(provenance): add Tracker interface"
 
 ## Type-Per-Type Hierarchy (Agent)
 
-Providence models Agents using a table-per-type (TPT) pattern:
+Provenance models Agents using a table-per-type (TPT) pattern:
 
 - Base table `agents` stores: `id`, `kind_id` (discriminator), `namespace`, `uuid`, `created_at`
 - Child tables `agents_human`, `agents_ml`, `agents_software` store kind-specific attributes

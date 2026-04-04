@@ -186,6 +186,25 @@ func TestWithModelRegistry_EmptyRegistry(t *testing.T) {
 	}
 }
 
+// TestDefaultRegistry_LookupRejectsBeforeDB verifies that the registry Lookup
+// fires before any DB layer interaction. A tracker opened with the default
+// registry (which seeds 3 Anthropic models) must reject a Google model via
+// the registry's Lookup — returning ErrNotFound — without touching the DB.
+func TestDefaultRegistry_LookupRejectsBeforeDB(t *testing.T) {
+	tr, err := provenance.OpenMemory() // default registry: 3 Anthropic models seeded
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	defer tr.Close()
+
+	// ProviderGoogle + "gemini-2.0-flash" is not in the default registry.
+	// The registry Lookup should reject it before any DB insert is attempted.
+	_, err = tr.RegisterMLAgent("ns", provenance.RoleWorker, provenance.ProviderGoogle, "gemini-2.0-flash")
+	if !errors.Is(err, provenance.ErrNotFound) {
+		t.Errorf("RegisterMLAgent(Google, gemini-2.0-flash) with default registry: got %v, want errors.Is(err, ErrNotFound)", err)
+	}
+}
+
 func TestWithModelRegistry_NilRegistry(t *testing.T) {
 	// Passing untyped nil must not panic — the default registry is preserved.
 	tr, err := provenance.OpenMemory(provenance.WithModelRegistry(nil))
