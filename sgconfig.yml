@@ -1,0 +1,4 @@
+# ast-grep project configuration for Go type safety auditing.
+# Run: ast-grep scan --config sgconfig.yml .
+ruleDirs:
+  - ast-grep
