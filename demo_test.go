@@ -1,6 +1,6 @@
 package provenance_test
 
-// demo_test.go — 9 integration demos proving provenance replaces Beads with
+// demo_test.go — 10 integration demos proving provenance replaces Beads with
 // full PROV-O lineage tracking. See pasture/llm/demo/provenance.md for the plan.
 
 import (
@@ -519,6 +519,117 @@ func TestDemo_FullEpochSimulation(t *testing.T) {
 	t.Logf("Full epoch simulation passed: %d agents, %d activities, %d tasks, full provenance chain verified",
 		5, 4, 4, // human+architect+supervisor+worker+reviewer, 4 activities, 4 tasks
 	)
+}
+
+// ---------------------------------------------------------------------------
+// Demo 10: Multi-Provider Agents from Bestiary
+// ---------------------------------------------------------------------------
+
+func TestDemo_MultiProviderAgentsFromBestiary(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "bestiary-multi-provider.db")
+
+	// Open tracker — default registry backed by bestiary.Models()
+	tr, err := provenance.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+
+	// Explore the bestiary catalog: query by provider, look up known models
+	reg := provenance.DefaultModelRegistry()
+	anthropicModels := reg.ModelsByProvider(provenance.ProviderAnthropic)
+	googleModels := reg.ModelsByProvider(provenance.ProviderGoogle)
+	t.Logf("Bestiary catalog: %d Anthropic, %d Google models",
+		len(anthropicModels), len(googleModels))
+
+	// Verify known models exist via Lookup
+	if _, ok := reg.Lookup(provenance.ProviderAnthropic, "claude-opus-4-6"); !ok {
+		t.Fatal("Lookup(Anthropic, claude-opus-4-6) not found in bestiary")
+	}
+	if _, ok := reg.Lookup(provenance.ProviderGoogle, "gemini-2.0-flash"); !ok {
+		t.Fatal("Lookup(Google, gemini-2.0-flash) not found in bestiary")
+	}
+
+	// Provider validation is case-insensitive
+	if !provenance.ProviderAnthropic.IsValid() {
+		t.Error("ProviderAnthropic.IsValid() should be true")
+	}
+	if !provenance.Provider("GOOGLE").IsValid() {
+		t.Error("Provider(GOOGLE).IsValid() should be true (case-insensitive)")
+	}
+
+	// Register agents from different providers — both from bestiary catalog
+	architect := mustRegisterMLAgent(t, tr, "aura",
+		provenance.RoleArchitect, provenance.ProviderAnthropic, provenance.ModelID("claude-opus-4-6"))
+	worker := mustRegisterMLAgent(t, tr, "aura",
+		provenance.RoleWorker, provenance.ProviderGoogle, provenance.ModelID("gemini-2.0-flash"))
+
+	// Read back both — verify string Provider survives the DB round-trip
+	gotArchitect, err := tr.MLAgent(architect.ID)
+	if err != nil {
+		t.Fatalf("MLAgent(architect): %v", err)
+	}
+	if gotArchitect.Model.Provider != provenance.ProviderAnthropic {
+		t.Errorf("Architect Provider = %q, want %q", gotArchitect.Model.Provider, provenance.ProviderAnthropic)
+	}
+	if gotArchitect.Model.Name != "claude-opus-4-6" {
+		t.Errorf("Architect Model.Name = %q, want %q", gotArchitect.Model.Name, "claude-opus-4-6")
+	}
+	if gotArchitect.Role != provenance.RoleArchitect {
+		t.Errorf("Architect Role = %v, want RoleArchitect", gotArchitect.Role)
+	}
+
+	gotWorker, err := tr.MLAgent(worker.ID)
+	if err != nil {
+		t.Fatalf("MLAgent(worker): %v", err)
+	}
+	if gotWorker.Model.Provider != provenance.ProviderGoogle {
+		t.Errorf("Worker Provider = %q, want %q", gotWorker.Model.Provider, provenance.ProviderGoogle)
+	}
+	if gotWorker.Model.Name != "gemini-2.0-flash" {
+		t.Errorf("Worker Model.Name = %q, want %q", gotWorker.Model.Name, "gemini-2.0-flash")
+	}
+
+	// Wire provenance: task attributed to both agents
+	task := mustCreate(t, tr, "aura", "REQUEST: Multi-provider demo", "",
+		provenance.TaskTypeFeature, provenance.PriorityHigh, provenance.PhaseRequest)
+	mustAddEdge(t, tr, task.ID, architect.ID.String(), provenance.EdgeAttributedTo)
+	mustAddEdge(t, tr, task.ID, worker.ID.String(), provenance.EdgeAttributedTo)
+
+	attrTo := provenance.EdgeAttributedTo
+	edges, err := tr.Edges(task.ID, &attrTo)
+	if err != nil {
+		t.Fatalf("Edges(AttributedTo): %v", err)
+	}
+	if len(edges) != 2 {
+		t.Errorf("Task should have 2 AttributedTo edges (architect + worker), got %d", len(edges))
+	}
+
+	tr.Close()
+
+	// Session 2: reopen, verify agents and edges survive
+	tr2, err := provenance.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite reopen: %v", err)
+	}
+	defer tr2.Close()
+
+	// Agents survive
+	found, err := tr2.MLAgent(worker.ID)
+	if err != nil {
+		t.Fatalf("MLAgent(worker) after reopen: %v", err)
+	}
+	if found.Model.Provider != provenance.ProviderGoogle {
+		t.Errorf("After reopen: Provider = %q, want %q", found.Model.Provider, provenance.ProviderGoogle)
+	}
+
+	// Edges survive
+	edges2, err := tr2.Edges(task.ID, &attrTo)
+	if err != nil {
+		t.Fatalf("Edges after reopen: %v", err)
+	}
+	if len(edges2) != 2 {
+		t.Errorf("After reopen: AttributedTo edges = %d, want 2", len(edges2))
+	}
 }
 
 // ---------------------------------------------------------------------------
