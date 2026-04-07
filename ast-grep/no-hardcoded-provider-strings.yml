@@ -1,0 +1,22 @@
+id: no-hardcoded-provider-strings
+language: Go
+severity: error
+message: >
+  A hardcoded provider string is used where a typed Provider constant
+  should be used. Use ProviderAnthropic, ProviderGoogle, ProviderOpenAI,
+  or ProviderLocal instead.
+note: >
+  Hardcoded provider strings bypass the Provider type and can silently
+  diverge from the declared constants. Use the typed constants from
+  pkg/ptypes or the root provenance package. If this is in a SQL seed
+  statement or test fixture, consider whether it should reference the
+  constant's string value via string(ProviderAnthropic) instead.
+rule:
+  any:
+    - pattern: Provider("anthropic")
+    - pattern: Provider("google")
+    - pattern: Provider("openai")
+    - pattern: Provider("local")
+ignore:
+  - "**/vendor/**"
+  - "**/*_test.go"

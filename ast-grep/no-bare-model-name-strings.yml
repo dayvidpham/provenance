@@ -1,0 +1,17 @@
+id: no-bare-model-name-strings
+language: Go
+severity: warning
+message: >
+  A bare string literal is passed as the model name argument to
+  RegisterMLAgent. Use ModelID("...") for type safety.
+note: >
+  Bare strings bypass the ModelID type system, making it possible to
+  accidentally pass a namespace, label, or other string where a model
+  identifier is expected. Wrap with ModelID("...") at the call site.
+  Example: RegisterMLAgent(ns, role, provider, ModelID("claude-opus-4-6"))
+rule:
+  any:
+    - pattern: RegisterMLAgent($A, $B, $C, "$M")
+    - pattern: mustRegisterMLAgent($T, $TR, $A, $B, $C, "$M")
+ignore:
+  - "**/vendor/**"

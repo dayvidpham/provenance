@@ -1,0 +1,17 @@
+id: no-sql-string-interpolation
+language: Go
+severity: error
+message: >
+  fmt.Sprintf is used to build a string that is then passed to
+  sqlitex.ExecuteTransient or sqlitex.Execute. This risks SQL injection
+  if any %s placeholder interpolates user-controlled values. Use
+  parameterized queries (? placeholders) with ExecOptions.Args instead.
+note: >
+  Safe pattern: build the query with ? placeholders and pass values via
+  sqlitex.ExecOptions{Args: []any{value1, value2}}.
+  The only safe use of fmt.Sprintf in SQL is for parameter index numbers
+  (e.g., fmt.Sprintf("col = ?%d", idx)) where no user values are interpolated.
+rule:
+  pattern: sqlitex.ExecuteTransient($CONN, fmt.Sprintf($$$), $OPTS)
+ignore:
+  - "**/vendor/**"
