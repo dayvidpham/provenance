@@ -297,14 +297,12 @@ func (a AgentKind) IsValid() bool {
 // Provider identifies the organization behind an ML model.
 //
 // Provider is an open string type: any non-empty string is accepted by
-// MarshalText, UnmarshalText, and IsValid. The well-known constants below
-// are preserved for source compatibility, but callers must not assume the
-// set is closed — the bestiary catalog contains ~110 providers (and growing).
+// MarshalText and UnmarshalText. The well-known constants below are preserved
+// for source compatibility, but callers must not assume the set is closed —
+// the bestiary catalog contains ~110 providers (and growing).
 //
-// For catalog membership checks use provenance.IsKnown(p) from the root
-// provenance package. IsValid() here only rejects the empty string; the
-// pkg/ptypes package imports no bestiary-catalog packages (leaf-package layering
-// to avoid cyclic imports) and has no access to the bestiary catalog.
+// For catalog membership checks use provenance.IsValid(p) from the root
+// provenance package, which delegates to bestiary.Provider(p).IsKnown().
 type Provider string
 
 const (
@@ -321,32 +319,19 @@ func (p Provider) String() string {
 }
 
 // MarshalText implements encoding.TextMarshaler.
-// Any Provider value round-trips without error; use IsValid() to guard empty values.
+// Any Provider value round-trips without error; the caller is responsible for
+// validating non-empty values before marshaling if strict validation is needed.
 func (p Provider) MarshalText() ([]byte, error) {
 	return []byte(p), nil
 }
 
 // UnmarshalText implements encoding.TextUnmarshaler.
 // The input is whitespace-trimmed, lowercased, and accepted unconditionally
-// (any string is valid after trimming). Trimming ensures consistency with
-// IsValid(), which also rejects whitespace-only strings via TrimSpace.
-// Use provenance.IsKnown(p) at the call-site when catalog membership
-// must be enforced.
+// (any string is valid after trimming). Use provenance.IsValid(p) at the
+// call-site when catalog membership must be enforced.
 func (p *Provider) UnmarshalText(b []byte) error {
 	*p = Provider(strings.ToLower(strings.TrimSpace(string(b))))
 	return nil
-}
-
-// IsValid reports whether p is a non-empty Provider string.
-// Provider is an open set — this method only rejects the empty string.
-//
-// For catalog membership (i.e. "is this provider known to the bestiary API?"),
-// use provenance.IsKnown(p) from the root provenance package, which delegates
-// to bestiary.Provider(p).IsKnown(). pkg/ptypes imports no bestiary-catalog
-// packages (leaf-package layering; no parent-package import) and cannot
-// perform catalog membership checks.
-func (p Provider) IsValid() bool {
-	return strings.TrimSpace(string(p)) != ""
 }
 
 // ---------------------------------------------------------------------------

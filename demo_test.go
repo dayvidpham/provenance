@@ -549,12 +549,13 @@ func TestDemo_MultiProviderAgentsFromBestiary(t *testing.T) {
 		t.Fatal("Lookup(Google, gemini-2.0-flash) not found in bestiary")
 	}
 
-	// Provider validation is case-insensitive
-	if !provenance.ProviderAnthropic.IsValid() {
-		t.Error("ProviderAnthropic.IsValid() should be true")
+	// Provider validation delegates to the bestiary catalog (URD R9): case-sensitive.
+	if !provenance.IsValid(provenance.ProviderAnthropic) {
+		t.Error("provenance.IsValid(ProviderAnthropic) should be true")
 	}
-	if !provenance.Provider("GOOGLE").IsValid() {
-		t.Error("Provider(GOOGLE).IsValid() should be true (case-insensitive)")
+	// "GOOGLE" (uppercase) is not in the bestiary catalog — validation is case-sensitive.
+	if provenance.IsValid(provenance.Provider("GOOGLE")) {
+		t.Error("provenance.IsValid(Provider(\"GOOGLE\")) should be false (catalog is case-sensitive)")
 	}
 
 	// Register agents from different providers — both from bestiary catalog

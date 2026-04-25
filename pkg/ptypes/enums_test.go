@@ -368,10 +368,8 @@ func TestProviderRoundTrip(t *testing.T) {
 }
 
 // TestProvider_EmptyMarshal documents that MarshalText on an empty Provider is
-// permissive: it returns empty bytes without error. Before the open-set refactor,
-// MarshalText rejected empty Providers via an IsValid() guard. The current
-// implementation is unconditional — callers should use IsValid() to guard empty
-// values before marshaling if they need strict validation.
+// permissive: it returns empty bytes without error. The implementation is
+// unconditional — callers are responsible for validation before marshaling.
 func TestProvider_EmptyMarshal(t *testing.T) {
 	var p ptypes.Provider // zero value — empty string
 	b, err := p.MarshalText()
@@ -384,11 +382,10 @@ func TestProvider_EmptyMarshal(t *testing.T) {
 }
 
 // TestProvider_WhitespaceUnmarshal verifies that UnmarshalText strips leading
-// and trailing whitespace before storing, ensuring consistency with IsValid()
-// which also uses TrimSpace to reject whitespace-only strings.
-// Without trimming, UnmarshalText("  anthropic  ") would store Provider("  anthropic  ")
-// and IsValid() would return true (non-empty), but the stored value would never
-// match a well-known constant — a subtle round-trip asymmetry.
+// and trailing whitespace before storing. Without trimming,
+// UnmarshalText("  anthropic  ") would store Provider("  anthropic  ") which
+// would never match a well-known constant — a subtle round-trip asymmetry.
+// Validation (catalog membership) is provenance.IsValid in the root package.
 func TestProvider_WhitespaceUnmarshal(t *testing.T) {
 	cases := []struct {
 		input string
@@ -410,12 +407,6 @@ func TestProvider_WhitespaceUnmarshal(t *testing.T) {
 		if string(p) != c.want {
 			t.Errorf("UnmarshalText(%q) stored %q, want %q", c.input, string(p), c.want)
 		}
-		// IsValid() on the stored value must be consistent with whether the
-		// result is non-empty (no more asymmetry).
-		wantValid := c.want != ""
-		if p.IsValid() != wantValid {
-			t.Errorf("Provider(%q).IsValid() = %v, want %v (after UnmarshalText(%q))", string(p), p.IsValid(), wantValid, c.input)
-		}
 	}
 }
 
@@ -432,38 +423,6 @@ func TestProviderStringValues(t *testing.T) {
 	for _, c := range cases {
 		if got := c.p.String(); got != c.want {
 			t.Errorf("Provider(%q).String() = %q, want %q", string(c.p), got, c.want)
-		}
-	}
-}
-
-// TestProviderIsValid verifies the permissive IsValid semantics:
-// any non-empty string is valid; only the empty string is rejected.
-// Provider is an open set — "unknown" or arbitrary vendor strings are valid.
-func TestProviderIsValid(t *testing.T) {
-	cases := []struct {
-		input ptypes.Provider
-		valid bool
-	}{
-		// Well-known constants
-		{ptypes.Provider("anthropic"), true},
-		{ptypes.Provider("google"), true},
-		{ptypes.Provider("openai"), true},
-		{ptypes.Provider("local"), true},
-		// Case variants — IsValid is case-preserving; these are valid non-empty strings
-		{ptypes.Provider("ANTHROPIC"), true},
-		{ptypes.Provider("Anthropic"), true},
-		{ptypes.Provider("GOOGLE"), true},
-		// Arbitrary/unknown providers — must be valid (open set)
-		{ptypes.Provider("unknown"), true},
-		{ptypes.Provider("amazon-bedrock"), true},
-		{ptypes.Provider("mistral"), true},
-		// Only empty string is invalid
-		{ptypes.Provider(""), false},
-		{ptypes.Provider("   "), false},
-	}
-	for _, c := range cases {
-		if got := c.input.IsValid(); got != c.valid {
-			t.Errorf("Provider(%q).IsValid() = %v, want %v", string(c.input), got, c.valid)
 		}
 	}
 }

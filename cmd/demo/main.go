@@ -29,9 +29,9 @@ func main() {
 
 	// --- Provider validation ---
 
-	fmt.Println("Provider validation (case-insensitive):")
+	fmt.Println("Provider validation (catalog-membership, case-sensitive):")
 	for _, p := range []provenance.Provider{"anthropic", "ANTHROPIC", "Google", "", "unknown"} {
-		fmt.Printf("  Provider(%q).IsValid() = %v\n", p, p.IsValid())
+		fmt.Printf("  provenance.IsValid(%q) = %v\n", p, provenance.IsValid(p))
 	}
 	fmt.Println()
 
