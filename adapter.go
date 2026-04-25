@@ -30,7 +30,7 @@ func RegistryFromBestiary(models []bestiary.ModelInfo) ptypes.ModelRegistry {
 			Provider:    ptypes.Provider(m.Provider),
 			Name:        ptypes.ModelID(m.ID),
 			DisplayName: m.DisplayName,
-			Family:      m.Family,
+			Family:      string(m.Family),
 		}
 	}
 	return NewRegistry(entries)
