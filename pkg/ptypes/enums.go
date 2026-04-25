@@ -301,9 +301,9 @@ func (a AgentKind) IsValid() bool {
 // are preserved for source compatibility, but callers must not assume the
 // set is closed — the bestiary catalog contains ~110 providers (and growing).
 //
-// Use bestiary.Provider(p).IsKnown() at the root-package level when you
-// need to verify membership in the live bestiary catalog. IsValid() here
-// only rejects the empty string.
+// For catalog membership checks use provenance.IsKnown(p) from the root
+// provenance package. IsValid() here only rejects the empty string; the
+// pkg/ptypes package is zero-dep and has no access to the bestiary catalog.
 type Provider string
 
 const (
@@ -327,7 +327,7 @@ func (p Provider) MarshalText() ([]byte, error) {
 
 // UnmarshalText implements encoding.TextUnmarshaler.
 // The input is lowercased and accepted unconditionally (any string is valid).
-// Use bestiary.Provider(p).IsKnown() at the call-site when catalog membership
+// Use provenance.IsKnown(p) at the call-site when catalog membership
 // must be enforced.
 func (p *Provider) UnmarshalText(b []byte) error {
 	*p = Provider(strings.ToLower(string(b)))
@@ -336,7 +336,11 @@ func (p *Provider) UnmarshalText(b []byte) error {
 
 // IsValid reports whether p is a non-empty Provider string.
 // Provider is an open set — this method only rejects the empty string.
-// To check membership in the bestiary catalog, use bestiary.Provider(p).IsKnown().
+//
+// For catalog membership (i.e. "is this provider known to the bestiary API?"),
+// use provenance.IsKnown(p) from the root provenance package, which delegates
+// to bestiary.Provider(p).IsKnown(). pkg/ptypes has no bestiary dependency and
+// cannot perform catalog membership checks.
 func (p Provider) IsValid() bool {
 	return strings.TrimSpace(string(p)) != ""
 }
