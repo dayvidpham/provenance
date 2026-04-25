@@ -2,6 +2,7 @@ package provenance_test
 
 import (
 	"errors"
+	"sort"
 	"testing"
 
 	"github.com/dayvidpham/bestiary"
@@ -139,12 +140,20 @@ func TestDefaultModelRegistry_ModelsByProvider(t *testing.T) {
 	// ModelsByProvider must return only models with the requested provider —
 	// use a sample of providers from the full bestiary catalog rather than the
 	// hardcoded 4-value set, proving the filter works for any provider string.
+	// Iterate in sorted order so that test failure output is deterministic.
 	allModels := bestiary.Models()
 	seen := map[provenance.Provider]bool{}
 	for _, m := range allModels {
 		seen[provenance.Provider(m.Provider)] = true
 	}
+	providers := make([]provenance.Provider, 0, len(seen))
 	for p := range seen {
+		providers = append(providers, p)
+	}
+	sort.Slice(providers, func(i, j int) bool {
+		return string(providers[i]) < string(providers[j])
+	})
+	for _, p := range providers {
 		for _, m := range reg.ModelsByProvider(p) {
 			if m.Provider != p {
 				t.Errorf("ModelsByProvider(%s) returned entry with Provider=%s", p, m.Provider)
