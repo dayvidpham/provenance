@@ -336,12 +336,20 @@ func TestAgentKindStringValues(t *testing.T) {
 // Provider
 // ---------------------------------------------------------------------------
 
+// TestProviderRoundTrip verifies that MarshalText/UnmarshalText round-trips
+// for the four well-known constants AND for an arbitrary non-standard provider
+// string, proving Provider is an open (permissive) set.
 func TestProviderRoundTrip(t *testing.T) {
 	values := []ptypes.Provider{
+		// Well-known constants (source-compat aliases)
 		ptypes.ProviderAnthropic,
 		ptypes.ProviderGoogle,
 		ptypes.ProviderOpenAI,
 		ptypes.ProviderLocal,
+		// Non-standard providers — must round-trip without error
+		ptypes.Provider("amazon-bedrock"),
+		ptypes.Provider("mistral"),
+		ptypes.Provider("cohere"),
 	}
 	for _, p := range values {
 		b, err := p.MarshalText()
@@ -375,22 +383,58 @@ func TestProviderStringValues(t *testing.T) {
 	}
 }
 
-func TestProviderIsValidCaseInsensitive(t *testing.T) {
+// TestProviderIsValid verifies the permissive IsValid semantics:
+// any non-empty string is valid; only the empty string is rejected.
+// Provider is an open set — "unknown" or arbitrary vendor strings are valid.
+func TestProviderIsValid(t *testing.T) {
 	cases := []struct {
 		input ptypes.Provider
 		valid bool
 	}{
+		// Well-known constants
 		{ptypes.Provider("anthropic"), true},
+		{ptypes.Provider("google"), true},
+		{ptypes.Provider("openai"), true},
+		{ptypes.Provider("local"), true},
+		// Case variants — IsValid is case-preserving; these are valid non-empty strings
 		{ptypes.Provider("ANTHROPIC"), true},
 		{ptypes.Provider("Anthropic"), true},
-		{ptypes.Provider("google"), true},
 		{ptypes.Provider("GOOGLE"), true},
-		{ptypes.Provider("unknown"), false},
+		// Arbitrary/unknown providers — must be valid (open set)
+		{ptypes.Provider("unknown"), true},
+		{ptypes.Provider("amazon-bedrock"), true},
+		{ptypes.Provider("mistral"), true},
+		// Only empty string is invalid
 		{ptypes.Provider(""), false},
+		{ptypes.Provider("   "), false},
 	}
 	for _, c := range cases {
 		if got := c.input.IsValid(); got != c.valid {
 			t.Errorf("Provider(%q).IsValid() = %v, want %v", string(c.input), got, c.valid)
+		}
+	}
+}
+
+// TestProvider_UnmarshalUnknownAccepted asserts that UnmarshalText returns nil
+// for arbitrary strings that are not in the well-known 4-value set.
+// This is the key permissiveness test: no rejection of unknown providers.
+func TestProvider_UnmarshalUnknownAccepted(t *testing.T) {
+	unknowns := []string{
+		"amazon-bedrock",
+		"completely-unknown-vendor",
+		"mistral",
+		"cohere",
+		"xai",
+		"vertex-ai",
+	}
+	for _, s := range unknowns {
+		var p ptypes.Provider
+		if err := p.UnmarshalText([]byte(s)); err != nil {
+			t.Errorf("UnmarshalText(%q) returned error %v, want nil — Provider must be permissive", s, err)
+		}
+		// Value must be stored (lowercased)
+		if string(p) != s {
+			t.Errorf("UnmarshalText(%q) stored %q, want %q", s, string(p), s)
 		}
 	}
 }

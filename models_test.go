@@ -101,13 +101,14 @@ func TestDefaultModelRegistry_ModelsByProvider(t *testing.T) {
 	}
 
 	// ModelsByProvider must return only models with the requested provider —
-	// content-agnostic so the assertion stays valid as bestiary's catalog grows.
-	for _, p := range []provenance.Provider{
-		provenance.ProviderAnthropic,
-		provenance.ProviderGoogle,
-		provenance.ProviderOpenAI,
-		provenance.ProviderLocal,
-	} {
+	// use a sample of providers from the full bestiary catalog rather than the
+	// hardcoded 4-value set, proving the filter works for any provider string.
+	allModels := bestiary.Models()
+	seen := map[provenance.Provider]bool{}
+	for _, m := range allModels {
+		seen[provenance.Provider(m.Provider)] = true
+	}
+	for p := range seen {
 		for _, m := range reg.ModelsByProvider(p) {
 			if m.Provider != p {
 				t.Errorf("ModelsByProvider(%s) returned entry with Provider=%s", p, m.Provider)
