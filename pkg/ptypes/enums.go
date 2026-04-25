@@ -295,53 +295,50 @@ func (a AgentKind) IsValid() bool {
 // ---------------------------------------------------------------------------
 
 // Provider identifies the organization behind an ML model.
+//
+// Provider is an open string type: any non-empty string is accepted by
+// MarshalText, UnmarshalText, and IsValid. The well-known constants below
+// are preserved for source compatibility, but callers must not assume the
+// set is closed — the bestiary catalog contains ~110 providers (and growing).
+//
+// Use bestiary.Provider(p).IsKnown() at the root-package level when you
+// need to verify membership in the live bestiary catalog. IsValid() here
+// only rejects the empty string.
 type Provider string
 
 const (
+	// Well-known providers — kept for source and binary compatibility.
+	// The set is not closed: any non-empty string is a valid Provider.
 	ProviderAnthropic Provider = "anthropic"
 	ProviderGoogle    Provider = "google"
 	ProviderOpenAI    Provider = "openai"
 	ProviderLocal     Provider = "local"
 )
 
-// knownProviders is the set of recognized Provider values.
-var knownProviders = [...]Provider{
-	ProviderAnthropic,
-	ProviderGoogle,
-	ProviderOpenAI,
-	ProviderLocal,
-}
-
 func (p Provider) String() string {
 	return string(p)
 }
 
+// MarshalText implements encoding.TextMarshaler.
+// Any Provider value round-trips without error; use IsValid() to guard empty values.
 func (p Provider) MarshalText() ([]byte, error) {
-	if !p.IsValid() {
-		return nil, fmt.Errorf("provenance: cannot marshal invalid Provider %q — valid values: anthropic, google, openai, local", string(p))
-	}
 	return []byte(p), nil
 }
 
+// UnmarshalText implements encoding.TextUnmarshaler.
+// The input is lowercased and accepted unconditionally (any string is valid).
+// Use bestiary.Provider(p).IsKnown() at the call-site when catalog membership
+// must be enforced.
 func (p *Provider) UnmarshalText(b []byte) error {
-	candidate := Provider(strings.ToLower(string(b)))
-	if !candidate.IsValid() {
-		return fmt.Errorf(
-			"provenance: unknown Provider %q — valid values: anthropic, google, openai, local — "+
-				"fix by using one of the listed values",
-			string(b),
-		)
-	}
-	*p = candidate
+	*p = Provider(strings.ToLower(string(b)))
 	return nil
 }
 
+// IsValid reports whether p is a non-empty Provider string.
+// Provider is an open set — this method only rejects the empty string.
+// To check membership in the bestiary catalog, use bestiary.Provider(p).IsKnown().
 func (p Provider) IsValid() bool {
-	switch Provider(strings.ToLower(string(p))) {
-	case ProviderAnthropic, ProviderGoogle, ProviderOpenAI, ProviderLocal:
-		return true
-	}
-	return false
+	return strings.TrimSpace(string(p)) != ""
 }
 
 // ---------------------------------------------------------------------------
