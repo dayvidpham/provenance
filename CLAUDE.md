@@ -13,73 +13,121 @@ project. All contributors (human and AI) must follow these standards.
 
 ```
 provenance/
-├── provenance.go           # Package doc + public facade (Tracker interface + constructors)
-├── types.go                # All public types: TaskID, AgentID, ActivityID, Task, Agent (TPT), Edge, etc.
-├── enums.go                # All iota enums: Status, Priority, TaskType, EdgeKind, AgentKind, Provider, Role, Phase, Stage
-├── errors.go               # Sentinel errors and error constructors
-├── tracker.go              # sqliteTracker implementation of Tracker interface
-├── tracker_test.go         # Integration tests for Tracker (black-box, package provenance_test)
+├── doc.go                  # Package documentation
+├── provenance.go           # Tracker interface + OpenSQLite/OpenMemory constructors
+├── tracker.go              # sqliteTracker implementation of Tracker
+├── adapter.go              # RegistryFromBestiary adapter (bestiary → ModelRegistry)
+├── models.go               # inMemoryRegistry, NewRegistry, DefaultModelRegistry
+├── options.go              # Functional options (WithModelRegistry, etc.)
+├── reexports.go            # Type aliases re-exporting pkg/ptypes + pkg/namespace
+├── tracker_test.go         # Integration tests for Tracker (black-box)
+├── models_test.go          # ModelRegistry tests (black-box)
+├── demo_test.go            # End-to-end demos (black-box)
+├── reexport_test.go        # Verifies type aliases match ptypes originals
+├── create_permutation_test.go
+│
+├── pkg/
+│   ├── ptypes/             # Zero-dependency public type package
+│   │   ├── types.go        # TaskID, AgentID, ActivityID, Task, Agent (TPT), Edge, etc.
+│   │   ├── enums.go        # All enums: Status, Priority, TaskType, EdgeKind, AgentKind,
+│   │   │                   #   Provider (string), Role, Phase, Stage
+│   │   ├── errors.go       # Sentinel errors and error constructors
+│   │   ├── models.go       # ModelEntry, ModelID, ModelRegistry interface
+│   │   └── *_test.go       # Type, enum, and parse permutation tests
+│   │
+│   └── namespace/          # Namespace URI utilities (DefaultNamespace, FromGitRemote, …)
+│       ├── namespace.go
+│       └── namespace_test.go
+│
 ├── internal/
-│   ├── graph/
-│   │   ├── store.go        # dominikbraun/graph Store[TaskID, Task] implementation backed by SQLite
-│   │   └── store_test.go   # Store implementation tests
-│   ├── sqlite/
-│   │   ├── db.go           # Database open/close, WAL config, schema migration
-│   │   ├── tasks.go        # Task CRUD SQL operations
-│   │   ├── edges.go        # Edge insert/delete/query SQL operations
+│   ├── sqlite/             # SQL persistence (zombiezen). No graph logic.
+│   │   ├── db.go           # Open/Close, WAL config, schema migration, ml_models seeding
+│   │   ├── tasks.go        # Task CRUD
+│   │   ├── edges.go        # Edge insert/delete/query
 │   │   ├── agents.go       # Agent TPT CRUD (base + 3 child tables)
-│   │   ├── activities.go   # Activity CRUD SQL operations
-│   │   ├── labels.go       # Label add/remove/query SQL operations
-│   │   ├── comments.go     # Comment add/query SQL operations
+│   │   ├── activities.go   # Activity CRUD
+│   │   ├── labels.go       # Label add/remove/query
+│   │   ├── comments.go     # Comment add/query
 │   │   └── db_test.go      # SQLite integration tests
-│   └── helpers/
-│       ├── ancestors.go    # Ancestors/Descendants composed from DFS + PredecessorMap
-│       └── ancestors_test.go
-├── docs/
-│   ├── PROPOSAL-1.md       # Original proposal (superseded)
-│   └── PROPOSAL-2.md       # Current architecture and implementation plan
-├── go.mod
-├── go.sum
-├── LICENSE
-├── .gitignore
+│   │
+│   ├── graph/              # dominikbraun/graph Store backed by internal/sqlite
+│   │   ├── store.go
+│   │   └── store_test.go
+│   │
+│   ├── helpers/            # Graph traversal (Ancestors/Descendants)
+│   │   ├── ancestors.go
+│   │   └── ancestors_test.go
+│   │
+│   └── testutil/           # Shared test fixtures (e.g., TestModels)
+│       └── fixtures.go
+│
+├── cmd/
+│   └── demo/               # Runnable demonstration of the full library API
+│       └── main.go
+│
+├── docs/                   # Historical proposals (superseded — for audit trail)
+│   ├── PROPOSAL-1.md
+│   ├── PROPOSAL-2.md
+│   ├── FOLLOWUP_PROPOSAL-1.md
+│   └── FOLLOWUP_PROPOSAL-2.md
+│
+├── go.mod, go.sum
+├── flake.nix, flake.lock   # Nix dev shell (optional)
+├── LICENSE, .gitignore
 ├── Makefile                # fmt, lint, test, build targets
-├── CLAUDE.md               # This file
-└── CONTRIBUTING.md         # Development workflow guide
+├── README.md
+├── CONCEPTS.md             # PROV-O / PROV-DM domain alignment
+├── CONTRIBUTING.md         # Development workflow guide
+├── AGENTS.md               # Agent-facing onboarding (bd usage, etc.)
+└── CLAUDE.md               # This file
 ```
 
 ### Package Responsibilities
 
 | Package | Role |
 |---------|------|
-| `provenance` (root) | Public API surface. All exported types, the `Tracker` interface, constructors (`OpenSQLite`, `OpenMemory`), and the internal `sqliteTracker` implementation. Consumers (e.g., pasture) import only this package. |
-| `internal/sqlite` | All SQL operations. Encapsulates the zombiezen SQLite driver. No graph logic here — pure relational CRUD including agent table-per-type operations. |
-| `internal/graph` | Implements `dominikbraun/graph.Store[TaskID, Task]` backed by `internal/sqlite`. Bridges graph library and persistence. |
-| `internal/helpers` | Graph traversal utilities (Ancestors, Descendants) composed from dominikbraun/graph primitives. |
+| `provenance` (root) | **Public API surface**. Consumers (e.g., pasture) import only this package. Holds the `Tracker` interface, constructors (`OpenSQLite`, `OpenMemory`), the `sqliteTracker` implementation, and the bestiary adapter. Re-exports every `pkg/ptypes` and `pkg/namespace` symbol via type aliases (`reexports.go`) so consumers see `provenance.TaskID` rather than `ptypes.TaskID`. |
+| `pkg/ptypes` | **Zero-dependency type definitions**. Holds every public type, enum, and sentinel error. Imports nothing outside stdlib (no bestiary, no zombiezen). This is what allows `internal/sqlite` to import the types without creating an import cycle through the root package. Consumers should not import this directly — use the root re-exports. |
+| `pkg/namespace` | Namespace URI derivation (git remote → canonical HTTPS, working dir → `file://`). Used to scope IDs. Re-exported by root. |
+| `internal/sqlite` | **All SQL operations**. Encapsulates the zombiezen SQLite driver. No graph logic — pure relational CRUD including agent table-per-type operations and ml_models seeding from the registry. |
+| `internal/graph` | Implements `dominikbraun/graph.Store[string, Task]` backed by `internal/sqlite`. Bridges graph library and persistence. |
+| `internal/helpers` | Graph traversal utilities (Ancestors, Descendants) composed from dominikbraun/graph primitives (DFS + PredecessorMap). |
+| `internal/testutil` | Shared test fixtures (e.g., known-model lists for seeding test databases). |
+| `cmd/demo` | Runnable demonstration that exercises the full library API end-to-end. Not a CLI — it's a scripted scenario to verify integration. Run with `go run ./cmd/demo`. |
+
+### Why root and `pkg/ptypes` are split
+
+The root package implements `sqliteTracker`, which delegates to `internal/sqlite`. `internal/sqlite` needs the type definitions (`Task`, `TaskID`, `MLAgent`, …) to write SQL against. If those types lived at the root, you'd have an import cycle: `root → internal/sqlite → root`.
+
+The split solves it: `pkg/ptypes` holds type definitions only (zero deps), `internal/sqlite` imports `ptypes`, and the root re-exports every `ptypes` symbol via Go type aliases (`type TaskID = ptypes.TaskID`). The aliases are transparent at compile time — `provenance.TaskID` and `ptypes.TaskID` are the *same* type — so consumers get a clean import surface (`provenance.TaskID`) without ever seeing the internal split.
 
 ## Dependencies (Approved)
 
+Direct dependencies pinned in `go.mod`:
+
 | Package | Purpose | Version |
 |---------|---------|---------|
+| `github.com/dayvidpham/bestiary` | ML model catalog (single source of truth for `DefaultModelRegistry`) | v0.1.0 |
 | `github.com/dominikbraun/graph` | Directed graph operations, topological sort, cycle detection | v0.23.0 |
-| `github.com/google/uuid` | UUIDv7 generation | v1.6.0 |
-| `zombiezen.com/go/sqlite` | Pure-Go SQLite (audit trail, local state) | latest |
+| `github.com/google/uuid` | UUIDv7 generation for IDs | v1.6.0 |
+| `gopkg.in/yaml.v3` | YAML parsing (used by namespace and frontmatter helpers) | v3.0.1 |
+| `zombiezen.com/go/sqlite` | Pure-Go SQLite (audit trail, local state) | v1.4.2 |
 
-No other external dependencies may be added without supervisor approval.
+No other direct external dependencies may be added without supervisor approval. Indirect (transitive) dependencies are tracked in `go.mod`'s `indirect` block — see `CONTRIBUTING.md` for why `modernc.org/sqlite` appears there.
 
 ## Go Conventions
 
 ### No CGo
-```go
-// build constraint at top of any file that must remain CGo-free
-//go:build !cgo
-```
-All SQLite usage MUST use `zombiezen.com/go/sqlite` (pure Go), never `mattn/go-sqlite3` or `modernc.org/sqlite`.
+Production builds run with `CGO_ENABLED=0`. All direct SQLite usage MUST go through `zombiezen.com/go/sqlite` (pure Go). Never import `github.com/mattn/go-sqlite3` (CGo) and never import `modernc.org/sqlite` directly — even though `modernc.org/sqlite` is pure Go, we standardise on the zombiezen API at the source level.
+
+`modernc.org/sqlite` *does* appear as an indirect dependency in `go.mod` because zombiezen and bestiary use it transitively. That's expected and CGo-free; see `CONTRIBUTING.md` for the rationale.
 
 ### Strongly-Typed Enums
-Prefer typed constants with iota over bare strings or integers. All enums must include `String()`, `MarshalText()`, `UnmarshalText()`, and `IsValid()` methods:
+Prefer named types with explicit constants over bare strings or integers. All enums must implement `String()`, `MarshalText()`, `UnmarshalText()`, and `IsValid()`.
+
+The default form is `iota`-based `int` enums (used for `Status`, `Priority`, `TaskType`, `EdgeKind`, `AgentKind`, `Role`, `Phase`, `Stage`):
 
 ```go
-// Correct
 type Status int
 
 const (
@@ -87,12 +135,29 @@ const (
     StatusInProgress               // Work is actively happening
     StatusClosed                   // Work is complete
 )
+```
 
-// Wrong
+Use a `string` underlying type when the enum needs to interop with an external string-typed contract (e.g., `Provider` mirrors `bestiary.Provider`). The required methods still apply, and `IsValid()`/`UnmarshalText()` should be **case-insensitive** for string enums:
+
+```go
+type Provider string
+
 const (
-    StatusOpen = "open"            // stringly typed
-    StatusClosed = 1               // magic number with no name
+    ProviderAnthropic Provider = "anthropic"
+    ProviderGoogle    Provider = "google"
+    ProviderOpenAI    Provider = "openai"
+    ProviderLocal     Provider = "local"
 )
+```
+
+What's wrong is bare untyped constants:
+
+```go
+// Wrong — stringly typed, no IsValid, no compiler enforcement
+const StatusOpen = "open"
+
+// Wrong — magic number with no enum type
+const StatusClosed = 1
 ```
 
 ### ID Types
@@ -157,12 +222,14 @@ make build  # CGO_ENABLED=0 go build ./...
 ## Build
 
 ```bash
-make build          # CGO_ENABLED=0 go build ./...
-make test           # CGO_ENABLED=1 go test -race -count=1 ./...
-make lint           # go vet ./... + ast-grep scan
 make fmt            # gofmt -w .
+make lint           # go vet ./... + ast-grep scan
+make test           # CGO_ENABLED=1 go test -race -count=1 ./...
+make build          # runs fmt + lint + test, then CGO_ENABLED=0 go build ./...
 make clean          # rm -rf bin/
 ```
+
+`make build` is the full quality gate — it depends on `fmt`, `lint`, and `test` before invoking `go build`.
 
 Cross-compilation:
 ```bash
