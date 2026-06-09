@@ -143,6 +143,14 @@ type Tracker interface {
 	// A UUIDv7 ActivityID is assigned automatically.
 	StartActivity(agentID AgentID, phase Phase, stage Stage, notes string) (Activity, error)
 
+	// StartActivityWithID records the start of an activity using a
+	// caller-supplied ActivityID, idempotently: a second call with the same id
+	// is a no-op (INSERT ... ON CONFLICT(id) DO NOTHING) returning the existing
+	// row. Use a deterministic id (e.g. a name-based UUIDv5 over the caller's
+	// logical identity) to make activity emission safe to replay, e.g. across
+	// durable-workflow recovery. Returns the canonical persisted activity.
+	StartActivityWithID(id ActivityID, agentID AgentID, phase Phase, stage Stage, notes string) (Activity, error)
+
 	// EndActivity records the end time of an activity.
 	// Returns ErrNotFound if the activity does not exist.
 	EndActivity(id ActivityID) (Activity, error)

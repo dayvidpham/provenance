@@ -639,6 +639,66 @@ func TestStartAndEndActivity(t *testing.T) {
 	}
 }
 
+func TestStartActivityWithID_Idempotent(t *testing.T) {
+	db := openTestDB(t)
+
+	agent, err := db.RegisterHumanAgent("ns", "Eve", "")
+	if err != nil {
+		t.Fatalf("RegisterHumanAgent error: %v", err)
+	}
+
+	// A deterministic id derived from a logical key (the pattern callers use to
+	// make activity emission replay-safe: same logical step -> same id).
+	mkID := func(name string) ptypes.ActivityID {
+		return ptypes.ActivityID{Namespace: "ns", UUID: uuid.NewSHA1(uuid.NameSpaceURL, []byte(name))}
+	}
+	id1 := mkID("epoch-1/p9-worker-slices/slice/2")
+
+	// First emission inserts the row.
+	a1, err := db.StartActivityWithID(id1, agent.ID, ptypes.PhaseWorkerSlices, ptypes.StageInProgress, "slice 2")
+	if err != nil {
+		t.Fatalf("StartActivityWithID (1st) error: %v", err)
+	}
+	if a1.ID != id1 {
+		t.Errorf("returned id = %v, want %v", a1.ID, id1)
+	}
+
+	// Replaying with the SAME id is a no-op (ON CONFLICT DO NOTHING) and returns
+	// the existing row — this is the exactly-once guarantee under crash-replay.
+	a2, err := db.StartActivityWithID(id1, agent.ID, ptypes.PhaseWorkerSlices, ptypes.StageInProgress, "slice 2 (replay)")
+	if err != nil {
+		t.Fatalf("StartActivityWithID (replay) error: %v", err)
+	}
+	if a2.ID != id1 {
+		t.Errorf("replay returned id = %v, want %v", a2.ID, id1)
+	}
+
+	acts, err := db.GetActivities(&agent.ID)
+	if err != nil {
+		t.Fatalf("GetActivities error: %v", err)
+	}
+	if len(acts) != 1 {
+		t.Fatalf("after two same-id emissions, GetActivities = %d rows, want 1 (exactly-once)", len(acts))
+	}
+	// The original row wins on conflict: notes from the first call, not the replay.
+	if acts[0].Notes != "slice 2" {
+		t.Errorf("notes = %q, want %q (original row preserved on conflict)", acts[0].Notes, "slice 2")
+	}
+
+	// A distinct logical key -> a distinct row.
+	id2 := mkID("epoch-1/p9-worker-slices/slice/3")
+	if _, err := db.StartActivityWithID(id2, agent.ID, ptypes.PhaseWorkerSlices, ptypes.StageInProgress, "slice 3"); err != nil {
+		t.Fatalf("StartActivityWithID (distinct) error: %v", err)
+	}
+	acts, err = db.GetActivities(&agent.ID)
+	if err != nil {
+		t.Fatalf("GetActivities (after distinct) error: %v", err)
+	}
+	if len(acts) != 2 {
+		t.Fatalf("after a distinct id, GetActivities = %d rows, want 2", len(acts))
+	}
+}
+
 func TestGetActivities(t *testing.T) {
 	db := openTestDB(t)
 

@@ -42,6 +42,63 @@ func (db *DB) StartActivity(agentID ptypes.AgentID, phase ptypes.Phase, stage pt
 	return activity, nil
 }
 
+// StartActivityWithID records the start of an activity using a CALLER-SUPPLIED
+// ActivityID, idempotently. Unlike StartActivity (which mints a random UUIDv7),
+// the caller owns the id; a second call with the same id is a no-op
+// (INSERT ... ON CONFLICT(id) DO NOTHING) and the existing row is returned. This
+// makes activity emission safe to replay — e.g. when a durable-workflow step
+// re-executes after a crash, a deterministic id (such as a name-based UUIDv5
+// over the workflow's logical identity) collapses the duplicate to one row.
+// Acquires the DB mutex.
+func (db *DB) StartActivityWithID(id ptypes.ActivityID, agentID ptypes.AgentID, phase ptypes.Phase, stage ptypes.Stage, notes string) (ptypes.Activity, error) {
+	now := time.Now().UTC()
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if err := sqlitex.Execute(db.conn,
+		`INSERT INTO activities (id, agent_id, phase_id, stage_id, started_at, ended_at, notes)
+		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+		 ON CONFLICT(id) DO NOTHING`,
+		&sqlitex.ExecOptions{Args: []any{
+			id.String(), agentID.String(),
+			int(phase), int(stage),
+			now.UnixNano(), nil, notes,
+		}}); err != nil {
+		return ptypes.Activity{}, fmt.Errorf(
+			"sqlite.StartActivityWithID: failed to insert activity %q for agent %q: %w — "+
+				"ensure the agent is registered before starting an activity",
+			id.String(), agentID.String(), err,
+		)
+	}
+
+	// Re-fetch the canonical row: the just-inserted row, or the pre-existing one
+	// on conflict (idempotent replay).
+	var act ptypes.Activity
+	var found bool
+	if err := sqlitex.Execute(db.conn,
+		`SELECT id, agent_id, phase_id, stage_id, started_at, ended_at, notes
+		 FROM activities WHERE id = ?1`,
+		&sqlitex.ExecOptions{
+			Args: []any{id.String()},
+			ResultFunc: func(stmt *zs.Stmt) error {
+				var err error
+				act, err = ScanActivity(stmt)
+				if err != nil {
+					return err
+				}
+				found = true
+				return nil
+			},
+		}); err != nil {
+		return ptypes.Activity{}, fmt.Errorf("sqlite.StartActivityWithID: re-fetch: %w", err)
+	}
+	if !found {
+		return ptypes.Activity{}, fmt.Errorf(
+			"sqlite.StartActivityWithID: activity %q not found after insert", id.String())
+	}
+	return act, nil
+}
+
 // EndActivity records the end time of an activity. Returns the updated activity.
 // Returns ptypes.ErrNotFound if the activity does not exist. Acquires the DB mutex.
 func (db *DB) EndActivity(id ptypes.ActivityID) (ptypes.Activity, error) {

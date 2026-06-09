@@ -376,6 +376,14 @@ func (t *sqliteTracker) StartActivity(agentID AgentID, phase Phase, stage Stage,
 	return act, nil
 }
 
+func (t *sqliteTracker) StartActivityWithID(id ActivityID, agentID AgentID, phase Phase, stage Stage, notes string) (Activity, error) {
+	act, err := t.db.StartActivityWithID(id, agentID, phase, stage, notes)
+	if err != nil {
+		return Activity{}, fmt.Errorf("provenance.Tracker.StartActivityWithID: %w", err)
+	}
+	return act, nil
+}
+
 func (t *sqliteTracker) EndActivity(id ActivityID) (Activity, error) {
 	act, err := t.db.EndActivity(id)
 	if err != nil {
