@@ -255,8 +255,27 @@ func (db *DB) seedReferenceData(models []ptypes.ModelEntry) error {
 // Uses INSERT OR IGNORE so existing rows are preserved on re-open.
 // Each model is inserted with parameterized queries to prevent SQL injection.
 func (db *DB) seedMLModels(models []ptypes.ModelEntry) error {
+	var existing int
+	if err := sqlitex.Execute(db.conn,
+		`SELECT COUNT(*) FROM ml_models`,
+		&sqlitex.ExecOptions{
+			ResultFunc: func(stmt *zs.Stmt) error {
+				existing = stmt.ColumnInt(0)
+				return nil
+			},
+		},
+	); err != nil {
+		return fmt.Errorf("seedMLModels: count existing models: %w", err)
+	}
+	if existing >= len(models) {
+		return nil
+	}
+
+	var err error
+	endTx := sqlitex.Transaction(db.conn)
+	defer endTx(&err)
 	for _, m := range models {
-		if err := sqlitex.Execute(db.conn,
+		if err = sqlitex.Execute(db.conn,
 			`INSERT OR IGNORE INTO ml_models (provider_id, name) VALUES ((SELECT id FROM providers WHERE name = ?1), ?2)`,
 			&sqlitex.ExecOptions{Args: []any{string(m.Provider), string(m.Name)}},
 		); err != nil {
