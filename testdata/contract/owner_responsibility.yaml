@@ -1,0 +1,84 @@
+# Adversarial histories for owner-responsibility lifecycle bound to legal
+# task close (docs/journal-relational-contract.md §4.4, §8.1).
+cases:
+  - name: task-close-ends-active-assignment-atomically
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#5 task close ends responsibility and clears Owner atomically"}
+    mutation:
+      description: >-
+        Closing a task with an active owner-responsibility assignment must,
+        in the same operation, write an ended transition for that episode
+        and clear tasks.owner_id in the same projection update.
+      operator: close-task-with-active-assignment
+    input:
+      operationId: op-close-2
+      task: t1
+      activeEpisode: {assignmentId: A, slot: owner-responsibility}
+    expected:
+      episodeEnded: true
+      taskOwnerCleared: true
+      sameOperation: true
+
+  - name: task-close-without-ending-assignment-rejected
+    classification: must-fail
+    provenance: {source: bug, ref: "regression (c): owner-responsibility end bound to legal close"}
+    mutation:
+      description: >-
+        An attempted close operation that writes the task_event
+        provenance.task.closed effect but omits the corresponding ended
+        transition for the active owner-responsibility episode must be
+        rejected outright — a task cannot be closed while an episode
+        remains open, and the reducer must not allow the two facts to
+        drift apart.
+      operator: close-task-omit-ended-transition
+    input:
+      operationId: op-close-3
+      task: t1
+      activeEpisode: {assignmentId: A, slot: owner-responsibility}
+      effects:
+        - {kind: task_event, task: t1, eventKind: "provenance.task.closed"}
+      omitEndedTransitionFor: A
+    expected:
+      accepted: false
+      reason: close-without-ending-active-episode
+
+  - name: reopen-leaves-task-unassigned
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#5 reopen stays unassigned"}
+    mutation:
+      description: >-
+        Reopening a closed task does not resurrect the previously-ended
+        owner-responsibility episode or start a new one; the task remains
+        unassigned until an explicit new assignment operation runs.
+      operator: reopen-task
+    input:
+      operationId: op-reopen-1
+      task: t1
+      priorEndedEpisode: {assignmentId: A}
+    expected:
+      taskStatus: open
+      taskOwner: null
+      newEpisodeStarted: false
+
+  - name: transfer-cas-single-winner-loser-gets-stale-conflict
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#5 responsibility-transfer CAS permits one concurrent winner"}
+    mutation:
+      description: >-
+        Two concurrent transfer operations both attempt to end the same
+        active episode A and start a new successor. Exactly one commits
+        (ends A, starts its successor); the other receives a typed stale
+        conflict and writes nothing — no partial ended-without-started or
+        started-without-ended state for either attempt.
+      operator: concurrent-transfer-cas
+    input:
+      task: t1
+      activeEpisode: {assignmentId: A}
+      concurrentAttempts:
+        - {operationId: op-transfer-winner, newAssignmentId: B}
+        - {operationId: op-transfer-loser, newAssignmentId: C}
+    expected:
+      winnerCommitted: true
+      loserAccepted: false
+      loserReason: stale-episode-conflict
+      partialWritesFromLoser: 0

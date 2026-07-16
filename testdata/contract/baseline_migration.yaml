@@ -1,0 +1,92 @@
+# Adversarial histories for legacy baseline migration
+# (docs/journal-relational-contract.md §13).
+cases:
+  - name: fresh-task-baseline-no-assignment
+    classification: must-pass
+    provenance: {source: boundary, ref: "provenance#4 amendment §13 baseline transitions: fresh"}
+    mutation:
+      description: >-
+        A legacy task with no owner migrates to one journal_task_events
+        migration-marker row and zero authority episodes.
+      operator: migrate-legacy-task
+    input:
+      legacyTask: {id: t1, owner: null, status: open, updatedAt: "2025-06-01T00:00:00Z"}
+    expected:
+      migrationEventCreated: true
+      episodesCreated: 0
+
+  - name: legacy-assigned-nonterminal-baseline-preserves-owner
+    classification: must-pass
+    provenance: {source: boundary, ref: "provenance#4 amendment §13 baseline transitions: legacy-assigned"}
+    mutation:
+      description: >-
+        A legacy task with a registered owner and non-terminal status
+        migrates to one migration-marker event plus one started transition
+        on a new owner-responsibility episode, RecordedAt = legacy updatedAt.
+      operator: migrate-legacy-task
+    input:
+      legacyTask: {id: t2, owner: actor-alice, status: in_progress, updatedAt: "2025-06-02T00:00:00Z"}
+    expected:
+      migrationEventCreated: true
+      episodesCreated: 1
+      episodeActiveAfterMigration: true
+      startedTransitionRecordedAt: "2025-06-02T00:00:00Z"
+
+  - name: legacy-terminal-baseline-ends-assignment-at-legal-close-not-now
+    classification: must-pass
+    provenance: {source: boundary, ref: "provenance#4 amendment §13 baseline transitions: legacy-terminal"}
+    mutation:
+      description: >-
+        A legacy task with a registered owner and Closed status migrates to
+        a started transition AND an ended transition on the same episode,
+        both stamped with the legacy row's own closedAt (falling back to
+        updatedAt if closedAt is absent) — never the wall-clock time the
+        migration itself runs at.
+      operator: migrate-legacy-task
+    input:
+      legacyTask: {id: t3, owner: actor-bob, status: closed, updatedAt: "2025-06-03T00:00:00Z", closedAt: "2025-06-04T00:00:00Z"}
+      migrationRunWallClock: "2026-07-16T21:47:00Z"
+    expected:
+      episodesCreated: 1
+      startedTransitionRecordedAt: "2025-06-03T00:00:00Z"
+      endedTransitionRecordedAt: "2025-06-04T00:00:00Z"
+      endedTransitionRecordedAtEqualsWallClock: false
+
+  - name: fabricated-wallclock-timestamp-in-baseline-rejected
+    classification: must-fail
+    provenance: {source: bug, ref: "regression (g): honest, non-fabricated timestamps in bootstrap/migration repair"}
+    mutation:
+      description: >-
+        An attempted migration writer stamps a baseline's ended transition
+        with the migration's own wall-clock time instead of the legacy
+        row's closedAt/updatedAt. This must be rejected by validation
+        (RecordedAt for a migration-sourced row must trace to a legacy
+        column value, never to a wall-clock read taken during migration).
+      operator: migrate-legacy-task-with-fabricated-timestamp
+    input:
+      legacyTask: {id: t4, owner: actor-carol, status: closed, updatedAt: "2025-06-05T00:00:00Z", closedAt: "2025-06-06T00:00:00Z"}
+      migrationRunWallClock: "2026-07-16T21:47:00Z"
+      writerUsesWallClockForEndedTransition: true
+    expected:
+      accepted: false
+      reason: recorded-at-not-traced-to-legacy-source
+
+  - name: unmappable-owner-fails-closed-no-partial-migration
+    classification: must-fail
+    provenance: {source: boundary, ref: "provenance#4 amendment §13 baseline transitions: unmappable-owner"}
+    mutation:
+      description: >-
+        One legacy task among several has an owner string that does not
+        resolve to a registered ActorID. The entire migration transaction
+        (covering every legacy task in the run, not just the offending one)
+        must roll back with zero baseline rows committed for any task.
+      operator: migrate-batch-with-one-unmappable-owner
+    input:
+      legacyTasks:
+        - {id: t5, owner: actor-dave, status: open, updatedAt: "2025-06-07T00:00:00Z"}
+        - {id: t6, owner: "unregistered-legacy-owner", status: open, updatedAt: "2025-06-08T00:00:00Z"}
+        - {id: t7, owner: null, status: open, updatedAt: "2025-06-09T00:00:00Z"}
+    expected:
+      accepted: false
+      reason: unmappable-owner
+      committedAnchorsForAnyTask: 0

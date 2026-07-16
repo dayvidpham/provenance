@@ -1,0 +1,90 @@
+# Adversarial histories for JournalID ordering vs RecordedAt.
+#
+# Schema (per docs/journal-relational-contract.md §12): each case's `input`
+# is an ordered list of journal rows as they are COMMITTED (i.e. list order
+# == the JournalID assignment order the implementation must produce), each
+# row giving its kind, actor, and a RecordedAt value that may deliberately
+# disagree with commit order. `expected.order` is the JournalID-ascending
+# sequence of row `id` labels a query MUST return, regardless of RecordedAt.
+cases:
+  - name: equal-recordedat-tiebreak-by-journalid
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#4 RecordedAt doctrine"}
+    mutation:
+      description: >-
+        Two task events for the same task are committed back-to-back with an
+        identical RecordedAt (clock granularity collision).
+      operator: order-by-journalid
+    input:
+      rows:
+        - {id: e1, kind: task_event, task: t1, recordedAt: "2026-01-01T00:00:00Z"}
+        - {id: e2, kind: task_event, task: t1, recordedAt: "2026-01-01T00:00:00Z"}
+    expected:
+      order: [e1, e2]
+
+  - name: concurrent-equal-timestamp-stable-order
+    classification: must-pass
+    provenance: {source: bug, ref: "salvage TestConcurrentEqualTimeAppendsHaveStableEventIDOrder"}
+    mutation:
+      description: >-
+        32 concurrent operations append one task event each with the same
+        wall-clock timestamp; SQLite's single-writer serialization plus
+        AUTOINCREMENT must still produce a strictly ascending, unique
+        JournalID order with no gaps interpretable as ambiguity.
+      operator: order-by-journalid-concurrent
+    input:
+      concurrentRows: 32
+      recordedAt: "2026-01-01T00:00:00Z"
+    expected:
+      strictlyAscendingUniqueJournalIDs: true
+
+  - name: backdated-insert-does-not-reorder-journalid
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#4 amendment: RecordedAt never establishes causality"}
+    mutation:
+      description: >-
+        A later-committed operation supplies a RecordedAt earlier than an
+        already-committed row (clock skew between callers). JournalID order
+        must still reflect commit order; a query must not resurrect the
+        backdated row ahead of already-visible rows.
+      operator: order-by-journalid
+    input:
+      rows:
+        - {id: e1, kind: task_event, task: t1, recordedAt: "2026-01-02T00:00:00Z"}
+        - {id: e2, kind: task_event, task: t1, recordedAt: "2026-01-01T00:00:00Z"}
+    expected:
+      order: [e1, e2]
+
+  - name: clock-skew-does-not-grant-later-authority
+    classification: must-fail
+    provenance: {source: requirement, ref: "provenance#4 amendment §9.3 per-effect authorization"}
+    mutation:
+      description: >-
+        An authority-lifecycle row is backdated to appear, by RecordedAt
+        alone, to predate a task event it should not be able to authorize
+        (its true JournalID is after the event). Authorizing the event using
+        the backdated authority must fail.
+      operator: authorize-using-recordedat-not-journalid
+    input:
+      rows:
+        - {id: ev1, kind: task_event, task: t1, recordedAt: "2026-01-05T00:00:00Z"}
+        - {id: auth1, kind: authority, recordedAt: "2026-01-01T00:00:00Z", assignmentFor: t1}
+      claim: "auth1 authorizes ev1 because auth1.recordedAt < ev1.recordedAt"
+    expected:
+      accepted: false
+      reason: authority-journalid-after-effect
+
+  - name: query-ordering-ignores-caller-supplied-order-hint
+    classification: must-fail
+    provenance: {source: boundary, ref: "provenance#4 §1 architectural principle"}
+    mutation:
+      description: >-
+        A query requests ordering "by RecordedAt" explicitly; the contract
+        does not expose RecordedAt as an orderable query dimension at all,
+        so the request itself must be rejected rather than silently honored.
+      operator: reject-non-journalid-order-request
+    input:
+      requestedOrderBy: recordedAt
+    expected:
+      accepted: false
+      reason: unsupported-order-dimension

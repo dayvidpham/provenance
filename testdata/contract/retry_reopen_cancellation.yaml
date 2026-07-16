@@ -1,0 +1,100 @@
+# Adversarial histories for retry/reopen/cancellation and the shared
+# Apply/Open reducer (docs/journal-relational-contract.md §9).
+cases:
+  - name: retry-same-operation-after-fault-returns-original-result
+    classification: must-pass
+    provenance: {source: bug, ref: "salvage canonicalMutationProofDescriptors RetrySameOperation"}
+    mutation:
+      description: >-
+        A fault is injected mid-way through a multi-effect operation
+        (rollback, no commit). The identical OperationID is retried
+        immediately after with no other state change; it must now succeed
+        and commit exactly the effects the original attempt would have.
+      operator: fault-then-retry-same-operation
+    input:
+      operationId: op-close-task-1
+      faultStage: {stage: mutation.assignment, index: 1}
+      effects:
+        - {kind: authority, transition: ended, task: t1, slot: owner-responsibility}
+        - {kind: task_event, task: t1, eventKind: "provenance.task.closed"}
+    expected:
+      firstAttempt: {committed: false, rollback: true}
+      retryAttempt: {committed: true, anchorCount: 1}
+
+  - name: reopen-after-close-replays-shared-reducer
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#4 amendment §9.2 incrementality equals bulk-replay equivalence"}
+    mutation:
+      description: >-
+        The store is closed and reopened after a task-close operation
+        commits. Open's full replay of journal history must derive the
+        identical tasks.* projection (status, owner) that Apply produced
+        live, using the same fold — not a second lifecycle switch statement.
+      operator: apply-then-close-then-reopen-compare-projection
+    input:
+      operations:
+        - {operationId: op-create-1, effects: [{kind: task_event, task: t1, eventKind: "provenance.task.created"}]}
+        - {operationId: op-assign-1, effects: [{kind: authority, transition: started, task: t1, slot: owner-responsibility}]}
+        - {operationId: op-close-1, effects: [{kind: authority, transition: ended, task: t1, slot: owner-responsibility}, {kind: task_event, task: t1, eventKind: "provenance.task.closed"}]}
+    expected:
+      liveProjection: {status: closed, owner: null}
+      reopenedProjection: {status: closed, owner: null}
+      projectionsMatch: true
+
+  - name: apply-and-open-converge-on-same-projection
+    classification: must-pass
+    provenance: {source: bug, ref: "salvage TestCoordinatedActivationRepeatAndConcurrentStartupConverge; regression (e)"}
+    mutation:
+      description: >-
+        Two concurrent Open calls race during first-time activation, followed
+        by a subsequent reopen. All three must converge on one identical
+        baseline projection with no duplicate migration and no divergence
+        between whichever Open committed the baseline and any later replay.
+      operator: concurrent-open-then-reopen-converge
+    input:
+      concurrentOpens: 2
+      subsequentReopens: 1
+      legacyTasks: 5
+    expected:
+      baselineAnchorsCreated: 5
+      allThreeProjectionsIdentical: true
+
+  - name: cancellation-mid-batch-rolls-back-all-effects
+    classification: must-fail
+    provenance: {source: requirement, ref: "provenance#4 amendment §9.5 fail-closed atomicity"}
+    mutation:
+      description: >-
+        A ConditionalMutationBatch with 4 child effects is cancelled (context
+        cancellation, not a fault) after effect 2 has been folded in-memory
+        but before the transaction commits. No effect, including effects 1-2,
+        may remain committed.
+      operator: cancel-mid-batch
+    input:
+      operationId: op-batch-cancel-1
+      effects:
+        - {kind: task_event, task: t1, eventKind: "provenance.task.updated"}
+        - {kind: authority, transition: started, task: t1, slot: owner-responsibility}
+        - {kind: task_event, task: t1, eventKind: "provenance.task.status-changed"}
+        - {kind: evidence, task: t1, evidenceKind: "pasture.git.commit"}
+      cancelAfterEffectIndex: 2
+    expected:
+      committedEffectCount: 0
+      anchorCreated: false
+
+  - name: operationid-reuse-different-command-conflicts
+    classification: must-fail
+    provenance: {source: requirement, ref: "provenance#5 OperationID reuse with different actor/authority/command fails actionably"}
+    mutation:
+      description: >-
+        The same OperationID is reused for a structurally different
+        Mutation than the one it originally committed. Apply must reject
+        with a typed conflict and write nothing, even though the actor and
+        authority are unchanged.
+      operator: reuse-operationid-different-mutation-digest
+    input:
+      operationId: op-close-task-1
+      originalMutationDigest: "digest-a"
+      replayMutationDigest: "digest-b"
+    expected:
+      variant: CommittedConflict
+      writesCommitted: 0

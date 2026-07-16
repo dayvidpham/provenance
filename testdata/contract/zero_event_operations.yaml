@@ -1,0 +1,91 @@
+# Adversarial histories for zero-task-event operation anchoring
+# (docs/journal-relational-contract.md §10 totality rule 1, §14.1).
+cases:
+  - name: zero-event-operation-still-anchored
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#4 amendment: every committed logical operation receives a journal entry"}
+    mutation:
+      description: >-
+        A pure authority-lifecycle operation (StartTaskAssignment) that
+        produces no task_event rows must still produce exactly one
+        journal_operations anchor row.
+      operator: apply-zero-task-event-operation
+    input:
+      operationId: op-assign-only-1
+      effects:
+        - {kind: authority, transition: started, task: t1, slot: owner-responsibility}
+    expected:
+      anchorCreated: true
+      taskEventCount: 0
+      producedByOperationJournalIdOnAnchor: null
+
+  - name: empty-append-task-event-batch-still-anchored
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#5 AppendTaskEventBatch"}
+    mutation:
+      description: >-
+        AppendTaskEventBatch called with an explicit empty draft list is a
+        valid zero-task-event operation, distinct from a rejected call — it
+        commits one anchor row and zero task_event rows, not an error.
+      operator: apply-empty-batch
+    input:
+      operationId: op-empty-batch-1
+      drafts: []
+    expected:
+      accepted: true
+      anchorCreated: true
+      taskEventCount: 0
+
+  - name: zero-event-operation-orders-authority-not-recordedat
+    classification: must-pass
+    provenance: {source: bug, ref: "regression (b): logical ordering of zero-event operation authority"}
+    mutation:
+      description: >-
+        Two zero-task-event authority operations on the same task are
+        committed in a specific JournalID order with RecordedAt values that
+        disagree with that order (second-committed carries the earlier
+        RecordedAt). Whether the second operation's authority precondition
+        is satisfied must be evaluated using JournalID order, not
+        RecordedAt order.
+      operator: authority-precedence-by-journalid
+    input:
+      rows:
+        - {id: op1, kind: operation, recordedAt: "2026-01-03T00:00:00Z", effect: "end owner-responsibility episode A on t1"}
+        - {id: op2, kind: operation, recordedAt: "2026-01-01T00:00:00Z", effect: "start owner-responsibility episode B on t1, predecessor A"}
+    expected:
+      op2Accepted: true
+      reason: op1-journalid-precedes-op2-journalid-regardless-of-recordedat
+
+  - name: lookup-committed-absent-for-never-applied-operation
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#5 LookupCommitted CommittedAbsent"}
+    mutation:
+      description: >-
+        LookupCommitted for an OperationID with no journal_operations row
+        returns the closed Absent variant with nil error and executes
+        nothing.
+      operator: lookup-committed
+    input:
+      operationId: op-never-applied
+      priorAnchors: []
+    expected:
+      variant: CommittedAbsent
+      sideEffects: none
+
+  - name: zero-event-operation-replay-returns-same-anchor
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#5 exact replay identity"}
+    mutation:
+      description: >-
+        Replaying the exact same zero-task-event operation (same
+        OperationID, actor, authority, command digest, mutation digest)
+        returns the original anchor's JournalID without creating a second
+        anchor row.
+      operator: replay-zero-task-event-operation
+    input:
+      operationId: op-assign-only-1
+      firstApply: {effects: [{kind: authority, transition: started, task: t1, slot: owner-responsibility}]}
+      secondApply: {sameOperationId: true, sameIdentity: true}
+    expected:
+      anchorCount: 1
+      secondApplyReturnsOriginalAnchor: true

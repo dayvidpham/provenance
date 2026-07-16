@@ -1,0 +1,115 @@
+# Adversarial histories for per-effect authority and single-consumption
+# assignment evidence (docs/journal-relational-contract.md §9.3, §14).
+cases:
+  - name: effect-authorized-against-state-at-own-journalid
+    classification: must-pass
+    provenance: {source: bug, ref: "regression (a): per-effect authorization at the effect's own journal position"}
+    mutation:
+      description: >-
+        A single ConditionalMutationBatch operation's second child effect
+        (StartTaskAssignment on a NEW slot occupant) depends on its first
+        child effect (EndTaskAssignment on the OLD occupant) having already
+        been folded — i.e. the second effect's authority check must see the
+        first effect's just-committed state, not the pre-transaction
+        snapshot. A superseded implementation validated authority once for
+        the whole batch and let every child reuse that stale value; this
+        case proves the reducer must not do that.
+      operator: fold-sequentially-check-effect2-sees-effect1
+    input:
+      operationId: op-transfer-1
+      effects:
+        - {index: 1, kind: authority, transition: ended, task: t1, slot: owner-responsibility, assignment: A}
+        - {index: 2, kind: authority, transition: started, task: t1, slot: owner-responsibility, assignment: B, predecessor: A}
+    expected:
+      effect1Accepted: true
+      effect2AuthorizedAgainst: "state-after-effect-1"
+      effect2Accepted: true
+
+  - name: orphaned-predecessor-assignment-rejected
+    classification: must-fail
+    provenance: {source: bug, ref: "regression (d): responsibility-assignment semantics bound to explicit lifecycle records"}
+    mutation:
+      description: >-
+        A started transition names PredecessorAssignmentID = C, but episode
+        C has no ended transition row (it is still active, or was never
+        properly started). The referenced episode exists (so the foreign
+        key alone is satisfied) but the business-rule check that it has
+        actually ended must reject the operation.
+      operator: start-with-orphaned-predecessor
+    input:
+      operationId: op-orphan-1
+      predecessorEpisode: {assignmentId: C, hasEndedTransition: false}
+      newEpisode: {assignmentId: D, predecessor: C}
+    expected:
+      accepted: false
+      reason: predecessor-not-ended
+
+  - name: predecessor-assignment-consumed-twice-rejected
+    classification: must-fail
+    provenance: {source: bug, ref: "regression (d): single-consumption ownership-assignment evidence"}
+    mutation:
+      description: >-
+        Two different successor episodes (E and F) both name the same
+        already-ended predecessor episode (A) as their PredecessorAssignmentID.
+        The UNIQUE(PredecessorAssignmentID) constraint must reject the
+        second one.
+      operator: two-successors-same-predecessor
+    input:
+      operationId: op-double-consume-1
+      predecessorEpisode: {assignmentId: A, hasEndedTransition: true}
+      firstSuccessor: {assignmentId: E, predecessor: A}
+      secondSuccessor: {assignmentId: F, predecessor: A}
+    expected:
+      firstSuccessorAccepted: true
+      secondSuccessorAccepted: false
+      reason: predecessor-already-consumed
+
+  - name: unrelated-assignment-authority-rejected
+    classification: must-fail
+    provenance: {source: bug, ref: "salvage authorityUnrelated / issue-5-1-unrelated-escalation"}
+    mutation:
+      description: >-
+        An operation presents authority from an assignment on task T2 to
+        mutate task T1, where no active assignment or governing-parent
+        lineage connects the authority to T1.
+      operator: authority-unrelated
+    input:
+      authorityTask: t2
+      targetTask: t1
+      topology: unrelated
+    expected:
+      allowed: false
+
+  - name: active-parent-authority-governs-child-task
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#5 governing-parent role"}
+    mutation:
+      description: >-
+        An authority whose assignment is on a governing-parent task is
+        permitted to mutate a child task reachable through an active
+        parent/ancestor assignment chain.
+      operator: authority-governing-parent
+    input:
+      authorityTask: parent1
+      targetTask: child1
+      topology: active-parent-chain
+    expected:
+      allowed: true
+
+  - name: ended-authority-exact-replay-still-succeeds
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#5 exact ended authority may replay"}
+    mutation:
+      description: >-
+        An operation is replayed (identical OperationID, actor, authority,
+        command digest, mutation digest) after the authority it originally
+        used has since ended. Exact replay must still return the original
+        result; only a NEW operation using an ended authority is rejected.
+      operator: replay-with-ended-authority
+    input:
+      operationId: op-review-1
+      authorityEndedSinceOriginalCommit: true
+      replayIsExactIdentity: true
+    expected:
+      accepted: true
+      reason: exact-replay-skips-current-authority-check
