@@ -32,7 +32,9 @@ type (
 
 // ID types
 type (
-	TaskID     = ptypes.TaskID
+	TaskID  = ptypes.TaskID
+	ActorID = ptypes.ActorID
+	// AgentID is the deprecated source-compatibility spelling for ActorID.
 	AgentID    = ptypes.AgentID
 	ActivityID = ptypes.ActivityID
 	CommentID  = ptypes.CommentID
@@ -175,8 +177,14 @@ func ParseTaskID(s string) (TaskID, error) {
 	return ptypes.ParseTaskID(s)
 }
 
-// ParseAgentID parses "namespace--uuid" into an AgentID.
-// See ptypes.ParseAgentID for full documentation.
+// ParseActorID parses "namespace--uuid" into the sole ActorID identity domain.
+func ParseActorID(s string) (ActorID, error) {
+	return ptypes.ParseActorID(s)
+}
+
+// ParseAgentID parses "namespace--uuid" into the ActorID domain.
+//
+// Deprecated: use ParseActorID.
 func ParseAgentID(s string) (AgentID, error) {
 	return ptypes.ParseAgentID(s)
 }
