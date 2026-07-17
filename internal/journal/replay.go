@@ -1,6 +1,7 @@
 package journal
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -46,6 +47,75 @@ func (s TaskStatus) String() string {
 	}
 }
 
+// TaskStatusFromString is the inverse of String for the three seeded statuses,
+// reporting ok=false for any other token. It is the single decoder the migration
+// marker's captured legacy status (EncodeMigrationMarkerPayload) round-trips
+// through so the status projection stays reproducible solely from journal history
+// (§13, §15).
+func TaskStatusFromString(s string) (TaskStatus, bool) {
+	switch s {
+	case "open":
+		return TaskStatusOpen, true
+	case "in_progress":
+		return TaskStatusInProgress, true
+	case "closed":
+		return TaskStatusClosed, true
+	default:
+		return 0, false
+	}
+}
+
+// LegacyStatusPayloadKey is the JSON object key the migration-marker task_event
+// (EventKindTaskMigrated) carries so the migrated task's preserved legacy status
+// is recorded IN the journal — not read from the mutable tasks row — and is thus
+// reproducible solely from ordered journal history when Open re-derives the status
+// projection from empty (§13, §15). Without it, a migrated-but-never-relifecycled
+// task's status would not be journal-derivable and a from-empty convergence check
+// could neither reproduce nor verify it.
+const LegacyStatusPayloadKey = "legacy_status"
+
+// EncodeMigrationMarkerPayload builds the migration-marker task_event payload that
+// captures a migrated task's legacy status verbatim (§13 item 1). The shared
+// reducer decodes it via DecodeLegacyStatus to seed the status projection during
+// both live migration and Open-time from-empty replay, so both derive the same
+// value from the same journal fact (§9.2).
+func EncodeMigrationMarkerPayload(status TaskStatus) json.RawMessage {
+	// Encoded by hand from a closed value set so the marker payload is a stable,
+	// canonical object rather than depending on struct field/tag ordering.
+	return json.RawMessage(fmt.Sprintf(`{%q:%q}`, LegacyStatusPayloadKey, status.String()))
+}
+
+// DecodeLegacyStatus recovers the legacy status a migration marker captured
+// (EncodeMigrationMarkerPayload). ok is false when the payload carries no
+// legacy-status key (e.g. a non-marker task_event payload); an unrecognized status
+// token is a typed error rather than a silent default, so a corrupted marker fails
+// closed rather than seeding an arbitrary status.
+func DecodeLegacyStatus(payload []byte) (TaskStatus, bool, error) {
+	if len(payload) == 0 {
+		return 0, false, nil
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &fields); err != nil {
+		return 0, false, fmt.Errorf("provenance: decode migration-marker payload: %w", err)
+	}
+	raw, ok := fields[LegacyStatusPayloadKey]
+	if !ok {
+		return 0, false, nil
+	}
+	var token string
+	if err := json.Unmarshal(raw, &token); err != nil {
+		return 0, false, fmt.Errorf("provenance: decode migration-marker %s: %w", LegacyStatusPayloadKey, err)
+	}
+	status, valid := TaskStatusFromString(token)
+	if !valid {
+		return 0, false, fmt.Errorf(
+			"provenance: migration marker carries unrecognized legacy status %q — where: status "+
+				"projection seed (§13, §15); impact: the status projection cannot be reproduced from journal "+
+				"history; fix: the marker payload must record one of open/in_progress/closed", token)
+	}
+	return status, true, nil
+}
+
 // Lifecycle task-event kinds the reducer projects to a status transition (§8.1).
 // This is a small closed set of Provenance-owned namespaced kinds — not a
 // sprawling caller-domain switch — folded identically by Apply and Open.
@@ -61,10 +131,15 @@ const (
 // kind (e.g. provenance.task.updated or any caller kind) returns ok=false and does
 // not move the status projection. This is the single source of truth the shared
 // reducer step consults for both Apply and Open (§9.2).
-// The migration marker (EventKindTaskMigrated) is deliberately NOT a
-// status-changing kind: migration preserves each legacy task's own status verbatim
-// (§13) and must never overwrite a closed legacy task's status to open. It records
-// the fact of migration, not a lifecycle transition.
+// The migration marker (EventKindTaskMigrated) is deliberately NOT a fixed
+// kind→status mapping here: migration preserves each legacy task's own status
+// verbatim (§13), so the marker instead CAPTURES that status in its payload
+// (EncodeMigrationMarkerPayload) and the shared reducer seeds the projection from
+// the captured value (DecodeLegacyStatus), never overwriting a closed legacy task's
+// status to open. Because the captured status lives in the journal row, it remains
+// reproducible solely from journal history when Open re-derives from empty (§15);
+// StatusForEventKind stays the source of truth only for the fixed-mapping lifecycle
+// kinds (created/reopened/closed).
 func StatusForEventKind(kind EventKind) (TaskStatus, bool) {
 	switch kind {
 	case EventKindTaskCreated, EventKindTaskReopened:
@@ -116,9 +191,9 @@ func (r ReplayResult) ProjectionForTask(id TaskID) (TaskProjection, bool) {
 type ProjectionDivergenceError struct {
 	Operation string // where: the replay routine
 	Task      TaskID // what: the task whose projection diverged
-	Field     string // what: the diverging projection field (owner/status/watermark)
+	Field     string // what: the diverging projection field (owner/status/watermark/attribution)
 	Stored    string // what: the stored incremental value
-	Replayed  string // what: the value the shared fold derived
+	Replayed  string // what: the value the shared from-empty fold derived
 	Why       string // why
 	Impact    string // caller impact
 	Fix       string // how to fix

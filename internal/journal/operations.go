@@ -178,12 +178,22 @@ type Effect struct {
 	// is used.
 	ActorID ActorID
 
-	// RecordedAtOverride, when non-nil, is the audit/display RecordedAt stamped on
-	// this effect's journal row instead of the operation's single RecordedAt (§12).
-	// It exists for honest legacy-baseline migration (§13), where the marker/started
-	// rows carry the legacy updated_at and an ended row carries the legacy closed_at —
-	// two different honest legacy timestamps within one operation. It never
-	// establishes causality or order (JournalID still totally orders, §1, §12).
+	// RecordedAtOverride, when non-nil, is a general-purpose per-effect audit/display
+	// RecordedAt stamped on this effect's journal row instead of the operation's
+	// single RecordedAt. Its scope is exactly §12's caller-trust doctrine for
+	// RecordedAt generally: it is audit/display only and NEVER establishes causality,
+	// order, or authority (JournalID still totally orders, §1, §12), so Apply applies
+	// it unconditionally with no honesty verification — a live caller setting it is
+	// exactly as trusted as the same caller supplying an unusual operation-level
+	// RecordedAt, which the system already permits by design. It is settable by any
+	// Apply caller, not migration-restricted. Honest legacy-baseline migration (§13)
+	// is its primary/motivating use (the marker/started rows carry the legacy
+	// updated_at and an ended row the legacy closed_at — two honest legacy timestamps
+	// within one operation), and migration adds its OWN self-consistency guard
+	// (assertHonestBaselineTimestamps) that runs ONLY on the migration path and only
+	// over values migration itself derived — that guard is not a general invariant on
+	// this field for non-migration callers (§13 regression g is enforced on the
+	// migration path alone).
 	RecordedAtOverride *RecordedTime
 
 	// task_event (EffectTaskEvent)

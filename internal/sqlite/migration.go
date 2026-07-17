@@ -39,6 +39,31 @@ var expectedJournalShape = []expectedTable{
 	{"journal_authorities", []string{"JournalID", "authority_kind_id", "operation_authority_id"}},
 }
 
+// recognizedJournalSpineTables is the CLOSED set of journal-spine relations
+// (every `journal`-prefixed table this build creates, §3-§6). Preflight's
+// extra-table direction (§13: "an unexpected extra table") enumerates the live
+// `journal`-prefixed tables and fails closed on any name outside this set — a
+// stray migration artifact, a manually-created table, or a future schema
+// version's table left behind after a downgrade — so a partially-provisioned
+// deployment halts rather than proceeding against a shape it does not fully
+// understand. Non-journal-spine relations (tasks/agents/edges/…) are not
+// enumerated here: they are matched by the `journal`-prefix convention below, so
+// they are never mistaken for a stray spine table.
+var recognizedJournalSpineTables = map[string]struct{}{
+	"journal":                                  {},
+	"journal_kinds":                            {},
+	"journal_task_events":                      {},
+	"journal_task_event_contexts":              {},
+	"journal_operations":                       {},
+	"journal_operation_result_slots":           {},
+	"journal_authorities":                      {},
+	"journal_authority_bootstraps":             {},
+	"journal_authority_assignment_episodes":    {},
+	"journal_authority_assignment_transitions": {},
+	"journal_decisions":                        {},
+	"journal_evidence":                         {},
+}
+
 // PreflightSchema verifies the external pre-journal schema shape (§13). It is a
 // read-only check that runs strictly before any transaction opens; any mismatch is
 // a typed SchemaPreflightError and no row of any kind is written.
@@ -71,6 +96,42 @@ func (db *DB) preflightSchemaLocked() error {
 		}
 		if perr := checkColumns(want, actual); perr != nil {
 			return perr
+		}
+	}
+	// Extra-table direction (§13): every live `journal`-prefixed table must be a
+	// recognized journal-spine relation. An unrecognized one fails closed.
+	return db.preflightNoUnexpectedSpineTableLocked()
+}
+
+// preflightNoUnexpectedSpineTableLocked enumerates every live table whose name
+// follows the journal-spine convention (name = 'journal' or name LIKE 'journal_%')
+// and fails closed with a typed SchemaPreflightError on any name outside the
+// closed recognizedJournalSpineTables set — the extra-table direction §13's prose
+// promises alongside the extra-column direction (§13, checkColumns).
+func (db *DB) preflightNoUnexpectedSpineTableLocked() error {
+	var unexpected string
+	if err := sqlitex.Execute(db.conn,
+		`SELECT name FROM sqlite_master WHERE type='table'
+		   AND (name = 'journal' OR name LIKE 'journal\_%' ESCAPE '\')
+		 ORDER BY name ASC`,
+		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
+			name := stmt.ColumnText(0)
+			if _, ok := recognizedJournalSpineTables[name]; !ok && unexpected == "" {
+				unexpected = name
+			}
+			return nil
+		}}); err != nil {
+		return fmt.Errorf("preflight: enumerate journal-spine tables: %w", err)
+	}
+	if unexpected != "" {
+		return &journal.SchemaPreflightError{
+			Operation:     "PreflightSchema",
+			ExpectedShape: "only recognized journal-spine tables present",
+			FoundShape:    "unexpected extra table " + unexpected,
+			Stage:         "table-exclusivity check across the journal-spine set",
+			Why:           "the live schema carries a journal-spine-named table outside any migration this build recognizes, so its shape is not fully understood",
+			Impact:        "no row of any kind is written; activation halts rather than proceeding against an unreviewed schema",
+			Fix:           "revert the out-of-band table addition or teach this build the migration that added it, then re-open",
 		}
 	}
 	return nil
@@ -258,11 +319,15 @@ func baselineOperation(in journal.MigrationInput, lt journal.LegacyTaskRow, owne
 		RecordedAt:         updatedAt,
 	}
 	updated := updatedAt
-	// 1. Migration-marker event, honest legacy updated_at (§13 item 1).
+	// 1. Migration-marker event, honest legacy updated_at (§13 item 1). Its payload
+	//    captures the legacy status verbatim so the status projection is reproducible
+	//    solely from journal history — the shared reducer seeds status from THIS
+	//    captured value, never from the mutable tasks row (§13, §15).
 	op.Effects = append(op.Effects, journal.Effect{
 		Sort:               journal.EffectTaskEvent,
 		TaskID:             lt.ID,
 		EventKind:          journal.EventKindTaskMigrated,
+		Payload:            journal.EncodeMigrationMarkerPayload(lt.Status),
 		RecordedAtOverride: &updated,
 	})
 	if owner == nil {

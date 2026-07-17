@@ -78,9 +78,14 @@ operators:
   - {operator: migrate-batch-with-one-unmappable-owner,     slice: s1.3, reason: migration fail-closed}
   - {operator: migrate-then-extend-compare-to-native-only,  slice: s1.3, reason: migrated/native equivalence}
   - {operator: migrate-then-remigrate-same-legacy-set,      slice: s1.3, reason: idempotent re-migration}
+  - {operator: migrate-two-identical-createdat-tie-break,   slice: s1.3, reason: "deterministic created_at/id sort totality"}
   - {operator: schema-preflight,                            slice: s1.3, reason: external-schema preflight}
   - {operator: schema-preflight-extra-column,               slice: s1.3, reason: external-schema preflight}
+  - {operator: schema-preflight-extra-table,                slice: s1.3, reason: external-schema preflight extra-table direction}
   - {operator: schema-preflight-missing-column,             slice: s1.3, reason: external-schema preflight}
   - {operator: schema-preflight-missing-table,              slice: s1.3, reason: external-schema preflight}
   - {operator: fault-mid-migration,                         slice: s1.3, reason: migration fail-closed}
   - {operator: concurrent-open-during-corruption,           slice: s1.3, reason: fail-closed topology detection}
+  - {operator: replay-converges-clean,                      slice: s1.3, reason: §15 from-empty convergence}
+  - {operator: replay-converges-migrated-status,            slice: s1.3, reason: §15 migrated-status reproducibility}
+  - {operator: replay-detects-out-of-band-corruption,       slice: s1.3, reason: §15 fail-closed divergence detection}

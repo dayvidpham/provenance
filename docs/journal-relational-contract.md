@@ -1160,9 +1160,48 @@ columns, `task_attributions`, `task_event_activity`,
 `assignment_current`) is reproducible **solely** from ordered `journal`
 history — no projection may be seeded, patched, or reconciled from any
 non-journal input. `tasks.LastJournalID` exists specifically so this claim is
-checkable: `Open` may assert `stored_projection == Reduce(history,
-stored_projection.LastJournalID)` for every task before accepting a database
-as converged.
+checkable.
+
+**`Open` verifies convergence by a genuine from-empty re-derivation.**
+`ReplayProjections` (the `Open`/startup replay) does **not** re-fold on top of
+the stored projection and diff a before/after snapshot — such an on-top re-fold
+only detects drift in a field some journal row actually writes, so an
+out-of-band corruption on a field no row revisits (e.g. a hand-corrupted
+`tasks.status_id` on a task whose journal history carries **no** status-changing
+lifecycle event) reads back unchanged and is silently reported as converged.
+Instead, `Open` clears the projection to an empty slate in a scratch savepoint,
+re-folds the entire journal through the one shared reducer step (§9.2), and
+asserts `stored_projection == Reduce(history[..], from empty)` across the **full
+projection set** — owner, status, watermark, **and** `task_attributions` — for
+every task. The scratch rebuild is always rolled back, so the check is read-only
+and idempotent; a genuine divergence fails closed with a typed
+`ProjectionDivergenceError` (§13.1 six-field shape) naming the task, the
+diverging field, and the stored-vs-derived values, and no projection is silently
+repaired.
+
+Because the re-derivation runs from empty, every value it seeds is itself a
+journal fact: a task's status baseline is the reducer's zero (`open`) unless a
+lifecycle event (created/reopened/closed) or a **migration marker** moves it — a
+migration marker captures the migrated task's preserved legacy status in its own
+payload (§13 item 1), and the reducer seeds status from **that captured journal
+value**, never from the mutable `tasks` row, so a migrated-but-never-relifecycled
+task's status remains reproducible solely from journal history.
+
+**Staging scope (pasture#14).** Convergence is asserted for **journal-anchored**
+tasks — those with at least one journal-spine row (a `journal_task_events`,
+`journal_authority_*` episode, `journal_decisions`, or `journal_evidence` row) —
+so their owner, status, watermark, and attributions are all journal-reproducible.
+A **pure direct-write task with zero journal rows** has no journal history to
+reduce over, so it is outside the checkable set until the direct-write task path
+retires (the same honest-staging coupling already accepted for
+`tasks.LastJournalID` and the `produced_by_operation_journal_id` FK). A migrated
+task **is** journal-anchored and fully checked. A status set purely by the
+direct-write path (`tracker.Update`) on a task that **is** journal-anchored but
+carries no status-changing lifecycle event or migration marker is, by
+construction, not reproducible from journal history and so is reported as a
+divergence — which is the correct reading of this invariant, not a false
+positive: the fix is to route that status change through a journal lifecycle
+event once the direct-write path retires.
 
 ## Adversarial proof corpus
 
@@ -1182,8 +1221,9 @@ that first exposed it — never a Beads ID or a proposal/slice/phase label.
 | [`retry_reopen_cancellation.yaml`](../testdata/contract/retry_reopen_cancellation.yaml) | 5 | Retry/reopen/cancellation; regression (e) |
 | [`authority_evidence.yaml`](../testdata/contract/authority_evidence.yaml) | 9 | Per-effect authority at each `JournalID`; orphaned/multiply-consumed evidence; committing-actor agreement; assignment-transition lifecycle order; regressions (a), (d) |
 | [`owner_responsibility.yaml`](../testdata/contract/owner_responsibility.yaml) | 6 | Owner-responsibility end bound to legal close; transfer-CAS and transfer-crash atomicity; occupant attribution; regression (c) |
-| [`baseline_migration.yaml`](../testdata/contract/baseline_migration.yaml) | 7 | Fresh/legacy-assigned/legacy-terminal/unmappable-owner baseline transitions; honest timestamps; actionable migration-error fields; migrated/native observational equivalence; idempotent re-run; regression (g) |
-| [`topology_corruption.yaml`](../testdata/contract/topology_corruption.yaml) | 6 | Fail-closed on missing/corrupted external schema (table + column, both directions); actionable preflight-error fields; regression (f) |
+| [`baseline_migration.yaml`](../testdata/contract/baseline_migration.yaml) | 8 | Fresh/legacy-assigned/legacy-terminal/unmappable-owner baseline transitions; honest timestamps; actionable migration-error fields; migrated/native full-projection observational equivalence; deterministic `(created_at, id)` tie-break; idempotent re-run; regression (g) |
+| [`topology_corruption.yaml`](../testdata/contract/topology_corruption.yaml) | 7 | Fail-closed on missing/corrupted external schema (table + column, both directions incl. unexpected extra table); actionable preflight-error fields; regression (f) |
+| [`projection_convergence.yaml`](../testdata/contract/projection_convergence.yaml) | 6 | From-empty §15 convergence over the full projection set (owner/status/watermark/attributions); fail-closed `ProjectionDivergenceError` on out-of-band owner/status/watermark/attribution corruption; migrated-status reproducibility |
 | [`genesis_bootstrap.yaml`](../testdata/contract/genesis_bootstrap.yaml) | 5 | Genesis authority base case; NULL-authority discipline (first-operation-only, sole-bootstrap-effect); same-`OperationID` genesis retry short-circuit |
 | [`operation_results.yaml`](../testdata/contract/operation_results.yaml) | 3 | `ResultSlotID` → produced-row mapping reconstruction; EmittedEvents via the produced closure; rule-9 result-slot own-operation integrity (must-fail) |
 | [`subtype_integrity.yaml`](../testdata/contract/subtype_integrity.yaml) | 4 | Subtype totality/exclusivity/discriminator agreement (both inheritance levels) |

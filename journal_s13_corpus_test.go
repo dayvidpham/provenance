@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	dbsqlite "github.com/dayvidpham/provenance/internal/sqlite"
 	"github.com/dayvidpham/provenance/internal/testcorpus"
 )
 
@@ -37,13 +38,19 @@ var s13Operators = map[testcorpus.OperatorName]s11Handler{
 	"migrate-batch-with-one-unmappable-owner":       opMigrateBatchOneUnmappableOwner,
 	"migrate-then-extend-compare-to-native-only":    opMigrateThenExtendCompareNativeOnly,
 	"migrate-then-remigrate-same-legacy-set":        opMigrateThenRemigrateSameSet,
+	"migrate-two-identical-createdat-tie-break":     opMigrateTwoIdenticalCreatedAtTieBreak,
 	// topology_corruption.yaml (§13 preflight)
 	"schema-preflight":                  opSchemaPreflight,
 	"schema-preflight-missing-table":    opSchemaPreflightMissingTable,
 	"schema-preflight-extra-column":     opSchemaPreflightExtraColumn,
+	"schema-preflight-extra-table":      opSchemaPreflightExtraTable,
 	"schema-preflight-missing-column":   opSchemaPreflightMissingColumn,
 	"fault-mid-migration":               opFaultMidMigration,
 	"concurrent-open-during-corruption": opConcurrentOpenDuringCorruption,
+	// projection_convergence.yaml (§9.2, §15)
+	"replay-converges-clean":                opReplayConvergesClean,
+	"replay-converges-migrated-status":      opReplayConvergesMigratedStatus,
+	"replay-detects-out-of-band-corruption": opReplayDetectsCorruption,
 	// owner_responsibility.yaml (§8.1, §9.5)
 	"reopen-task": opReopenTask,
 	"fault-between-transfer-ended-and-started": opFaultBetweenTransferEndedAndStarted,
@@ -325,6 +332,17 @@ func opMigrateLegacyTask(t *testing.T, input, expected anyMap, _ testcorpus.Clas
 	} else if anchors != 1 {
 		return fmt.Errorf("expected 1 baseline anchor, found %d", anchors)
 	}
+	// The migration marker materializes the legacy status into the projection,
+	// captured verbatim in its payload so it stays journal-reproducible (§13, §15).
+	if wantStatus, err := asString(expected, "projectedStatus"); err == nil {
+		got, err := env.tr.Show(lt.ID)
+		if err != nil {
+			return err
+		}
+		if got.Status.String() != wantStatus {
+			return fmt.Errorf("migrated task projected status = %q, want %q (legacy status preserved verbatim)", got.Status.String(), wantStatus)
+		}
+	}
 	wantEpisodes, _ := asInt(expected, "episodesCreated")
 	gotEpisodes, err := st.db.CountEpisodesForTask(lt.ID)
 	if err != nil {
@@ -464,13 +482,18 @@ func opMigrateThenExtendCompareNativeOnly(t *testing.T, input, expected anyMap, 
 	frank := env.actorFor(t, "actor-frank")
 	grace := env.actorFor(t, "actor-grace")
 
+	// The legacy status the migrated task preserves — read from the case's own
+	// input so the fixture and the assertion cannot silently drift (a hardcoded
+	// value was the original gap). It is a status a native history can also reach.
+	legacyStatus := parseTaskStatus(mustMap(input, "legacyTask"))
+
 	// Migrated history: baseline episode, then a native transfer chaining off it.
 	migrated := env.taskFor(t, "t8")
 	base := time.Date(2025, 6, 10, 0, 0, 0, 0, time.UTC)
 	if _, err := env.tr.Journal().MigrateLegacyBaseline(MigrationInput{
 		System: system, BootstrapAuthority: boot,
 		Owners: map[string]ActorID{"actor-frank": frank},
-		Legacy: []LegacyTaskRow{{ID: migrated, RawOwner: "actor-frank", Status: TaskStatusInProgress, CreatedAt: base, UpdatedAt: base}},
+		Legacy: []LegacyTaskRow{{ID: migrated, RawOwner: "actor-frank", Status: legacyStatus, CreatedAt: base, UpdatedAt: base}},
 	}); err != nil {
 		return fmt.Errorf("migrate t8: %w", err)
 	}
@@ -486,22 +509,76 @@ func opMigrateThenExtendCompareNativeOnly(t *testing.T, input, expected anyMap, 
 		return fmt.Errorf("native transfer: %w", err)
 	}
 
-	migratedOwner, err := env.tr.Show(migrated)
+	// §13.2 observational equivalence over the FULL TaskProjection (owner AND status
+	// AND watermark), driven by the case's own `expected` block, not hardcoded values.
+	wantMigratedOwner, err := asString(expected, "migratedOwner")
 	if err != nil {
 		return err
 	}
-	nativeOwner, err := env.tr.Show(native)
+	wantNativeOwner, err := asString(expected, "nativeOnlyOwner")
 	if err != nil {
 		return err
 	}
-	if migratedOwner.Owner == nil || migratedOwner.Owner.String() != grace.String() {
-		return fmt.Errorf("migrated task owner = %v, want actor-grace", migratedOwner.Owner)
+	wantMigratedStatus, err := asString(expected, "migratedStatus")
+	if err != nil {
+		return err
 	}
-	if nativeOwner.Owner == nil || nativeOwner.Owner.String() != grace.String() {
-		return fmt.Errorf("native-only task owner = %v, want actor-grace", nativeOwner.Owner)
+	wantNativeStatus, err := asString(expected, "nativeOnlyStatus")
+	if err != nil {
+		return err
 	}
-	// Observational equivalence beyond RecordedAt provenance (§13.2): both reach the
-	// same owner projection through the identical fold.
+	migratedProj, err := env.tr.Show(migrated)
+	if err != nil {
+		return err
+	}
+	nativeProj, err := env.tr.Show(native)
+	if err != nil {
+		return err
+	}
+	// Owner + status equality (the position-independent projection fields).
+	if migratedProj.Owner == nil || env.actorFor(t, wantMigratedOwner).String() != migratedProj.Owner.String() {
+		return fmt.Errorf("migrated task owner = %v, want %s", migratedProj.Owner, wantMigratedOwner)
+	}
+	if nativeProj.Owner == nil || env.actorFor(t, wantNativeOwner).String() != nativeProj.Owner.String() {
+		return fmt.Errorf("native-only task owner = %v, want %s", nativeProj.Owner, wantNativeOwner)
+	}
+	if migratedProj.Status.String() != wantMigratedStatus {
+		return fmt.Errorf("migrated task status = %q, want %q", migratedProj.Status.String(), wantMigratedStatus)
+	}
+	if nativeProj.Status.String() != wantNativeStatus {
+		return fmt.Errorf("native-only task status = %q, want %q", nativeProj.Status.String(), wantNativeStatus)
+	}
+	// The two paths reach an IDENTICAL owner+status projection (observational
+	// equivalence beyond RecordedAt provenance, §13.2).
+	if migratedProj.Owner.String() != nativeProj.Owner.String() || migratedProj.Status != nativeProj.Status {
+		return fmt.Errorf("migrated {owner:%v status:%v} != native {owner:%v status:%v} — projections not observationally equivalent",
+			migratedProj.Owner, migratedProj.Status, nativeProj.Owner, nativeProj.Status)
+	}
+	// Watermark: the absolute LastJournalID differs between two distinct tasks in
+	// one database, so it is compared STRUCTURALLY — each task's watermark points at
+	// its own most-recent journal row via a converged from-empty replay — rather
+	// than by absolute equality (§13.2 observational-equivalence definition).
+	migratedReplay, err := env.tr.Journal().ReplayProjections()
+	if err != nil {
+		return fmt.Errorf("from-empty replay must converge for both migrated and native tasks: %w", err)
+	}
+	mp, okM := migratedReplay.ProjectionForTask(migrated)
+	np, okN := migratedReplay.ProjectionForTask(native)
+	if !okM || !okN {
+		return fmt.Errorf("replay produced no projection for one of the equivalence tasks (migrated=%v native=%v)", okM, okN)
+	}
+	if mp.LastJournalID == 0 || np.LastJournalID == 0 {
+		return fmt.Errorf("watermark not set for an equivalence task (migrated=%d native=%d)", mp.LastJournalID, np.LastJournalID)
+	}
+	// The from-empty replay converging (above) already proves each task's stored
+	// watermark equals its own re-derived latest journal position. The two absolute
+	// values necessarily DIFFER because they are distinct tasks at distinct journal
+	// positions in one database — §13.2's equivalence is over owner+status, with the
+	// watermark compared structurally (each correct for its own task), not by
+	// absolute equality.
+	if mp.LastJournalID == np.LastJournalID {
+		return fmt.Errorf("two distinct tasks share watermark %d; expected position-dependent distinct watermarks", mp.LastJournalID)
+	}
 	return nil
 }
 
@@ -543,6 +620,85 @@ func opMigrateThenRemigrateSameSet(t *testing.T, input, expected anyMap, _ testc
 	return nil
 }
 
+// opMigrateTwoIdenticalCreatedAtTieBreak proves the (created_at, id) pre-migration
+// sort breaks a created_at tie by id alone: with identical created_at, the task
+// whose id sorts smaller gets the smaller baseline anchor JournalID, deterministically
+// (§13 sort totality).
+func opMigrateTwoIdenticalCreatedAtTieBreak(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
+	env := newOpsEnv(t)
+	boot := env.genesis(t, "op-genesis")
+	system := env.actorFor(t, "pasture-system")
+
+	rows, err := asList(input, "legacyTasks")
+	if err != nil {
+		return err
+	}
+	if len(rows) != 2 {
+		return fmt.Errorf("tie-break case needs exactly 2 legacy tasks, got %d", len(rows))
+	}
+	var legacy []LegacyTaskRow
+	var createdAts []time.Time
+	for _, r := range rows {
+		m, err := asMap(r)
+		if err != nil {
+			return err
+		}
+		label, err := asString(m, "id")
+		if err != nil {
+			return err
+		}
+		createdAt, err := asTime(m, "createdAt")
+		if err != nil {
+			return err
+		}
+		createdAts = append(createdAts, createdAt)
+		task := env.taskFor(t, "tie-"+label)
+		legacy = append(legacy, LegacyTaskRow{ID: task, Status: TaskStatusOpen, CreatedAt: createdAt, UpdatedAt: createdAt})
+	}
+	if !createdAts[0].Equal(createdAts[1]) {
+		return fmt.Errorf("tie-break case must use identical created_at for both tasks (got %v vs %v)", createdAts[0], createdAts[1])
+	}
+
+	res, err := env.tr.Journal().MigrateLegacyBaseline(MigrationInput{System: system, BootstrapAuthority: boot, Legacy: legacy})
+	if err != nil {
+		return fmt.Errorf("migrate tie-break batch: %w", err)
+	}
+	if res.BaselineAnchorsCreated != 2 {
+		return fmt.Errorf("tie-break migration created %d anchors, want 2", res.BaselineAnchorsCreated)
+	}
+
+	anchorOf := func(task TaskID) (JournalID, error) {
+		r, err := env.tr.Journal().LookupCommitted(MigrationBaselineOperationID(task))
+		if err != nil {
+			return 0, err
+		}
+		if r.Kind != CommittedExact || r.AnchorJournalID == 0 {
+			return 0, fmt.Errorf("no committed baseline anchor for task %s", task.String())
+		}
+		return r.AnchorJournalID, nil
+	}
+	anchorA, err := anchorOf(legacy[0].ID)
+	if err != nil {
+		return err
+	}
+	anchorB, err := anchorOf(legacy[1].ID)
+	if err != nil {
+		return err
+	}
+	// With identical created_at, id alone orders the migration: the smaller
+	// id.String() must have received the smaller baseline anchor JournalID.
+	smallerIsA := legacy[0].ID.String() < legacy[1].ID.String()
+	if smallerIsA && anchorA >= anchorB {
+		return fmt.Errorf("id-ascending tie-break violated: smaller id %s got anchor %d >= larger id %s anchor %d",
+			legacy[0].ID.String(), anchorA, legacy[1].ID.String(), anchorB)
+	}
+	if !smallerIsA && anchorB >= anchorA {
+		return fmt.Errorf("id-ascending tie-break violated: smaller id %s got anchor %d >= larger id %s anchor %d",
+			legacy[1].ID.String(), anchorB, legacy[0].ID.String(), anchorA)
+	}
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // external-schema preflight / topology corruption (§13)
 // ---------------------------------------------------------------------------
@@ -571,6 +727,15 @@ func opSchemaPreflightExtraColumn(t *testing.T, input, expected anyMap, _ testco
 		return fmt.Errorf("corrupt schema (extra column): %w", err)
 	}
 	return expectPreflightFailure(env.tr.Journal().PreflightSchema(), "an unexpected extra column")
+}
+
+func opSchemaPreflightExtraTable(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
+	env := newOpsEnv(t)
+	st := env.tr.(*sqliteTracker)
+	if err := st.db.AdversarialAddTable("journal_unreviewed"); err != nil {
+		return fmt.Errorf("corrupt schema (extra table): %w", err)
+	}
+	return expectPreflightFailure(env.tr.Journal().PreflightSchema(), "an unexpected extra journal-spine table")
 }
 
 func opSchemaPreflightMissingColumn(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
@@ -822,6 +987,192 @@ func opReplayZeroTaskEventOperation(t *testing.T, input, expected anyMap, _ test
 		return fmt.Errorf("replay returned anchor %d, want the original %d", res2.AnchorJournalID, res1.AnchorJournalID)
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// §15 projection convergence: from-empty re-derivation + fail-closed divergence
+// ---------------------------------------------------------------------------
+
+// convergenceEnv builds a journal-anchored task with a started owner-responsibility
+// episode and one non-lifecycle task_event — the "lifecycle-quiet" shape whose
+// stored status no journal row writes, so an on-top re-fold could not verify it.
+// It returns the env and the task.
+func convergenceEnv(t *testing.T) (*opsEnv, TaskID, ActorID) {
+	env := newOpsEnv(t)
+	boot := env.genesis(t, "op-genesis")
+	task := env.taskFor(t, "conv-t1")
+	occupant := env.actorFor(t, "occ")
+	env.startEpisode(t, "op-seed-A", boot, task, "A", occupant)
+	if _, err := env.tr.Journal().Apply(OperationInput{
+		OperationID: "op-nonlifecycle-1", ActorID: env.actor, AuthorityJournalID: &boot,
+		CommandDigest: env.digest("c"), MutationDigest: env.digest("m"),
+		Effects: []Effect{{Sort: EffectTaskEvent, TaskID: task, EventKind: "provenance.task.updated"}},
+	}); err != nil {
+		t.Fatalf("apply non-lifecycle task_event: %v", err)
+	}
+	return env, task, occupant
+}
+
+func opReplayConvergesClean(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
+	env, task, occupant := convergenceEnv(t)
+	replay, err := env.tr.Journal().ReplayProjections()
+	if err != nil {
+		return fmt.Errorf("from-empty replay of a clean projection diverged: %w", err)
+	}
+	if replay.RowsFolded == 0 {
+		return fmt.Errorf("clean replay folded no journal rows")
+	}
+	p, ok := replay.ProjectionForTask(task)
+	if !ok {
+		return fmt.Errorf("clean replay produced no projection for the journal-anchored task")
+	}
+	if p.Owner == nil || p.Owner.String() != occupant.String() {
+		return fmt.Errorf("clean replay owner = %v, want the episode occupant", p.Owner)
+	}
+	if p.Status != TaskStatusOpen {
+		return fmt.Errorf("clean replay status = %v, want open (no lifecycle event, no migration marker)", p.Status)
+	}
+	return nil
+}
+
+func opReplayConvergesMigratedStatus(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
+	env := newOpsEnv(t)
+	boot := env.genesis(t, "op-genesis")
+	system := env.actorFor(t, "pasture-system")
+
+	rows, err := asList(input, "legacyTasks")
+	if err != nil {
+		return err
+	}
+	owners := map[string]ActorID{}
+	var legacy []LegacyTaskRow
+	wantStatus := map[string]TaskStatus{}
+	for _, r := range rows {
+		m, err := asMap(r)
+		if err != nil {
+			return err
+		}
+		lt, o, _, err := env.parseLegacyTask(t, m)
+		if err != nil {
+			return err
+		}
+		for k, v := range o {
+			owners[k] = v
+		}
+		legacy = append(legacy, lt)
+		wantStatus[lt.ID.String()] = lt.Status
+	}
+	if _, err := env.tr.Journal().MigrateLegacyBaseline(MigrationInput{System: system, BootstrapAuthority: boot, Owners: owners, Legacy: legacy}); err != nil {
+		return fmt.Errorf("migrate non-open legacy statuses: %w", err)
+	}
+	// The live projection materialized each captured legacy status.
+	for _, lt := range legacy {
+		got, err := env.tr.Show(lt.ID)
+		if err != nil {
+			return err
+		}
+		if int(got.Status) != int(wantStatus[lt.ID.String()]) {
+			return fmt.Errorf("migrated task %s status = %v, want %v", lt.ID.String(), got.Status, wantStatus[lt.ID.String()])
+		}
+	}
+	// From-empty replay re-derives each status SOLELY from the captured marker
+	// payload and converges — no divergence despite the non-open statuses.
+	if _, err := env.tr.Journal().ReplayProjections(); err != nil {
+		return fmt.Errorf("from-empty replay of migrated non-open statuses diverged: %w", err)
+	}
+	return nil
+}
+
+func opReplayDetectsCorruption(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
+	env, task, _ := convergenceEnv(t)
+	st := env.tr.(*sqliteTracker)
+
+	// Sanity: the clean projection converges before any corruption.
+	if _, err := env.tr.Journal().ReplayProjections(); err != nil {
+		return fmt.Errorf("pre-corruption replay unexpectedly diverged: %w", err)
+	}
+
+	field, err := asString(input, "field")
+	if err != nil {
+		return err
+	}
+	switch field {
+	case "status":
+		token, err := asString(input, "corruptTo")
+		if err != nil {
+			return err
+		}
+		status, ok := statusTokenToInt(token)
+		if !ok {
+			return fmt.Errorf("corruptTo %q is not a known status token", token)
+		}
+		if err := st.db.AdversarialCorruptTaskProjection(task, dbsqlite.AdversarialFieldStatus, status); err != nil {
+			return fmt.Errorf("corrupt status: %w", err)
+		}
+	case "owner":
+		intruder := env.actorFor(t, "intruder")
+		if err := st.db.AdversarialCorruptTaskProjection(task, dbsqlite.AdversarialFieldOwner, intruder.String()); err != nil {
+			return fmt.Errorf("corrupt owner: %w", err)
+		}
+	case "watermark":
+		// The genesis anchor is JournalID 1: an existing (FK-valid) but wrong
+		// watermark for this task, whose real watermark is its latest event.
+		if err := st.db.AdversarialCorruptTaskProjection(task, dbsqlite.AdversarialFieldWatermark, int64(1)); err != nil {
+			return fmt.Errorf("corrupt watermark: %w", err)
+		}
+	case "attribution":
+		intruder := env.actorFor(t, "intruder")
+		if err := st.db.AdversarialInsertSpuriousAttribution(task, intruder, JournalID(1)); err != nil {
+			return fmt.Errorf("insert spurious attribution: %w", err)
+		}
+	default:
+		return fmt.Errorf("unknown corruption field %q", field)
+	}
+
+	_, err = env.tr.Journal().ReplayProjections()
+	if err == nil {
+		return fmt.Errorf("out-of-band %s corruption was accepted as converged; expected a fail-closed ProjectionDivergenceError", field)
+	}
+	if !errors.Is(err, ErrProjectionDivergence) {
+		return fmt.Errorf("%s corruption rejected with %v, want ErrProjectionDivergence", field, err)
+	}
+	var typed *ProjectionDivergenceError
+	if !errors.As(err, &typed) {
+		return fmt.Errorf("%s corruption: error is not a typed *ProjectionDivergenceError: %v", field, err)
+	}
+	wantField, err := asString(expected, "divergentField")
+	if err != nil {
+		return err
+	}
+	if typed.Field != wantField {
+		return fmt.Errorf("divergence named field %q, want %q", typed.Field, wantField)
+	}
+	if typed.Task.Namespace == "" {
+		return fmt.Errorf("ProjectionDivergenceError Task (what) is empty")
+	}
+	if fld := firstEmptyField(map[string]string{
+		"Operation": typed.Operation, "Field": typed.Field, "Stored": typed.Stored,
+		"Replayed": typed.Replayed, "Why": typed.Why, "Impact": typed.Impact, "Fix": typed.Fix,
+	}); fld != "" {
+		return fmt.Errorf("ProjectionDivergenceError field %q is empty (six-field actionable contract)", fld)
+	}
+	if !errorIsActionable(typed.Error()) {
+		return fmt.Errorf("ProjectionDivergenceError is not actionable (missing why/where/when/impact/fix): %v", typed)
+	}
+	return nil
+}
+
+func statusTokenToInt(token string) (int, bool) {
+	switch token {
+	case "open":
+		return int(TaskStatusOpen), true
+	case "in_progress":
+		return int(TaskStatusInProgress), true
+	case "closed":
+		return int(TaskStatusClosed), true
+	default:
+		return 0, false
+	}
 }
 
 // ---------------------------------------------------------------------------

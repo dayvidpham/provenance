@@ -32,6 +32,7 @@ var contractCorpusFiles = []string{
 	"owner_responsibility.yaml",
 	"baseline_migration.yaml",
 	"topology_corruption.yaml",
+	"projection_convergence.yaml",
 	"genesis_bootstrap.yaml",
 	"operation_results.yaml",
 	"subtype_integrity.yaml",

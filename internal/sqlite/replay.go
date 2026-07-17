@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/dayvidpham/provenance/internal/journal"
@@ -82,12 +83,14 @@ func (db *DB) projectTaskEventRowLocked(jid int64, committing journal.ActorID, r
 	var (
 		taskRaw string
 		kindStr string
+		payload []byte
 	)
 	if err := sqlitex.Execute(db.conn,
-		`SELECT task_id, event_kind FROM journal_task_events WHERE JournalID = ?1`,
+		`SELECT task_id, event_kind, payload FROM journal_task_events WHERE JournalID = ?1`,
 		&sqlitex.ExecOptions{Args: []any{jid}, ResultFunc: func(stmt *zs.Stmt) error {
 			taskRaw = stmt.ColumnText(0)
 			kindStr = stmt.ColumnText(1)
+			payload = readBlob(stmt, 2)
 			return nil
 		}}); err != nil {
 		return fmt.Errorf("project task_event %d: %w", jid, err)
@@ -98,6 +101,20 @@ func (db *DB) projectTaskEventRowLocked(jid int64, committing journal.ActorID, r
 	}
 	if err := db.insertAttributionLocked(task, committing, jid); err != nil {
 		return err
+	}
+	// A migration marker seeds the status projection from the legacy status it
+	// captured in its own payload (§13, §15) — read from the journal row, never from
+	// the mutable tasks row — so both live migration and Open's from-empty replay
+	// derive the identical status from the identical journal fact (§9.2).
+	if journal.EventKind(kindStr) == journal.EventKindTaskMigrated {
+		status, ok, derr := journal.DecodeLegacyStatus(payload)
+		if derr != nil {
+			return fmt.Errorf("project task_event %d: %w", jid, derr)
+		}
+		if ok {
+			return db.projectTaskStatusLocked(task, status, jid, recordedAt)
+		}
+		return db.advanceWatermarkLocked(task, jid)
 	}
 	if status, isLifecycle := journal.StatusForEventKind(journal.EventKind(kindStr)); isLifecycle {
 		return db.projectTaskStatusLocked(task, status, jid, recordedAt)
@@ -214,14 +231,38 @@ func (db *DB) projectTaskStatusLocked(task journal.TaskID, status journal.TaskSt
 // Open-time full replay (§9.2, §15)
 // ---------------------------------------------------------------------------
 
-// ReplayProjections folds the ENTIRE journal in JournalID order through the same
-// projectJournalRowLocked reducer step Apply uses (§9.2), then verifies the
-// recomputed projection converges with the stored incremental projection (§15). It
-// first runs the external-schema preflight (§13) so a corrupted/partial topology
-// fails closed before any fold. It is the Open/startup replay entry point and is
-// idempotent: re-running it on a converged database is a no-op that returns the
-// same per-task projection. On genuine divergence it returns a typed
-// ProjectionDivergenceError and writes nothing further.
+// errReplayScratchRollback forces the from-empty scratch re-derivation savepoint
+// to roll back after its projections are captured, so ReplayProjections is a
+// read-only convergence CHECK that never persists the rebuild (it fails closed on
+// divergence rather than silently repairing). It never escapes ReplayProjections.
+var errReplayScratchRollback = errors.New("provenance: internal replay-scratch rollback (never surfaced)")
+
+// ReplayProjections re-derives EVERY projection from an EMPTY slate by folding the
+// entire journal in JournalID order through the same projectJournalRowLocked
+// reducer step Apply uses (§9.2, §15), then verifies the stored projection equals
+// that genuine from-empty re-derivation. Unlike an on-top re-fold (which only
+// detects drift in a field some journal row actually writes, so an out-of-band
+// corruption on a field no row revisits — e.g. a hand-corrupted tasks.status_id on
+// a task with no status-changing lifecycle event — reads back unchanged and is
+// falsely reported as converged), this clears the projection to a blank slate in a
+// scratch savepoint, refolds, and compares the FULL projection set — owner, status,
+// watermark, AND task_attributions — for every journal-anchored task. It first runs
+// the external-schema preflight (§13). It is read-only and idempotent: the scratch
+// rebuild is always rolled back, so a converged database is left untouched and
+// returns the from-empty per-task projection. On genuine divergence it returns a
+// typed ProjectionDivergenceError naming the task, field, and stored-vs-derived
+// values, and writes nothing (§13.1 six-field actionable shape).
+//
+// Scope during the direct-write staging window (pasture#14): convergence is
+// asserted for journal-anchored tasks — tasks with at least one journal row
+// (task_event, assignment episode, decision, or evidence) — so their owner, status,
+// watermark, and attributions are all journal-reproducible (§15). A pure
+// direct-write task with zero journal rows has no journal history to reduce over, so
+// it is outside the checkable set until the direct-write path retires (the same
+// honest-staging coupling already accepted for tasks.LastJournalID / the FK). A
+// migrated task IS journal-anchored: its legacy status is captured in the migration
+// marker's payload and re-derived from there, never trusted as pre-existing row
+// state.
 func (db *DB) ReplayProjections() (journal.ReplayResult, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -229,16 +270,70 @@ func (db *DB) ReplayProjections() (journal.ReplayResult, error) {
 		return journal.ReplayResult{}, err
 	}
 
-	before, err := db.snapshotTaskProjectionsLocked()
+	// Snapshot the STORED projection before any change, keyed by task id.
+	storedTasks, err := db.snapshotTaskProjectionsLocked()
+	if err != nil {
+		return journal.ReplayResult{}, err
+	}
+	storedAttribs, err := db.snapshotAttributionsLocked()
+	if err != nil {
+		return journal.ReplayResult{}, err
+	}
+	anchored, err := db.journalAnchoredTasksLocked()
 	if err != nil {
 		return journal.ReplayResult{}, err
 	}
 
-	var txErr error
-	endTx := sqlitex.Transaction(db.conn)
-	defer endTx(&txErr)
+	// Re-derive every projection from empty in a scratch savepoint that is always
+	// rolled back (read-only check).
+	derivedTasks, derivedAttribs, folded, err := db.rederiveProjectionsScratchLocked()
+	if err != nil {
+		return journal.ReplayResult{}, err
+	}
 
-	folded := 0
+	// Convergence over the FULL projection set, scoped to journal-anchored tasks.
+	if err := diffTaskProjections(storedTasks, derivedTasks, anchored); err != nil {
+		return journal.ReplayResult{}, err
+	}
+	if err := diffAttributions(storedAttribs, derivedAttribs, anchored); err != nil {
+		return journal.ReplayResult{}, err
+	}
+
+	result := journal.ReplayResult{RowsFolded: folded}
+	for id := range anchored {
+		if p, ok := derivedTasks[id]; ok {
+			result.Tasks = append(result.Tasks, p)
+		}
+	}
+	return result, nil
+}
+
+// rederiveProjectionsScratchLocked clears the projection to an empty slate and
+// refolds the whole journal through the single shared reducer step (§9.2), then
+// captures the from-empty projection and attribution snapshots. The scratch
+// rebuild runs inside a savepoint that is ALWAYS rolled back, so ReplayProjections
+// never persists the rebuild — it returns the derived state purely for comparison.
+func (db *DB) rederiveProjectionsScratchLocked() (
+	tasks map[string]journal.TaskProjection,
+	attribs map[string]map[string]int64,
+	folded int,
+	err error,
+) {
+	var txErr error
+	endTx := sqlitex.Save(db.conn)
+	defer func() {
+		// Force the scratch rebuild to roll back even on the success path, so the
+		// destructive clear+refold is never durable.
+		if txErr == nil {
+			txErr = errReplayScratchRollback
+		}
+		endTx(&txErr)
+	}()
+
+	if txErr = db.clearProjectionsLocked(); txErr != nil {
+		return nil, nil, 0, fmt.Errorf("ReplayProjections: clear projections for from-empty replay: %w", txErr)
+	}
+
 	var order []int64
 	if txErr = sqlitex.Execute(db.conn,
 		`SELECT JournalID FROM journal ORDER BY JournalID ASC`,
@@ -246,36 +341,71 @@ func (db *DB) ReplayProjections() (journal.ReplayResult, error) {
 			order = append(order, stmt.ColumnInt64(0))
 			return nil
 		}}); txErr != nil {
-		return journal.ReplayResult{}, fmt.Errorf("ReplayProjections: enumerate journal: %w", txErr)
+		return nil, nil, 0, fmt.Errorf("ReplayProjections: enumerate journal: %w", txErr)
 	}
 	for _, jid := range order {
 		if txErr = db.projectJournalRowLocked(jid); txErr != nil {
-			return journal.ReplayResult{}, fmt.Errorf("ReplayProjections: fold row %d: %w", jid, txErr)
+			return nil, nil, 0, fmt.Errorf("ReplayProjections: fold row %d: %w", jid, txErr)
 		}
 		folded++
 	}
 
-	after, err := db.snapshotTaskProjectionsLocked()
-	if err != nil {
-		txErr = err
-		return journal.ReplayResult{}, err
+	tasks, txErr = db.snapshotTaskProjectionsLocked()
+	if txErr != nil {
+		return nil, nil, 0, txErr
 	}
-	// Convergence: the full replay must reproduce the stored incremental
-	// projection exactly (§15). Any divergence is a fail-closed typed error.
-	if txErr = diffTaskProjections(before, after); txErr != nil {
-		return journal.ReplayResult{}, txErr
+	attribs, txErr = db.snapshotAttributionsLocked()
+	if txErr != nil {
+		return nil, nil, 0, txErr
 	}
+	// txErr is nil here: the deferred rollback replaces it with the scratch
+	// sentinel so the rebuild is discarded; the captured snapshots survive.
+	return tasks, attribs, folded, nil
+}
 
-	result := journal.ReplayResult{RowsFolded: folded}
-	for _, p := range after {
-		result.Tasks = append(result.Tasks, p)
+// clearProjectionsLocked resets every task's projection columns to the empty-slate
+// values (owner NULL, status open, closed_at NULL, watermark NULL) and empties the
+// task_attributions projection, so the subsequent refold rebuilds them SOLELY from
+// journal history rather than reading any value back from the pre-existing row
+// (§15: no projection is seeded/patched from a non-journal input). The journal-spine
+// subtype tables — the source of truth the reducer reads — are untouched.
+func (db *DB) clearProjectionsLocked() error {
+	if err := sqlitex.Execute(db.conn,
+		`UPDATE tasks SET owner_id = NULL, status_id = ?1, closed_at = NULL, last_journal_id = NULL`,
+		&sqlitex.ExecOptions{Args: []any{statusOpenID}}); err != nil {
+		return fmt.Errorf("clear tasks projection: %w", err)
 	}
-	return result, nil
+	if err := sqlitex.Execute(db.conn, `DELETE FROM task_attributions`, nil); err != nil {
+		return fmt.Errorf("clear task_attributions projection: %w", err)
+	}
+	return nil
+}
+
+// journalAnchoredTasksLocked returns the set of task ids referenced by at least one
+// journal-spine subtype row (task_event, assignment episode, task-scoped decision
+// or evidence). These are the tasks whose projections are journal-reproducible and
+// therefore in scope for the §15 convergence assertion.
+func (db *DB) journalAnchoredTasksLocked() (map[string]struct{}, error) {
+	out := map[string]struct{}{}
+	if err := sqlitex.Execute(db.conn,
+		`SELECT task_id FROM journal_task_events
+		 UNION SELECT task_id FROM journal_authority_assignment_episodes
+		 UNION SELECT task_id FROM journal_decisions WHERE task_id IS NOT NULL
+		 UNION SELECT task_id FROM journal_evidence WHERE task_id IS NOT NULL`,
+		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
+			if stmt.ColumnType(0) != zs.TypeNull {
+				out[stmt.ColumnText(0)] = struct{}{}
+			}
+			return nil
+		}}); err != nil {
+		return nil, fmt.Errorf("enumerate journal-anchored tasks: %w", err)
+	}
+	return out, nil
 }
 
 // snapshotTaskProjectionsLocked reads every task's current projection (owner,
 // status, watermark) keyed by task id, so a replay can compare its recomputed
-// state against the stored incremental one (§15).
+// state against the stored one (§15).
 func (db *DB) snapshotTaskProjectionsLocked() (map[string]journal.TaskProjection, error) {
 	out := map[string]journal.TaskProjection{}
 	if err := sqlitex.Execute(db.conn,
@@ -305,33 +435,96 @@ func (db *DB) snapshotTaskProjectionsLocked() (map[string]journal.TaskProjection
 	return out, nil
 }
 
-func diffTaskProjections(before, after map[string]journal.TaskProjection) error {
-	for id, a := range after {
-		b := before[id]
-		if ownerString(a.Owner) != ownerString(b.Owner) {
-			return divergence(a.TaskID, "owner", ownerString(b.Owner), ownerString(a.Owner))
+// snapshotAttributionsLocked reads the task_attributions projection as a nested
+// map task_id → (actor_id → first_journal_id), so a replay can compare the stored
+// attribution edges against the from-empty re-derivation (§8.2, §15).
+func (db *DB) snapshotAttributionsLocked() (map[string]map[string]int64, error) {
+	out := map[string]map[string]int64{}
+	if err := sqlitex.Execute(db.conn,
+		`SELECT task_id, actor_id, first_journal_id FROM task_attributions`,
+		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
+			task := stmt.ColumnText(0)
+			if out[task] == nil {
+				out[task] = map[string]int64{}
+			}
+			out[task][stmt.ColumnText(1)] = stmt.ColumnInt64(2)
+			return nil
+		}}); err != nil {
+		return nil, fmt.Errorf("snapshot task_attributions: %w", err)
+	}
+	return out, nil
+}
+
+// diffTaskProjections asserts the stored projection equals the from-empty
+// re-derivation for every journal-anchored task, across owner, status, and
+// watermark. A stored value present on a fold-unvisited field (an out-of-band
+// corruption) diverges here because the derived value is the reducer's ground truth
+// from an empty slate, not the pre-existing row.
+func diffTaskProjections(stored, derived map[string]journal.TaskProjection, anchored map[string]struct{}) error {
+	for id := range anchored {
+		s := stored[id]
+		d := derived[id]
+		if ownerString(s.Owner) != ownerString(d.Owner) {
+			return divergence(d.TaskID, "owner", ownerString(s.Owner), ownerString(d.Owner))
 		}
-		if a.Status != b.Status {
-			return divergence(a.TaskID, "status", b.Status.String(), a.Status.String())
+		if s.Status != d.Status {
+			return divergence(d.TaskID, "status", s.Status.String(), d.Status.String())
 		}
-		if a.LastJournalID != b.LastJournalID {
-			return divergence(a.TaskID, "watermark",
-				fmt.Sprintf("%d", int64(b.LastJournalID)), fmt.Sprintf("%d", int64(a.LastJournalID)))
+		if s.LastJournalID != d.LastJournalID {
+			return divergence(d.TaskID, "watermark",
+				fmt.Sprintf("%d", int64(s.LastJournalID)), fmt.Sprintf("%d", int64(d.LastJournalID)))
 		}
 	}
 	return nil
 }
 
-func divergence(task journal.TaskID, field, stored, replayed string) error {
+// diffAttributions asserts the stored task_attributions edges equal the from-empty
+// re-derivation for every journal-anchored task: a spurious stored edge, a missing
+// edge, or a wrong first_journal_id all diverge (§8.2, §15).
+func diffAttributions(stored, derived map[string]map[string]int64, anchored map[string]struct{}) error {
+	for id := range anchored {
+		task, err := journalParseTask(id)
+		if err != nil {
+			return err
+		}
+		s := stored[id]
+		d := derived[id]
+		// Every stored edge must be reproduced by the from-empty fold.
+		for actor, sJID := range s {
+			dJID, ok := d[actor]
+			if !ok {
+				return divergence(task, "attribution",
+					fmt.Sprintf("actor %s attributed at %d", actor, sJID),
+					fmt.Sprintf("actor %s not attributed by the from-empty fold", actor))
+			}
+			if dJID != sJID {
+				return divergence(task, "attribution",
+					fmt.Sprintf("actor %s first_journal_id %d", actor, sJID),
+					fmt.Sprintf("actor %s first_journal_id %d", actor, dJID))
+			}
+		}
+		// The from-empty fold must not derive an edge the stored projection lacks.
+		for actor, dJID := range d {
+			if _, ok := s[actor]; !ok {
+				return divergence(task, "attribution",
+					fmt.Sprintf("actor %s not attributed in the stored projection", actor),
+					fmt.Sprintf("actor %s attributed at %d by the from-empty fold", actor, dJID))
+			}
+		}
+	}
+	return nil
+}
+
+func divergence(task journal.TaskID, field, stored, derived string) error {
 	return &journal.ProjectionDivergenceError{
 		Operation: "ReplayProjections",
 		Task:      task,
 		Field:     field,
 		Stored:    stored,
-		Replayed:  replayed,
-		Why:       "the stored incremental projection does not equal the projection derived by folding ordered journal history",
+		Replayed:  derived,
+		Why:       "the stored projection does not equal the projection derived by folding ordered journal history from an empty slate",
 		Impact:    "the database is not accepted as converged; no further projection write is applied",
-		Fix:       "rebuild projections from the journal, or investigate the out-of-band write that corrupted the stored projection (§8.1: owner/status are reducer-exclusive)",
+		Fix:       "rebuild projections from the journal, or investigate the out-of-band write that corrupted the stored projection (§8.1: owner/status/attribution are reducer-exclusive)",
 	}
 }
 

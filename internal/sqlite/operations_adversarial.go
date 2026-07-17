@@ -248,6 +248,73 @@ func (db *DB) AdversarialMigrateFabricatedEndedTimestamp(in journal.MigrationInp
 	return journal.MigrationResult{}, fmt.Errorf("AdversarialMigrateFabricatedEndedTimestamp: fabricated timestamp was not rejected by the honest-timestamp guard")
 }
 
+// AdversarialAddTable creates an unrecognized extra journal-spine-named table
+// (a stray migration artifact, a manually-created table, or a future schema
+// version's table left after a downgrade), corrupting the external schema shape so
+// the corpus can drive the fail-closed extra-table preflight (§13). The table name
+// comes from the closed corpus, never caller input.
+func (db *DB) AdversarialAddTable(table string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	// DDL identifier cannot be bound as a parameter; table comes from the closed
+	// corpus, never caller input, so identifier interpolation is safe here.
+	stmt := fmt.Sprintf(`CREATE TABLE %q (JournalID INTEGER PRIMARY KEY) STRICT`, table)
+	if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
+		return fmt.Errorf("AdversarialAddTable %q: %w", table, err)
+	}
+	return nil
+}
+
+// AdversarialProjectionField names the projection column an out-of-band corruption
+// seam writes past the reducer, so the corpus stays a closed set rather than
+// accepting arbitrary column names.
+type AdversarialProjectionField string
+
+const (
+	AdversarialFieldOwner     AdversarialProjectionField = "owner_id"
+	AdversarialFieldStatus    AdversarialProjectionField = "status_id"
+	AdversarialFieldWatermark AdversarialProjectionField = "last_journal_id"
+)
+
+// AdversarialCorruptTaskProjection writes directly to a task's stored projection
+// column, BYPASSING the shared reducer — the out-of-band corruption §15's
+// convergence check exists to detect (analogous to the AdversarialAddColumn schema
+// seams). It is the seam that proves ReplayProjections' ProjectionDivergenceError
+// actually fires: a production writer only ever advances tasks.* through
+// projectJournalRowLocked, so this deliberately installs a value no ordered journal
+// history would derive. The field comes from the closed AdversarialProjectionField
+// set, never free-form caller input.
+func (db *DB) AdversarialCorruptTaskProjection(task journal.TaskID, field AdversarialProjectionField, value any) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	switch field {
+	case AdversarialFieldOwner, AdversarialFieldStatus, AdversarialFieldWatermark:
+	default:
+		return fmt.Errorf("AdversarialCorruptTaskProjection: unknown projection field %q (closed set: owner_id/status_id/last_journal_id)", field)
+	}
+	// The column name is one of the closed constants above, never caller input.
+	stmt := fmt.Sprintf(`UPDATE tasks SET %s = ?1 WHERE id = ?2`, string(field))
+	if err := sqlitex.Execute(db.conn, stmt,
+		&sqlitex.ExecOptions{Args: []any{value, task.String()}}); err != nil {
+		return fmt.Errorf("AdversarialCorruptTaskProjection %q.%s: %w", task, field, err)
+	}
+	return nil
+}
+
+// AdversarialInsertSpuriousAttribution writes a task_attributions edge directly,
+// BYPASSING the shared reducer, so the corpus can prove ReplayProjections detects a
+// spurious attribution edge no ordered journal history would derive (§8.2, §15).
+func (db *DB) AdversarialInsertSpuriousAttribution(task journal.TaskID, actor journal.ActorID, jid journal.JournalID) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if err := sqlitex.Execute(db.conn,
+		`INSERT OR REPLACE INTO task_attributions (task_id, actor_id, first_journal_id) VALUES (?1, ?2, ?3)`,
+		&sqlitex.ExecOptions{Args: []any{task.String(), actor.String(), int64(jid)}}); err != nil {
+		return fmt.Errorf("AdversarialInsertSpuriousAttribution %q/%q: %w", task, actor, err)
+	}
+	return nil
+}
+
 // AdversarialResolveOperationIDInsertRace drives the §9.6-bullet-2 race-translation
 // path (resolveOperationIDInsertRaceLocked) directly. Under the in-process db.mu
 // that path is unreachable — Apply's §9.4 lookup always observes a concurrent

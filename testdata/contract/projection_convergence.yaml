@@ -1,0 +1,135 @@
+# Adversarial histories for the §15 projection-convergence check: Open's full
+# replay re-derives every projection from an EMPTY slate and asserts the stored
+# projection equals that genuine from-empty re-derivation
+# (docs/journal-relational-contract.md §9.2, §15). These are the must-fail
+# out-of-band-corruption cases the on-top re-fold silently accepted, plus the
+# must-pass convergence controls.
+cases:
+  - name: converged-projection-passes-from-empty-replay
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#4 amendment §15 stored_projection == Reduce(history, LastJournalID)"}
+    mutation:
+      description: >-
+        A task with a started owner-responsibility episode and one non-lifecycle
+        task_event (no status-changing lifecycle event) is built through the
+        production Apply path. Open's from-empty full replay re-derives owner,
+        status, watermark, and attributions and finds the stored projection
+        already converged — no divergence, no error.
+      operator: replay-converges-clean
+    input:
+      shape: episode-plus-nonlifecycle-event
+    expected:
+      converged: true
+
+  - name: converged-after-migrating-nonopen-legacy-status
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#4 amendment §13/§15 migrated status reproducible solely from journal history"}
+    mutation:
+      description: >-
+        A closed and an in_progress legacy task are migrated to baselines whose
+        migration markers capture the legacy status in their payloads. Open's
+        from-empty replay re-derives each task's status SOLELY from the captured
+        marker payload (never from the mutable tasks row) and converges — proving
+        a migrated task's preserved legacy status is journal-reproducible.
+      operator: replay-converges-migrated-status
+    input:
+      legacyTasks:
+        - {id: closed-one, owner: actor-mona, status: closed, updatedAt: "2025-06-20T00:00:00Z", closedAt: "2025-06-21T00:00:00Z"}
+        - {id: prog-one,   owner: actor-nate, status: in_progress, updatedAt: "2025-06-22T00:00:00Z"}
+    expected:
+      converged: true
+
+  - name: corrupt-status-on-lifecycle-quiet-task-detected
+    classification: must-fail
+    provenance: {source: bug, ref: "salvage: on-top re-fold silently accepted a hand-corrupted tasks.status_id on a task with no status-changing lifecycle event"}
+    mutation:
+      description: >-
+        On a task with a started episode and one non-lifecycle task_event (so no
+        journal row ever writes its status), tasks.status_id is hand-corrupted to
+        closed directly, bypassing the reducer. Open's from-empty replay derives
+        the ground-truth status (open) and MUST fail closed with a typed
+        ProjectionDivergenceError naming the status field — the exact corruption
+        the on-top re-fold reported as converged.
+      operator: replay-detects-out-of-band-corruption
+    input:
+      field: status
+      corruptTo: closed
+    expected:
+      accepted: false
+      errorType: ProjectionDivergenceError
+      divergentField: status
+      errorHasWhat: true
+      errorHasWhy: true
+      errorHasWhere: true
+      errorHasWhen: true
+      errorHasImpact: true
+      errorHasFix: true
+
+  - name: corrupt-owner-on-episode-task-detected
+    classification: must-fail
+    provenance: {source: bug, ref: "salvage: on-top re-fold could not detect a spurious owner_id (owner is reducer-exclusive, §8.1)"}
+    mutation:
+      description: >-
+        A task's stored owner_id is hand-corrupted to a different actor,
+        bypassing the reducer. Open's from-empty replay derives the true owner
+        from the episode transitions and MUST fail closed with a typed
+        ProjectionDivergenceError naming the owner field.
+      operator: replay-detects-out-of-band-corruption
+    input:
+      field: owner
+    expected:
+      accepted: false
+      errorType: ProjectionDivergenceError
+      divergentField: owner
+      errorHasWhat: true
+      errorHasWhy: true
+      errorHasWhere: true
+      errorHasWhen: true
+      errorHasImpact: true
+      errorHasFix: true
+
+  - name: corrupt-watermark-detected
+    classification: must-fail
+    provenance: {source: bug, ref: "salvage: on-top re-fold trusted the stored watermark it was seeded from"}
+    mutation:
+      description: >-
+        A task's stored last_journal_id watermark is hand-corrupted to an
+        earlier (but existing) journal row, bypassing the reducer. Open's
+        from-empty replay derives the true watermark and MUST fail closed with a
+        typed ProjectionDivergenceError naming the watermark field.
+      operator: replay-detects-out-of-band-corruption
+    input:
+      field: watermark
+    expected:
+      accepted: false
+      errorType: ProjectionDivergenceError
+      divergentField: watermark
+      errorHasWhat: true
+      errorHasWhy: true
+      errorHasWhere: true
+      errorHasWhen: true
+      errorHasImpact: true
+      errorHasFix: true
+
+  - name: spurious-attribution-edge-detected
+    classification: must-fail
+    provenance: {source: bug, ref: "salvage: on-top re-fold omitted task_attributions from the compared projection set (§15)"}
+    mutation:
+      description: >-
+        A spurious task_attributions edge for an actor no journal row attributes
+        is inserted directly, bypassing the reducer. Open's from-empty replay
+        re-derives the attribution edges and MUST fail closed with a typed
+        ProjectionDivergenceError naming the attribution field.
+      operator: replay-detects-out-of-band-corruption
+    input:
+      field: attribution
+    expected:
+      accepted: false
+      errorType: ProjectionDivergenceError
+      divergentField: attribution
+      errorHasWhat: true
+      errorHasWhy: true
+      errorHasWhere: true
+      errorHasWhen: true
+      errorHasImpact: true
+      errorHasFix: true
