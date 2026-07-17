@@ -47,7 +47,7 @@ func (db *DB) projectJournalRowLocked(jid int64) error {
 	// attributes the same committing actor whether Apply folds a just-produced
 	// subordinate row or Open replays it (§9.2).
 	if err := sqlitex.Execute(db.conn,
-		`SELECT kind_id, effective_actor_id, recorded_at FROM journal_attributed WHERE JournalID = ?1`,
+		`SELECT kind_id, effective_actor_id, recorded_at FROM journal_attributed WHERE journal_id = ?1`,
 		&sqlitex.ExecOptions{Args: []any{jid}, ResultFunc: func(stmt *zs.Stmt) error {
 			found = true
 			kind = stmt.ColumnInt(0)
@@ -91,7 +91,7 @@ func (db *DB) projectTaskEventRowLocked(jid int64, committing journal.ActorID, r
 		payload []byte
 	)
 	if err := sqlitex.Execute(db.conn,
-		`SELECT task_id, event_kind, payload FROM journal_task_events WHERE JournalID = ?1`,
+		`SELECT task_id, event_kind, payload FROM journal_task_events WHERE journal_id = ?1`,
 		&sqlitex.ExecOptions{Args: []any{jid}, ResultFunc: func(stmt *zs.Stmt) error {
 			taskRaw = stmt.ColumnText(0)
 			kindStr = stmt.ColumnText(1)
@@ -139,7 +139,7 @@ func (db *DB) projectAuthorityRowLocked(jid int64) error {
 		hasTrans   bool
 	)
 	if err := sqlitex.Execute(db.conn,
-		`SELECT assignment_id, transition_id FROM journal_authority_assignment_transitions WHERE JournalID = ?1`,
+		`SELECT assignment_id, transition_id FROM journal_authority_assignment_transitions WHERE journal_id = ?1`,
 		&sqlitex.ExecOptions{Args: []any{jid}, ResultFunc: func(stmt *zs.Stmt) error {
 			hasTrans = true
 			assignment = stmt.ColumnText(0)
@@ -192,7 +192,7 @@ func (db *DB) projectTaskScopedRowLocked(jid int64, committing journal.ActorID, 
 	var taskRaw string
 	hasTask := false
 	if err := sqlitex.Execute(db.conn,
-		fmt.Sprintf(`SELECT task_id FROM %s WHERE JournalID = ?1`, table),
+		fmt.Sprintf(`SELECT task_id FROM %s WHERE journal_id = ?1`, table),
 		&sqlitex.ExecOptions{Args: []any{jid}, ResultFunc: func(stmt *zs.Stmt) error {
 			if stmt.ColumnType(0) != zs.TypeNull {
 				taskRaw = stmt.ColumnText(0)
@@ -341,7 +341,7 @@ func (db *DB) rederiveProjectionsScratchLocked() (
 
 	var order []int64
 	if txErr = sqlitex.Execute(db.conn,
-		`SELECT JournalID FROM journal ORDER BY JournalID ASC`,
+		`SELECT journal_id FROM journal ORDER BY journal_id ASC`,
 		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 			order = append(order, stmt.ColumnInt64(0))
 			return nil

@@ -174,10 +174,10 @@ func (db *DB) ensureSchema(models []ptypes.ModelEntry) error {
 			-- Nullable at the journal-base layer because the existing direct-write
 			-- task path predates the shared reducer; the reducer slice
 			-- (dayvidpham/provenance#5) makes every task write flow through Apply
-			-- and tightens this to NOT NULL. FK target journal(JournalID) is
+			-- and tightens this to NOT NULL. FK target journal(journal_id) is
 			-- created by ensureJournalSchema (SQLite resolves cross-table FKs at
 			-- row time, not at CREATE).
-			last_journal_id INTEGER REFERENCES journal(JournalID)
+			last_journal_id INTEGER REFERENCES journal(journal_id)
 		) STRICT`,
 		`CREATE INDEX IF NOT EXISTS idx_tasks_namespace ON tasks (namespace)`,
 		`CREATE INDEX IF NOT EXISTS idx_tasks_status    ON tasks (status_id)`,

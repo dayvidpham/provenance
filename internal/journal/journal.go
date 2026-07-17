@@ -152,49 +152,86 @@ type AppendTaskEventInput struct {
 // Ordered query surface (§8.3, §12)
 // ---------------------------------------------------------------------------
 
-// OrderDimension is the closed set of orderable query dimensions. Only
-// JournalID is exposed: RecordedAt is deliberately absent so a request to
-// order by wall-clock time is rejected rather than silently honored
-// (§1, §12, ordering.yaml/query-ordering-ignores-caller-supplied-order-hint).
+// OrderDimension is the closed set of orderable query dimensions. Two are
+// exposed, and they serve deliberately different purposes (the display-vs-canonical
+// firewall, §12):
+//
+//   - OrderByRecordedAt is a NON-CAUSAL display order — a readable timeline over
+//     what happened, by wall-clock time. It NEVER establishes causality; replay,
+//     authorization, and lifecycle decisions never consult it.
+//   - OrderByJournalID is the sole CANONICAL order. Replay, authorization,
+//     lifecycle, and convergence order by JournalID and nothing else.
+//
+// Any other dimension value is unexposed and rejected by Validate before a query
+// runs, so a malformed order request fails loudly rather than being silently honored.
 type OrderDimension int
 
 const (
-	// OrderByJournalID is the sole canonical ordering. Ascending JournalID.
-	OrderByJournalID OrderDimension = iota
+	// OrderByRecordedAt orders results by (RecordedAt, JournalID): the RecordedAt
+	// wall-clock time with JournalID as the composite tiebreak, so equal timestamps
+	// and backdated rows still yield a total, stable order. It is a readable
+	// timeline over what happened and the DEFAULT for display-facing listing queries
+	// (§12 "Readable timeline"); it is the zero value so an unqualified display query
+	// gets the timeline order. It is explicitly NON-CAUSAL — it never reorders replay
+	// or grants authority (the causal firewall stands).
+	OrderByRecordedAt OrderDimension = iota
+	// OrderByJournalID is the sole canonical ordering. Ascending JournalID. It stays
+	// available explicitly and remains the ONLY order for replay/authorization/
+	// lifecycle/convergence.
+	OrderByJournalID
 )
 
 func (d OrderDimension) String() string {
-	if d == OrderByJournalID {
+	switch d {
+	case OrderByRecordedAt:
+		return "recorded_at"
+	case OrderByJournalID:
 		return "journal_id"
+	default:
+		return fmt.Sprintf("OrderDimension(%d)", int(d))
 	}
-	return fmt.Sprintf("OrderDimension(%d)", int(d))
 }
 
 // IsValid reports whether d is a supported ordering dimension.
-func (d OrderDimension) IsValid() bool { return d == OrderByJournalID }
+func (d OrderDimension) IsValid() bool {
+	return d == OrderByRecordedAt || d == OrderByJournalID
+}
 
-// JournalQueryV1 is the versioned, JournalID-ordered journal query. Values
-// within TaskIDs and EventKinds are ORed; non-empty dimensions combine with
-// AND. The first page leaves the cursor fields zero. Later pages repeat the
-// filters and carry the page's SnapshotMaxJournalID and exclusive AfterJournalID
-// cursor (§12 re-expresses the salvage RecordedAt cursor as a pure JournalID
-// cursor — RecordedAt is never an ordering or cursor dimension).
+// JournalQueryV1 is the versioned journal query. Values within TaskIDs and
+// EventKinds are ORed; non-empty dimensions combine with AND. OrderBy selects the
+// display-vs-canonical firewall (§12): OrderByRecordedAt (the zero-value default)
+// walks the readable timeline in (RecordedAt, JournalID) order; OrderByJournalID
+// walks the canonical order. The first page leaves the cursor fields zero. Later
+// pages repeat the filters and carry the page's SnapshotMaxJournalID watermark plus
+// the exclusive cursor: AfterJournalID alone under OrderByJournalID, or the composite
+// (AfterRecordedAt, AfterJournalID) under OrderByRecordedAt so a timeline walk never
+// skips or duplicates a row across equal timestamps or backdated rows. The snapshot
+// watermark is JournalID-bounded under both orders.
 type JournalQueryV1 struct {
-	OrderBy              OrderDimension `json:"orderBy"`
-	TaskIDs              []TaskID       `json:"taskIds,omitempty"`
-	EventKinds           []EventKind    `json:"eventKinds,omitempty"`
-	Contexts             []EventContext `json:"contexts,omitempty"`
-	Limit                int            `json:"limit,omitempty"`
-	SnapshotMaxJournalID JournalID      `json:"snapshotMaxJournalId,omitempty"`
-	AfterJournalID       JournalID      `json:"afterJournalId,omitempty"`
+	OrderBy    OrderDimension `json:"orderBy"`
+	TaskIDs    []TaskID       `json:"taskIds,omitempty"`
+	EventKinds []EventKind    `json:"eventKinds,omitempty"`
+	Contexts   []EventContext `json:"contexts,omitempty"`
+	Limit      int            `json:"limit,omitempty"`
+	// SnapshotMaxJournalID pins the page to a JournalID-bounded snapshot; repeated
+	// on every later page of a walk (both orders).
+	SnapshotMaxJournalID JournalID `json:"snapshotMaxJournalId,omitempty"`
+	// AfterJournalID is the exclusive JournalID cursor: the whole cursor under
+	// OrderByJournalID, and the composite tiebreak component under OrderByRecordedAt.
+	AfterJournalID JournalID `json:"afterJournalId,omitempty"`
+	// AfterRecordedAt is the RecordedAt component of the composite display cursor
+	// (OrderByRecordedAt only): together with AfterJournalID it is the exclusive
+	// lower bound (AfterRecordedAt, AfterJournalID). Ignored under OrderByJournalID.
+	AfterRecordedAt time.Time `json:"afterRecordedAt,omitempty"`
 }
 
 // Validate rejects an unsupported ordering dimension before any query executes.
 func (q JournalQueryV1) Validate() error {
 	if !q.OrderBy.IsValid() {
 		return fmt.Errorf("%w: requested order dimension %s is not exposed — "+
-			"the journal is ordered exclusively by JournalID (RecordedAt is "+
-			"audit metadata only); reissue the query with OrderByJournalID",
+			"the journal exposes OrderByRecordedAt (a non-causal readable-timeline "+
+			"display order, the default) and OrderByJournalID (the canonical order); "+
+			"reissue the query with one of those",
 			ErrUnsupportedOrderDimension, q.OrderBy)
 	}
 	if q.Limit < 0 {
@@ -211,14 +248,21 @@ func (q JournalQueryV1) Validate() error {
 	return nil
 }
 
-// JournalCursorV1 is the exclusive JournalID cursor for the next page.
+// JournalCursorV1 is the exclusive cursor for the next page. Under
+// OrderByJournalID only AfterJournalID is meaningful; under OrderByRecordedAt the
+// composite (AfterRecordedAt, AfterJournalID) is the exclusive lower bound so the
+// timeline walk is duplicate-free across ties and timestamp regressions.
 type JournalCursorV1 struct {
 	SnapshotMaxJournalID JournalID `json:"snapshotMaxJournalId"`
 	AfterJournalID       JournalID `json:"afterJournalId"`
+	// AfterRecordedAt is set only on a next-cursor produced by an OrderByRecordedAt
+	// page: the RecordedAt of the page's last row.
+	AfterRecordedAt time.Time `json:"afterRecordedAt,omitempty"`
 }
 
-// JournalTaskEventPageV1 is one page of task-event rows in ascending JournalID
-// order plus the snapshot watermark and optional next cursor.
+// JournalTaskEventPageV1 is one page of task-event rows in the query's order
+// (canonical JournalID or the readable-timeline (RecordedAt, JournalID)) plus the
+// snapshot watermark and optional next cursor.
 type JournalTaskEventPageV1 struct {
 	Events               []TaskEventRow   `json:"events"`
 	SnapshotMaxJournalID JournalID        `json:"snapshotMaxJournalId"`
@@ -243,7 +287,8 @@ type TaskAttribution struct {
 
 var (
 	// ErrUnsupportedOrderDimension is returned when a query requests an
-	// ordering dimension the contract does not expose (§1, §12).
+	// ordering dimension the contract does not expose — i.e. neither the
+	// canonical OrderByJournalID nor the display OrderByRecordedAt (§1, §12).
 	ErrUnsupportedOrderDimension = errors.New("provenance: unsupported order dimension")
 	// ErrInvalidQuery is returned for otherwise malformed queries.
 	ErrInvalidQuery = errors.New("provenance: invalid journal query")

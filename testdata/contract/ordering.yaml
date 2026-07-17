@@ -6,6 +6,13 @@
 # row giving its kind, actor, and a RecordedAt value that may deliberately
 # disagree with commit order. `expected.order` is the JournalID-ascending
 # sequence of row `id` labels a query MUST return, regardless of RecordedAt.
+#
+# The readable-timeline case additionally supplies `input.pageLimit` and asserts
+# two sequences: `expected.displayOrder` — the (recorded_at, journal_id) order a
+# paginated OrderByRecordedAt walk MUST return (complete and duplicate-free across
+# ties/backdated rows) — and `expected.canonicalOrder` — the journal_id order the
+# canonical OrderByJournalID query MUST still return. This is the display-vs-
+# canonical firewall: the timeline is non-causal; journal_id stays canonical.
 cases:
   # NOTE: this first case is a FOUNDATION/sanity check for the property "ties
   # are legal and resolved by JournalID" — it does NOT by itself discriminate a
@@ -82,17 +89,43 @@ cases:
       accepted: false
       reason: authority-journalid-after-effect
 
-  - name: query-ordering-ignores-caller-supplied-order-hint
-    classification: must-fail
-    provenance: {source: boundary, ref: "provenance#4 §1 architectural principle"}
+  - name: timeline-walk-orders-by-recordedat-with-journalid-tiebreak
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#4 C2 readable-timeline ruling: displays default to a readable timeline over what happened"}
     mutation:
       description: >-
-        A query requests ordering "by RecordedAt" explicitly; the contract
-        does not expose RecordedAt as an orderable query dimension at all,
-        so the request itself must be rejected rather than silently honored.
+        Rows are committed so wall-clock time disagrees with commit order: one
+        backdated row and an equal-timestamp tie. A display timeline walk —
+        paginated with the composite exclusive (recorded_at, journal_id) cursor —
+        must return every row exactly once in (recorded_at, journal_id) order
+        (the readable timeline), while the canonical journal_id query still
+        returns commit order. This is the display-vs-canonical firewall: the
+        timeline is non-causal; journal_id remains the sole canonical order.
+      operator: order-by-recordedat-timeline
+    input:
+      pageLimit: 2
+      rows:
+        - {id: e1, kind: task_event, task: t1, recordedAt: "2026-01-03T00:00:00Z"}
+        - {id: e2, kind: task_event, task: t1, recordedAt: "2026-01-01T00:00:00Z"}
+        - {id: e3, kind: task_event, task: t1, recordedAt: "2026-01-02T00:00:00Z"}
+        - {id: e4, kind: task_event, task: t1, recordedAt: "2026-01-02T00:00:00Z"}
+    expected:
+      displayOrder:   [e2, e3, e4, e1]
+      canonicalOrder: [e1, e2, e3, e4]
+
+  - name: query-rejects-unexposed-order-dimension
+    classification: must-fail
+    provenance: {source: boundary, ref: "provenance#4 §12 closed order-dimension set"}
+    mutation:
+      description: >-
+        A query requests an order dimension outside the exposed closed set —
+        neither the canonical journal_id nor the display recorded_at. RecordedAt
+        is NOW an exposed, non-causal display order (§12 readable timeline), so
+        the barred dimension here is a genuinely unknown one; the request itself
+        must be rejected rather than silently honored.
       operator: reject-non-journalid-order-request
     input:
-      requestedOrderBy: recordedAt
+      requestedOrderBy: wall-clock-latency
     expected:
       accepted: false
       reason: unsupported-order-dimension

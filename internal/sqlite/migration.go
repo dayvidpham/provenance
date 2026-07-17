@@ -33,10 +33,10 @@ type expectedTable struct {
 // set is the core journal spine; the ordinary reference/task tables are not
 // enumerated here because migration only writes journal rows.
 var expectedJournalShape = []expectedTable{
-	{"journal", []string{"JournalID", "kind_id", "actor_id", "recorded_at", "produced_by_operation_journal_id"}},
-	{"journal_task_events", []string{"JournalID", "task_id", "event_kind", "payload"}},
-	{"journal_operations", []string{"JournalID", "operation_id", "authority_journal_id", "command_digest", "mutation_digest"}},
-	{"journal_authorities", []string{"JournalID", "authority_kind_id", "operation_authority_id"}},
+	{"journal", []string{"journal_id", "kind_id", "actor_id", "recorded_at", "produced_by_operation_journal_id"}},
+	{"journal_task_events", []string{"journal_id", "task_id", "event_kind", "payload"}},
+	{"journal_operations", []string{"journal_id", "operation_id", "authority_journal_id", "command_digest", "mutation_digest"}},
+	{"journal_authorities", []string{"journal_id", "authority_kind_id", "operation_authority_id"}},
 }
 
 // recognizedJournalSpineTables is the CLOSED set of journal-spine relations
@@ -419,7 +419,7 @@ func (db *DB) EpisodeTransitionRecordedAt(assignment journal.AssignmentID, start
 	found := false
 	if err := sqlitex.Execute(db.conn,
 		`SELECT j.recorded_at FROM journal_authority_assignment_transitions t
-		 JOIN journal j ON j.JournalID = t.JournalID
+		 JOIN journal j ON j.journal_id = t.journal_id
 		 WHERE t.assignment_id = ?1 AND t.transition_id = ?2`,
 		&sqlitex.ExecOptions{Args: []any{string(assignment), transition}, ResultFunc: func(stmt *zs.Stmt) error {
 			found = true

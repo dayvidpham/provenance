@@ -29,12 +29,12 @@ func (db *DB) AdversarialJournalRowTwoSubtypes(actor journal.ActorID) (journal.J
 		return 0, txErr
 	}
 	if txErr = sqlitex.Execute(db.conn,
-		`INSERT INTO journal_decisions (JournalID, decision_kind, task_id, payload) VALUES (?1, 'pasture.review.vote', NULL, '{}')`,
+		`INSERT INTO journal_decisions (journal_id, decision_kind, task_id, payload) VALUES (?1, 'pasture.review.vote', NULL, '{}')`,
 		&sqlitex.ExecOptions{Args: []any{jid}}); txErr != nil {
 		return 0, txErr
 	}
 	if txErr = sqlitex.Execute(db.conn,
-		`INSERT INTO journal_evidence (JournalID, evidence_kind, task_id, content_digest, payload) VALUES (?1, 'pasture.git.commit', NULL, ?2, '{}')`,
+		`INSERT INTO journal_evidence (journal_id, evidence_kind, task_id, content_digest, payload) VALUES (?1, 'pasture.git.commit', NULL, ?2, '{}')`,
 		&sqlitex.ExecOptions{Args: []any{jid, []byte("x")}}); txErr != nil {
 		return 0, txErr
 	}
@@ -74,7 +74,7 @@ func (db *DB) AdversarialSubordinateRowCarryingActor(actor journal.ActorID, task
 		return 0, txErr
 	}
 	if txErr = sqlitex.Execute(db.conn,
-		`INSERT INTO journal_operations (JournalID, operation_id, authority_journal_id, command_digest, mutation_digest)
+		`INSERT INTO journal_operations (journal_id, operation_id, authority_journal_id, command_digest, mutation_digest)
 		 VALUES (?1, ?2, NULL, ?3, ?4)`,
 		&sqlitex.ExecOptions{Args: []any{anchorJID, fmt.Sprintf("adversarial-subord-op-%d", anchorJID), []byte("c"), []byte("m")}}); txErr != nil {
 		return 0, txErr
@@ -88,7 +88,7 @@ func (db *DB) AdversarialSubordinateRowCarryingActor(actor journal.ActorID, task
 	}
 	subordinateJID := db.conn.LastInsertRowID()
 	if txErr = sqlitex.Execute(db.conn,
-		`INSERT INTO journal_task_events (JournalID, task_id, event_kind, payload) VALUES (?1, ?2, 'provenance.task.updated', '{}')`,
+		`INSERT INTO journal_task_events (journal_id, task_id, event_kind, payload) VALUES (?1, ?2, 'provenance.task.updated', '{}')`,
 		&sqlitex.ExecOptions{Args: []any{subordinateJID, task.String()}}); txErr != nil {
 		return 0, txErr
 	}
@@ -110,12 +110,12 @@ func (db *DB) AdversarialSubtypeMismatchingKind(actor journal.ActorID) (journal.
 		return 0, txErr
 	}
 	if txErr = sqlitex.Execute(db.conn,
-		`INSERT INTO journal_decisions (JournalID, decision_kind, task_id, payload) VALUES (?1, 'pasture.review.vote', NULL, '{}')`,
+		`INSERT INTO journal_decisions (journal_id, decision_kind, task_id, payload) VALUES (?1, 'pasture.review.vote', NULL, '{}')`,
 		&sqlitex.ExecOptions{Args: []any{jid}}); txErr != nil {
 		return 0, txErr
 	}
 	if txErr = sqlitex.Execute(db.conn,
-		`INSERT INTO journal_operations (JournalID, operation_id, authority_journal_id, command_digest, mutation_digest)
+		`INSERT INTO journal_operations (journal_id, operation_id, authority_journal_id, command_digest, mutation_digest)
 		 VALUES (?1, ?2, NULL, ?3, ?4)`,
 		&sqlitex.ExecOptions{Args: []any{jid, fmt.Sprintf("adversarial-op-%d", jid), []byte("c"), []byte("m")}}); txErr != nil {
 		return 0, txErr
@@ -139,12 +139,12 @@ func (db *DB) AdversarialAuthorityDetailMismatch(actor journal.ActorID, task jou
 		return 0, txErr
 	}
 	if txErr = sqlitex.Execute(db.conn,
-		`INSERT INTO journal_authorities (JournalID, authority_kind_id, operation_authority_id) VALUES (?1, ?2, ?3)`,
+		`INSERT INTO journal_authorities (journal_id, authority_kind_id, operation_authority_id) VALUES (?1, ?2, ?3)`,
 		&sqlitex.ExecOptions{Args: []any{jid, authKindBootstrapID, fmt.Sprintf("adversarial-auth-%d", jid)}}); txErr != nil {
 		return 0, txErr
 	}
 	if txErr = sqlitex.Execute(db.conn,
-		`INSERT INTO journal_authority_bootstraps (JournalID, label) VALUES (?1, 'adversarial')`,
+		`INSERT INTO journal_authority_bootstraps (journal_id, label) VALUES (?1, 'adversarial')`,
 		&sqlitex.ExecOptions{Args: []any{jid}}); txErr != nil {
 		return 0, txErr
 	}
@@ -157,7 +157,7 @@ func (db *DB) AdversarialAuthorityDetailMismatch(actor journal.ActorID, task jou
 	}
 	// The transition points at the bootstrap authority above — the mismatch.
 	if txErr = sqlitex.Execute(db.conn,
-		`INSERT INTO journal_authority_assignment_transitions (JournalID, assignment_id, transition_id) VALUES (?1, ?2, ?3)`,
+		`INSERT INTO journal_authority_assignment_transitions (journal_id, assignment_id, transition_id) VALUES (?1, ?2, ?3)`,
 		&sqlitex.ExecOptions{Args: []any{jid, assignment, transitionStartedID}}); txErr != nil {
 		return 0, txErr
 	}
@@ -312,7 +312,7 @@ func (db *DB) AdversarialAddTable(table string) error {
 	defer db.mu.Unlock()
 	// DDL identifier cannot be bound as a parameter; table comes from the closed
 	// corpus, never caller input, so identifier interpolation is safe here.
-	stmt := fmt.Sprintf(`CREATE TABLE %q (JournalID INTEGER PRIMARY KEY) STRICT`, table)
+	stmt := fmt.Sprintf(`CREATE TABLE %q (journal_id INTEGER PRIMARY KEY) STRICT`, table)
 	if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
 		return fmt.Errorf("AdversarialAddTable %q: %w", table, err)
 	}

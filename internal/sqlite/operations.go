@@ -62,28 +62,28 @@ func (db *DB) ensureOperationsSchema() error {
 		// never the PK and never an ordering source (§11). The four-field replay
 		// identity (§9.4) is deliberately NOT a UNIQUE constraint here.
 		`CREATE TABLE IF NOT EXISTS journal_operations (
-			JournalID            INTEGER PRIMARY KEY REFERENCES journal(JournalID),
+			journal_id            INTEGER PRIMARY KEY REFERENCES journal(journal_id),
 			operation_id         TEXT NOT NULL UNIQUE,
-			authority_journal_id INTEGER REFERENCES journal_authorities(JournalID),
+			authority_journal_id INTEGER REFERENCES journal_authorities(journal_id),
 			command_digest       BLOB NOT NULL,
 			mutation_digest      BLOB NOT NULL
 		) STRICT`,
 		// Slot-keyed committed-result mapping (§3.2). rule-9 own-operation
 		// integrity is reducer-enforced (the two FKs alone cannot express it).
 		`CREATE TABLE IF NOT EXISTS journal_operation_result_slots (
-			JournalID           INTEGER NOT NULL REFERENCES journal_operations(JournalID),
+			journal_id           INTEGER NOT NULL REFERENCES journal_operations(journal_id),
 			result_slot_id      TEXT NOT NULL,
-			produced_journal_id INTEGER NOT NULL REFERENCES journal(JournalID),
-			PRIMARY KEY (JournalID, result_slot_id)
+			produced_journal_id INTEGER NOT NULL REFERENCES journal(journal_id),
+			PRIMARY KEY (journal_id, result_slot_id)
 		) STRICT, WITHOUT ROWID`,
 		// Authority supertype (§4.2) and its bootstrap detail (§4.3).
 		`CREATE TABLE IF NOT EXISTS journal_authorities (
-			JournalID              INTEGER PRIMARY KEY REFERENCES journal(JournalID),
+			journal_id              INTEGER PRIMARY KEY REFERENCES journal(journal_id),
 			authority_kind_id      INTEGER NOT NULL REFERENCES authority_kinds(id),
 			operation_authority_id TEXT NOT NULL UNIQUE
 		) STRICT`,
 		`CREATE TABLE IF NOT EXISTS journal_authority_bootstraps (
-			JournalID INTEGER PRIMARY KEY REFERENCES journal_authorities(JournalID),
+			journal_id INTEGER PRIMARY KEY REFERENCES journal_authorities(journal_id),
 			label     TEXT NOT NULL
 		) STRICT`,
 		// Assignment lifecycle BCNF decomposition (§4.4): whole-episode identity
@@ -97,20 +97,20 @@ func (db *DB) ensureOperationsSchema() error {
 			predecessor_assignment_id TEXT UNIQUE REFERENCES journal_authority_assignment_episodes(assignment_id)
 		) STRICT`,
 		`CREATE TABLE IF NOT EXISTS journal_authority_assignment_transitions (
-			JournalID     INTEGER PRIMARY KEY REFERENCES journal_authorities(JournalID),
+			journal_id     INTEGER PRIMARY KEY REFERENCES journal_authorities(journal_id),
 			assignment_id TEXT NOT NULL REFERENCES journal_authority_assignment_episodes(assignment_id),
 			transition_id INTEGER NOT NULL REFERENCES assignment_transitions(id),
 			UNIQUE (assignment_id, transition_id)
 		) STRICT`,
 		// Decisions (§6.1) and material-work evidence (§6.2).
 		`CREATE TABLE IF NOT EXISTS journal_decisions (
-			JournalID     INTEGER PRIMARY KEY REFERENCES journal(JournalID),
+			journal_id     INTEGER PRIMARY KEY REFERENCES journal(journal_id),
 			decision_kind TEXT NOT NULL,
 			task_id       TEXT REFERENCES tasks(id),
 			payload       TEXT NOT NULL CHECK (json_valid(payload))
 		) STRICT`,
 		`CREATE TABLE IF NOT EXISTS journal_evidence (
-			JournalID      INTEGER PRIMARY KEY REFERENCES journal(JournalID),
+			journal_id      INTEGER PRIMARY KEY REFERENCES journal(journal_id),
 			evidence_kind  TEXT NOT NULL,
 			task_id        TEXT REFERENCES tasks(id),
 			content_digest BLOB NOT NULL,
@@ -150,7 +150,7 @@ func (db *DB) ensureOperationsSchema() error {
 // completeJournalOperationFK completes the journal.produced_by_operation_journal_id
 // foreign key the journal-base layer staged without an FK (§2.1 staging note).
 // It rebuilds the journal table (the standard SQLite 12-step table rebuild)
-// preserving every child FK that references journal(JournalID), so an
+// preserving every child FK that references journal(journal_id), so an
 // operation-produced row can no longer name a producing operation that does not
 // exist. Idempotent: it is a no-op once the FK is present.
 func (db *DB) completeJournalOperationFK() error {
@@ -163,7 +163,7 @@ func (db *DB) completeJournalOperationFK() error {
 	}
 	// PRAGMA foreign_keys is a no-op inside a transaction, so toggle it around
 	// an explicit rebuild transaction. The journal is empty at first Open, so
-	// the row copy is trivial; child tables reference journal(JournalID) by name
+	// the row copy is trivial; child tables reference journal(journal_id) by name
 	// and remain valid across the drop+rename.
 	if err := sqlitex.ExecuteTransient(db.conn, `PRAGMA foreign_keys=OFF`, nil); err != nil {
 		return fmt.Errorf("completeJournalOperationFK: disable FK enforcement: %w", err)
@@ -185,20 +185,23 @@ func (db *DB) completeJournalOperationFK() error {
 		// rebuild only completes the produced_by FK, it does not relax the actor
 		// placement invariant the journal-base layer already established.
 		`CREATE TABLE journal_new (
-			JournalID   INTEGER PRIMARY KEY AUTOINCREMENT,
+			journal_id   INTEGER PRIMARY KEY AUTOINCREMENT,
 			kind_id     INTEGER NOT NULL REFERENCES journal_kinds(id),
 			actor_id    TEXT REFERENCES agents(id),
 			recorded_at INTEGER NOT NULL,
-			produced_by_operation_journal_id INTEGER REFERENCES journal_operations(JournalID),
+			produced_by_operation_journal_id INTEGER REFERENCES journal_operations(journal_id),
 			CHECK ((actor_id IS NULL) = (produced_by_operation_journal_id IS NOT NULL))
 		) STRICT`,
-		`INSERT INTO journal_new (JournalID, kind_id, actor_id, recorded_at, produced_by_operation_journal_id)
-			SELECT JournalID, kind_id, actor_id, recorded_at, produced_by_operation_journal_id FROM journal`,
+		`INSERT INTO journal_new (journal_id, kind_id, actor_id, recorded_at, produced_by_operation_journal_id)
+			SELECT journal_id, kind_id, actor_id, recorded_at, produced_by_operation_journal_id FROM journal`,
 		`DROP TABLE journal`,
 		`ALTER TABLE journal_new RENAME TO journal`,
 		`CREATE INDEX IF NOT EXISTS idx_journal_kind  ON journal (kind_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_journal_actor ON journal (actor_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_journal_pboj  ON journal (produced_by_operation_journal_id)`,
+		// Recreate the readable-timeline covering index (§12.1): dropped with the old
+		// journal table, it must be rebuilt so the display order keeps its index.
+		`CREATE INDEX IF NOT EXISTS idx_journal_recorded_at ON journal (recorded_at, journal_id)`,
 		// Recreate the §8.5 attribution view now that journal exists again.
 		journalAttributedViewDDL,
 	}
@@ -478,7 +481,7 @@ func (db *DB) foldTaskEventLocked(in journal.OperationInput, jid int64, eff jour
 		return fmt.Errorf("Apply: task_event payload for %q is not valid JSON", eff.EventKind)
 	}
 	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO journal_task_events (JournalID, task_id, event_kind, payload) VALUES (?1, ?2, ?3, ?4)`,
+		`INSERT INTO journal_task_events (journal_id, task_id, event_kind, payload) VALUES (?1, ?2, ?3, ?4)`,
 		&sqlitex.ExecOptions{Args: []any{jid, eff.TaskID.String(), string(eff.EventKind), string(payload)}}); err != nil {
 		return fmt.Errorf("Apply: insert journal_task_events: %w", err)
 	}
@@ -510,7 +513,7 @@ func (db *DB) foldBootstrapAuthorityLocked(jid int64, eff journal.Effect) error 
 		authorityID = fmt.Sprintf("authority--bootstrap--%d", jid)
 	}
 	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO journal_authorities (JournalID, authority_kind_id, operation_authority_id) VALUES (?1, ?2, ?3)`,
+		`INSERT INTO journal_authorities (journal_id, authority_kind_id, operation_authority_id) VALUES (?1, ?2, ?3)`,
 		&sqlitex.ExecOptions{Args: []any{jid, authKindBootstrapID, authorityID}}); err != nil {
 		return fmt.Errorf("Apply: insert journal_authorities (bootstrap): %w", err)
 	}
@@ -519,7 +522,7 @@ func (db *DB) foldBootstrapAuthorityLocked(jid int64, eff journal.Effect) error 
 		label = "bootstrap"
 	}
 	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO journal_authority_bootstraps (JournalID, label) VALUES (?1, ?2)`,
+		`INSERT INTO journal_authority_bootstraps (journal_id, label) VALUES (?1, ?2)`,
 		&sqlitex.ExecOptions{Args: []any{jid, label}}); err != nil {
 		return fmt.Errorf("Apply: insert journal_authority_bootstraps: %w", err)
 	}
@@ -633,7 +636,7 @@ func (db *DB) foldDecisionLocked(in journal.OperationInput, jid int64, eff journ
 		payload = json.RawMessage(`{}`)
 	}
 	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO journal_decisions (JournalID, decision_kind, task_id, payload) VALUES (?1, ?2, ?3, ?4)`,
+		`INSERT INTO journal_decisions (journal_id, decision_kind, task_id, payload) VALUES (?1, ?2, ?3, ?4)`,
 		&sqlitex.ExecOptions{Args: []any{jid, string(eff.DecisionKind), taskID, string(payload)}}); err != nil {
 		return fmt.Errorf("Apply: insert journal_decisions: %w", err)
 	}
@@ -656,7 +659,7 @@ func (db *DB) foldEvidenceLocked(in journal.OperationInput, jid int64, eff journ
 		payload = json.RawMessage(`{}`)
 	}
 	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO journal_evidence (JournalID, evidence_kind, task_id, content_digest, payload) VALUES (?1, ?2, ?3, ?4, ?5)`,
+		`INSERT INTO journal_evidence (journal_id, evidence_kind, task_id, content_digest, payload) VALUES (?1, ?2, ?3, ?4, ?5)`,
 		&sqlitex.ExecOptions{Args: []any{jid, string(eff.EvidenceKind), taskID, eff.ContentDigest, string(payload)}}); err != nil {
 		return fmt.Errorf("Apply: insert journal_evidence: %w", err)
 	}

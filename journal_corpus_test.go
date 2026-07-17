@@ -196,6 +196,7 @@ type s11Handler func(t *testing.T, input, expected anyMap, class testcorpus.Clas
 var s11Operators = map[testcorpus.OperatorName]s11Handler{
 	"order-by-journalid":                   opOrderByJournalID,
 	"order-by-journalid-concurrent":        opOrderByJournalIDConcurrent,
+	"order-by-recordedat-timeline":         opOrderByRecordedAtTimeline,
 	"reject-non-journalid-order-request":   opRejectNonJournalIDOrder,
 	"claim-two-disjoint-namespaces":        opClaimTwoDisjoint,
 	"claim-overlapping-namespace":          opClaimOverlapping,
@@ -348,25 +349,133 @@ func opOrderByJournalIDConcurrent(t *testing.T, input, expected anyMap, _ testco
 
 func opRejectNonJournalIDOrder(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
 	env := newJournalEnv(t)
-	// The contract exposes only OrderByJournalID; a request to order by any
-	// other dimension (here RecordedAt) is represented by an out-of-range
-	// OrderDimension and must be rejected by Validate before any query runs.
+	// The contract exposes a closed set of order dimensions — the canonical
+	// OrderByJournalID and the display OrderByRecordedAt. A request for anything
+	// outside that set is represented by an out-of-range OrderDimension and must
+	// be rejected by Validate before any query runs.
 	dim, err := asString(input, "requestedOrderBy")
 	if err != nil {
 		return err
 	}
-	if dim == "journal_id" {
-		return fmt.Errorf("case requests journal_id ordering, which is not a rejection scenario")
+	if dim == "journal_id" || dim == "recorded_at" {
+		return fmt.Errorf("case requests the exposed %q ordering, which is not a rejection scenario", dim)
 	}
-	_, qErr := env.tr.Journal().QueryTaskEvents(JournalQueryV1{OrderBy: OrderDimension(1)})
+	// A value beyond the two exposed dimensions (0=recorded_at, 1=journal_id).
+	unexposed := OrderDimension(99)
+	if unexposed.IsValid() {
+		return fmt.Errorf("test setup error: OrderDimension(99) is unexpectedly a valid dimension")
+	}
+	_, qErr := env.tr.Journal().QueryTaskEvents(JournalQueryV1{OrderBy: unexposed})
 	if qErr == nil {
-		return fmt.Errorf("query with a non-JournalID order dimension %q was accepted; expected rejection", dim)
+		return fmt.Errorf("query with an unexposed order dimension %q was accepted; expected rejection", dim)
 	}
 	if !errors.Is(qErr, ErrUnsupportedOrderDimension) {
 		return fmt.Errorf("rejected with %v, want ErrUnsupportedOrderDimension", qErr)
 	}
 	if accepted, _ := asBool(expected, "accepted"); accepted {
 		return fmt.Errorf("case marks accepted=true but the query was rejected")
+	}
+	return nil
+}
+
+// opOrderByRecordedAtTimeline drives the readable-timeline display order (§12)
+// against production code: it appends the case's rows in list (commit) order,
+// then walks OrderByRecordedAt paginated with the composite (recorded_at,
+// journal_id) cursor and asserts the walk is complete and duplicate-free in
+// displayOrder, while the canonical OrderByJournalID query still returns
+// canonicalOrder. This proves the display-vs-canonical firewall end to end.
+func opOrderByRecordedAtTimeline(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
+	env := newJournalEnv(t)
+	rows, err := asList(input, "rows")
+	if err != nil {
+		return err
+	}
+	pageLimit, err := asInt(input, "pageLimit")
+	if err != nil {
+		return err
+	}
+	labelByJID := map[JournalID]string{}
+	for _, r := range rows {
+		row, err := asMap(r)
+		if err != nil {
+			return err
+		}
+		label, err := asString(row, "id")
+		if err != nil {
+			return err
+		}
+		recordedAt, err := asTime(row, "recordedAt")
+		if err != nil {
+			return err
+		}
+		out, err := env.tr.Journal().AppendTaskEvent(AppendTaskEventInput{
+			ActorID:    env.actor,
+			TaskID:     env.task,
+			EventKind:  "provenance.task.updated",
+			RecordedAt: recordedAt,
+		})
+		if err != nil {
+			return fmt.Errorf("append %q: %w", label, err)
+		}
+		labelByJID[out.JournalID] = label
+	}
+
+	// Paginated timeline walk with the composite exclusive cursor.
+	var display []string
+	seen := map[JournalID]int{}
+	q := JournalQueryV1{OrderBy: OrderByRecordedAt, Limit: pageLimit}
+	for {
+		page, err := env.tr.Journal().QueryTaskEvents(q)
+		if err != nil {
+			return fmt.Errorf("timeline page: %w", err)
+		}
+		for _, ev := range page.Events {
+			seen[ev.JournalID]++
+			display = append(display, labelByJID[ev.JournalID])
+		}
+		if page.Next == nil {
+			break
+		}
+		q = JournalQueryV1{
+			OrderBy: OrderByRecordedAt, Limit: pageLimit,
+			SnapshotMaxJournalID: page.Next.SnapshotMaxJournalID,
+			AfterJournalID:       page.Next.AfterJournalID,
+			AfterRecordedAt:      page.Next.AfterRecordedAt,
+		}
+	}
+	for jid, n := range seen {
+		if n != 1 {
+			return fmt.Errorf("journal row %d appeared %d times in the timeline walk; want exactly 1 (no skip/duplicate)", jid, n)
+		}
+	}
+	wantDisplay, err := asStringList(expected, "displayOrder")
+	if err != nil {
+		return err
+	}
+	if !equalStrings(display, wantDisplay) {
+		return fmt.Errorf("timeline display order = %v, want %v", display, wantDisplay)
+	}
+
+	// The canonical order is untouched: journal_id ascending == commit order.
+	canon, err := env.tr.Journal().QueryTaskEvents(JournalQueryV1{OrderBy: OrderByJournalID})
+	if err != nil {
+		return fmt.Errorf("canonical query: %w", err)
+	}
+	var got []string
+	var lastJID JournalID
+	for _, ev := range canon.Events {
+		if ev.JournalID <= lastJID {
+			return fmt.Errorf("canonical query returned non-ascending journal_id: %d after %d", ev.JournalID, lastJID)
+		}
+		lastJID = ev.JournalID
+		got = append(got, labelByJID[ev.JournalID])
+	}
+	wantCanon, err := asStringList(expected, "canonicalOrder")
+	if err != nil {
+		return err
+	}
+	if !equalStrings(got, wantCanon) {
+		return fmt.Errorf("canonical journal_id order = %v, want %v (firewall intact)", got, wantCanon)
 	}
 	return nil
 }

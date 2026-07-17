@@ -190,6 +190,79 @@ func TestQueryTaskEventsOrdersByJournalIDWithPaging(t *testing.T) {
 	}
 }
 
+// TestQueryTaskEventsTimelineWalkComposite proves the readable-timeline display
+// order (§12): a paginated walk ordered by (recorded_at, journal_id) with a
+// composite exclusive cursor returns every row exactly once, in wall-clock order
+// with the journal_id tiebreak, even across an equal-timestamp tie and a backdated
+// row — while the canonical journal_id query still returns commit order.
+func TestQueryTaskEventsTimelineWalkComposite(t *testing.T) {
+	db := newJournalDB(t)
+	actor, task := seedActorAndTask(t, db)
+
+	// Commit order (journal_id 1..4) deliberately disagrees with wall-clock:
+	// jid1 latest, jid2 earliest (backdated), jid3/jid4 an equal-timestamp tie.
+	secs := []int64{300, 100, 200, 200}
+	for _, s := range secs {
+		if _, err := db.AppendTaskEvent(journal.AppendTaskEventInput{
+			ActorID: actor, TaskID: task, EventKind: "provenance.task.updated",
+			RecordedAt: time.Unix(s, 0),
+		}); err != nil {
+			t.Fatalf("append t=%d: %v", s, err)
+		}
+	}
+
+	// Timeline walk with page size 2 and a composite cursor.
+	var display []journal.JournalID
+	seen := map[journal.JournalID]int{}
+	q := journal.JournalQueryV1{OrderBy: journal.OrderByRecordedAt, Limit: 2}
+	for {
+		p, err := db.QueryTaskEvents(q)
+		if err != nil {
+			t.Fatalf("timeline page: %v", err)
+		}
+		for _, ev := range p.Events {
+			seen[ev.JournalID]++
+			display = append(display, ev.JournalID)
+		}
+		if p.SnapshotMaxJournalID != 4 {
+			t.Fatalf("timeline snapshot = %d, want 4 (journal_id-bounded)", p.SnapshotMaxJournalID)
+		}
+		if p.Next == nil {
+			break
+		}
+		q = journal.JournalQueryV1{
+			OrderBy: journal.OrderByRecordedAt, Limit: 2,
+			SnapshotMaxJournalID: p.Next.SnapshotMaxJournalID,
+			AfterJournalID:       p.Next.AfterJournalID,
+			AfterRecordedAt:      p.Next.AfterRecordedAt,
+		}
+	}
+
+	// (recorded_at, journal_id): jid2(100), jid3(200), jid4(200), jid1(300).
+	wantDisplay := []journal.JournalID{2, 3, 4, 1}
+	if !equalJournalIDs(display, wantDisplay) {
+		t.Errorf("timeline display order = %v, want %v", display, wantDisplay)
+	}
+	for jid, n := range seen {
+		if n != 1 {
+			t.Errorf("journal_id %d appeared %d times in the timeline walk; want exactly 1 (no duplicate/skip)", jid, n)
+		}
+	}
+	if len(seen) != 4 {
+		t.Errorf("timeline walk saw %d distinct rows, want 4 (complete)", len(seen))
+	}
+
+	// The canonical order is untouched: journal_id ascending == commit order.
+	canon, err := db.QueryTaskEvents(journal.JournalQueryV1{OrderBy: journal.OrderByJournalID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCanon := []journal.JournalID{1, 2, 3, 4}
+	if !equalJournalIDs(journalIDsOf(canon.Events), wantCanon) {
+		t.Errorf("canonical order = %v, want %v (journal_id firewall intact)", journalIDsOf(canon.Events), wantCanon)
+	}
+}
+
 func TestQueryTaskEventsFiltersByContexts(t *testing.T) {
 	db := newJournalDB(t)
 	actor, task := seedActorAndTask(t, db)

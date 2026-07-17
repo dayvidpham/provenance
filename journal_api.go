@@ -69,7 +69,10 @@ const (
 	JournalKindDecision  = journal.JournalKindDecision
 	JournalKindEvidence  = journal.JournalKindEvidence
 
-	OrderByJournalID = journal.OrderByJournalID
+	// OrderByRecordedAt is the non-causal readable-timeline display order and the
+	// default for display-facing listings; OrderByJournalID is the canonical order.
+	OrderByRecordedAt = journal.OrderByRecordedAt
+	OrderByJournalID  = journal.OrderByJournalID
 
 	EventContextKindTask     = journal.EventContextKindTask
 	EventContextKindActivity = journal.EventContextKindActivity
@@ -166,8 +169,9 @@ type JournalAPI interface {
 	// AppendTaskEvent appends one task-event row to the global journal and
 	// advances its projections in a single fail-closed transaction.
 	AppendTaskEvent(in AppendTaskEventInput) (TaskEventRow, error)
-	// QueryTaskEvents returns one JournalID-ordered page. A non-JournalID order
-	// request is rejected with ErrUnsupportedOrderDimension.
+	// QueryTaskEvents returns one page in the query's order: the readable-timeline
+	// (RecordedAt, JournalID) display order (the default) or the canonical JournalID
+	// order. An unexposed order dimension is rejected with ErrUnsupportedOrderDimension.
 	QueryTaskEvents(q JournalQueryV1) (JournalTaskEventPageV1, error)
 	// TaskAttributions returns a task's cumulative attribution edges (§8.2).
 	TaskAttributions(taskID TaskID) ([]TaskAttribution, error)
