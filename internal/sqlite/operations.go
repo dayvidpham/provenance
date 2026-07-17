@@ -247,24 +247,47 @@ func (db *DB) journalProducedByFKPresent() (bool, error) {
 // per-effect authorization (§9.3), persists result slots (§3.2), and runs the
 // subtype-integrity and close-ends-assignment gates before commit.
 func (db *DB) Apply(in journal.OperationInput) (journal.CommittedResult, error) {
+	if err := validateApplyInput(in); err != nil {
+		return journal.CommittedResult{}, err
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.applyLocked(in, nil)
+}
+
+// validateApplyInput runs the pre-transaction input checks shared by the public
+// Apply and the internal applyLocked callers (migration, replay).
+func validateApplyInput(in journal.OperationInput) error {
 	if err := journal.ValidateOperationID(in.OperationID); err != nil {
-		return journal.CommittedResult{}, fmt.Errorf("Apply: %w", err)
+		return fmt.Errorf("Apply: %w", err)
 	}
 	if in.ActorID.Namespace == "" {
-		return journal.CommittedResult{}, fmt.Errorf("Apply: operation %q: committing actor is required", in.OperationID)
+		return fmt.Errorf("Apply: operation %q: committing actor is required", in.OperationID)
 	}
 	if len(in.CommandDigest) == 0 || len(in.MutationDigest) == 0 {
-		return journal.CommittedResult{}, fmt.Errorf(
+		return fmt.Errorf(
 			"Apply: operation %q: CommandDigest and MutationDigest are both required (§3.1) — "+
 				"where: Apply input validation; impact: nothing committed; fix: supply both opaque digests",
 			in.OperationID)
 	}
+	return nil
+}
 
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
+// applyLocked is the lock-free core of Apply: it assumes db.mu is held and folds
+// one operation as a nested SQLite savepoint transaction (§9.5). It is reused by
+// migration (which spans many per-task operations in one outer transaction) and
+// exposes an optional faultHook so the adversarial corpus can inject a
+// crash/cancellation between effects and observe the fail-closed rollback (§9.5) —
+// production callers pass nil. faultHook, when non-nil, is invoked after each
+// effect index is folded; a non-nil return aborts and rolls back the whole
+// operation, committing nothing.
+func (db *DB) applyLocked(in journal.OperationInput, faultHook func(effectIndex int) error) (journal.CommittedResult, error) {
+	// SAVEPOINT (not BEGIN) so applyLocked composes as a nested transaction when
+	// migration folds many per-task operations inside one outer savepoint (§9.5,
+	// §13 whole-batch atomicity); standalone it behaves as an ordinary atomic
+	// transaction.
 	var txErr error
-	endTx := sqlitex.Transaction(db.conn)
+	endTx := sqlitex.Save(db.conn)
 	defer endTx(&txErr)
 
 	// §9.4: OperationID-presence short-circuit, evaluated before any
@@ -331,8 +354,24 @@ func (db *DB) Apply(in journal.OperationInput) (journal.CommittedResult, error) 
 			txErr = err
 			return journal.CommittedResult{}, txErr
 		}
+		// Advance the projections through the single shared reducer step Open's
+		// full replay also uses (§9.2): one fold, no second switch. Projection is
+		// derived from the just-committed row, exactly as replay derives it from a
+		// persisted row.
+		if err := db.projectJournalRowLocked(producedJID); err != nil {
+			txErr = err
+			return journal.CommittedResult{}, txErr
+		}
 		if eff.ResultSlot != "" {
 			if err := db.insertResultSlotLocked(anchorJID, eff.ResultSlot, producedJID); err != nil {
+				txErr = err
+				return journal.CommittedResult{}, txErr
+			}
+		}
+		// Fail-closed atomicity seam (§9.5): an injected fault/cancellation after
+		// effect i rolls back every effect 1..i and the anchor as one transaction.
+		if faultHook != nil {
+			if err := faultHook(i); err != nil {
 				txErr = err
 				return journal.CommittedResult{}, txErr
 			}
@@ -376,7 +415,13 @@ func (db *DB) foldEffectLocked(in journal.OperationInput, anchorJID int64, eff j
 	if err != nil {
 		return 0, err
 	}
-	jid, err := db.insertJournalRowLocked(kind, in.ActorID, in.RecordedAt, &anchorJID)
+	// RecordedAt is audit/display only (§12); a per-effect override carries an
+	// honest legacy timestamp during migration (§13) without affecting order.
+	recordedAt := in.RecordedAt
+	if eff.RecordedAtOverride != nil {
+		recordedAt = *eff.RecordedAtOverride
+	}
+	jid, err := db.insertJournalRowLocked(kind, in.ActorID, recordedAt, &anchorJID)
 	if err != nil {
 		return 0, err
 	}
@@ -433,11 +478,10 @@ func (db *DB) foldTaskEventLocked(in journal.OperationInput, jid int64, eff jour
 			return fmt.Errorf("Apply: insert context edge: %w", err)
 		}
 	}
-	// Attribution edge for the authoring (committing) actor (§8.2).
-	if err := db.insertAttributionLocked(eff.TaskID, in.ActorID, jid); err != nil {
-		return err
-	}
-	return db.advanceWatermarkLocked(eff.TaskID, jid)
+	// Projections (attribution, watermark, and any lifecycle-status transition)
+	// are advanced by the shared reducer step projectJournalRowLocked after this
+	// row is inserted — the single fold Apply and Open both run (§9.2).
+	return nil
 }
 
 func (db *DB) foldBootstrapAuthorityLocked(jid int64, eff journal.Effect) error {
@@ -506,20 +550,10 @@ func (db *DB) foldAssignmentStartLocked(in journal.OperationInput, jid int64, ef
 		}
 		return fmt.Errorf("Apply: insert assignment episode %q: %w", eff.AssignmentID, err)
 	}
-	if err := db.insertAuthorityAssignmentTransitionLocked(jid, eff.AssignmentID, transitionStartedID); err != nil {
-		return err
-	}
-	// Attribution credits the episode occupant, never the committing actor (§8.2).
-	if err := db.insertAttributionLocked(eff.TaskID, occupant, jid); err != nil {
-		return err
-	}
-	// Projection: current owner-responsibility occupant (§8.1).
-	if eff.SlotID == journal.SlotOwnerResponsibility || eff.SlotID == "" {
-		if err := db.recomputeTaskOwnerLocked(eff.TaskID, jid); err != nil {
-			return err
-		}
-	}
-	return nil
+	// The transition row's occupant/owner projection (attribution to the episode
+	// occupant, current owner-responsibility recompute) is advanced by the shared
+	// reducer step projectJournalRowLocked after this row is inserted (§8.2, §9.2).
+	return db.insertAuthorityAssignmentTransitionLocked(jid, eff.AssignmentID, transitionStartedID)
 }
 
 func (db *DB) foldAssignmentEndLocked(in journal.OperationInput, jid int64, eff journal.Effect) error {
@@ -556,12 +590,10 @@ func (db *DB) foldAssignmentEndLocked(in journal.OperationInput, jid int64, eff 
 	if err := db.requireAuthorityGovernsLocked(in, jid, task); err != nil {
 		return err
 	}
-	if err := db.insertAuthorityAssignmentTransitionLocked(jid, eff.AssignmentID, transitionEndedID); err != nil {
-		return err
-	}
-	// Projection: recompute the current owner (cleared when this ended the active
-	// owner episode, §8.1).
-	return db.recomputeTaskOwnerLocked(task, jid)
+	// The owner-responsibility recompute (cleared when this ends the active owner
+	// episode, §8.1) is advanced by the shared reducer step projectJournalRowLocked
+	// after this row is inserted (§9.2).
+	return db.insertAuthorityAssignmentTransitionLocked(jid, eff.AssignmentID, transitionEndedID)
 }
 
 func (db *DB) foldDecisionLocked(in journal.OperationInput, jid int64, eff journal.Effect) error {

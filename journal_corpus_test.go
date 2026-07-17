@@ -115,7 +115,18 @@ func TestContractCorpusPartitionIsComplete(t *testing.T) {
 		t.Fatalf("executable s1.2 registry does not match the s1.2 scope partition: %v", err)
 	}
 
-	t.Logf("contract corpus: %d cases across %d files; s1.1 executable=%d s1.2 executable=%d s1.3 deferred=%d",
+	// The S1.3 shared-reducer/replay/migration layer is now executable too: its
+	// registry must equal the s1.3 partition exactly (a new corpus operator or a
+	// stale handler fails).
+	registered13 := make([]testcorpus.OperatorName, 0, len(s13Operators))
+	for name := range s13Operators {
+		registered13 = append(registered13, name)
+	}
+	if err := testcorpus.CheckClosedSet(scope.Operators(testcorpus.SliceS13), registered13); err != nil {
+		t.Fatalf("executable s1.3 registry does not match the s1.3 scope partition: %v", err)
+	}
+
+	t.Logf("contract corpus: %d cases across %d files; s1.1 executable=%d s1.2 executable=%d s1.3 executable=%d",
 		total, len(contractCorpusFiles),
 		len(scope.Operators(testcorpus.SliceS11)),
 		len(scope.Operators(testcorpus.SliceS12)),
@@ -131,7 +142,7 @@ func TestContractCorpusExecutesImplementedPartitions(t *testing.T) {
 
 	executed11 := 0
 	executed12 := 0
-	deferred := 0
+	executed13 := 0
 	for _, file := range contractCorpusFiles {
 		corpus := loadContractCorpus(t, file)
 		for _, c := range corpus.Cases {
@@ -139,48 +150,40 @@ func TestContractCorpusExecutesImplementedPartitions(t *testing.T) {
 			if !ok {
 				t.Fatalf("%s/%s: operator %q missing from scope table", file, c.Name, c.Mutation.Operator)
 			}
+			var registry map[testcorpus.OperatorName]s11Handler
 			switch slice {
 			case testcorpus.SliceS11:
-				op, ok := s11Operators[c.Mutation.Operator]
-				if !ok {
-					t.Fatalf("%s/%s: s1.1 operator %q has no registered handler", file, c.Name, c.Mutation.Operator)
+				registry = s11Operators
+			case testcorpus.SliceS12:
+				registry = s12Operators
+			case testcorpus.SliceS13:
+				registry = s13Operators
+			default:
+				t.Fatalf("%s/%s: operator %q has unknown slice %q", file, c.Name, c.Mutation.Operator, slice)
+			}
+			op, ok := registry[c.Mutation.Operator]
+			if !ok {
+				t.Fatalf("%s/%s: %s operator %q has no registered handler", file, c.Name, slice, c.Mutation.Operator)
+			}
+			t.Run(file+"/"+c.Name, func(t *testing.T) {
+				if err := op(t, c.Input, c.Expected, c.Classification); err != nil {
+					t.Fatalf("execute %q: %v", c.Mutation.Operator, err)
 				}
-				t.Run(file+"/"+c.Name, func(t *testing.T) {
-					if err := op(t, c.Input, c.Expected, c.Classification); err != nil {
-						t.Fatalf("execute %q: %v", c.Mutation.Operator, err)
-					}
-				})
+			})
+			switch slice {
+			case testcorpus.SliceS11:
 				executed11++
 			case testcorpus.SliceS12:
-				op, ok := s12Operators[c.Mutation.Operator]
-				if !ok {
-					t.Fatalf("%s/%s: s1.2 operator %q has no registered handler", file, c.Name, c.Mutation.Operator)
-				}
-				t.Run(file+"/"+c.Name, func(t *testing.T) {
-					if err := op(t, c.Input, c.Expected, c.Classification); err != nil {
-						t.Fatalf("execute %q: %v", c.Mutation.Operator, err)
-					}
-				})
 				executed12++
-			default:
-				// Deferred S1.3 obligation: assert there is genuinely no handler in
-				// either implemented registry, so an accidental future handler for
-				// an out-of-scope operator is caught rather than silently masking
-				// the partition.
-				if _, ok := s11Operators[c.Mutation.Operator]; ok {
-					t.Fatalf("%s/%s: operator %q is scoped %s but has an s1.1 handler", file, c.Name, c.Mutation.Operator, slice)
-				}
-				if _, ok := s12Operators[c.Mutation.Operator]; ok {
-					t.Fatalf("%s/%s: operator %q is scoped %s but has an s1.2 handler", file, c.Name, c.Mutation.Operator, slice)
-				}
-				deferred++
+			case testcorpus.SliceS13:
+				executed13++
 			}
 		}
 	}
-	if executed11 == 0 || executed12 == 0 {
-		t.Fatalf("expected both partitions to execute; s1.1=%d s1.2=%d — the harness would vacuously pass", executed11, executed12)
+	if executed11 == 0 || executed12 == 0 || executed13 == 0 {
+		t.Fatalf("expected all partitions to execute; s1.1=%d s1.2=%d s1.3=%d — the harness would vacuously pass", executed11, executed12, executed13)
 	}
-	t.Logf("executed %d S1.1 + %d S1.2 cases against production code; %d s1.3 obligations recorded", executed11, executed12, deferred)
+	t.Logf("executed %d S1.1 + %d S1.2 + %d S1.3 cases against production code", executed11, executed12, executed13)
 }
 
 // s11Handler drives one S1.1 case against production code. Returning nil means

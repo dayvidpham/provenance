@@ -120,6 +120,134 @@ func (db *DB) AdversarialForeignResultSlotRejected(anchorOp, foreignProduced jou
 	return db.requireResultSlotOwnOperationLocked(int64(anchorOp), int64(foreignProduced))
 }
 
+// AdversarialApplyWithFault applies one operation but injects a fault immediately
+// after the effect at faultAfterEffectIndex is folded, exercising §9.5 fail-closed
+// atomicity through the production applyLocked path: the whole operation, including
+// its anchor, must roll back with nothing committed. It writes nothing on return.
+// Production Apply passes no fault hook; this seam is used only by the corpus to
+// drive crash/cancellation-mid-batch and transfer-crash histories.
+func (db *DB) AdversarialApplyWithFault(in journal.OperationInput, faultAfterEffectIndex int) (journal.CommittedResult, error) {
+	if err := validateApplyInput(in); err != nil {
+		return journal.CommittedResult{}, err
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	hook := func(i int) error {
+		if i == faultAfterEffectIndex {
+			return fmt.Errorf("%w: fault injected after effect %d (§9.5)", journal.ErrInjectedFault, i)
+		}
+		return nil
+	}
+	return db.applyLocked(in, hook)
+}
+
+// AdversarialMigrateWithFault runs a legacy-baseline migration but injects a fault
+// immediately after the baseline for the task at faultAfterTaskIndex commits,
+// exercising §13's whole-batch fail-closed atomicity through the production
+// migration path: every baseline written so far, not just the faulted task, must
+// roll back atomically. It writes nothing on return.
+func (db *DB) AdversarialMigrateWithFault(in journal.MigrationInput, faultAfterTaskIndex int) (journal.MigrationResult, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	hook := func(i int) error {
+		if i == faultAfterTaskIndex {
+			return fmt.Errorf("%w: fault injected after baseline %d (§9.5, §13)", journal.ErrMigrationFault, i)
+		}
+		return nil
+	}
+	return db.migrateLockedWithFault(in, hook)
+}
+
+// AdversarialAddColumn adds an unreviewed extra column to a journal table,
+// corrupting the external schema shape so the corpus can drive the fail-closed
+// preflight (§13). Column names come from the closed corpus, never caller input.
+func (db *DB) AdversarialAddColumn(table, column string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	// DDL identifiers cannot be bound as parameters; table/column come from the
+	// closed corpus, never caller input, so identifier interpolation is safe here.
+	stmt := fmt.Sprintf(`ALTER TABLE %q ADD COLUMN %q TEXT`, table, column)
+	if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
+		return fmt.Errorf("AdversarialAddColumn %q.%q: %w", table, column, err)
+	}
+	return nil
+}
+
+// AdversarialDropColumn removes an expected column from a journal table, the
+// symmetric corruption to AdversarialAddColumn, so the corpus can drive the
+// missing-expected-column preflight failure (§13).
+func (db *DB) AdversarialDropColumn(table, column string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	// DDL identifiers cannot be bound; table/column come from the closed corpus.
+	stmt := fmt.Sprintf(`ALTER TABLE %q DROP COLUMN %q`, table, column)
+	if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
+		return fmt.Errorf("AdversarialDropColumn %q.%q: %w", table, column, err)
+	}
+	return nil
+}
+
+// AdversarialDropTable drops a journal table entirely (a corrupted or partially
+// provisioned deployment), so the corpus can drive the missing-table preflight
+// failure (§13). Foreign-key enforcement is toggled off around the drop so a table
+// referenced by empty child tables can be removed; the database is left in the
+// deliberately corrupt state the corpus then opens against.
+func (db *DB) AdversarialDropTable(table string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if err := sqlitex.ExecuteTransient(db.conn, `PRAGMA foreign_keys=OFF`, nil); err != nil {
+		return fmt.Errorf("AdversarialDropTable %q: disable FK: %w", table, err)
+	}
+	defer func() { _ = sqlitex.ExecuteTransient(db.conn, `PRAGMA foreign_keys=ON`, nil) }()
+	// DDL identifier cannot be bound; table comes from the closed corpus.
+	stmt := fmt.Sprintf(`DROP TABLE %q`, table)
+	if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
+		return fmt.Errorf("AdversarialDropTable %q: %w", table, err)
+	}
+	return nil
+}
+
+// AdversarialMigrateFabricatedEndedTimestamp attempts to migrate a single legacy
+// task while fabricating the ended transition's RecordedAt with the migration's own
+// wall-clock time instead of the legacy closed_at/updated_at, exercising regression
+// (g)'s honest-timestamp guard (§13). The production guard rejects it with
+// ErrDishonestMigrationTimestamp before any write; nothing is committed. The input
+// must carry exactly one closed, owned legacy task.
+func (db *DB) AdversarialMigrateFabricatedEndedTimestamp(in journal.MigrationInput, wallClockNanos int64) (journal.MigrationResult, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if err := db.preflightSchemaLocked(); err != nil {
+		return journal.MigrationResult{}, err
+	}
+	if len(in.Legacy) != 1 {
+		return journal.MigrationResult{}, fmt.Errorf("AdversarialMigrateFabricatedEndedTimestamp: expected exactly one legacy task, got %d", len(in.Legacy))
+	}
+	lt := in.Legacy[0]
+	owner, ok := in.Owners[lt.RawOwner]
+	if !ok {
+		return journal.MigrationResult{}, fmt.Errorf("AdversarialMigrateFabricatedEndedTimestamp: owner %q is not registered", lt.RawOwner)
+	}
+	op := baselineOperation(in, lt, &owner)
+	// Fabricate: overwrite the ended transition's RecordedAt with a wall-clock read
+	// that traces to no legacy column — the exact dishonesty regression (g) forbids.
+	fabricated := false
+	for i := range op.Effects {
+		if op.Effects[i].Sort == journal.EffectAssignmentEnd {
+			wc := wallClockNanos
+			op.Effects[i].RecordedAtOverride = &wc
+			fabricated = true
+		}
+	}
+	if !fabricated {
+		return journal.MigrationResult{}, fmt.Errorf("AdversarialMigrateFabricatedEndedTimestamp: legacy task %s has no ended transition to fabricate", lt.ID.String())
+	}
+	if err := assertHonestBaselineTimestamps(lt, op); err != nil {
+		return journal.MigrationResult{}, err // the guard rejects before any write
+	}
+	// Unreachable: the guard above always rejects a fabricated wall-clock stamp.
+	return journal.MigrationResult{}, fmt.Errorf("AdversarialMigrateFabricatedEndedTimestamp: fabricated timestamp was not rejected by the honest-timestamp guard")
+}
+
 // AdversarialResolveOperationIDInsertRace drives the §9.6-bullet-2 race-translation
 // path (resolveOperationIDInsertRaceLocked) directly. Under the in-process db.mu
 // that path is unreachable — Apply's §9.4 lookup always observes a concurrent

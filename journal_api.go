@@ -48,6 +48,17 @@ type (
 	ResultSlotBinding       = journal.ResultSlotBinding
 	CommittedResult         = journal.CommittedResult
 	OperationConflict       = journal.OperationConflict
+
+	// Shared-reducer replay, migration, and preflight surface (§9, §13, §15).
+	TaskStatus                    = journal.TaskStatus
+	TaskProjection                = journal.TaskProjection
+	ReplayResult                  = journal.ReplayResult
+	LegacyTaskRow                 = journal.LegacyTaskRow
+	MigrationInput                = journal.MigrationInput
+	MigrationResult               = journal.MigrationResult
+	MigrationOwnerUnmappableError = journal.MigrationOwnerUnmappableError
+	SchemaPreflightError          = journal.SchemaPreflightError
+	ProjectionDivergenceError     = journal.ProjectionDivergenceError
 )
 
 // Closed enum values.
@@ -86,6 +97,17 @@ const (
 	CommittedAbsent   = journal.CommittedAbsent
 	CommittedExact    = journal.CommittedExact
 	CommittedConflict = journal.CommittedConflict
+
+	// Task-status projection (§8.1).
+	TaskStatusOpen       = journal.TaskStatusOpen
+	TaskStatusInProgress = journal.TaskStatusInProgress
+	TaskStatusClosed     = journal.TaskStatusClosed
+
+	// Provenance lifecycle task-event kinds the reducer projects (§8.1, §13).
+	EventKindTaskCreated  = journal.EventKindTaskCreated
+	EventKindTaskClosed   = journal.EventKindTaskClosed
+	EventKindTaskReopened = journal.EventKindTaskReopened
+	EventKindTaskMigrated = journal.EventKindTaskMigrated
 )
 
 // Typed context and validation constructors.
@@ -100,6 +122,11 @@ var (
 	OrdinalUUID            = journal.OrdinalUUID
 	BigEndianUUID          = journal.BigEndianUUID
 	LookupCodec            = journal.LookupCodec
+
+	// Deterministic migration identity + lifecycle-status projection (§8.1, §13).
+	MigrationBaselineOperationID  = journal.MigrationBaselineOperationID
+	MigrationBaselineAssignmentID = journal.MigrationBaselineAssignmentID
+	StatusForEventKind            = journal.StatusForEventKind
 )
 
 // Journal sentinel errors, re-exported for errors.Is at call sites.
@@ -120,6 +147,14 @@ var (
 	ErrStaleEpisode        = journal.ErrStaleEpisode
 	ErrResultSlotIntegrity = journal.ErrResultSlotIntegrity
 	ErrCloseWithoutEnding  = journal.ErrCloseWithoutEnding
+
+	// Shared-reducer replay, migration, and preflight sentinels (§9, §13, §15).
+	ErrMigrationOwnerUnmappable    = journal.ErrMigrationOwnerUnmappable
+	ErrSchemaPreflight             = journal.ErrSchemaPreflight
+	ErrProjectionDivergence        = journal.ErrProjectionDivergence
+	ErrMigrationFault              = journal.ErrMigrationFault
+	ErrInjectedFault               = journal.ErrInjectedFault
+	ErrDishonestMigrationTimestamp = journal.ErrDishonestMigrationTimestamp
 )
 
 // JournalAPI is the ordered global-journal surface: append task-event rows,
@@ -162,6 +197,25 @@ type JournalAPI interface {
 	// AuthorityGovernsTaskAt reports whether the authority at authJID governs
 	// task for an effect at beforeJID, ordering strictly by JournalID (§9.3, §12).
 	AuthorityGovernsTaskAt(authJID JournalID, task TaskID, beforeJID JournalID) (bool, error)
+
+	// PreflightSchema verifies the external pre-journal schema's exact expected
+	// shape in both directions before any transaction opens (§13), failing closed
+	// with a typed *SchemaPreflightError on a missing table, missing expected
+	// column, or unexpected extra column.
+	PreflightSchema() error
+	// ReplayProjections folds the entire journal in JournalID order through the
+	// same reducer step Apply uses (§9.2) and verifies the recomputed projection
+	// converges with the stored incremental one (§15). It runs the schema preflight
+	// first, so a corrupted topology fails closed before any fold. It returns the
+	// converged per-task projection, or a typed *ProjectionDivergenceError.
+	ReplayProjections() (ReplayResult, error)
+	// MigrateLegacyBaseline migrates pre-journal tasks into deterministic baseline
+	// journal entries under the genesis bootstrap authority (§13): honest legacy
+	// RecordedAt, whole-batch fail-closed atomicity, and per-task idempotent anchors.
+	// An unmappable owner fails the whole batch with a typed
+	// *MigrationOwnerUnmappableError; a schema mismatch fails with a typed
+	// *SchemaPreflightError; nothing is committed in either case.
+	MigrateLegacyBaseline(in MigrationInput) (MigrationResult, error)
 }
 
 // Journal returns the ordered global-journal surface backed by the same SQLite

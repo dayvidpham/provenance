@@ -178,6 +178,14 @@ type Effect struct {
 	// is used.
 	ActorID ActorID
 
+	// RecordedAtOverride, when non-nil, is the audit/display RecordedAt stamped on
+	// this effect's journal row instead of the operation's single RecordedAt (§12).
+	// It exists for honest legacy-baseline migration (§13), where the marker/started
+	// rows carry the legacy updated_at and an ended row carries the legacy closed_at —
+	// two different honest legacy timestamps within one operation. It never
+	// establishes causality or order (JournalID still totally orders, §1, §12).
+	RecordedAtOverride *RecordedTime
+
 	// task_event (EffectTaskEvent)
 	TaskID    TaskID
 	EventKind EventKind
