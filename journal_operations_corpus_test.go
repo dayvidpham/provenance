@@ -993,7 +993,7 @@ func TestApplyConflictProducesTypedClosedSumAndErrorsAs(t *testing.T) {
 }
 
 // TestFoldDecisionEnforcesAuthorityGovernance pins §9.3's per-effect authority
-// checkpoint for journal_decisions (BLOCKER u1sjm): a task-scoped decision is
+// checkpoint for journal_decisions. A task-scoped decision is
 // rejected under an authority that does not govern the named task (zero writes),
 // accepted under one that does, and an untasked decision skips the check (§6.1).
 func TestFoldDecisionEnforcesAuthorityGovernance(t *testing.T) {
@@ -1043,7 +1043,7 @@ func TestFoldDecisionEnforcesAuthorityGovernance(t *testing.T) {
 }
 
 // TestFoldEvidenceEnforcesAuthorityGovernance is the §9.3 per-effect authority
-// checkpoint for journal_evidence (BLOCKER u1sjm), mirroring the decision case.
+// checkpoint for journal_evidence, mirroring the decision case.
 func TestFoldEvidenceEnforcesAuthorityGovernance(t *testing.T) {
 	env := newOpsEnv(t)
 	boot := env.genesis(t, "op-genesis")
