@@ -1,0 +1,58 @@
+# Adversarial histories for actor-namespace claim integrity — non-overlapping
+# ranges and entry-in-range validation, enforced by the reducer because
+# PRIMARY KEY(Namespace) and the Namespace FK cannot express range disjointness
+# or entry membership (docs/journal-relational-contract.md §7.3).
+cases:
+  - name: non-overlapping-namespace-claims-both-accepted
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#4 amendment §7.3 non-overlapping ranges"}
+    mutation:
+      description: >-
+        Two namespaces claim disjoint fixed-UUID ranges. Both registrations are
+        accepted because their [RangeMin, RangeMax] intervals do not intersect.
+      operator: claim-two-disjoint-namespaces
+    input:
+      claims:
+        - {namespace: pasture-system, rangeMin: "00000000000000000000000000000000", rangeMax: "000000000000000000000000000003ff"}
+        - {namespace: pasture-village, rangeMin: "00000000000000000000000000000400", rangeMax: "000000000000000000000000000007ff"}
+    expected:
+      accepted: true
+      claimsRegistered: 2
+
+  - name: overlapping-namespace-claim-rejected-naming-both
+    classification: must-fail
+    provenance: {source: requirement, ref: "provenance#4 amendment §7.3 non-overlapping ranges"}
+    mutation:
+      description: >-
+        A second namespace claims a range that intersects an existing claim's
+        range. PRIMARY KEY(Namespace) cannot express range disjointness, so the
+        reducer must reject the overlapping claim with an actionable error
+        naming BOTH the new and the conflicting namespace, before the overlap
+        surfaces later as an accidental fixed-entry PK collision.
+      operator: claim-overlapping-namespace
+    input:
+      existingClaim: {namespace: pasture-system, rangeMin: "00000000000000000000000000000000", rangeMax: "000000000000000000000000000003ff"}
+      newClaim: {namespace: pasture-intruder, rangeMin: "00000000000000000000000000000200", rangeMax: "000000000000000000000000000005ff"}
+    expected:
+      accepted: false
+      reason: namespace-range-overlap
+      errorNamesBothNamespaces: true
+
+  - name: manifest-entry-out-of-claimed-range-rejected
+    classification: must-fail
+    provenance: {source: requirement, ref: "provenance#4 amendment §7.3 entry-in-range"}
+    mutation:
+      description: >-
+        A fixed_actor_manifest_entries row's ActorID decodes, under its
+        namespace Codec, to an ordinal outside the namespace's claimed
+        [RangeMin, RangeMax]. The Namespace foreign key proves the claim exists
+        but not that the entry belongs inside it, so the reducer must reject the
+        out-of-range entry.
+      operator: register-manifest-entry-out-of-range
+    input:
+      namespace: pasture-system
+      claimedRange: {rangeMin: "00000000000000000000000000000000", rangeMax: "000000000000000000000000000003ff"}
+      entryActorOrdinal: 4096
+    expected:
+      accepted: false
+      reason: manifest-entry-outside-claimed-range

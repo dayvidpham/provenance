@@ -82,3 +82,47 @@ cases:
       loserAccepted: false
       loserReason: stale-episode-conflict
       partialWritesFromLoser: 0
+
+  - name: transfer-crash-between-ended-and-started-rows-commits-neither
+    classification: must-fail
+    provenance: {source: requirement, ref: "provenance#4 amendment §9.5 fail-closed atomicity; transfer two-row model §4.4"}
+    mutation:
+      description: >-
+        A transfer operation folds its two effects — an 'ended' transition on
+        the old episode A and a 'started' transition on the new episode B
+        (PredecessorAssignmentID = A) — and a fault is injected between the two.
+        Because both rows commit inside one transaction (§9.5), neither the
+        ended transition, the started transition, nor the anchor may remain
+        committed: the transfer is all-or-nothing. This pins the specific
+        transfer (ended, started) shape the two-row transfer model relies on,
+        rather than only the general N-effect fault cases.
+      operator: fault-between-transfer-ended-and-started
+    input:
+      operationId: op-transfer-crash-1
+      task: t1
+      effects:
+        - {index: 1, kind: authority, transition: ended, task: t1, slot: owner-responsibility, assignment: A}
+        - {index: 2, kind: authority, transition: started, task: t1, slot: owner-responsibility, assignment: B, predecessor: A}
+      faultBetweenEffectIndices: [1, 2]
+    expected:
+      committedEffectCount: 0
+      anchorCreated: false
+
+  - name: attribution-credits-occupant-not-committing-system-actor
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#4 amendment §8.2 attribution function"}
+    mutation:
+      description: >-
+        The Pasture system actor (actor-0) executes a transfer that starts a
+        new owner-responsibility episode whose occupant is actor-erin. The
+        task_attributions edge for the episode must credit the occupant
+        (episodes.ActorID = actor-erin), NOT the committing system actor
+        (journal.ActorID = actor-0), which earns no edge merely for committing.
+      operator: attribute-episode-occupant-not-committer
+    input:
+      operationId: op-system-transfer-1
+      committingActor: actor-0
+      episode: {assignmentId: J, slot: owner-responsibility, occupant: actor-erin}
+    expected:
+      attributedActor: actor-erin
+      committerAttributed: false

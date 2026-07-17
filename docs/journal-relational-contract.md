@@ -72,7 +72,7 @@ exactly one subtype table selected by `JournalKind`.
 | `RecordedAt` | `INTEGER` (UnixNano, UTC) | no | audit/display metadata only — see [§7](#7-recordedat-doctrine) |
 | `ProducedByOperationJournalID` | FK → `journal_operations.JournalID` | yes | the operation that produced this row; NULL **only** on the row that is itself the operation anchor (`JournalKind = 'operation'`) — see [§5](#5-totality-rules) |
 
-**Functional dependencies:** `{JournalID} → {JournalKind, ActorID, RecordedAt, ProducedByOperationJournalID}`. `JournalID` is a surrogate with no other functional source (two rows may legitimately share identical `(JournalKind, ActorID, RecordedAt)`, e.g. a timestamp collision or two same-actor events in the same batch).
+**Functional dependencies:** `{JournalID} → {JournalKind, ActorID, RecordedAt, ProducedByOperationJournalID}`. In addition, because `ActorID` is defined as the actor whose committed operation *produced* the row, every produced (non-anchor) row's actor equals its producing operation's actor: over rows with `ProducedByOperationJournalID` NOT NULL, `{ProducedByOperationJournalID} → {ActorID}`. (This FD does not hold over anchor rows, which share a NULL `ProducedByOperationJournalID` yet legitimately carry different actors.) `JournalID` is a surrogate with no other functional source (two rows may legitimately share identical `(JournalKind, ActorID, RecordedAt)`, e.g. a timestamp collision or two same-actor events in the same batch).
 
 **Candidate keys:** `{JournalID}` only.
 
@@ -80,7 +80,9 @@ exactly one subtype table selected by `JournalKind`.
 
 **Foreign keys:** `JournalKind → journal_kinds(id)`; `ActorID → agents(id)`; `ProducedByOperationJournalID → journal_operations(JournalID)`.
 
-**BCNF:** the only candidate key is the whole key on the only nontrivial FD's left side, so `journal` is trivially in BCNF — there is no room for a violation with a single-attribute key and no other candidate key.
+**Committing-actor model.** `ActorID` is the *committing* actor of the operation that produced the row — the actor who executed the operation, not necessarily the domain subject of the effect. A responsibility-slot occupant is carried separately on `journal_authority_assignment_episodes.ActorID` (§4.4) and may differ from the committing actor (a Pasture-system actor executing a transfer or a migration on behalf of an occupant, §13). Every row an operation produces therefore shares that operation's committing `ActorID`.
+
+**BCNF:** the surrogate `{JournalID}` is the only candidate key, but `{ProducedByOperationJournalID} → {ActorID}` (above) is a nontrivial FD whose determinant is **not** a candidate key of `journal`, so `journal` is deliberately **not** decomposed to BCNF on that FD. Decomposing `ActorID` out into a `(ProducedByOperationJournalID → ActorID)` table is impossible without loss — the anchor row carries `ActorID` with a NULL `ProducedByOperationJournalID`, so no such table could key an anchor's actor — and every read of a journal row needs its actor locally. The contract accepts this as controlled redundancy; the required agreement (every produced row's `ActorID` equals its anchor's `ActorID`) is a reducer invariant (§10 rule 5) the schema does not express, pinned by the must-fail history `authority_evidence.yaml` / `effect-actor-mismatches-anchor-rejected` in the §14.3 pattern, not by a normal-form decomposition. No other FD on `journal` violates BCNF.
 
 This one column — `ProducedByOperationJournalID` — is the structural fix for
 the salvage regression where a superseded implementation stored operation
@@ -92,7 +94,13 @@ is recorded — this foreign key — so drift between "what the operation says i
 produced" and "what actually exists" is structurally impossible, not merely
 checked. An operation's full result is the query
 `SELECT * FROM journal WHERE ProducedByOperationJournalID = :anchor ORDER BY JournalID`,
-joined out to each row's typed subtype table by `JournalKind`.
+joined out to each row's typed subtype table by `JournalKind`. This flat,
+ordered closure is exactly what reconstructs `CommittedExact.EmittedEvents`
+(the non-slot-keyed `[]EventID`). The *slot-keyed* portion of a committed
+result — `CanonicalMutationResult`'s caller-chosen local handles mapped to
+concrete IDs — needs one further column that this closure does not carry (which
+slot name the caller used for each produced row); that mapping is persisted by
+`journal_operation_result_slots` (§3.2).
 
 ### 2.2 `journal_kinds` (closed lookup)
 
@@ -115,7 +123,7 @@ argument, differing only in which values are seeded.
 |---|---|---|---|
 | `JournalID` | FK → `journal.JournalID` | no | PK; the operation's own anchor row |
 | `OperationID` | `TEXT` | no | caller-supplied alternate key, `UNIQUE` |
-| `AuthorityJournalID` | FK → `journal_authorities.JournalID` | no | the authority this operation executed under |
+| `AuthorityJournalID` | FK → `journal_authorities.JournalID` | yes | the authority this operation executed under; NULL **only** on a genesis operation whose sole effect is producing one `bootstrap` authority — see [§4.6](#46-genesis-the-authority-base-case) |
 | `CommandDigest` | `BLOB` | no | opaque caller-domain digest of the closed command |
 | `MutationDigest` | `BLOB` | no | Provenance-derived structural digest, independent of `CommandDigest` |
 
@@ -137,6 +145,41 @@ whatever row already carries the proposed `OperationID` (see
 incorrectly forbid two unrelated operations from coincidentally producing
 identical digests under different `OperationID`s, which is not itself an
 error.
+
+### 3.2 `journal_operation_result_slots`
+
+`LookupCommitted` must return, for a committed operation, its
+`CanonicalMutationResult` — the caller-chosen local handle name for each thing
+the operation allocated (`CanonicalTaskResult{Slot ResultSlotID; ID TaskID}`,
+and its `Assignment`/`Activity`/`Event` siblings), mapped to the concrete ID it
+resolved to. Canonical typed local handles let later mutations in one batch
+reference earlier allocations, and the replay-stable result maps every handle to
+its concrete ID. This mapping is **not** reconstructable from the §2.1
+`ProducedByOperationJournalID` closure (which enumerates *which* rows an
+operation produced but records no slot name), from the one-way
+`CommandDigest`/`MutationDigest` (not reversible), or from `LookupCommitted`'s
+own `OperationLookupIdentity{Actor, Authority, Command}` signature (which cannot
+resupply the original slot list) — so it must be durably persisted at
+Apply-commit time:
+
+| Attribute | Domain | Nullable | Notes |
+|---|---|---|---|
+| `JournalID` | FK → `journal_operations.JournalID` | no | part of PK; the producing operation's anchor |
+| `ResultSlotID` | `TEXT` | no | part of PK; the caller's local handle name (e.g. `new-task-1`) |
+| `ProducedJournalID` | FK → `journal.JournalID` | no | the concrete produced row this slot resolved to |
+
+**FD:** `{JournalID, ResultSlotID} → {ProducedJournalID}`. **Candidate key /
+PK:** `{JournalID, ResultSlotID}`. **BCNF:** trivial — single composite key, one
+non-key attribute, no other determinant.
+
+`CanonicalMutationResult` reconstructs as `SELECT ResultSlotID,
+ProducedJournalID, JournalKind FROM journal_operation_result_slots JOIN journal
+ON ProducedJournalID = journal.JournalID WHERE
+journal_operation_result_slots.JournalID = :anchor`, bucketed into
+`Tasks`/`Assignments`/`Activities`/`Events` by `JournalKind`. `EmittedEvents`
+(the flat, non-slot-keyed ordered event list) needs no row here — it is fully
+covered by the §2.1 `ProducedByOperationJournalID` closure. `operation_results.yaml`
+carries the slot-reconstruction histories.
 
 ## 4. Authority lifecycle
 
@@ -206,7 +249,12 @@ violation: a determinant that is a proper subset of a candidate key.
 **Decomposition** (lossless, dependency-preserving — `AssignmentID` is a
 candidate key of the first table below, so it is a superkey of the split,
 which guarantees a lossless join per the standard BCNF decomposition
-theorem):
+theorem; it is dependency-preserving because each original FD lands wholly
+within one component — `{AssignmentID} → {TaskID, SlotID, ActorID,
+PredecessorAssignmentID}` in the episodes table and `{AssignmentID, Transition}
+→ {JournalID}` in the transitions table — and `{JournalID} →` the remaining
+attributes is then recoverable by transitivity through those preserved FDs, so
+no dependency is lost across the split):
 
 **`journal_authority_assignment_episodes`**
 
@@ -218,10 +266,18 @@ theorem):
 | `ActorID` | FK → `agents.id` | no | the actor holding (or having held) the slot for this episode |
 | `PredecessorAssignmentID` | FK → `journal_authority_assignment_episodes.AssignmentID`, self | yes | the episode this one succeeds, for a CAS transfer; `UNIQUE` — see [§8.2](#82-single-consumption-ownership-assignment-evidence) |
 
-FD: `{AssignmentID} → {TaskID, SlotID, ActorID, PredecessorAssignmentID}`.
-Candidate key / PK: `{AssignmentID}`. BCNF: trivial — single key, and it is
-literally the whole-episode identity, so every attribute is properly
-dependent on it and on nothing smaller.
+FDs: `{AssignmentID} → {TaskID, SlotID, ActorID, PredecessorAssignmentID}`;
+and, over rows with `PredecessorAssignmentID` NOT NULL, the near-key
+partial-function dependency `{PredecessorAssignmentID} → {AssignmentID, TaskID,
+SlotID, ActorID}` induced by the `UNIQUE(PredecessorAssignmentID)` constraint
+(§14.2). A nullable `UNIQUE` column is not a candidate key in the strict
+relational sense — NULLs are permitted and are not compared equal — so it adds
+no candidate key and leaves BCNF unaffected. Candidate key / PK:
+`{AssignmentID}`. BCNF: trivial — the sole candidate key `{AssignmentID}` is
+literally the whole-episode identity; every FD determinant here is either
+`{AssignmentID}` itself or the near-key `{PredecessorAssignmentID}`, and the
+latter determines exactly the attributes a candidate key would, so no
+determinant is a proper subset of a key.
 
 **`journal_authority_assignment_transitions`**
 
@@ -251,6 +307,60 @@ episodes for `(TaskID=Y, SlotID=X)` that have a `started` transition and no
 `assignment_slots` seeds at minimum `owner-responsibility`, extensible for
 future non-owner slots without a schema change. `assignment_transitions`
 seeds exactly `started`, `ended`. Same shape/BCNF argument as §2.2.
+
+### 4.6 Genesis: the authority base case
+
+Totality rule 2 (§10) makes every non-anchor journal row cite a producing
+operation, and §3.1 makes every operation cite an executing authority. Treated
+as *universal* NOT NULL constraints these two rules have **no base case**: the
+first authority could never be produced (its producing operation would itself
+need a prior authority), and the first operation could never execute (it would
+need a prior authority to already exist) — a genuine foreign-key cycle
+(`journal.ProducedByOperationJournalID → journal_operations →
+journal_operations.AuthorityJournalID → journal_authorities → journal`) that no
+insert order satisfies under immediate FK checking. The contract breaks this
+cycle with exactly one narrow base case, mirroring the
+`ProducedByOperationJournalID` NULL-only-on-anchor pattern of §2.1:
+
+- **A genesis operation** is a `journal_operations` row with
+  `AuthorityJournalID = NULL`. It is the **only** row in the whole schema
+  permitted a NULL `AuthorityJournalID`. Its sole permitted effect is producing
+  exactly one `journal_authorities` row with `AuthorityKind = 'bootstrap'`
+  (with its `journal_authority_bootstraps` detail row). It produces no task
+  events, no assignment transitions, no decisions, and no evidence.
+- The bootstrap authority the genesis operation produces is an ordinary effect
+  row: its `journal.ProducedByOperationJournalID` is the genesis operation's own
+  `JournalID`, so **totality rule 2 stays universal** — every authority,
+  including the first, is produced by exactly one operation. Only
+  `AuthorityJournalID`'s NOT NULL requirement is relaxed, and only for the
+  genesis operation.
+- **Legal insert order** (immediate FK checking; no deferred constraints
+  required): (1) insert the genesis operation's `journal` anchor row
+  (`ProducedByOperationJournalID = NULL`); (2) insert its `journal_operations`
+  row (`AuthorityJournalID = NULL`); (3) insert the bootstrap authority's
+  `journal` row (`ProducedByOperationJournalID` = the genesis operation's
+  `JournalID`); (4) insert its `journal_authorities` and
+  `journal_authority_bootstraps` rows. No foreign key is ever unsatisfied at
+  insert time, so **no `PRAGMA defer_foreign_keys` or deferred-constraint
+  mechanism is needed** — this is a stated schema property, not an incidental
+  one.
+- **A genesis operation is accepted only when no `journal_operations` row yet
+  exists** — i.e. it is the first operation in the journal. This closes the
+  obvious hole: were arbitrary NULL-authority operations allowed, any caller
+  could mint a bootstrap authority under no authorization. Reducer invariants
+  §10 rules 6–7 enforce the NULL-only-on-genesis, first-operation-only, and
+  sole-bootstrap-effect rules.
+- **Migration (§13) executes under a bootstrap authority.** A migration run
+  first establishes (or requires already-established) the `pasture-system`
+  bootstrap authority via one genesis operation as above; every per-task
+  baseline anchor operation it then writes is an ordinary non-genesis operation
+  whose `AuthorityJournalID` is NOT NULL and equal to that bootstrap authority's
+  `JournalID`. Migration never writes a NULL-authority operation except the
+  single genesis operation, and never fabricates an authority.
+
+`genesis_bootstrap.yaml` carries the must-pass genesis history and the must-fail
+histories (NULL authority on a non-genesis operation, a second genesis against a
+non-empty journal, and a genesis producing a non-bootstrap effect).
 
 ## 5. Task and domain events
 
@@ -287,6 +397,18 @@ ContextIdentity)` at construction, exactly as in the salvage
 `CanonicalEventContexts` implementation, which is carried forward unchanged
 in behavior (validate-then-sort-then-dedup, sort key `(kind, identity)`
 lexical order).
+
+`ContextKind` mixes built-in values the reducer *interprets* for
+identity-encoding validation (`task`/`activity`/`actor`/`git`) with open
+caller-extension namespaces it records opaquely. The column is open-in-storage
+but the built-in list is closed-in-behavior. The criterion that keeps
+`JournalKind`/`AuthorityKind`/`Transition`/`SlotID` closed integer lookups
+(§2.2) is precisely *whether the schema or reducer dispatches on the value*: an
+open kind flows through Provenance opaquely, so it stays validated `TEXT`. If a
+future slice ever adds an attribute that functionally depends on a specific
+built-in `ContextKind` value — i.e. the reducer or schema begins to dispatch on
+it beyond identity-encoding validation — that value set **graduates to a closed
+integer lookup at that point**, by that same criterion.
 
 ## 6. Decisions and material-work evidence
 
@@ -386,6 +508,30 @@ and `FixedActorSpec` (historical `#5` body) remain implementable directly on
 top of these two relations without Provenance embedding any Pasture name or
 semantics.
 
+### 7.3 Namespace-claim integrity (reducer rules)
+
+Two properties the schema cannot express structurally are enforced by the
+reducer, documented here per the §14.3 convention so the proof corpus carries a
+dedicated negative case for each:
+
+1. **Non-overlapping ranges.** A new `actor_namespace_claims` row whose
+   `[RangeMin, RangeMax]` intersects the range of any existing claim is rejected
+   before commit, with an actionable error naming **both** the new and the
+   conflicting namespace. `PRIMARY KEY(Namespace)` prevents duplicate namespace
+   *names* but cannot express range disjointness across different names, so an
+   unchecked overlap would surface only later as an accidental
+   `fixed_actor_manifest_entries`/`agents` primary-key collision, with no
+   diagnostic tying it back to the two conflicting claims.
+2. **Entry-in-range.** A `fixed_actor_manifest_entries` row's `ActorID` must
+   decode, via its namespace's `Codec`, to an ordinal lying within that
+   namespace's `[RangeMin, RangeMax]`; an entry whose `ActorID` falls outside
+   its claimed range (or does not decode under the claimed codec) is rejected.
+   The `Namespace` foreign key guarantees the claim *exists* but cannot express
+   that the entry actually belongs inside the claimed range.
+
+`actor_namespace.yaml` carries a must-fail overlap history and a must-fail
+out-of-range entry history (plus a must-pass disjoint-claims history).
+
 ## 8. Projections
 
 Projections are the *only* relations this contract allows to be read as
@@ -433,6 +579,27 @@ when `Task.Owner` later changes. `Task.Owner` (the current
 projections over the same journal history; they diverge by design once
 ownership transfers.
 
+**Attribution function (per `JournalKind`).** Which `ActorID` a produced row
+attributes is fixed per kind, not left to the implementer — the two candidate
+actors (a row's committing `journal.ActorID` versus, for an assignment episode,
+the occupant `journal_authority_assignment_episodes.ActorID`) can differ, so
+the choice is stated explicitly:
+
+| Produced row kind | Attributed `ActorID` |
+|---|---|
+| authority assignment episode (its `started` transition) | the episode's occupant, `journal_authority_assignment_episodes.ActorID` — **not** the committing `journal.ActorID` |
+| `journal_task_events` | the row's committing `journal.ActorID` (the authoring actor, per the committing-actor model of §2.1) |
+| `journal_evidence` | the row's committing `journal.ActorID` (the actor who attached it) |
+| `journal_decisions` with a non-NULL `TaskID` | the row's committing `journal.ActorID` |
+| `journal_decisions` with `TaskID` NULL | no edge (attribution is per task; an untasked decision attributes nothing) |
+
+The committing actor of an operation does **not** earn an attribution edge
+merely for committing: a Pasture-system actor executing a transfer or a
+migration on behalf of an occupant attributes the *occupant* (via the episode's
+`ActorID`), never itself. `owner_responsibility.yaml` /
+`attribution-credits-occupant-not-committing-system-actor` pins this
+occupant-not-committer case.
+
 ### 8.3 `task_event_activity` (view, not a base relation)
 
 The filtered, task-scoped read that `pasture task event list` serves is
@@ -473,7 +640,11 @@ where `ProjectionState` is exactly the tuple of projections in §8
 their typed subtype row) with `JournalID ≤ uptoJournalID`. No wall-clock
 read, random value, or external service call may influence its output. Given
 the same prefix, `Reduce` always returns the same `ProjectionState` — this is
-what makes `LastJournalID` (§8.1) a meaningful convergence checkpoint.
+what makes `LastJournalID` (§8.1) a meaningful convergence checkpoint. This
+determinism presupposes that `journal` rows already have a total order
+(`JournalID`); for the effects *within* one not-yet-committed operation, which
+have no `JournalID` assigned yet, that order is fixed by §9.3.1 before folding
+begins.
 
 ### 9.2 Incrementality equals bulk-replay equivalence
 
@@ -512,6 +683,24 @@ being independently re-authorized against their own emerging state — the
 concrete case is worked out in
 [`authority_evidence.yaml`](../testdata/contract/authority_evidence.yaml).
 
+### 9.3.1 Intra-operation effect order
+
+§9.3 folds an operation's $N$ effects one at a time; the order in which they are
+folded — which effect is $1$ and which is $k{+}1$ — is exactly the order the
+caller's `Mutation`/command structure lists its child effects: an ordinal
+array/slice position, fixed before folding begins. It is **never** re-derived
+from Go map or set iteration order, from a sort over any non-ordinal field (a
+`TaskID`, `SlotID`, digest, or `RecordedAt`), or from any other
+non-deterministic source. This order fixes both each effect's relative
+`JournalID` assignment and the state each subsequent effect's §9.3 authority
+check is evaluated against, so it is a precondition of §9.1's determinism claim:
+two independent constructions of the same logical operation must fold — and
+therefore journal — their effects identically. An implementation that collected
+an operation's effects into a Go map (e.g. keyed by `TaskID` or `SlotID`, a
+natural shape given the keying elsewhere in this schema) before folding would
+silently violate this rule under Go's randomized map iteration; this section is
+the rule such an implementation violates.
+
 ### 9.4 Idempotent replay short-circuit
 
 If `journal_operations` already holds a row for the proposed `OperationID`,
@@ -532,6 +721,40 @@ roll back as a single SQL transaction. This is unchanged from the existing
 `STRICT`/transactional discipline already used across the live schema; the
 journal model does not relax it.
 
+### 9.6 Concurrency contention point
+
+Two concurrent `Apply` calls contend at a single serialization point: SQLite's
+single-writer transaction semantics, under which at most one write transaction
+commits at a time and the second-executing transaction observes the first's
+already-committed rows. The contract's two "exactly one concurrent writer wins"
+outcomes resolve there:
+
+- **Transfer CAS** (`owner_responsibility.yaml` /
+  `transfer-cas-single-winner-loser-gets-stale-conflict`). Both transfer
+  operations validate their precondition against `Reduce(history, J_current − 1)`.
+  Because writes serialize, the loser's transaction runs after the winner's has
+  committed; its §9.3 precondition re-check now observes the winner's committed
+  `ended` transition on episode A, finds A no longer active, and the reducer
+  rejects it with a typed `stale-episode-conflict`, writing nothing. The
+  `UNIQUE(AssignmentID, Transition)` and `UNIQUE(PredecessorAssignmentID)`
+  constraints are a defence-in-depth backstop (a raw violation would surface only
+  if two writers somehow both reached the write step), but the **primary,
+  specified** mechanism is the serialized precondition re-check yielding the
+  typed conflict — not a raw database error.
+- **Concurrent same-new-`OperationID`** (§9.4, §11). Two callers may each look up
+  the proposed new `OperationID`, each see no existing `journal_operations` row,
+  and each attempt to insert the anchor. Serialization means one insert commits
+  first; the second transaction's insert then violates
+  `journal_operations.OperationID UNIQUE`. The reducer catches that violation and
+  re-runs the §9.4 idempotent-replay path against the now-committed row: an exact
+  four-field identity match returns the original anchor (idempotent success);
+  otherwise it surfaces the typed `CommittedConflict`.
+
+In both cases the caller observes a **typed** conflict/idempotent result, never a
+raw SQLite constraint error: the translation from any backstop constraint
+violation to the typed result happens inside the reducer, at the `Apply`
+boundary, before returning to the caller.
+
 ## 10. Totality rules
 
 1. Every committed logical operation produces exactly one `journal_operations`
@@ -549,6 +772,36 @@ journal model does not relax it.
    ones that do not already exist on the supertype.
 4. `OperationID` is never a determinant of ordering and never a primary key
    anywhere in this schema (§3.1, §6).
+5. **Committing-actor agreement.** Every produced (non-anchor) journal row's
+   `ActorID` equals the `ActorID` of its producing operation's anchor row (the
+   committing-actor model of §2.1). The schema stores this redundantly rather
+   than decomposing it (§2.1 BCNF discussion); the reducer rejects any effect
+   row whose `ActorID` differs from its anchor's before commit.
+6. **Genesis NULL-authority discipline.** `journal_operations.AuthorityJournalID`
+   is `NULL` only on a **genesis operation** (§4.6), and a genesis operation is
+   accepted only when no `journal_operations` row yet exists — i.e. it is the
+   first operation in the journal. Any later operation presenting a `NULL`
+   `AuthorityJournalID`, or any genesis attempted against a non-empty journal, is
+   rejected before commit.
+7. **Genesis sole effect.** A genesis operation's only effect is exactly one
+   `journal_authorities` row with `AuthorityKind = 'bootstrap'` (plus its
+   `journal_authority_bootstraps` detail row): no task events, assignment
+   transitions, decisions, or evidence. A `NULL`-authority operation producing any
+   other or additional effect is rejected.
+8. **Subtype totality, exclusivity, and discriminator agreement.** Enforced by
+   the reducer at both inheritance levels (`journal` → its
+   `journal_operations`/`journal_task_events`/`journal_authorities`/`journal_decisions`/`journal_evidence`
+   subtypes, and `journal_authorities` → its `journal_authority_bootstraps`/assignment
+   detail rows). Because doctrine 3 (rule 3 above) forbids repeating the
+   discriminator on subtype rows, the schema cannot express these with a composite
+   `(JournalID, JournalKind)` foreign key, so the reducer enforces, before commit:
+   *(totality)* every `journal` row has exactly one subtype row selected by its
+   `JournalKind`; *(exclusivity)* no `JournalID` appears in two subtype tables;
+   *(agreement)* a subtype row's table matches its `journal.JournalKind`, and an
+   authority's bootstrap/assignment detail matches its `AuthorityKind`.
+   `subtype_integrity.yaml` carries the must-fail histories (no subtype, two
+   subtypes, discriminator mismatch, and the authority-level
+   bootstrap-with-transition mismatch).
 
 ## 11. OperationID doctrine
 
@@ -590,7 +843,27 @@ Migrating a pre-journal database installs one `journal_operations` anchor per
 existing task, in a deterministic pre-migration order (legacy `created_at`
 ascending, then legacy `id` ascending — a documented, reproducible sort over
 the *pre-migration* table, independent of any journal content, since none
-exists yet). For each legacy task, in that order:
+exists yet). Because `legacy id` is `tasks.id`, the existing table's own
+primary key, it is globally unique, so `(created_at, id)` is already a total,
+unique order regardless of how many legacy rows share an identical `created_at`
+— `id` alone breaks every tie.
+
+The whole migration executes under the `pasture-system` bootstrap authority
+established by the genesis operation (§4.6): the genesis operation is the first
+row written, then per-task anchors follow, each an ordinary non-genesis
+operation citing that bootstrap authority. Every migration row's
+`journal.ActorID` is the Pasture system actor (the actor *executing* the
+migration, per the committing-actor model of §2.1), **never** the legacy owner
+— the legacy owner appears only as the occupant `ActorID` on the assignment
+episode (item 2). Each per-task baseline anchor's `OperationID` is a
+deterministic function of the legacy task id — `provenance.migration.baseline--<legacy
+tasks.id>` — so a re-run after a partially-recovered migration (or an accidental
+second invocation) presents the identical `OperationID` per task and hits §9.4's
+idempotent short-circuit (or a typed conflict), never a duplicate baseline
+anchor. The anchor row's own `journal.RecordedAt` is the legacy task's
+`updated_at` — the same honest legacy value used for its migration-marker event
+(item 1), never the migration's wall-clock time. For each legacy task, in that
+order:
 
 1. One `journal_task_events` row, `EventKind = 'provenance.task.migrated'`,
    `RecordedAt` set to the legacy row's own `updated_at` — **never** the
@@ -612,9 +885,9 @@ exists yet). For each legacy task, in that order:
 4. If the legacy owner does not resolve to a registered `ActorID` (an
    unmappable owner string, e.g. orphaned free-text left over from a
    pre-Provenance import): the **entire migration transaction** fails closed
-   with an actionable error identifying the task and the raw owner value; no
-   task is migrated with a synthesized or guessed `ActorID`, and no partial
-   baseline is left committed for any other task in the same run.
+   with a typed `MigrationOwnerUnmappableError` (§13.1); no task is migrated
+   with a synthesized or guessed `ActorID`, and no partial baseline is left
+   committed for any other task in the same run.
 
 Because the resulting baseline rows are ordinary `journal`/`journal_operations`/
 `journal_authority_*` rows — not a special pre-journal state format — a
@@ -625,12 +898,77 @@ schema for legacy state: `Reduce` (§9) replays baseline rows through the
 identical fold used for every other row.
 
 **External-schema preflight.** Before the migration transaction opens, the
-migration routine verifies the pre-journal schema's exact expected shape
-(table and column presence/absence). Any mismatch — including topology
-corruption such as an unexpected extra column — fails closed with an
-actionable diagnostic identifying what was expected and what was found,
-before any row is written. See
+migration routine verifies the pre-journal schema's exact expected shape —
+table **and** column presence/absence, in **both** directions: a missing
+expected table, a missing expected column, an unexpected extra table, or an
+unexpected extra column. Any mismatch — or any other topology corruption —
+fails closed with a typed `SchemaPreflightError` (§13.1) before any row is
+written. See
 [`topology_corruption.yaml`](../testdata/contract/topology_corruption.yaml).
+
+### 13.1 Fail-closed error shape
+
+Both fail-closed paths in this section return a **typed, named-field error** —
+not a prose-only "actionable error" — mirroring `dayvidpham/provenance#6`'s
+established `StoreUnavailableError{Operation, Store, Stage, Impact, Fix, Cause}`
+/ `CheckpointDivergenceError{Operation, Stage, Impact, Fix, Cause}` convention.
+Each carries every component of the repo's six-part actionable-error contract:
+**what** failed, **why**, **where**, **when**, caller **impact**, and **how to
+fix**.
+
+- **`MigrationOwnerUnmappableError`** (item 4):
+  `{ Operation, Task, RawOwner, Stage, Why, Impact, Fix, Cause }`.
+  - *what*: `Task` + `RawOwner` — the offending legacy task id and the raw
+    unmappable owner string;
+  - *why*: `Why` — the owner string resolved to no registered `ActorID`;
+  - *where*: `Operation` + `Stage` — the migration routine and the
+    owner-resolution stage;
+  - *when*: `Stage` — owner resolution, before any baseline row for the run is
+    committed;
+  - *impact*: `Impact` — the entire migration transaction rolled back, zero
+    baselines for any task;
+  - *fix*: `Fix` — register the owner as an actor, or correct/remove the legacy
+    owner string, then re-run (the deterministic `OperationID` scheme makes the
+    re-run idempotent).
+- **`SchemaPreflightError`** (external-schema preflight):
+  `{ Operation, ExpectedShape, FoundShape, Stage, Why, Impact, Fix, Cause }`.
+  - *what*: `ExpectedShape` vs `FoundShape` — the exact table/column the
+    preflight expected and what it actually found (missing table, missing
+    expected column, or unexpected extra column);
+  - *why*: `Why` — the live schema does not match the shape this build
+    understands;
+  - *where*: `Operation` + `Stage` — the preflight routine and the specific
+    table/column check;
+  - *when*: `Stage` — preflight, strictly before any transaction opens;
+  - *impact*: `Impact` — no row of any kind is written, activation halts;
+  - *fix*: `Fix` — restore the expected schema shape or run the correct forward
+    migration, then re-open.
+
+Every field is non-empty on return. An implementation that fails closed with a
+bare `errors.New("unmappable owner")` — carrying only a *what* — does **not**
+satisfy this contract even though it technically "fails closed"; the corpus
+must-fail cases in `baseline_migration.yaml` and `topology_corruption.yaml`
+assert each of the six actionable components is present and non-empty
+(`errorHasWhat`/`errorHasWhy`/`errorHasWhere`/`errorHasWhen`/`errorHasImpact`/`errorHasFix`),
+so an inadequately actionable fail-closed error cannot pass this corpus.
+
+### 13.2 Migrated/native observational equivalence
+
+For any legacy task `T`, the `ProjectionState` (§9) produced by `Reduce` over
+`[T`'s migrated baseline rows, followed by a sequence of native operations
+`O_1..O_n]` is **identical** to the `ProjectionState` produced by `Reduce` over
+a native-only history that creates an equivalent task and applies the same
+logical sequence of operations reaching the same state. Migrated and native
+history prefixes are observationally indistinguishable to the reducer beyond
+`RecordedAt` provenance: because §13's baseline rows are ordinary
+`journal`/`journal_operations`/`journal_authority_*` rows folded through the
+identical §9 reducer — not a special pre-journal state format — nothing
+downstream of a migrated episode (a transfer chaining off its `AssignmentID`, a
+close ending its occupancy, an attribution edge) can observe that the episode
+originated in migration rather than in a native `StartTaskAssignment`. This is
+the concrete statement of the acceptance criterion "migrated/native histories
+are observationally equivalent", pinned by `baseline_migration.yaml` /
+`migrated-then-native-extended-equals-native-only`.
 
 ## 14. Authority consumption rules
 
@@ -663,6 +1001,24 @@ schema cannot fully express structurally, precisely so the proof corpus
 carries a dedicated negative case for it rather than relying on the FK alone
 to appear sufficient.
 
+### 14.4 Assignment-transition lifecycle order
+
+`UNIQUE(AssignmentID, Transition)` (§4.4) bounds an episode to at most one
+`started` and at most one `ended` row but cannot express their required order.
+The reducer enforces, before commit, for every `AssignmentID`: a `started`
+transition appears first (exactly once); an `ended` transition is optional (at
+most once) and, when present, must carry a strictly greater `JournalID` than
+that episode's `started` transition. An `ended` transition with no prior
+`started`, or a `started`/`ended` pair written in inverted `JournalID` order
+(including both written in one batch with `ended` folded before `started`,
+which §9.3's sequential per-effect fold also surfaces), is rejected. This is the
+base lifecycle-order rule the neighboring orphan rule (§14.3) implicitly
+assumes — §14.3 speaks of a predecessor that "has no ended transition row (…or
+was never properly started)", which presupposes exactly this ordering. Stated
+here (per the §14.3 convention) because the schema cannot express it;
+`authority_evidence.yaml` carries `ended-transition-without-started-rejected`
+and `ended-before-started-in-one-batch-rejected`.
+
 ## 15. Projection invariants
 
 Restated from §8 for completeness: every projection (`tasks.*` current-state
@@ -690,10 +1046,14 @@ that first exposed it — never a Beads ID or a proposal/slice/phase label.
 | [`ordering.yaml`](../testdata/contract/ordering.yaml) | 5 | Timestamp collisions; wall-clock-vs-`JournalID` divergence; regression (a) foundation |
 | [`zero_event_operations.yaml`](../testdata/contract/zero_event_operations.yaml) | 5 | Zero-task-event operation anchoring; regression (b) |
 | [`retry_reopen_cancellation.yaml`](../testdata/contract/retry_reopen_cancellation.yaml) | 5 | Retry/reopen/cancellation; regression (e) |
-| [`authority_evidence.yaml`](../testdata/contract/authority_evidence.yaml) | 6 | Per-effect authority at each `JournalID`; orphaned/multiply-consumed evidence; regressions (a), (d) |
-| [`owner_responsibility.yaml`](../testdata/contract/owner_responsibility.yaml) | 4 | Owner-responsibility end bound to legal close; regression (c) |
-| [`baseline_migration.yaml`](../testdata/contract/baseline_migration.yaml) | 5 | Fresh/legacy-assigned/legacy-terminal/unmappable-owner baseline transitions; honest timestamps; regression (g) |
-| [`topology_corruption.yaml`](../testdata/contract/topology_corruption.yaml) | 5 | Fail-closed on missing/corrupted external schema; regression (f) |
+| [`authority_evidence.yaml`](../testdata/contract/authority_evidence.yaml) | 9 | Per-effect authority at each `JournalID`; orphaned/multiply-consumed evidence; committing-actor agreement; assignment-transition lifecycle order; regressions (a), (d) |
+| [`owner_responsibility.yaml`](../testdata/contract/owner_responsibility.yaml) | 6 | Owner-responsibility end bound to legal close; transfer-CAS and transfer-crash atomicity; occupant attribution; regression (c) |
+| [`baseline_migration.yaml`](../testdata/contract/baseline_migration.yaml) | 7 | Fresh/legacy-assigned/legacy-terminal/unmappable-owner baseline transitions; honest timestamps; actionable migration-error fields; migrated/native observational equivalence; idempotent re-run; regression (g) |
+| [`topology_corruption.yaml`](../testdata/contract/topology_corruption.yaml) | 6 | Fail-closed on missing/corrupted external schema (table + column, both directions); actionable preflight-error fields; regression (f) |
+| [`genesis_bootstrap.yaml`](../testdata/contract/genesis_bootstrap.yaml) | 4 | Genesis authority base case; NULL-authority discipline (first-operation-only, sole-bootstrap-effect) |
+| [`operation_results.yaml`](../testdata/contract/operation_results.yaml) | 2 | `ResultSlotID` → produced-row mapping reconstruction; EmittedEvents via the produced closure |
+| [`subtype_integrity.yaml`](../testdata/contract/subtype_integrity.yaml) | 4 | Subtype totality/exclusivity/discriminator agreement (both inheritance levels) |
+| [`actor_namespace.yaml`](../testdata/contract/actor_namespace.yaml) | 3 | Namespace-claim range disjointness; entry-in-range validation |
 
 **Seven regression obligations, each with at least one named history**
 (file → case name):

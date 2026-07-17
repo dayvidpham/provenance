@@ -1,0 +1,74 @@
+# Adversarial histories for class-table-inheritance subtype totality,
+# exclusivity, and discriminator agreement. Because doctrine 3 forbids repeating
+# the discriminator on subtype rows, a composite (JournalID, JournalKind) FK
+# cannot express these, so the reducer enforces them
+# (docs/journal-relational-contract.md §1, §10 totality rule 8), at both
+# inheritance levels (journal -> subtypes, and journal_authorities -> details).
+cases:
+  - name: journal-row-with-no-subtype-row-rejected
+    classification: must-fail
+    provenance: {source: requirement, ref: "provenance#4 amendment §10 totality rule 8 (subtype totality)"}
+    mutation:
+      description: >-
+        A journal row is written with JournalKind = 'task_event' but no
+        matching journal_task_events subtype row. Class-table inheritance
+        requires exactly one subtype row selected by JournalKind; a journal row
+        with zero subtype rows must be rejected before commit.
+      operator: write-journal-row-missing-subtype
+    input:
+      journalKind: task_event
+      subtypeRowWritten: false
+    expected:
+      accepted: false
+      reason: subtype-totality-violated
+
+  - name: journal-row-with-two-subtype-rows-rejected
+    classification: must-fail
+    provenance: {source: requirement, ref: "provenance#4 amendment §10 totality rule 8 (subtype exclusivity)"}
+    mutation:
+      description: >-
+        One JournalID is given rows in two subtype tables (journal_decisions
+        AND journal_evidence). Exclusivity requires a JournalID appear in at
+        most one subtype table; the second subtype row must be rejected.
+      operator: write-journal-row-two-subtypes
+    input:
+      journalKind: decision
+      subtypeTables: [journal_decisions, journal_evidence]
+    expected:
+      accepted: false
+      reason: subtype-exclusivity-violated
+
+  - name: subtype-row-discriminator-mismatch-rejected
+    classification: must-fail
+    provenance: {source: requirement, ref: "provenance#4 amendment §10 totality rule 8 (discriminator agreement)"}
+    mutation:
+      description: >-
+        A journal row with JournalKind = 'decision' carries a
+        journal_operations subtype row. The subtype table must agree with the
+        supertype discriminator; a decision-kind journal row bearing an
+        operation subtype row must be rejected.
+      operator: write-subtype-mismatching-journalkind
+    input:
+      journalKind: decision
+      subtypeTable: journal_operations
+    expected:
+      accepted: false
+      reason: subtype-discriminator-mismatch
+
+  - name: authority-bootstrap-kind-with-transition-row-rejected
+    classification: must-fail
+    provenance: {source: requirement, ref: "provenance#4 amendment §10 totality rule 8 (authority-level discriminator agreement)"}
+    mutation:
+      description: >-
+        One level down, a journal_authorities row with AuthorityKind =
+        'bootstrap' carries a journal_authority_assignment_transitions row (an
+        assignment-level detail). The authority subtype detail must agree with
+        AuthorityKind; a bootstrap authority bearing an assignment transition
+        row must be rejected.
+      operator: write-authority-detail-mismatching-authoritykind
+    input:
+      authorityKind: bootstrap
+      detailTable: journal_authority_assignment_transitions
+    expected:
+      accepted: false
+      reason: authority-subtype-discriminator-mismatch

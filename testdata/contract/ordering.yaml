@@ -7,6 +7,14 @@
 # disagree with commit order. `expected.order` is the JournalID-ascending
 # sequence of row `id` labels a query MUST return, regardless of RecordedAt.
 cases:
+  # NOTE: this first case is a FOUNDATION/sanity check for the property "ties
+  # are legal and resolved by JournalID" — it does NOT by itself discriminate a
+  # correct JournalID-ordered implementation from an incorrect RecordedAt-ordered
+  # one. Because both rows share an identical RecordedAt, a wrong RecordedAt-sort
+  # with a stable/insertion-order or lexical-id tie-break would coincidentally
+  # also yield [e1, e2]. The genuinely discriminating RecordedAt-vs-JournalID
+  # proof is the NEXT case, `backdated-insert-does-not-reorder-journalid`, where
+  # a RecordedAt sort would produce the reversed [e2, e1].
   - name: equal-recordedat-tiebreak-by-journalid
     classification: must-pass
     provenance: {source: requirement, ref: "provenance#4 RecordedAt doctrine"}

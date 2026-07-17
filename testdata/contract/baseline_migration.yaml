@@ -90,3 +90,57 @@ cases:
       accepted: false
       reason: unmappable-owner
       committedAnchorsForAnyTask: 0
+      errorType: MigrationOwnerUnmappableError
+      errorHasWhat: true
+      errorHasWhy: true
+      errorHasWhere: true
+      errorHasWhen: true
+      errorHasImpact: true
+      errorHasFix: true
+
+  - name: migrated-then-native-extended-equals-native-only
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#4 amendment §13.2 migrated/native observational equivalence"}
+    mutation:
+      description: >-
+        A legacy assigned task is migrated to a baseline episode, then a native
+        responsibility transfer chains off the migrated episode's AssignmentID.
+        Reduce over [baseline rows, native transfer] must produce a projection
+        identical (beyond RecordedAt provenance) to Reduce over a native-only
+        history that creates the equivalent task, starts the equivalent first
+        episode, and applies the same transfer.
+      operator: migrate-then-extend-compare-to-native-only
+    input:
+      legacyTask: {id: t8, owner: actor-frank, status: in_progress, updatedAt: "2025-06-10T00:00:00Z"}
+      nativeExtension:
+        - {kind: transfer, fromOccupant: actor-frank, toOccupant: actor-grace, chainsOffMigratedEpisode: true}
+      nativeOnlyEquivalent:
+        - {kind: create, task: t8n}
+        - {kind: start, slot: owner-responsibility, occupant: actor-frank}
+        - {kind: transfer, fromOccupant: actor-frank, toOccupant: actor-grace}
+    expected:
+      projectionsIdenticalBeyondRecordedAt: true
+      migratedOwner: actor-grace
+      nativeOnlyOwner: actor-grace
+
+  - name: re-run-migration-hits-idempotent-short-circuit-no-duplicate-baseline
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#4 amendment §13 deterministic baseline OperationID; §9.4 idempotent replay"}
+    mutation:
+      description: >-
+        A migration is run, then re-run (e.g. after a partially-recovered first
+        run or an accidental second invocation). Because each baseline anchor's
+        OperationID is the deterministic function
+        provenance.migration.baseline--<legacy id>, the re-run presents the
+        identical OperationID per task and hits §9.4's idempotent short-circuit,
+        producing zero duplicate baseline anchors.
+      operator: migrate-then-remigrate-same-legacy-set
+    input:
+      legacyTasks:
+        - {id: t9, owner: actor-heidi, status: open, updatedAt: "2025-06-11T00:00:00Z"}
+      firstRun: {baselineAnchorsCreated: 1}
+      secondRun: {sameLegacySet: true}
+    expected:
+      baselineAnchorsAfterSecondRun: 1
+      secondRunShortCircuited: true
+      duplicateBaselineAnchors: 0

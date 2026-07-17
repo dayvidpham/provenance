@@ -113,3 +113,61 @@ cases:
     expected:
       accepted: true
       reason: exact-replay-skips-current-authority-check
+
+  - name: effect-actor-mismatches-anchor-rejected
+    classification: must-fail
+    provenance: {source: requirement, ref: "provenance#4 amendment §2.1 committing-actor model; §10 totality rule 5"}
+    mutation:
+      description: >-
+        An operation whose anchor row carries ActorID = actor-alice produces an
+        effect row (a task_event) stamped with a different journal.ActorID
+        (actor-bob). Because every produced row's committing actor must equal
+        its anchor's actor (controlled denormalization, §2.1), the reducer must
+        reject the mismatched effect before commit.
+      operator: produce-effect-with-actor-differing-from-anchor
+    input:
+      operationId: op-actor-mismatch-1
+      anchorActor: actor-alice
+      effect: {kind: task_event, task: t1, eventKind: "provenance.task.updated", actor: actor-bob}
+    expected:
+      accepted: false
+      reason: effect-actor-differs-from-anchor
+
+  - name: ended-transition-without-started-rejected
+    classification: must-fail
+    provenance: {source: requirement, ref: "provenance#4 amendment §14.4 assignment-transition lifecycle order"}
+    mutation:
+      description: >-
+        An operation writes an 'ended' transition for an episode that has no
+        prior 'started' transition row. Every FK, key, and totality rule is
+        satisfied, but the lifecycle-order rule requires a 'started' first, so
+        the reducer must reject the ended-without-started transition.
+      operator: end-episode-never-started
+    input:
+      operationId: op-end-orphan-1
+      episode: {assignmentId: G, hasStartedTransition: false}
+      transition: ended
+    expected:
+      accepted: false
+      reason: ended-without-started
+
+  - name: ended-before-started-in-one-batch-rejected
+    classification: must-fail
+    provenance: {source: requirement, ref: "provenance#4 amendment §14.4; §9.3 sequential per-effect fold"}
+    mutation:
+      description: >-
+        A single operation batches an 'ended' effect (index 1) before the
+        'started' effect (index 2) for the same episode. Sequential per-effect
+        folding (§9.3) evaluates the 'ended' effect first, against state in
+        which the episode has not started, so the lifecycle-order rule rejects
+        the batch — a started transition must carry a strictly smaller JournalID
+        than the ended transition of the same episode.
+      operator: batch-ended-before-started
+    input:
+      operationId: op-inverted-lifecycle-1
+      effects:
+        - {index: 1, kind: authority, transition: ended, task: t1, slot: owner-responsibility, assignment: H}
+        - {index: 2, kind: authority, transition: started, task: t1, slot: owner-responsibility, assignment: H}
+    expected:
+      accepted: false
+      reason: ended-before-started

@@ -1,0 +1,49 @@
+# Adversarial histories for the journal_operation_result_slots relation that
+# persists the caller's ResultSlotID -> produced-row mapping at Apply-commit
+# (docs/journal-relational-contract.md §3.2, §2.1). The slot-keyed portion of a
+# committed result is NOT reconstructable from the ProducedByOperationJournalID
+# closure, the one-way digests, or the LookupCommitted signature, so it must be
+# durably persisted; the flat EmittedEvents list needs no such row.
+cases:
+  - name: committed-result-reconstructs-slot-to-id-mapping
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#5 LookupCommitted CanonicalMutationResult; provenance#6 CommittedExact.Result"}
+    mutation:
+      description: >-
+        An operation allocates two tasks under caller-chosen local handles
+        ("new-task-1", "new-task-2"). At Apply-commit each handle is persisted
+        in journal_operation_result_slots mapping ResultSlotID -> the concrete
+        produced JournalID/TaskID. LookupCommitted must reconstruct the exact
+        slot->id mapping (bucketed by JournalKind), which is not recoverable
+        from the one-way CommandDigest/MutationDigest nor from the flat
+        ProducedByOperationJournalID closure alone.
+      operator: lookup-committed-reconstruct-result-slots
+    input:
+      operationId: op-alloc-2-tasks
+      resultSlots:
+        - {slot: new-task-1, producedKind: task_event, producedTask: t-alloc-a}
+        - {slot: new-task-2, producedKind: task_event, producedTask: t-alloc-b}
+    expected:
+      variant: CommittedExact
+      resultMapsSlotToId:
+        new-task-1: t-alloc-a
+        new-task-2: t-alloc-b
+
+  - name: emitted-events-covered-by-produced-closure-not-slot-keyed
+    classification: must-pass
+    provenance: {source: boundary, ref: "provenance#6 CommittedExact.Result EmittedEvents flat ordered list"}
+    mutation:
+      description: >-
+        EmittedEvents is a flat, ordered, non-slot-keyed list. It is fully
+        reconstructed from the existing ProducedByOperationJournalID closure
+        (journal rows of kind task_event in JournalID order) and needs no
+        journal_operation_result_slots row — only the slot-keyed
+        Tasks/Assignments/Activities/Events buckets use the new relation.
+      operator: lookup-committed-emitted-events-from-closure
+    input:
+      operationId: op-emit-events-1
+      producedTaskEvents: [ev-a, ev-b, ev-c]
+    expected:
+      variant: CommittedExact
+      emittedEventsInJournalIdOrder: [ev-a, ev-b, ev-c]
+      slotRowsRequiredForEmittedEvents: 0

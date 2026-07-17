@@ -1,0 +1,96 @@
+# Adversarial histories for genesis — the authority base case that breaks the
+# authority<->operation FK cycle (docs/journal-relational-contract.md §4.6,
+# §10 totality rules 6-7). A genesis operation is the ONLY row permitted a NULL
+# AuthorityJournalID, is accepted only as the first operation in an empty
+# journal, and may produce exactly one bootstrap authority and nothing else.
+cases:
+  - name: genesis-operation-creates-bootstrap-authority-under-null-authority
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#4 amendment §4.6 genesis authority base case"}
+    mutation:
+      description: >-
+        The first operation in an empty journal is a genesis operation with
+        AuthorityJournalID = NULL whose sole effect is producing one bootstrap
+        authority. The legal insert order (anchor row with NULL
+        ProducedByOperationJournalID; journal_operations with NULL authority;
+        bootstrap authority journal row with ProducedByOperationJournalID = the
+        anchor; journal_authorities; journal_authority_bootstraps) must commit
+        with immediate FK checking and no deferred-constraint mechanism,
+        establishing the base authority.
+      operator: apply-genesis-operation
+    input:
+      journalEmptyBefore: true
+      operationId: op-genesis-1
+      authorityJournalId: null
+      effects:
+        - {kind: authority, authorityKind: bootstrap, label: pasture-system}
+    expected:
+      accepted: true
+      anchorCreated: true
+      bootstrapAuthorityCreated: true
+      bootstrapAuthorityProducedByGenesisAnchor: true
+      deferredForeignKeysRequired: false
+
+  - name: null-authority-on-non-genesis-operation-rejected
+    classification: must-fail
+    provenance: {source: requirement, ref: "provenance#4 amendment §10 totality rule 6"}
+    mutation:
+      description: >-
+        After a genesis bootstrap authority already exists, a later operation
+        presents AuthorityJournalID = NULL. Only the first operation in an
+        empty journal may carry a NULL authority; a NULL authority on any later
+        operation must be rejected before commit.
+      operator: apply-null-authority-after-genesis
+    input:
+      journalEmptyBefore: false
+      priorGenesisExists: true
+      operationId: op-null-auth-late
+      authorityJournalId: null
+      effects:
+        - {kind: task_event, task: t1, eventKind: "provenance.task.created"}
+    expected:
+      accepted: false
+      reason: null-authority-only-on-genesis-first-operation
+
+  - name: second-genesis-against-non-empty-journal-rejected
+    classification: must-fail
+    provenance: {source: requirement, ref: "provenance#4 amendment §10 totality rule 6 (genesis accepted only when no operation exists)"}
+    mutation:
+      description: >-
+        A genesis operation (NULL authority, sole bootstrap-authority effect)
+        is attempted after a journal_operations row already exists. Genesis is
+        the base case accepted only in an empty journal, so a second genesis
+        must be rejected — otherwise any caller could mint a bootstrap
+        authority under no authorization.
+      operator: apply-second-genesis
+    input:
+      journalEmptyBefore: false
+      priorOperationExists: true
+      operationId: op-genesis-2
+      authorityJournalId: null
+      effects:
+        - {kind: authority, authorityKind: bootstrap, label: rogue-bootstrap}
+    expected:
+      accepted: false
+      reason: genesis-only-on-empty-journal
+
+  - name: genesis-operation-producing-non-bootstrap-effect-rejected
+    classification: must-fail
+    provenance: {source: requirement, ref: "provenance#4 amendment §10 totality rule 7 (genesis sole effect is one bootstrap authority)"}
+    mutation:
+      description: >-
+        A first-in-journal NULL-authority operation attempts to produce a
+        task_event in addition to one bootstrap authority. A genesis
+        operation's only permitted effect is exactly one bootstrap authority,
+        so any additional or non-bootstrap effect must be rejected.
+      operator: apply-genesis-with-extra-effect
+    input:
+      journalEmptyBefore: true
+      operationId: op-genesis-bad-effect
+      authorityJournalId: null
+      effects:
+        - {kind: authority, authorityKind: bootstrap, label: pasture-system}
+        - {kind: task_event, task: t1, eventKind: "provenance.task.created"}
+    expected:
+      accepted: false
+      reason: genesis-effect-must-be-single-bootstrap-authority

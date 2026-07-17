@@ -34,6 +34,13 @@ cases:
       preflightPassed: false
       writesAttempted: 0
       errorIdentifiesMissingTable: true
+      errorType: SchemaPreflightError
+      errorHasWhat: true
+      errorHasWhy: true
+      errorHasWhere: true
+      errorHasWhen: true
+      errorHasImpact: true
+      errorHasFix: true
 
   - name: extra-unexpected-column-fails-closed
     classification: must-fail
@@ -51,6 +58,13 @@ cases:
     expected:
       preflightPassed: false
       migrationTransactionRolledBack: true
+      errorType: SchemaPreflightError
+      errorHasWhat: true
+      errorHasWhy: true
+      errorHasWhere: true
+      errorHasWhen: true
+      errorHasImpact: true
+      errorHasFix: true
 
   - name: partial-baseline-fault-rolls-back-everything
     classification: must-fail
@@ -69,6 +83,12 @@ cases:
     expected:
       committedBaselineAnchors: 0
       committedSchemaMarker: false
+      errorHasWhat: true
+      errorHasWhy: true
+      errorHasWhere: true
+      errorHasWhen: true
+      errorHasImpact: true
+      errorHasFix: true
 
   - name: concurrent-open-during-corruption-detects-and-halts
     classification: must-fail
@@ -87,3 +107,35 @@ cases:
     expected:
       bothCallersFailClosed: true
       anyCallerProceeds: false
+      errorType: SchemaPreflightError
+      errorHasWhat: true
+      errorHasWhy: true
+      errorHasWhere: true
+      errorHasWhen: true
+      errorHasImpact: true
+      errorHasFix: true
+
+  - name: missing-expected-column-fails-closed
+    classification: must-fail
+    provenance: {source: requirement, ref: "provenance#4 amendment §13 external-schema preflight (column presence, both directions)"}
+    mutation:
+      description: >-
+        A recognized database is missing an EXPECTED column (journal_task_events
+        lacks its Payload column) — the symmetric direction to the
+        extra-unexpected-column case. Preflight verifies exact expected shape in
+        both directions, so a missing expected column must also fail closed
+        before any write, with a typed SchemaPreflightError.
+      operator: schema-preflight-missing-column
+    input:
+      markerPresent: true
+      missingColumn: {table: journal_task_events, column: Payload}
+    expected:
+      preflightPassed: false
+      writesAttempted: 0
+      errorType: SchemaPreflightError
+      errorHasWhat: true
+      errorHasWhy: true
+      errorHasWhere: true
+      errorHasWhen: true
+      errorHasImpact: true
+      errorHasFix: true
