@@ -8,6 +8,12 @@ type Tracker interface {
 	// It is safe to call Close multiple times.
 	Close() error
 
+	// Journal returns the ordered global-journal surface
+	// (docs/journal-relational-contract.md): task-event append, JournalID-ordered
+	// queries, the cumulative attribution projection, subtype-integrity
+	// verification, and the actor-namespace reservation registry.
+	Journal() JournalAPI
+
 	// ---------------------------------------------------------------------------
 	// Task CRUD
 	// ---------------------------------------------------------------------------
