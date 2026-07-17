@@ -70,7 +70,7 @@ exactly one subtype table selected by `JournalKind`.
 | `JournalKind` | FK → `journal_kinds.id` | no | discriminator: `operation` \| `task_event` \| `authority` \| `decision` \| `evidence` |
 | `ActorID` | FK → `agents.id` (ActorID domain) | no | the actor whose committed operation produced this row |
 | `RecordedAt` | `INTEGER` (UnixNano, UTC) | no | audit/display metadata only — see [§7](#7-recordedat-doctrine) |
-| `ProducedByOperationJournalID` | FK → `journal_operations.JournalID` | yes | the operation that produced this row; NULL **only** on the row that is itself the operation anchor (`JournalKind = 'operation'`) — see [§5](#5-totality-rules) |
+| `ProducedByOperationJournalID` | FK → `journal_operations.JournalID` | yes | the operation that produced this row; NULL **only** on the row that is itself the operation anchor (`JournalKind = 'operation'`) — see [§5](#5-totality-rules); **S1.1 staging note:** at the journal-base layer this column is uniformly NULL on `task_event` rows too (no `journal_operations` anchor exists yet to reference) — see the staging note after [§10 rule 2](#10-totality-rules) |
 
 **Functional dependencies:** `{JournalID} → {JournalKind, ActorID, RecordedAt, ProducedByOperationJournalID}`. In addition, because `ActorID` is defined as the actor whose committed operation *produced* the row, every produced (non-anchor) row's actor equals its producing operation's actor: over rows with `ProducedByOperationJournalID` NOT NULL, `{ProducedByOperationJournalID} → {ActorID}`. (This FD does not hold over anchor rows, which share a NULL `ProducedByOperationJournalID` yet legitimately carry different actors.) `JournalID` is a surrogate with no other functional source (two rows may legitimately share identical `(JournalKind, ActorID, RecordedAt)`, e.g. a timestamp collision or two same-actor events in the same batch).
 
@@ -618,6 +618,15 @@ outside `Apply`/`Open` — it is the "current occupant of the
 for query convenience rather than recomputed from `journal_authority_assignment_episodes`
 on every read.
 
+**S1.1 → S1.3 staging note.** At the journal-base layer (`dayvidpham/provenance#4`,
+S1.1) `tasks.LastJournalID` ships **nullable**: the pre-journal direct-write
+task-creation path predates the shared reducer, so existing and newly created
+tasks have no watermark to populate until every task write is routed through
+`Apply`/`Open` (§9). This is a deliberate staging gap, not a schema bug — the
+column is tightened to `NOT NULL` (as stated above) by the shared-reducer
+slice (`dayvidpham/provenance#5`, S1.3) once all task writes are
+journal-anchored.
+
 ### 8.2 `task_attributions`
 
 | Attribute | Domain | Nullable | Notes |
@@ -835,6 +844,19 @@ boundary, before returning to the caller.
    decision, evidence}`) has exactly one producing operation —
    `ProducedByOperationJournalID` is `NOT NULL` and refers to exactly one
    `journal_operations.JournalID`.
+
+   **S1.1 staging note.** At the journal-base layer (`dayvidpham/provenance#4`,
+   S1.1) no `journal_operations` subtype table exists yet, so there is no
+   operation anchor for a `task_event` row's `ProducedByOperationJournalID` to
+   reference. `AppendTaskEvent` — the pre-operations base primitive the
+   operations layer wraps — writes `task_event` rows with
+   `ProducedByOperationJournalID = NULL` uniformly, which does not yet satisfy
+   this rule. Rule 2's `NOT NULL` enforcement (and the `ProducedByOperationJournalID
+   → journal_operations.JournalID` foreign key from §2.1) takes hold starting
+   with the operations slice (`dayvidpham/provenance#5`, S1.2), when
+   `journal_operations` lands and every effect-producing operation anchors its
+   rows to it. `VerifyIntegrity`'s §10 rule 8 subtype-integrity guard does not
+   check rule 2 and is unaffected by this staging gap.
 3. Common fields (`JournalKind`, `ActorID`, `RecordedAt`) are never
    duplicated on a subtype row; a subtype row's only own attributes are the
    ones that do not already exist on the supertype.
@@ -1129,8 +1151,8 @@ that first exposed it — never a Beads ID or a proposal/slice/phase label.
 | [`owner_responsibility.yaml`](../testdata/contract/owner_responsibility.yaml) | 6 | Owner-responsibility end bound to legal close; transfer-CAS and transfer-crash atomicity; occupant attribution; regression (c) |
 | [`baseline_migration.yaml`](../testdata/contract/baseline_migration.yaml) | 7 | Fresh/legacy-assigned/legacy-terminal/unmappable-owner baseline transitions; honest timestamps; actionable migration-error fields; migrated/native observational equivalence; idempotent re-run; regression (g) |
 | [`topology_corruption.yaml`](../testdata/contract/topology_corruption.yaml) | 6 | Fail-closed on missing/corrupted external schema (table + column, both directions); actionable preflight-error fields; regression (f) |
-| [`genesis_bootstrap.yaml`](../testdata/contract/genesis_bootstrap.yaml) | 4 | Genesis authority base case; NULL-authority discipline (first-operation-only, sole-bootstrap-effect) |
-| [`operation_results.yaml`](../testdata/contract/operation_results.yaml) | 2 | `ResultSlotID` → produced-row mapping reconstruction; EmittedEvents via the produced closure |
+| [`genesis_bootstrap.yaml`](../testdata/contract/genesis_bootstrap.yaml) | 5 | Genesis authority base case; NULL-authority discipline (first-operation-only, sole-bootstrap-effect); same-`OperationID` genesis retry short-circuit |
+| [`operation_results.yaml`](../testdata/contract/operation_results.yaml) | 3 | `ResultSlotID` → produced-row mapping reconstruction; EmittedEvents via the produced closure; rule-9 result-slot own-operation integrity (must-fail) |
 | [`subtype_integrity.yaml`](../testdata/contract/subtype_integrity.yaml) | 4 | Subtype totality/exclusivity/discriminator agreement (both inheritance levels) |
 | [`actor_namespace.yaml`](../testdata/contract/actor_namespace.yaml) | 3 | Namespace-claim range disjointness; entry-in-range validation |
 

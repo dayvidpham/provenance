@@ -201,6 +201,13 @@ func (q JournalQueryV1) Validate() error {
 		return fmt.Errorf("%w: negative limit %d — pass 0 for unbounded or a positive page size",
 			ErrInvalidQuery, q.Limit)
 	}
+	for i, ctx := range q.Contexts {
+		if err := validateEventContext(ctx); err != nil {
+			return fmt.Errorf("%w: Contexts[%d] is malformed: %v — each context filter value must be "+
+				"constructed via TaskContext/ActivityContext/ActorContext/GitContext/ExtensionContext, "+
+				"never assembled by hand", ErrInvalidQuery, i, err)
+		}
+	}
 	return nil
 }
 

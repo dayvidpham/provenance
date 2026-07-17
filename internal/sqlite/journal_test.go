@@ -190,6 +190,210 @@ func TestQueryTaskEventsOrdersByJournalIDWithPaging(t *testing.T) {
 	}
 }
 
+func TestQueryTaskEventsFiltersByContexts(t *testing.T) {
+	db := newJournalDB(t)
+	actor, task := seedActorAndTask(t, db)
+
+	taskCtx, err := journal.TaskContext(task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gitCtx, err := journal.GitContext(journal.GitOID("0123456789abcdef0123456789abcdef01234567"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherActor := ptypes.ActorID{Namespace: "provenance-test", UUID: uuid.New()}
+	actorCtx, err := journal.ActorContext(otherActor)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// tagged: carries both the task context and the git context.
+	tagged, err := db.AppendTaskEvent(journal.AppendTaskEventInput{
+		ActorID: actor, TaskID: task, EventKind: "provenance.task.updated",
+		RecordedAt: time.Unix(1, 0), Contexts: []journal.EventContext{taskCtx, gitCtx},
+	})
+	if err != nil {
+		t.Fatalf("append tagged: %v", err)
+	}
+	// untagged: no contexts at all.
+	if _, err := db.AppendTaskEvent(journal.AppendTaskEventInput{
+		ActorID: actor, TaskID: task, EventKind: "provenance.task.updated",
+		RecordedAt: time.Unix(2, 0),
+	}); err != nil {
+		t.Fatalf("append untagged: %v", err)
+	}
+	// actorTagged: carries only the actor context (used to prove OR-within-dimension
+	// and to prove AND-across-dimensions against a second filter below).
+	actorTagged, err := db.AppendTaskEvent(journal.AppendTaskEventInput{
+		ActorID: actor, TaskID: task, EventKind: "provenance.task.updated",
+		RecordedAt: time.Unix(3, 0), Contexts: []journal.EventContext{actorCtx},
+	})
+	if err != nil {
+		t.Fatalf("append actor-tagged: %v", err)
+	}
+
+	// Positive: filtering by the git context returns only the tagged row.
+	page, err := db.QueryTaskEvents(journal.JournalQueryV1{
+		OrderBy: journal.OrderByJournalID, Contexts: []journal.EventContext{gitCtx},
+	})
+	if err != nil {
+		t.Fatalf("query by git context: %v", err)
+	}
+	if len(page.Events) != 1 || page.Events[0].JournalID != tagged.JournalID {
+		t.Fatalf("git-context filter returned %v, want exactly [%d]", journalIDsOf(page.Events), tagged.JournalID)
+	}
+
+	// Negative: filtering by a context no row carries returns an empty page.
+	unusedCtx, err := journal.GitContext(journal.GitOID("fedcba9876543210fedcba9876543210fedcba90"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, err = db.QueryTaskEvents(journal.JournalQueryV1{
+		OrderBy: journal.OrderByJournalID, Contexts: []journal.EventContext{unusedCtx},
+	})
+	if err != nil {
+		t.Fatalf("query by unused context: %v", err)
+	}
+	if len(page.Events) != 0 {
+		t.Fatalf("unused-context filter returned %v, want empty", journalIDsOf(page.Events))
+	}
+
+	// OR within Contexts: filtering by [gitCtx, actorCtx] returns both tagged
+	// rows (task+git and actor), not the untagged row.
+	page, err = db.QueryTaskEvents(journal.JournalQueryV1{
+		OrderBy: journal.OrderByJournalID, Contexts: []journal.EventContext{gitCtx, actorCtx},
+	})
+	if err != nil {
+		t.Fatalf("query by OR contexts: %v", err)
+	}
+	gotIDs := journalIDsOf(page.Events)
+	wantIDs := []journal.JournalID{tagged.JournalID, actorTagged.JournalID}
+	if !equalJournalIDs(gotIDs, wantIDs) {
+		t.Fatalf("OR-within-Contexts filter returned %v, want %v", gotIDs, wantIDs)
+	}
+
+	// AND across dimensions: combining Contexts=[actorCtx] with an EventKinds
+	// filter that only the untagged/actor-tagged rows satisfy still requires
+	// BOTH dimensions — only actorTagged satisfies both.
+	page, err = db.QueryTaskEvents(journal.JournalQueryV1{
+		OrderBy:    journal.OrderByJournalID,
+		Contexts:   []journal.EventContext{actorCtx},
+		EventKinds: []journal.EventKind{"provenance.task.updated"},
+	})
+	if err != nil {
+		t.Fatalf("query combined dimensions: %v", err)
+	}
+	if len(page.Events) != 1 || page.Events[0].JournalID != actorTagged.JournalID {
+		t.Fatalf("combined Contexts+EventKinds filter returned %v, want exactly [%d]",
+			journalIDsOf(page.Events), actorTagged.JournalID)
+	}
+}
+
+func journalIDsOf(rows []journal.TaskEventRow) []journal.JournalID {
+	out := make([]journal.JournalID, len(rows))
+	for i, r := range rows {
+		out[i] = r.JournalID
+	}
+	return out
+}
+
+func equalJournalIDs(a, b []journal.JournalID) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestQueryTaskEventsSnapshotWalkHidesLaterInserts proves the §5.2 snapshot
+// guarantee end to end: a row inserted after a snapshot's watermark was
+// pinned on page 1 stays invisible through every remaining page of that same
+// cursor walk, while a fresh (unsnapshotted) query issued after the insert
+// does see it — pinning the distinction between a pinned snapshot walk and a
+// fresh query.
+func TestQueryTaskEventsSnapshotWalkHidesLaterInserts(t *testing.T) {
+	db := newJournalDB(t)
+	actor, task := seedActorAndTask(t, db)
+
+	for i := 0; i < 5; i++ {
+		if _, err := db.AppendTaskEvent(journal.AppendTaskEventInput{
+			ActorID: actor, TaskID: task, EventKind: "provenance.task.updated",
+			RecordedAt: time.Unix(int64(i), 0),
+		}); err != nil {
+			t.Fatalf("seed append %d: %v", i, err)
+		}
+	}
+
+	// Page 1 pins the snapshot at JournalID 5.
+	page, err := db.QueryTaskEvents(journal.JournalQueryV1{OrderBy: journal.OrderByJournalID, Limit: 2})
+	if err != nil {
+		t.Fatalf("page 1: %v", err)
+	}
+	if page.SnapshotMaxJournalID != 5 || page.Next == nil {
+		t.Fatalf("page 1 snapshot=%d next=%v, want snapshot=5 with a next cursor", page.SnapshotMaxJournalID, page.Next)
+	}
+
+	// A new row is appended after the snapshot was taken; it must never appear
+	// in the remaining pages of the walk started above.
+	inserted, err := db.AppendTaskEvent(journal.AppendTaskEventInput{
+		ActorID: actor, TaskID: task, EventKind: "provenance.task.updated",
+		RecordedAt: time.Unix(100, 0),
+	})
+	if err != nil {
+		t.Fatalf("post-snapshot append: %v", err)
+	}
+	if inserted.JournalID <= page.SnapshotMaxJournalID {
+		t.Fatalf("post-snapshot insert JournalID %d must exceed the pinned snapshot %d", inserted.JournalID, page.SnapshotMaxJournalID)
+	}
+
+	seen := journalIDsOf(page.Events)
+	cursor := page.Next
+	for cursor != nil {
+		p, err := db.QueryTaskEvents(journal.JournalQueryV1{
+			OrderBy: journal.OrderByJournalID, Limit: 2,
+			SnapshotMaxJournalID: cursor.SnapshotMaxJournalID, AfterJournalID: cursor.AfterJournalID,
+		})
+		if err != nil {
+			t.Fatalf("walk page: %v", err)
+		}
+		seen = append(seen, journalIDsOf(p.Events)...)
+		cursor = p.Next
+	}
+	if len(seen) != 5 {
+		t.Fatalf("snapshot walk saw %d events, want exactly the 5 pre-snapshot rows: %v", len(seen), seen)
+	}
+	for _, id := range seen {
+		if id == inserted.JournalID {
+			t.Fatalf("post-snapshot row %d leaked into the pinned-snapshot walk %v", inserted.JournalID, seen)
+		}
+	}
+
+	// A fresh query (no SnapshotMaxJournalID) issued after the insert DOES see
+	// the new row, positively pinning the distinction from the pinned walk above.
+	fresh, err := db.QueryTaskEvents(journal.JournalQueryV1{OrderBy: journal.OrderByJournalID})
+	if err != nil {
+		t.Fatalf("fresh query: %v", err)
+	}
+	if fresh.SnapshotMaxJournalID != inserted.JournalID {
+		t.Fatalf("fresh query snapshot = %d, want %d (includes the new row)", fresh.SnapshotMaxJournalID, inserted.JournalID)
+	}
+	found := false
+	for _, ev := range fresh.Events {
+		if ev.JournalID == inserted.JournalID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("fresh query did not see the post-insert row %d among %v", inserted.JournalID, journalIDsOf(fresh.Events))
+	}
+}
+
 func TestQueryTaskEventsRejectsNonJournalIDOrder(t *testing.T) {
 	db := newJournalDB(t)
 	_, qErr := db.QueryTaskEvents(journal.JournalQueryV1{OrderBy: journal.OrderDimension(7)})

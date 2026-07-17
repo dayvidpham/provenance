@@ -421,6 +421,26 @@ func (db *DB) QueryTaskEvents(q journal.JournalQueryV1) (journal.JournalTaskEven
 		}
 		sql += ")"
 	}
+	if len(q.Contexts) > 0 {
+		// Contexts is ORed within the dimension (§8.3, §12): a task-event row
+		// matches if it carries ANY of the requested (kind, identity) context
+		// pairs. EXISTS against journal_task_event_contexts keeps the outer
+		// query from fanning out into duplicate rows per matching context edge.
+		sql += " AND EXISTS (SELECT 1 FROM journal_task_event_contexts ctx WHERE ctx.event_journal_id = te.JournalID AND ("
+		for i, ctx := range q.Contexts {
+			kind, identity, encErr := journal.EncodeStoredEventContext(ctx)
+			if encErr != nil {
+				return journal.JournalTaskEventPageV1{}, fmt.Errorf("QueryTaskEvents: encode context filter: %w", encErr)
+			}
+			if i > 0 {
+				sql += " OR "
+			}
+			sql += fmt.Sprintf("(ctx.context_kind = ?%d AND ctx.context_identity = ?%d)", next, next+1)
+			args = append(args, string(kind), identity)
+			next += 2
+		}
+		sql += "))"
+	}
 	sql += " ORDER BY j.JournalID ASC"
 	fetch := q.Limit
 	if fetch > 0 {

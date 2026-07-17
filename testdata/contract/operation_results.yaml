@@ -47,3 +47,26 @@ cases:
       variant: CommittedExact
       emittedEventsInJournalIdOrder: [ev-a, ev-b, ev-c]
       slotRowsRequiredForEmittedEvents: 0
+
+  - name: result-slot-referencing-foreign-operations-produced-row-rejected
+    classification: must-fail
+    provenance: {source: requirement, ref: "provenance#5 §10 totality rule 9 result-slot own-operation integrity"}
+    mutation:
+      description: >-
+        A journal_operation_result_slots row for operation op-a names a
+        ProducedJournalID that identifies a journal row actually produced by a
+        different operation (op-b) — i.e. the referenced row's own
+        ProducedByOperationJournalID equals op-b's anchor JournalID, not op-a's.
+        The two plain foreign keys (slot -> journal row, slot -> owning
+        operation) alone permit this cross-operation reference; rule 9 requires
+        the reducer to reject it before commit rather than let a result slot
+        map to a row it did not itself produce.
+      operator: reject-result-slot-referencing-foreign-operation
+    input:
+      operationId: op-a
+      resultSlot: {slot: borrowed-task, producedKind: task_event}
+      producingOperationId: op-b
+      producedJournalIdBelongsToOperationId: op-b
+    expected:
+      accepted: false
+      reason: result-slot-must-reference-own-operations-produced-row
