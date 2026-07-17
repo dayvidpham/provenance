@@ -32,13 +32,18 @@ validation reducer, and no redundant closure list stored beside the journal.
 Three doctrines govern every relation below:
 
 1. **`JournalID` is the sole canonical order.** It is a database-generated
-   `INTEGER` surrogate key. Every query, authorization check, and replay
-   decision orders by `JournalID`, never by `RecordedAt`.
-2. **`RecordedAt` is audit/display metadata only.** It never establishes
-   causality, authorization, lifecycle order, or migration replay order. Two
-   journal rows may share an identical `RecordedAt` (clock granularity,
-   concurrent commits, or honestly-replayed legacy timestamps); `JournalID`
-   still totally orders them.
+   `INTEGER` surrogate key. Every authorization check, replay, lifecycle, and
+   convergence decision orders by `JournalID`, never by `RecordedAt`. Display
+   listings may additionally be ordered by `RecordedAt` as a non-causal readable
+   timeline (doctrine 2, §12.1), but no causal decision ever consults that order.
+2. **`RecordedAt` is display/audit metadata — a readable timeline, never
+   causality.** Its purpose is to present a readable timeline over what happened
+   (§12.1), and the query surface exposes an `OrderByRecordedAt` display order for
+   exactly that. It never establishes causality, authorization, lifecycle order,
+   or migration replay order. Two journal rows may share an identical `RecordedAt`
+   (clock granularity, concurrent commits, or honestly-replayed legacy
+   timestamps); `JournalID` still totally orders them, and the timeline order
+   breaks the tie by `JournalID`.
 3. **Common fields live on the supertype exactly once.** No subtype table
    repeats `JournalKind`, `ActorID`, or `RecordedAt`.
 
@@ -59,6 +64,18 @@ table that is a typed subtype of the journal is named `journal_<family>`, and
 its primary key is always `JournalID`, a foreign key into `journal`. This is
 class-table inheritance: one row in `journal`, at most one matching row in
 exactly one subtype table selected by `JournalKind`.
+
+**Attribute naming (logical vs physical).** This contract names attributes by
+their **Go-level type names in PascalCase** — `JournalID`, `ActorID`, `TaskID`,
+`RecordedAt`, `ProducedByOperationJournalID` — for every relation. The **physical
+SQL columns** use the repository's `snake_case` convention uniformly:
+`journal_id`, `actor_id`, `task_id`, `recorded_at`,
+`produced_by_operation_journal_id`, `kind_id`. The mapping is mechanical
+(PascalCase attribute ↔ its `snake_case` column); in particular the journal
+supertype's primary-key column is `journal_id`, consistent with its siblings
+`kind_id` / `actor_id` / `recorded_at`. Illustrative DDL and SQL in this document
+uses the logical PascalCase names for readability; the executable schema and every
+query string use the `snake_case` columns.
 
 ## 2. Journal supertype
 
@@ -977,19 +994,65 @@ nothing.
 
 `RecordedAt` is copied from caller-supplied wall-clock time (or, during
 legacy migration, from the historical row being migrated — §13) into
-`journal.RecordedAt` for audit and display only. It is never:
+`journal.RecordedAt`. Its whole point is to provide **a readable timeline over
+what happened** — see §12.1. It is **non-causal**: it is never used to
 
-- used to order query results (`JournalID` is, always);
-- used to decide whether one journal row's effect happened "before" another
-  for authority purposes (§9.3 uses `JournalID`, always);
-- used to decide replay/migration order (§13 uses a documented deterministic
+- decide whether one journal row's effect happened "before" another for
+  authority purposes (§9.3 uses `JournalID`, always);
+- decide replay/migration order (§13 uses a documented deterministic
   pre-migration sort, not the migrated timestamps, precisely because two
-  legacy rows can carry identical or misordered timestamps).
+  legacy rows can carry identical or misordered timestamps);
+- order the **canonical** view of history — replay, authorization, lifecycle,
+  and convergence order by `JournalID` and nothing else.
+
+`RecordedAt` **is** used to order **display-facing listings** — the readable
+timeline of §12.1 — but only there, and only as a non-causal presentation order.
 
 Two journal rows sharing an identical `RecordedAt` is expected, not an error;
-`JournalID` still totally orders them. See
-[`ordering.yaml`](../testdata/contract/ordering.yaml) for the adversarial
-cases pinning this.
+`JournalID` still totally orders them, and the timeline order breaks the tie by
+`JournalID`. See [`ordering.yaml`](../testdata/contract/ordering.yaml) for the
+adversarial cases pinning this.
+
+### 12.1 Readable timeline
+
+The whole point of `RecordedAt` is to provide a readable timeline over what
+happened, so the journal query surface exposes a **display order** over it.
+The `OrderByRecordedAt` dimension orders results by `(RecordedAt, JournalID)`:
+wall-clock time, with `JournalID` as the composite tiebreak so equal timestamps
+and backdated rows still yield a total, stable order.
+
+**Display-vs-canonical firewall.** There are two order dimensions, and they are
+kept strictly apart:
+
+- **`OrderByRecordedAt` — non-causal display order.** A readable timeline over
+  what happened. It NEVER establishes causality: no authorization, replay,
+  lifecycle, or convergence decision consults it. It is the **default for
+  display-facing listing queries** — an unqualified display query gets the
+  readable timeline — because that is what a human reading history wants first.
+- **`OrderByJournalID` — the canonical order.** The sole order for replay,
+  authorization, lifecycle, and convergence. It remains available explicitly on
+  the query surface, and it is the *only* order those causal paths ever use. The
+  timeline dimension changes nothing about them.
+
+**Composite cursor.** A timeline walk paginates with a composite **exclusive**
+cursor `(after_recorded_at, after_journal_id)`: the next page returns rows whose
+`(recorded_at, journal_id)` is strictly greater than the last row of the previous
+page. Because the tiebreak is the total `JournalID` order, the walk never skips
+or duplicates a row across equal timestamps or a backdated (timestamp-regressing)
+row. The snapshot watermark is unchanged — still `JournalID`-bounded
+(`journal_id <= snapshot`) — so a walk sees a consistent prefix of history under
+either order.
+
+**Covering index.** `CREATE INDEX idx_journal_recorded_at ON journal
+(recorded_at, journal_id)` pairs with the dimension so the timeline walk seeks and
+range-scans on `(recorded_at, journal_id)` without a filesort. The canonical order
+continues to use the `journal_id` primary key.
+
+The must-pass history
+[`ordering.yaml`](../testdata/contract/ordering.yaml)/`timeline-walk-orders-by-recordedat-with-journalid-tiebreak`
+proves a paginated timeline walk across an equal-timestamp tie and a backdated row
+returns every row exactly once in `(recorded_at, journal_id)` order, while the
+canonical `JournalID` query still returns commit order.
 
 ## 13. Legacy-baseline semantics
 

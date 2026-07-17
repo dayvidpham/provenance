@@ -107,6 +107,34 @@ func TestJournalQueryValidateRejectsNonJournalIDOrder(t *testing.T) {
 	}
 }
 
+// TestOrderDimensionExposesTimelineAndCanonical proves the display-vs-canonical
+// firewall at the type layer: both the readable-timeline display order and the
+// canonical order are exposed and valid, the zero value defaults to the timeline
+// (readable-by-default for displays), and any other dimension is rejected.
+func TestOrderDimensionExposesTimelineAndCanonical(t *testing.T) {
+	var zero OrderDimension
+	if zero != OrderByRecordedAt {
+		t.Errorf("zero-value OrderDimension = %v, want OrderByRecordedAt (the display default)", zero)
+	}
+	for _, d := range []OrderDimension{OrderByRecordedAt, OrderByJournalID} {
+		if !d.IsValid() {
+			t.Errorf("%v should be a valid, exposed order dimension", d)
+		}
+		if err := (JournalQueryV1{OrderBy: d}).Validate(); err != nil {
+			t.Errorf("exposed dimension %v rejected by Validate: %v", d, err)
+		}
+	}
+	if OrderByRecordedAt.String() != "recorded_at" {
+		t.Errorf("OrderByRecordedAt.String() = %q, want recorded_at", OrderByRecordedAt.String())
+	}
+	if OrderByJournalID.String() != "journal_id" {
+		t.Errorf("OrderByJournalID.String() = %q, want journal_id", OrderByJournalID.String())
+	}
+	if OrderByRecordedAt == OrderByJournalID {
+		t.Fatal("the display and canonical dimensions must be distinct values")
+	}
+}
+
 func TestUUIDRangeOverlapAndContains(t *testing.T) {
 	a := UUIDRange{Min: BigEndianUUID(0), Max: BigEndianUUID(1023)}
 	disjoint := UUIDRange{Min: BigEndianUUID(1024), Max: BigEndianUUID(2047)}

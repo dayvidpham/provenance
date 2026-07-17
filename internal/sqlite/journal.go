@@ -66,21 +66,26 @@ func (db *DB) ensureJournalSchema() error {
 		// re-check it. At the journal-base layer every task_event is an anchor
 		// (produced_by_operation_journal_id uniformly NULL), so all carry actor_id.
 		`CREATE TABLE IF NOT EXISTS journal (
-			JournalID   INTEGER PRIMARY KEY AUTOINCREMENT,
+			journal_id  INTEGER PRIMARY KEY AUTOINCREMENT,
 			kind_id     INTEGER NOT NULL REFERENCES journal_kinds(id),
 			actor_id    TEXT REFERENCES agents(id),
 			recorded_at INTEGER NOT NULL,
 			-- The producing operation (§2.1, §4.6). NULL at the journal-base layer;
 			-- the operations slice (dayvidpham/provenance#5) adds the FK to
-			-- journal_operations(JournalID) when that subtype table lands.
+			-- journal_operations(journal_id) when that subtype table lands.
 			produced_by_operation_journal_id INTEGER,
 			CHECK ((actor_id IS NULL) = (produced_by_operation_journal_id IS NOT NULL))
 		) STRICT`,
 		`CREATE INDEX IF NOT EXISTS idx_journal_kind  ON journal (kind_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_journal_actor ON journal (actor_id)`,
-		// task_event subtype (§5.1). PK == JournalID, class-table inheritance.
+		// Covering index for the readable-timeline display order (§12): it lets a
+		// walk ordered by (recorded_at, journal_id) with a composite exclusive cursor
+		// seek and range-scan without a filesort. The canonical journal_id order uses
+		// the PK; this index serves only the non-causal display path.
+		`CREATE INDEX IF NOT EXISTS idx_journal_recorded_at ON journal (recorded_at, journal_id)`,
+		// task_event subtype (§5.1). PK == journal_id, class-table inheritance.
 		`CREATE TABLE IF NOT EXISTS journal_task_events (
-			JournalID  INTEGER PRIMARY KEY REFERENCES journal(JournalID),
+			journal_id INTEGER PRIMARY KEY REFERENCES journal(journal_id),
 			task_id    TEXT NOT NULL REFERENCES tasks(id),
 			event_kind TEXT NOT NULL,
 			payload    TEXT NOT NULL CHECK (json_valid(payload))
@@ -90,10 +95,10 @@ func (db *DB) ensureJournalSchema() error {
 		// AttachedByJournalID permanently, so a snapshot bounded by
 		// attached_by_journal_id <= watermark is reproducible.
 		`CREATE TABLE IF NOT EXISTS journal_task_event_contexts (
-			event_journal_id       INTEGER NOT NULL REFERENCES journal_task_events(JournalID),
+			event_journal_id       INTEGER NOT NULL REFERENCES journal_task_events(journal_id),
 			context_kind           TEXT NOT NULL,
 			context_identity       TEXT NOT NULL,
-			attached_by_journal_id INTEGER NOT NULL REFERENCES journal_task_events(JournalID),
+			attached_by_journal_id INTEGER NOT NULL REFERENCES journal_task_events(journal_id),
 			PRIMARY KEY (event_journal_id, context_kind, context_identity)
 		) STRICT, WITHOUT ROWID`,
 		// Actor-namespace registry (§7.1, §7.2).
@@ -116,7 +121,7 @@ func (db *DB) ensureJournalSchema() error {
 		`CREATE TABLE IF NOT EXISTS task_attributions (
 			task_id          TEXT NOT NULL REFERENCES tasks(id),
 			actor_id         TEXT NOT NULL REFERENCES agents(id),
-			first_journal_id INTEGER NOT NULL REFERENCES journal(JournalID),
+			first_journal_id INTEGER NOT NULL REFERENCES journal(journal_id),
 			PRIMARY KEY (task_id, actor_id)
 		) STRICT, WITHOUT ROWID`,
 		// journal_attributed (§8.5): the read-only denormalized attribution surface.
@@ -127,14 +132,14 @@ func (db *DB) ensureJournalSchema() error {
 		// SQL resolved at query time, so it survives the operations slice's journal
 		// table rebuild (completeJournalOperationFK) unchanged.
 		`CREATE VIEW IF NOT EXISTS journal_attributed AS
-			SELECT j.JournalID                            AS JournalID,
+			SELECT j.journal_id                           AS journal_id,
 			       j.kind_id                              AS kind_id,
 			       COALESCE(j.actor_id, anchor.actor_id)  AS effective_actor_id,
 			       j.recorded_at                          AS recorded_at,
 			       j.produced_by_operation_journal_id     AS produced_by_operation_journal_id
 			FROM journal j
 			LEFT JOIN journal anchor
-			  ON anchor.JournalID = j.produced_by_operation_journal_id`,
+			  ON anchor.journal_id = j.produced_by_operation_journal_id`,
 	}
 	for _, stmt := range ddl {
 		if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
@@ -204,7 +209,7 @@ func (db *DB) AppendTaskEvent(in journal.AppendTaskEventInput) (journal.TaskEven
 	journalID = db.conn.LastInsertRowID()
 
 	if txErr = sqlitex.Execute(db.conn,
-		`INSERT INTO journal_task_events (JournalID, task_id, event_kind, payload)
+		`INSERT INTO journal_task_events (journal_id, task_id, event_kind, payload)
 		 VALUES (?1, ?2, ?3, ?4)`,
 		&sqlitex.ExecOptions{Args: []any{
 			journalID, in.TaskID.String(), string(in.EventKind), string(in.Payload),
@@ -320,7 +325,7 @@ func (db *DB) verifyActorPlacementLocked() error {
 		violated bool
 	)
 	if err := sqlitex.Execute(db.conn,
-		`SELECT JournalID, produced_by_operation_journal_id IS NOT NULL
+		`SELECT journal_id, produced_by_operation_journal_id IS NOT NULL
 		 FROM journal
 		 WHERE (produced_by_operation_journal_id IS NOT NULL AND actor_id IS NOT NULL)
 		    OR (produced_by_operation_journal_id IS NULL     AND actor_id IS NULL)
@@ -393,9 +398,9 @@ func (db *DB) verifySubtypeIntegrityLocked() error {
 		// Totality: a journal row of this kind with no subtype row.
 		var missing int64
 		if err := sqlitex.Execute(db.conn,
-			fmt.Sprintf(`SELECT j.JournalID FROM journal j
-				LEFT JOIN %s s ON s.JournalID = j.JournalID
-				WHERE j.kind_id = ?1 AND s.JournalID IS NULL LIMIT 1`, table),
+			fmt.Sprintf(`SELECT j.journal_id FROM journal j
+				LEFT JOIN %s s ON s.journal_id = j.journal_id
+				WHERE j.kind_id = ?1 AND s.journal_id IS NULL LIMIT 1`, table),
 			&sqlitex.ExecOptions{
 				Args:       []any{int(kind)},
 				ResultFunc: func(stmt *zs.Stmt) error { missing = stmt.ColumnInt64(0); return nil },
@@ -417,8 +422,8 @@ func (db *DB) verifySubtypeIntegrityLocked() error {
 		// subtype table).
 		var mismatch int64
 		if err := sqlitex.Execute(db.conn,
-			fmt.Sprintf(`SELECT s.JournalID FROM %s s
-				JOIN journal j ON j.JournalID = s.JournalID
+			fmt.Sprintf(`SELECT s.journal_id FROM %s s
+				JOIN journal j ON j.journal_id = s.journal_id
 				WHERE j.kind_id <> ?1 LIMIT 1`, table),
 			&sqlitex.ExecOptions{
 				Args:       []any{int(kind)},
@@ -443,11 +448,16 @@ func (db *DB) verifySubtypeIntegrityLocked() error {
 // Ordered query surface (§8.3, §12)
 // ---------------------------------------------------------------------------
 
-// QueryTaskEvents returns one page of task-event rows in strictly ascending
-// JournalID order (§12). It rejects any non-JournalID ordering before touching
-// the database (§1). The first call (SnapshotMaxJournalID == 0) pins the
-// snapshot to the current MAX(JournalID); later pages must repeat that
-// watermark and pass the previous page's AfterJournalID cursor.
+// QueryTaskEvents returns one page of task-event rows in the query's order (§12):
+// the canonical ascending journal_id (OrderByJournalID) or the readable-timeline
+// (recorded_at, journal_id) display order (OrderByRecordedAt, the default for
+// display-facing listings). It rejects an unexposed ordering before touching the
+// database (§1). The first call (SnapshotMaxJournalID == 0) pins the snapshot to
+// the current MAX(journal_id) under BOTH orders; later pages must repeat that
+// watermark and pass the previous page's cursor — AfterJournalID under the
+// canonical order, or the composite (AfterRecordedAt, AfterJournalID) under the
+// timeline order so the walk never skips or duplicates a row across equal
+// timestamps or backdated rows.
 func (db *DB) QueryTaskEvents(q journal.JournalQueryV1) (journal.JournalTaskEventPageV1, error) {
 	if err := q.Validate(); err != nil {
 		return journal.JournalTaskEventPageV1{}, err
@@ -459,7 +469,7 @@ func (db *DB) QueryTaskEvents(q journal.JournalQueryV1) (journal.JournalTaskEven
 	snapshot := int64(q.SnapshotMaxJournalID)
 	if snapshot == 0 {
 		if err := sqlitex.Execute(db.conn,
-			`SELECT COALESCE(MAX(JournalID), 0) FROM journal`,
+			`SELECT COALESCE(MAX(journal_id), 0) FROM journal`,
 			&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 				snapshot = stmt.ColumnInt64(0)
 				return nil
@@ -469,16 +479,35 @@ func (db *DB) QueryTaskEvents(q journal.JournalQueryV1) (journal.JournalTaskEven
 		}
 	}
 
-	args := []any{snapshot, int64(q.AfterJournalID)}
+	timeline := q.OrderBy == journal.OrderByRecordedAt
 	// Read the row's actor through journal_attributed (§8.5): effective_actor_id is
 	// the row's own stored actor on an anchor, or its derived anchor actor on a
 	// subordinate row — never a bare read of the (NULL-on-subordinate) actor_id
 	// column. At this layer every task_event is an anchor, so this equals the
 	// stored actor; the derived surface keeps the read correct once operations land.
-	sql := `SELECT j.JournalID, j.effective_actor_id, j.recorded_at, te.task_id, te.event_kind, te.payload
-		FROM journal_attributed j JOIN journal_task_events te ON te.JournalID = j.JournalID
-		WHERE j.JournalID <= ?1 AND j.JournalID > ?2`
-	next := 3
+	//
+	// The snapshot is journal_id-bounded under both orders (`j.journal_id <= ?1`).
+	// The exclusive cursor differs: the canonical order advances on journal_id
+	// alone; the timeline order advances on the composite (recorded_at, journal_id)
+	// so ties and backdated rows neither drop nor repeat across the page boundary.
+	var sql string
+	var args []any
+	var next int
+	if timeline {
+		afterRecordedAt := q.AfterRecordedAt.UTC().UnixNano()
+		sql = `SELECT j.journal_id, j.effective_actor_id, j.recorded_at, te.task_id, te.event_kind, te.payload
+			FROM journal_attributed j JOIN journal_task_events te ON te.journal_id = j.journal_id
+			WHERE j.journal_id <= ?1
+			  AND (j.recorded_at > ?2 OR (j.recorded_at = ?2 AND j.journal_id > ?3))`
+		args = []any{snapshot, afterRecordedAt, int64(q.AfterJournalID)}
+		next = 4
+	} else {
+		sql = `SELECT j.journal_id, j.effective_actor_id, j.recorded_at, te.task_id, te.event_kind, te.payload
+			FROM journal_attributed j JOIN journal_task_events te ON te.journal_id = j.journal_id
+			WHERE j.journal_id <= ?1 AND j.journal_id > ?2`
+		args = []any{snapshot, int64(q.AfterJournalID)}
+		next = 3
+	}
 	if len(q.TaskIDs) > 0 {
 		sql += " AND te.task_id IN ("
 		for i, id := range q.TaskIDs {
@@ -508,7 +537,7 @@ func (db *DB) QueryTaskEvents(q journal.JournalQueryV1) (journal.JournalTaskEven
 		// matches if it carries ANY of the requested (kind, identity) context
 		// pairs. EXISTS against journal_task_event_contexts keeps the outer
 		// query from fanning out into duplicate rows per matching context edge.
-		sql += " AND EXISTS (SELECT 1 FROM journal_task_event_contexts ctx WHERE ctx.event_journal_id = te.JournalID AND ("
+		sql += " AND EXISTS (SELECT 1 FROM journal_task_event_contexts ctx WHERE ctx.event_journal_id = te.journal_id AND ("
 		for i, ctx := range q.Contexts {
 			kind, identity, encErr := journal.EncodeStoredEventContext(ctx)
 			if encErr != nil {
@@ -523,7 +552,11 @@ func (db *DB) QueryTaskEvents(q journal.JournalQueryV1) (journal.JournalTaskEven
 		}
 		sql += "))"
 	}
-	sql += " ORDER BY j.JournalID ASC"
+	if timeline {
+		sql += " ORDER BY j.recorded_at ASC, j.journal_id ASC"
+	} else {
+		sql += " ORDER BY j.journal_id ASC"
+	}
 	fetch := q.Limit
 	if fetch > 0 {
 		sql += fmt.Sprintf(" LIMIT %d", fetch+1) // +1 to detect a further page
@@ -547,11 +580,17 @@ func (db *DB) QueryTaskEvents(q journal.JournalQueryV1) (journal.JournalTaskEven
 	page := journal.JournalTaskEventPageV1{SnapshotMaxJournalID: journal.JournalID(snapshot)}
 	if fetch > 0 && len(rows) > fetch {
 		rows = rows[:fetch]
-		last := rows[len(rows)-1].JournalID
-		page.Next = &journal.JournalCursorV1{
+		last := rows[len(rows)-1]
+		next := &journal.JournalCursorV1{
 			SnapshotMaxJournalID: journal.JournalID(snapshot),
-			AfterJournalID:       last,
+			AfterJournalID:       last.JournalID,
 		}
+		if timeline {
+			// Composite cursor: carry the last row's RecordedAt so the next page
+			// resumes at (recorded_at, journal_id) exactly after this row.
+			next.AfterRecordedAt = last.RecordedAt
+		}
+		page.Next = next
 	}
 	// Attach each row's canonical context set.
 	for i := range rows {

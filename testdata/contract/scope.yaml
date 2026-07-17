@@ -27,6 +27,7 @@ operators:
   # --- s1.1: executable now against journal-base production code -------------
   - {operator: order-by-journalid,                          slice: s1.1}
   - {operator: order-by-journalid-concurrent,               slice: s1.1}
+  - {operator: order-by-recordedat-timeline,                slice: s1.1, reason: readable-timeline display order (§12)}
   - {operator: reject-non-journalid-order-request,          slice: s1.1}
   - {operator: claim-two-disjoint-namespaces,               slice: s1.1}
   - {operator: claim-overlapping-namespace,                 slice: s1.1}
