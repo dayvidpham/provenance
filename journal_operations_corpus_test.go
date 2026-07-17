@@ -33,18 +33,19 @@ var s12Operators = map[testcorpus.OperatorName]s11Handler{
 	"lookup-committed-emitted-events-from-closure":     opLookupCommittedEmittedEventsFromClosure,
 	"reject-result-slot-referencing-foreign-operation": opRejectResultSlotForeignOperation,
 	// authority_evidence.yaml (§9.3, §14)
-	"fold-sequentially-check-effect2-sees-effect1":     opFoldSequentiallyEffect2SeesEffect1,
-	"start-with-orphaned-predecessor":                  opStartWithOrphanedPredecessor,
-	"two-successors-same-predecessor":                  opTwoSuccessorsSamePredecessor,
-	"authority-unrelated":                              opAuthorityUnrelated,
-	"blocked-by-edge-does-not-grant-authority":         opBlockedByEdgeDoesNotGrantAuthority,
-	"transitive-parent-citation-grants-authority":      opTransitiveParentCitationGrantsAuthority,
-	"parent-chain-middle-episode-ended-cuts-authority": opParentChainMiddleEndedCutsAuthority,
-	"citation-of-inactive-parent-at-start-rejected":    opCitationOfInactiveParentRejected,
-	"corrupted-cyclic-parent-chain-fails-closed":       opCorruptedCyclicParentChainFailsClosed,
-	"produce-subordinate-row-carrying-actor":           opProduceSubordinateRowCarryingActor,
-	"end-episode-never-started":                        opEndEpisodeNeverStarted,
-	"batch-ended-before-started":                       opBatchEndedBeforeStarted,
+	"fold-sequentially-check-effect2-sees-effect1":            opFoldSequentiallyEffect2SeesEffect1,
+	"start-with-orphaned-predecessor":                         opStartWithOrphanedPredecessor,
+	"two-successors-same-predecessor":                         opTwoSuccessorsSamePredecessor,
+	"authority-unrelated":                                     opAuthorityUnrelated,
+	"blocked-by-scheduling-edge-does-not-grant-authority":     opBlockedByEdgeDoesNotGrantAuthority,
+	"transitive-parent-citation-grants-authority":             opTransitiveParentCitationGrantsAuthority,
+	"parent-chain-middle-episode-ended-cuts-authority":        opParentChainMiddleEndedCutsAuthority,
+	"parent-chain-middle-ended-same-operation-cuts-authority": opParentChainMiddleEndedSameOperationCutsAuthority,
+	"citation-of-inactive-parent-at-start-rejected":           opCitationOfInactiveParentRejected,
+	"corrupted-cyclic-parent-chain-fails-closed":              opCorruptedCyclicParentChainFailsClosed,
+	"produce-subordinate-row-carrying-actor":                  opProduceSubordinateRowCarryingActor,
+	"end-episode-never-started":                               opEndEpisodeNeverStarted,
+	"batch-ended-before-started":                              opBatchEndedBeforeStarted,
 	// owner_responsibility.yaml (§4.4, §8.1, §8.2, §9.6)
 	"close-task-with-active-assignment":        opCloseTaskWithActiveAssignment,
 	"close-task-omit-ended-transition":         opCloseTaskOmitEndedTransition,
@@ -629,6 +630,50 @@ func opParentChainMiddleEndedCutsAuthority(t *testing.T, input, expected anyMap,
 		Effects: []Effect{{Sort: EffectTaskEvent, TaskID: subtask, EventKind: "provenance.task.updated"}},
 	})
 	return expectRejected(err, ErrAuthorityScope, "a grandchild effect after the middle chain episode ended")
+}
+
+// opParentChainMiddleEndedSameOperationCutsAuthority proves §14.5 whole-chain
+// liveness holds WITHIN a single operation's per-effect fold (§9.3.1), not only
+// across separate Apply calls (opParentChainMiddleEndedCutsAuthority covers the
+// cross-operation cut). One operation batches two effects on the
+// supervisor <- worker <- helper citation chain: effect 1 ends the MIDDLE (worker)
+// episode E-WRK, and effect 2 mutates the helper's subtask under the supervisor
+// authority. Because each effect is authorized against the state produced by all
+// earlier effects of the same operation, effect 2 must see effect 1's just-ended
+// middle episode and the supervisor's transitive reach to the subtask is already
+// cut — the whole operation is rejected with ErrAuthorityScope and nothing is
+// committed. This mirrors opFoldSequentiallyEffect2SeesEffect1's
+// two-effects-in-one-op shape, but exercises the §14.5 parent-citation governance
+// walk rather than the pre-existing predecessor/successor succession path.
+func opParentChainMiddleEndedSameOperationCutsAuthority(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
+	env := newOpsEnv(t)
+	boot := env.genesis(t, "op-genesis")
+	epic := env.taskFor(t, "epic")
+	story := env.taskFor(t, "story")
+	subtask := env.taskFor(t, "subtask")
+	// E-SUP on epic (no parent); its started transition is the supervisor authority.
+	supAuth := env.startEpisode(t, "op-start-sup", boot, epic, "E-SUP", env.actorFor(t, "supervisor"))
+	// E-WRK on story cites E-SUP; E-HLP on subtask cites E-WRK.
+	env.startEpisodeWithParent(t, "op-start-wrk", boot, story, "E-WRK", "E-SUP", env.actorFor(t, "worker"))
+	env.startEpisodeWithParent(t, "op-start-hlp", boot, subtask, "E-HLP", "E-WRK", env.actorFor(t, "helper"))
+	// ONE operation batches: (1) end the MIDDLE episode E-WRK on the story, (2) a
+	// subtask effect under the supervisor authority. Effect 1 is authorized because
+	// the chain E-WRK -> E-SUP is still active at effect 1's journal position; effect
+	// 2 then folds against effect 1's just-inserted ended-E-WRK transition, so the
+	// helper's chain to the supervisor is broken and the supervisor authority no
+	// longer reaches the subtask (§9.3.1, §14.5). The whole operation is rejected.
+	_, err := env.tr.Journal().Apply(OperationInput{
+		OperationID:        opID(input, "op-end-middle-then-grandchild-effect"),
+		ActorID:            env.actor,
+		AuthorityJournalID: &supAuth,
+		CommandDigest:      env.digest("c"),
+		MutationDigest:     env.digest("m"),
+		Effects: []Effect{
+			{Sort: EffectAssignmentEnd, AssignmentID: "E-WRK", TaskID: story, SlotID: SlotOwnerResponsibility},
+			{Sort: EffectTaskEvent, TaskID: subtask, EventKind: "provenance.task.updated"},
+		},
+	})
+	return expectRejected(err, ErrAuthorityScope, "a same-operation grandchild effect after effect 1 ended the middle chain episode")
 }
 
 // opCitationOfInactiveParentRejected proves §14.5 citation validity: citing an

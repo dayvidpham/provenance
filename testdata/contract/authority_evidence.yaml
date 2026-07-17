@@ -95,7 +95,7 @@ cases:
         reject the over-grant. Any broader governance chain (e.g. a genuine
         governing-parent relation) requires a contract amendment before
         implementation (§14.1 authority note).
-      operator: blocked-by-edge-does-not-grant-authority
+      operator: blocked-by-scheduling-edge-does-not-grant-authority
     input:
       authorityTask: prereq
       targetTask: dependent
@@ -192,6 +192,34 @@ cases:
     expected:
       accepted: false
       reason: whole-chain-liveness-broken-by-ended-middle-episode
+
+  - name: parent-chain-middle-ended-same-operation-cuts-authority
+    classification: must-fail
+    provenance: {source: bug, ref: "same-operation regression: §14.5 whole-chain liveness must hold WITHIN one operation's per-effect fold, not only across operations"}
+    mutation:
+      description: >-
+        The same supervisor -> worker -> helper citation chain, but the cut
+        happens WITHIN a single operation. One operation batches two effects:
+        effect 1 ends the middle (worker) episode on the story, and effect 2
+        mutates the helper's subtask under the supervisor authority. Per the
+        per-effect fold (§9.3.1) each effect is authorized against the state
+        produced by all earlier effects of the same operation, so effect 2 must
+        see effect 1's just-ended middle episode and the supervisor's transitive
+        reach to the subtask is already cut — the whole operation is rejected and
+        nothing is committed. This mirrors the predecessor/successor
+        same-operation fold case (effect-authorized-against-state-at-own-journalid)
+        for the §14.5 parent-citation governance walk rather than for the
+        pre-existing succession path.
+      operator: parent-chain-middle-ended-same-operation-cuts-authority
+    input:
+      operationId: op-end-middle-then-grandchild-effect
+      chain: [{episode: E-SUP, task: epic, parent: null}, {episode: E-WRK, task: story, parent: E-SUP}, {episode: E-HLP, task: subtask, parent: E-WRK}]
+      effects:
+        - {index: 1, kind: authority, transition: ended, task: story, slot: owner-responsibility, assignment: E-WRK}
+        - {index: 2, kind: task_event, task: subtask, eventKind: provenance.task.updated, authorityEpisode: E-SUP}
+    expected:
+      accepted: false
+      reason: effect-2-sees-effect-1-ended-middle-episode-cutting-whole-chain-liveness
 
   - name: citation-of-inactive-parent-at-start-rejected
     classification: must-fail

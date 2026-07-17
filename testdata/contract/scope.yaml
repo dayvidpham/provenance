@@ -48,10 +48,11 @@ operators:
   - {operator: lookup-committed-emitted-events-from-closure, slice: s1.2, reason: produced-row closure}
   - {operator: lookup-committed-reconstruct-result-slots,   slice: s1.2, reason: result-slot reconstruction}
   - {operator: reject-result-slot-referencing-foreign-operation, slice: s1.2, reason: result-slot own-operation integrity (rule 9)}
-  - {operator: blocked-by-edge-does-not-grant-authority,    slice: s1.2, reason: authority}
+  - {operator: blocked-by-scheduling-edge-does-not-grant-authority, slice: s1.2, reason: authority}
   - {operator: authority-unrelated,                         slice: s1.2, reason: authority}
   - {operator: transitive-parent-citation-grants-authority, slice: s1.2, reason: parent-citation governance (§14.5)}
   - {operator: parent-chain-middle-episode-ended-cuts-authority, slice: s1.2, reason: parent-citation whole-chain liveness (§14.5)}
+  - {operator: parent-chain-middle-ended-same-operation-cuts-authority, slice: s1.2, reason: "parent-citation whole-chain liveness within one operation's per-effect fold (§9.3.1 / §14.5)"}
   - {operator: citation-of-inactive-parent-at-start-rejected, slice: s1.2, reason: parent-citation validity at start (§14.5)}
   - {operator: corrupted-cyclic-parent-chain-fails-closed,  slice: s1.2, reason: parent-citation bounded fail-closed walk (§14.5)}
   - {operator: batch-ended-before-started,                  slice: s1.2, reason: assignment lifecycle order}
