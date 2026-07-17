@@ -52,7 +52,7 @@ operators:
   - {operator: batch-ended-before-started,                  slice: s1.2, reason: assignment lifecycle order}
   - {operator: end-episode-never-started,                   slice: s1.2, reason: assignment lifecycle order}
   - {operator: fold-sequentially-check-effect2-sees-effect1, slice: s1.2, reason: per-effect authorization}
-  - {operator: produce-effect-with-actor-differing-from-anchor, slice: s1.2, reason: committing-actor agreement}
+  - {operator: produce-subordinate-row-carrying-actor,      slice: s1.2, reason: anchor-only actor placement (§10 rule 5)}
   - {operator: start-with-orphaned-predecessor,             slice: s1.2, reason: orphaned-evidence rejection}
   - {operator: two-successors-same-predecessor,             slice: s1.2, reason: single-consumption evidence}
   - {operator: attribute-episode-occupant-not-committer,    slice: s1.2, reason: assignment-episode attribution}

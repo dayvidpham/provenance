@@ -121,24 +121,29 @@ cases:
       accepted: true
       reason: exact-replay-skips-current-authority-check
 
-  - name: effect-actor-mismatches-anchor-rejected
+  - name: subordinate-row-carrying-actor-rejected
     classification: must-fail
-    provenance: {source: requirement, ref: "provenance#4 amendment §2.1 committing-actor model; §10 totality rule 5"}
+    provenance: {source: requirement, ref: "provenance#4 amendment §2.1 anchor-only actor placement; §10 totality rule 5"}
     mutation:
       description: >-
-        An operation whose anchor row carries ActorID = actor-alice produces an
-        effect row (a task_event) stamped with a different journal.ActorID
-        (actor-bob). Because every produced row's committing actor must equal
-        its anchor's actor (controlled denormalization, §2.1), the reducer must
-        reject the mismatched effect before commit.
-      operator: produce-effect-with-actor-differing-from-anchor
+        A subordinate (operation-produced) journal row is written carrying a
+        stored actor_id at all — the new-model violation. Under anchor-only
+        placement (§2.1) a subordinate row's actor_id must be NULL and its
+        committing actor derived from its anchor (§8.5); a stored actor on a
+        subordinate row is structurally forbidden. Driven via the adversarial
+        seam that bypasses the CHECK constraint so the reducer/VerifyIntegrity
+        placement guard (§10 rule 5) is exercised directly, it must be rejected
+        before commit. (Disagreement between a produced row's actor and its
+        anchor is no longer expressible — the column is simply absent — so the
+        retired committing-actor-agreement case is replaced by this one.)
+      operator: produce-subordinate-row-carrying-actor
     input:
-      operationId: op-actor-mismatch-1
+      operationId: op-subordinate-actor-1
       anchorActor: actor-alice
-      effect: {kind: task_event, task: t1, eventKind: "provenance.task.updated", actor: actor-bob}
+      subordinateRow: {kind: task_event, task: t1, eventKind: "provenance.task.updated", carriesActor: true}
     expected:
       accepted: false
-      reason: effect-actor-differs-from-anchor
+      reason: subordinate-row-carries-actor
 
   - name: ended-transition-without-started-rejected
     classification: must-fail
