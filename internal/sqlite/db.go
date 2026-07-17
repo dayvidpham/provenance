@@ -168,7 +168,16 @@ func (db *DB) ensureSchema(models []ptypes.ModelEntry) error {
 			created_at   INTEGER NOT NULL,
 			updated_at   INTEGER NOT NULL,
 			closed_at    INTEGER,
-			close_reason TEXT NOT NULL DEFAULT ''
+			close_reason TEXT NOT NULL DEFAULT '',
+			-- Projection watermark (docs/journal-relational-contract.md §8.1): the
+			-- JournalID whose ordered history this row's derived state reflects.
+			-- Nullable at the journal-base layer because the existing direct-write
+			-- task path predates the shared reducer; the reducer slice
+			-- (dayvidpham/provenance#5) makes every task write flow through Apply
+			-- and tightens this to NOT NULL. FK target journal(JournalID) is
+			-- created by ensureJournalSchema (SQLite resolves cross-table FKs at
+			-- row time, not at CREATE).
+			last_journal_id INTEGER REFERENCES journal(JournalID)
 		) STRICT`,
 		`CREATE INDEX IF NOT EXISTS idx_tasks_namespace ON tasks (namespace)`,
 		`CREATE INDEX IF NOT EXISTS idx_tasks_status    ON tasks (status_id)`,
@@ -219,7 +228,10 @@ func (db *DB) ensureSchema(models []ptypes.ModelEntry) error {
 			return fmt.Errorf("ensureSchema: %w — statement: %s", err, stmt[:min(len(stmt), 80)])
 		}
 	}
-	return db.seedReferenceData(models)
+	if err := db.seedReferenceData(models); err != nil {
+		return err
+	}
+	return db.ensureJournalSchema()
 }
 
 // ---------------------------------------------------------------------------
