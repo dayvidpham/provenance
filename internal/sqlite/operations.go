@@ -30,11 +30,6 @@ const (
 
 	transitionStartedID = int(journal.TransitionStarted)
 	transitionEndedID   = int(journal.TransitionEnded)
-
-	// blockedByEdgeKindID is edge_kinds.id for 'blocked_by' (db.go seed). A
-	// task's governing-parent chain is walked over these edges: source blocked_by
-	// target means target is an ancestor that may govern source (§9.3 governance).
-	blockedByEdgeKindID = 0
 )
 
 // slotDBID maps a typed AssignmentSlotID to its assignment_slots.id. Only
@@ -121,7 +116,10 @@ func (db *DB) ensureOperationsSchema() error {
 			content_digest BLOB NOT NULL,
 			payload        TEXT NOT NULL CHECK (json_valid(payload))
 		) STRICT`,
-		`CREATE INDEX IF NOT EXISTS idx_journal_pboj ON journal (produced_by_operation_journal_id)`,
+		// idx_journal_pboj is owned solely by the journal rebuild in
+		// completeJournalOperationFK (which drops and recreates the journal table),
+		// so it is deliberately NOT created here — creating it in both places would
+		// build it, drop it, then rebuild it on a first open (§ single-owner index).
 		`CREATE INDEX IF NOT EXISTS idx_transitions_assignment ON journal_authority_assignment_transitions (assignment_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_episodes_task ON journal_authority_assignment_episodes (task_id)`,
 	}
@@ -170,6 +168,13 @@ func (db *DB) completeJournalOperationFK() error {
 	if err := sqlitex.ExecuteTransient(db.conn, `PRAGMA foreign_keys=OFF`, nil); err != nil {
 		return fmt.Errorf("completeJournalOperationFK: disable FK enforcement: %w", err)
 	}
+	// Restore FK enforcement no matter how the rebuild ends (commit, rollback on a
+	// step error, or rollback on a detected violation). PRAGMA foreign_keys=ON is
+	// itself a no-op inside a transaction, so it runs here in autocommit after the
+	// transaction has already ended.
+	defer func() { _ = sqlitex.ExecuteTransient(db.conn, `PRAGMA foreign_keys=ON`, nil) }()
+	// Steps 3-9 of the canonical SQLite 12-step table rebuild, up to but NOT
+	// including COMMIT. idx_journal_pboj is created here (its single owner).
 	rebuild := []string{
 		`BEGIN IMMEDIATE`,
 		`CREATE TABLE journal_new (
@@ -186,27 +191,33 @@ func (db *DB) completeJournalOperationFK() error {
 		`CREATE INDEX IF NOT EXISTS idx_journal_kind  ON journal (kind_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_journal_actor ON journal (actor_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_journal_pboj  ON journal (produced_by_operation_journal_id)`,
-		`COMMIT`,
 	}
 	for _, stmt := range rebuild {
 		if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
 			_ = sqlitex.ExecuteTransient(db.conn, `ROLLBACK`, nil)
-			_ = sqlitex.ExecuteTransient(db.conn, `PRAGMA foreign_keys=ON`, nil)
 			return fmt.Errorf("completeJournalOperationFK: rebuild step %q: %w", stmt[:min(len(stmt), 40)], err)
 		}
 	}
+	// Step 10 of the canonical rebuild: foreign_key_check runs INSIDE the
+	// transaction, before COMMIT, so a detected violation ROLLBACKs the whole
+	// rebuild atomically rather than leaving a corrupt journal durably committed.
+	// (foreign_key_check IS permitted inside a transaction; only the
+	// foreign_keys=ON/OFF toggle is the no-op-inside-a-tx pragma handled above.)
 	var violations int
 	if err := sqlitex.ExecuteTransient(db.conn, `PRAGMA foreign_key_check`,
 		&sqlitex.ExecOptions{ResultFunc: func(*zs.Stmt) error { violations++; return nil }}); err != nil {
+		_ = sqlitex.ExecuteTransient(db.conn, `ROLLBACK`, nil)
 		return fmt.Errorf("completeJournalOperationFK: foreign_key_check: %w", err)
 	}
-	if err := sqlitex.ExecuteTransient(db.conn, `PRAGMA foreign_keys=ON`, nil); err != nil {
-		return fmt.Errorf("completeJournalOperationFK: re-enable FK enforcement: %w", err)
-	}
 	if violations > 0 {
-		return fmt.Errorf("completeJournalOperationFK: rebuild left %d foreign-key violations — "+
-			"where: journal FK completion; impact: the database is not converged; "+
+		_ = sqlitex.ExecuteTransient(db.conn, `ROLLBACK`, nil)
+		return fmt.Errorf("completeJournalOperationFK: rebuild left %d foreign-key violations, rolled back — "+
+			"where: journal FK completion; impact: the rebuild was reverted and the database left unchanged; "+
 			"fix: this indicates a producing operation referenced by a journal row does not exist", violations)
+	}
+	if err := sqlitex.ExecuteTransient(db.conn, `COMMIT`, nil); err != nil {
+		_ = sqlitex.ExecuteTransient(db.conn, `ROLLBACK`, nil)
+		return fmt.Errorf("completeJournalOperationFK: commit rebuild: %w", err)
 	}
 	return nil
 }
@@ -264,23 +275,15 @@ func (db *DB) Apply(in journal.OperationInput) (journal.CommittedResult, error) 
 		return journal.CommittedResult{}, txErr
 	}
 	if found {
-		if field, ok := identityMismatch(existing.identity, journal.StoredOperationIdentity{
-			ActorID:            in.ActorID,
-			AuthorityJournalID: in.AuthorityJournalID,
-			CommandDigest:      in.CommandDigest,
-			MutationDigest:     in.MutationDigest,
-		}); !ok {
-			conflict := &journal.OperationConflict{OperationID: in.OperationID, Field: field}
-			txErr = fmt.Errorf("%w: %s", journal.ErrOperationConflict, conflict.Error())
-			return journal.CommittedResult{}, txErr
-		}
-		res, err := db.reconstructCommittedLocked(existing.anchor)
+		// A committed row for this OperationID already exists: an exact four-field
+		// identity match short-circuits (§9.4), any mismatch is the typed
+		// CommittedConflict (§11). Either way no effect is folded and nothing is
+		// written; on a conflict txErr is set so the transaction rolls back.
+		res, err := db.committedOutcomeForExistingLocked(in, existing)
 		if err != nil {
 			txErr = err
-			return journal.CommittedResult{}, txErr
 		}
-		res.ShortCircuited = true
-		return res, nil // commit (no writes performed)
+		return res, err
 	}
 
 	// New operation: genesis discipline (§4.6, §10 rules 6-7).
@@ -302,6 +305,19 @@ func (db *DB) Apply(in journal.OperationInput) (journal.CommittedResult, error) 
 		return journal.CommittedResult{}, txErr
 	}
 	if err := db.insertOperationRowLocked(anchorJID, in); err != nil {
+		if isUniqueViolation(err) {
+			// §9.6 bullet 2 (defense-in-depth): a concurrent writer committed this
+			// new OperationID first, so the anchor insert violates
+			// journal_operations.OperationID UNIQUE. Translate the raw constraint
+			// error into the typed idempotent/conflict outcome the caller is
+			// promised — never a raw SQLite error. Unreachable under the in-process
+			// db.mu (which serializes Apply end-to-end so the §9.4 lookup above
+			// always observes a concurrent writer's committed row first), but
+			// honoured for a future multi-connection/multi-process writer.
+			res, rErr := db.resolveOperationIDInsertRaceLocked(in)
+			txErr = rErr
+			return res, rErr
+		}
 		txErr = err
 		return journal.CommittedResult{}, txErr
 	}
@@ -374,9 +390,9 @@ func (db *DB) foldEffectLocked(in journal.OperationInput, anchorJID int64, eff j
 	case journal.EffectAssignmentEnd:
 		return jid, db.foldAssignmentEndLocked(in, jid, eff)
 	case journal.EffectDecision:
-		return jid, db.foldDecisionLocked(jid, eff)
+		return jid, db.foldDecisionLocked(in, jid, eff)
 	case journal.EffectEvidence:
-		return jid, db.foldEvidenceLocked(jid, eff)
+		return jid, db.foldEvidenceLocked(in, jid, eff)
 	default:
 		return 0, fmt.Errorf("Apply: operation %q effect %d has unknown sort %s", in.OperationID, index, eff.Sort)
 	}
@@ -548,14 +564,21 @@ func (db *DB) foldAssignmentEndLocked(in journal.OperationInput, jid int64, eff 
 	return db.recomputeTaskOwnerLocked(task, jid)
 }
 
-func (db *DB) foldDecisionLocked(jid int64, eff journal.Effect) error {
+func (db *DB) foldDecisionLocked(in journal.OperationInput, jid int64, eff journal.Effect) error {
+	// §9.3 names journal_decisions as a consuming effect: a task-scoped decision is
+	// authorized against the operation's authority at this effect's own JournalID,
+	// exactly like a task_event. An untasked decision (§6.1 permits a NULL task_id)
+	// legitimately skips the governance check.
+	var taskID any
+	if eff.TaskID.Namespace != "" {
+		if err := db.requireAuthorityGovernsLocked(in, jid, eff.TaskID); err != nil {
+			return err
+		}
+		taskID = eff.TaskID.String()
+	}
 	payload := eff.Payload
 	if len(payload) == 0 {
 		payload = json.RawMessage(`{}`)
-	}
-	var taskID any
-	if eff.TaskID.Namespace != "" {
-		taskID = eff.TaskID.String()
 	}
 	if err := sqlitex.Execute(db.conn,
 		`INSERT INTO journal_decisions (JournalID, decision_kind, task_id, payload) VALUES (?1, ?2, ?3, ?4)`,
@@ -565,14 +588,20 @@ func (db *DB) foldDecisionLocked(jid int64, eff journal.Effect) error {
 	return nil
 }
 
-func (db *DB) foldEvidenceLocked(jid int64, eff journal.Effect) error {
+func (db *DB) foldEvidenceLocked(in journal.OperationInput, jid int64, eff journal.Effect) error {
+	// §9.3 names journal_evidence as a consuming effect: a task-scoped evidence row
+	// is authorized against the operation's authority at this effect's own
+	// JournalID. An untasked evidence row (§6.2 permits a NULL task_id) skips it.
+	var taskID any
+	if eff.TaskID.Namespace != "" {
+		if err := db.requireAuthorityGovernsLocked(in, jid, eff.TaskID); err != nil {
+			return err
+		}
+		taskID = eff.TaskID.String()
+	}
 	payload := eff.Payload
 	if len(payload) == 0 {
 		payload = json.RawMessage(`{}`)
-	}
-	var taskID any
-	if eff.TaskID.Namespace != "" {
-		taskID = eff.TaskID.String()
 	}
 	if err := sqlitex.Execute(db.conn,
 		`INSERT INTO journal_evidence (JournalID, evidence_kind, task_id, content_digest, payload) VALUES (?1, ?2, ?3, ?4, ?5)`,

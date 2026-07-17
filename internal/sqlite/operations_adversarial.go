@@ -119,3 +119,18 @@ func (db *DB) AdversarialForeignResultSlotRejected(anchorOp, foreignProduced jou
 	defer db.mu.Unlock()
 	return db.requireResultSlotOwnOperationLocked(int64(anchorOp), int64(foreignProduced))
 }
+
+// AdversarialResolveOperationIDInsertRace drives the §9.6-bullet-2 race-translation
+// path (resolveOperationIDInsertRaceLocked) directly. Under the in-process db.mu
+// that path is unreachable — Apply's §9.4 lookup always observes a concurrent
+// writer's committed row before reaching the anchor insert — so this seam invokes
+// the translation the reducer runs when the anchor insert loses the UNIQUE race:
+// it re-reads the now-committed row for in.OperationID and returns the typed
+// idempotent result or typed CommittedConflict the caller is promised, never a raw
+// SQLite constraint error. It writes nothing. Callers pass an input whose
+// OperationID is already committed (simulating the winner's row).
+func (db *DB) AdversarialResolveOperationIDInsertRace(in journal.OperationInput) (journal.CommittedResult, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.resolveOperationIDInsertRaceLocked(in)
+}

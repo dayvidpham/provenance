@@ -47,7 +47,7 @@ operators:
   - {operator: lookup-committed-emitted-events-from-closure, slice: s1.2, reason: produced-row closure}
   - {operator: lookup-committed-reconstruct-result-slots,   slice: s1.2, reason: result-slot reconstruction}
   - {operator: reject-result-slot-referencing-foreign-operation, slice: s1.2, reason: result-slot own-operation integrity (rule 9)}
-  - {operator: authority-governing-parent,                  slice: s1.2, reason: authority}
+  - {operator: blocked-by-edge-does-not-grant-authority,    slice: s1.2, reason: authority}
   - {operator: authority-unrelated,                         slice: s1.2, reason: authority}
   - {operator: batch-ended-before-started,                  slice: s1.2, reason: assignment lifecycle order}
   - {operator: end-episode-never-started,                   slice: s1.2, reason: assignment lifecycle order}

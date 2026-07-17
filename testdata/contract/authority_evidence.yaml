@@ -80,21 +80,28 @@ cases:
     expected:
       allowed: false
 
-  - name: active-parent-authority-governs-child-task
-    classification: must-pass
-    provenance: {source: requirement, ref: "provenance#5 governing-parent role"}
+  - name: blocked-by-scheduling-edge-does-not-grant-authority
+    classification: must-fail
+    provenance: {source: bug, ref: "authorization over-grant: scheduling edges (blocked_by) carry no ownership semantics"}
     mutation:
       description: >-
-        An authority whose assignment is on a governing-parent task is
-        permitted to mutate a child task reachable through an active
-        parent/ancestor assignment chain.
-      operator: authority-governing-parent
+        Two organizationally unrelated tasks are linked only by a blocked_by
+        scheduling edge (dependent blocked_by prereq: the prereq must finish
+        before the dependent, a pure ordering constraint with no ownership
+        meaning). An authority whose active assignment is on the prereq task
+        attempts to mutate the unrelated dependent task. An assignment
+        authority governs ONLY its own active episode's task; a task merely
+        reachable through a scheduling edge is NOT governed, so the reducer must
+        reject the over-grant. Any broader governance chain (e.g. a genuine
+        governing-parent relation) requires a contract amendment before
+        implementation (§14.1 authority note).
+      operator: blocked-by-edge-does-not-grant-authority
     input:
-      authorityTask: parent1
-      targetTask: child1
-      topology: active-parent-chain
+      authorityTask: prereq
+      targetTask: dependent
+      topology: blocked-by-only
     expected:
-      allowed: true
+      allowed: false
 
   - name: ended-authority-exact-replay-still-succeeds
     classification: must-pass

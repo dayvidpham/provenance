@@ -37,7 +37,7 @@ var s12Operators = map[testcorpus.OperatorName]s11Handler{
 	"start-with-orphaned-predecessor":                 opStartWithOrphanedPredecessor,
 	"two-successors-same-predecessor":                 opTwoSuccessorsSamePredecessor,
 	"authority-unrelated":                             opAuthorityUnrelated,
-	"authority-governing-parent":                      opAuthorityGoverningParent,
+	"blocked-by-edge-does-not-grant-authority":        opBlockedByEdgeDoesNotGrantAuthority,
 	"produce-effect-with-actor-differing-from-anchor": opProduceEffectActorMismatch,
 	"end-episode-never-started":                       opEndEpisodeNeverStarted,
 	"batch-ended-before-started":                      opBatchEndedBeforeStarted,
@@ -506,29 +506,31 @@ func opAuthorityUnrelated(t *testing.T, input, expected anyMap, _ testcorpus.Cla
 	return expectRejected(err, ErrAuthorityScope, "an unrelated assignment authority")
 }
 
-func opAuthorityGoverningParent(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
+// opBlockedByEdgeDoesNotGrantAuthority proves a scheduling edge (blocked_by)
+// grants no authority: an assignment authority on a prereq task must NOT be able
+// to mutate an organizationally unrelated task that merely lists the prereq as a
+// scheduling blocker. An assignment authority governs ONLY its own active
+// episode's task (§14.1 — no edge-graph governance without a contract amendment).
+func opBlockedByEdgeDoesNotGrantAuthority(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
 	env := newOpsEnv(t)
 	boot := env.genesis(t, "op-genesis")
-	parent := env.taskFor(t, "parent1")
-	child := env.taskFor(t, "child1")
-	// child blocked_by parent → parent is a governing ancestor of child.
-	if err := env.tr.AddEdge(child, parent.String(), EdgeBlockedBy); err != nil {
-		return fmt.Errorf("add governing-parent edge: %w", err)
+	prereq := env.taskFor(t, "unrelated-prereq")
+	dependent := env.taskFor(t, "unrelated-dependent")
+	// dependent blocked_by prereq: a pure scheduling constraint (prereq must
+	// finish before dependent), carrying no ownership/governance semantics.
+	if err := env.tr.AddEdge(dependent, prereq.String(), EdgeBlockedBy); err != nil {
+		return fmt.Errorf("add blocked_by scheduling edge: %w", err)
 	}
 	occupant := env.actorFor(t, "occ")
-	auth := env.startEpisode(t, "op-seed-auth", boot, parent, "PAUTH", occupant)
-	res, err := env.tr.Journal().Apply(OperationInput{
-		OperationID: "op-governed-1", ActorID: env.actor, AuthorityJournalID: &auth,
+	// Authority scoped ONLY to prereq.
+	auth := env.startEpisode(t, "op-seed-auth", boot, prereq, "PREREQ-AUTH", occupant)
+	// Attempt to mutate the unrelated dependent under the prereq's authority.
+	_, err := env.tr.Journal().Apply(OperationInput{
+		OperationID: "op-over-grant-1", ActorID: env.actor, AuthorityJournalID: &auth,
 		CommandDigest: env.digest("c"), MutationDigest: env.digest("m"),
-		Effects: []Effect{{Sort: EffectTaskEvent, TaskID: child, EventKind: "provenance.task.updated"}},
+		Effects: []Effect{{Sort: EffectTaskEvent, TaskID: dependent, EventKind: "provenance.task.updated"}},
 	})
-	if err != nil {
-		return fmt.Errorf("governing-parent authority was rejected: %w", err)
-	}
-	if res.Kind != CommittedExact {
-		return fmt.Errorf("governed operation did not commit: %+v", res)
-	}
-	return nil
+	return expectRejected(err, ErrAuthorityScope, "an authority reaching an unrelated task via a blocked_by scheduling edge")
 }
 
 func opProduceEffectActorMismatch(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
@@ -934,5 +936,207 @@ func TestApplyRejectsOperationIDReuseWithDifferentIdentity(t *testing.T) {
 	}
 	if len(res.EmittedEvents) != 1 {
 		t.Fatalf("after a rejected reuse there are %d emitted events, want 1 (nothing extra committed)", len(res.EmittedEvents))
+	}
+}
+
+// TestApplyConflictProducesTypedClosedSumAndErrorsAs pins the honest conflict
+// surface (§11, §9.6): a reused OperationID with a differing four-field identity
+// yields the closed-sum CommittedConflict variant carrying the typed
+// *OperationConflict payload, AND an error that both errors.Is-matches
+// ErrOperationConflict and errors.As-extracts the *OperationConflict — no dead
+// enum variant, no stringified-only payload.
+func TestApplyConflictProducesTypedClosedSumAndErrorsAs(t *testing.T) {
+	env := newOpsEnv(t)
+	boot := env.genesis(t, "op-genesis")
+	task := env.taskFor(t, "t1")
+	base := OperationInput{
+		OperationID: "op-x", ActorID: env.actor, AuthorityJournalID: &boot,
+		CommandDigest: env.digest("c"), MutationDigest: env.digest("m"),
+		Effects: []Effect{{Sort: EffectTaskEvent, TaskID: task, EventKind: "provenance.task.updated"}},
+	}
+	if _, err := env.tr.Journal().Apply(base); err != nil {
+		t.Fatalf("first apply: %v", err)
+	}
+	conflicting := base
+	conflicting.MutationDigest = env.digest("different-m")
+	res, err := env.tr.Journal().Apply(conflicting)
+	if err == nil {
+		t.Fatal("reused OperationID with a different identity was accepted; want a conflict error")
+	}
+	// Closed-sum production: Kind is actually CommittedConflict with a typed payload.
+	if res.Kind != CommittedConflict {
+		t.Fatalf("conflict res.Kind = %s, want CommittedConflict", res.Kind)
+	}
+	if res.Conflict == nil {
+		t.Fatal("CommittedConflict result carried a nil Conflict payload")
+	}
+	if res.Conflict.OperationID != "op-x" || res.Conflict.Field != "mutation digest" {
+		t.Fatalf("res.Conflict = {%q,%q}, want {op-x, mutation digest}", res.Conflict.OperationID, res.Conflict.Field)
+	}
+	// errors.Is recovers the sentinel; errors.As recovers the typed *OperationConflict.
+	if !errors.Is(err, ErrOperationConflict) {
+		t.Fatalf("errors.Is(err, ErrOperationConflict) = false: %v", err)
+	}
+	var oc *OperationConflict
+	if !errors.As(err, &oc) {
+		t.Fatalf("errors.As(err, &*OperationConflict) = false — typed payload not recoverable: %v", err)
+	}
+	if oc.OperationID != "op-x" || oc.Field != "mutation digest" {
+		t.Fatalf("errors.As recovered {%q,%q}, want {op-x, mutation digest}", oc.OperationID, oc.Field)
+	}
+	// Nothing extra committed: the original event is the only one.
+	if r, lerr := env.tr.Journal().LookupCommitted("op-x"); lerr != nil {
+		t.Fatalf("lookup: %v", lerr)
+	} else if len(r.EmittedEvents) != 1 {
+		t.Fatalf("after a conflict there are %d emitted events, want 1", len(r.EmittedEvents))
+	}
+}
+
+// TestFoldDecisionEnforcesAuthorityGovernance pins §9.3's per-effect authority
+// checkpoint for journal_decisions (BLOCKER u1sjm): a task-scoped decision is
+// rejected under an authority that does not govern the named task (zero writes),
+// accepted under one that does, and an untasked decision skips the check (§6.1).
+func TestFoldDecisionEnforcesAuthorityGovernance(t *testing.T) {
+	env := newOpsEnv(t)
+	boot := env.genesis(t, "op-genesis")
+	governed := env.taskFor(t, "t-governed")
+	other := env.taskFor(t, "t-other")
+	occupant := env.actorFor(t, "occ")
+	auth := env.startEpisode(t, "op-seed-auth", boot, other, "OTHER-AUTH", occupant)
+
+	// must-fail: a task-scoped decision on t-governed under the t-other authority.
+	_, err := env.tr.Journal().Apply(OperationInput{
+		OperationID: "op-decision-ungoverned", ActorID: env.actor, AuthorityJournalID: &auth,
+		CommandDigest: env.digest("c"), MutationDigest: env.digest("m"),
+		Effects: []Effect{{Sort: EffectDecision, TaskID: governed, DecisionKind: "pasture.review.vote", Payload: []byte(`{}`)}},
+	})
+	if e := expectRejected(err, ErrAuthorityScope, "an ungoverned task-scoped decision"); e != nil {
+		t.Fatal(e)
+	}
+	if r, lerr := env.tr.Journal().LookupCommitted("op-decision-ungoverned"); lerr != nil {
+		t.Fatalf("lookup: %v", lerr)
+	} else if r.Kind != CommittedAbsent {
+		t.Fatalf("rejected decision left a committed operation (non-zero writes): %+v", r)
+	}
+
+	// must-pass: the same decision on t-other, which its authority governs.
+	res, err := env.tr.Journal().Apply(OperationInput{
+		OperationID: "op-decision-governed", ActorID: env.actor, AuthorityJournalID: &auth,
+		CommandDigest: env.digest("c2"), MutationDigest: env.digest("m2"),
+		Effects: []Effect{{Sort: EffectDecision, TaskID: other, DecisionKind: "pasture.review.vote", Payload: []byte(`{}`)}},
+	})
+	if err != nil {
+		t.Fatalf("governed decision rejected: %v", err)
+	}
+	if res.Kind != CommittedExact {
+		t.Fatalf("governed decision did not commit: %+v", res)
+	}
+
+	// must-pass: an untasked decision legitimately skips the governance check.
+	if _, err := env.tr.Journal().Apply(OperationInput{
+		OperationID: "op-decision-untasked", ActorID: env.actor, AuthorityJournalID: &auth,
+		CommandDigest: env.digest("c3"), MutationDigest: env.digest("m3"),
+		Effects: []Effect{{Sort: EffectDecision, DecisionKind: "pasture.review.vote", Payload: []byte(`{}`)}},
+	}); err != nil {
+		t.Fatalf("untasked decision rejected: %v", err)
+	}
+}
+
+// TestFoldEvidenceEnforcesAuthorityGovernance is the §9.3 per-effect authority
+// checkpoint for journal_evidence (BLOCKER u1sjm), mirroring the decision case.
+func TestFoldEvidenceEnforcesAuthorityGovernance(t *testing.T) {
+	env := newOpsEnv(t)
+	boot := env.genesis(t, "op-genesis")
+	governed := env.taskFor(t, "t-governed")
+	other := env.taskFor(t, "t-other")
+	occupant := env.actorFor(t, "occ")
+	auth := env.startEpisode(t, "op-seed-auth", boot, other, "OTHER-AUTH", occupant)
+
+	// must-fail: a task-scoped evidence row on t-governed under the t-other authority.
+	_, err := env.tr.Journal().Apply(OperationInput{
+		OperationID: "op-evidence-ungoverned", ActorID: env.actor, AuthorityJournalID: &auth,
+		CommandDigest: env.digest("c"), MutationDigest: env.digest("m"),
+		Effects: []Effect{{Sort: EffectEvidence, TaskID: governed, EvidenceKind: "pasture.git.commit", ContentDigest: env.digest("x"), Payload: []byte(`{}`)}},
+	})
+	if e := expectRejected(err, ErrAuthorityScope, "an ungoverned task-scoped evidence row"); e != nil {
+		t.Fatal(e)
+	}
+	if r, lerr := env.tr.Journal().LookupCommitted("op-evidence-ungoverned"); lerr != nil {
+		t.Fatalf("lookup: %v", lerr)
+	} else if r.Kind != CommittedAbsent {
+		t.Fatalf("rejected evidence left a committed operation (non-zero writes): %+v", r)
+	}
+
+	// must-pass: the same evidence on t-other, which its authority governs.
+	res, err := env.tr.Journal().Apply(OperationInput{
+		OperationID: "op-evidence-governed", ActorID: env.actor, AuthorityJournalID: &auth,
+		CommandDigest: env.digest("c2"), MutationDigest: env.digest("m2"),
+		Effects: []Effect{{Sort: EffectEvidence, TaskID: other, EvidenceKind: "pasture.git.commit", ContentDigest: env.digest("y"), Payload: []byte(`{}`)}},
+	})
+	if err != nil {
+		t.Fatalf("governed evidence rejected: %v", err)
+	}
+	if res.Kind != CommittedExact {
+		t.Fatalf("governed evidence did not commit: %+v", res)
+	}
+
+	// must-pass: an untasked evidence row legitimately skips the governance check.
+	if _, err := env.tr.Journal().Apply(OperationInput{
+		OperationID: "op-evidence-untasked", ActorID: env.actor, AuthorityJournalID: &auth,
+		CommandDigest: env.digest("c3"), MutationDigest: env.digest("m3"),
+		Effects: []Effect{{Sort: EffectEvidence, EvidenceKind: "pasture.git.commit", ContentDigest: env.digest("z"), Payload: []byte(`{}`)}},
+	}); err != nil {
+		t.Fatalf("untasked evidence rejected: %v", err)
+	}
+}
+
+// TestResolveOperationIDInsertRaceTranslatesToTypedOutcome exercises §9.6's
+// bullet-2 race-translation path directly (MINOR 2xizh, absorbing yvgcn): when the
+// anchor insert loses a concurrent same-new-OperationID UNIQUE race, the reducer
+// re-reads the winner's committed row and returns the typed idempotent result (on
+// an exact identity match) or the typed CommittedConflict (on a mismatch), never a
+// raw SQLite constraint error. Under the in-process db.mu the live path is
+// unreachable, so the translation is driven through the adversarial seam.
+func TestResolveOperationIDInsertRaceTranslatesToTypedOutcome(t *testing.T) {
+	env := newOpsEnv(t)
+	boot := env.genesis(t, "op-genesis")
+	task := env.taskFor(t, "t1")
+	st := env.tr.(*sqliteTracker)
+
+	// The winner committed the OperationID first.
+	winner := OperationInput{
+		OperationID: "op-raced", ActorID: env.actor, AuthorityJournalID: &boot,
+		CommandDigest: env.digest("c"), MutationDigest: env.digest("m"),
+		Effects: []Effect{{Sort: EffectTaskEvent, TaskID: task, EventKind: "provenance.task.updated"}},
+	}
+	if _, err := env.tr.Journal().Apply(winner); err != nil {
+		t.Fatalf("winner apply: %v", err)
+	}
+
+	// Idempotent loser: identical four-field identity → typed idempotent result.
+	res, err := st.db.AdversarialResolveOperationIDInsertRace(winner)
+	if err != nil {
+		t.Fatalf("idempotent race translation returned a raw error: %v", err)
+	}
+	if res.Kind != CommittedExact || !res.ShortCircuited {
+		t.Fatalf("idempotent race did not short-circuit to CommittedExact: %+v", res)
+	}
+
+	// Conflicting loser: same OperationID, different identity → typed conflict.
+	conflicting := winner
+	conflicting.MutationDigest = env.digest("different-m")
+	res2, err2 := st.db.AdversarialResolveOperationIDInsertRace(conflicting)
+	if err2 == nil {
+		t.Fatal("conflicting race translation returned no error")
+	}
+	if !errors.Is(err2, ErrOperationConflict) {
+		t.Fatalf("conflicting race error = %v, want ErrOperationConflict (not a raw SQLite error)", err2)
+	}
+	var oc *OperationConflict
+	if !errors.As(err2, &oc) {
+		t.Fatalf("conflicting race error not errors.As-extractable: %v", err2)
+	}
+	if res2.Kind != CommittedConflict || res2.Conflict == nil {
+		t.Fatalf("conflicting race did not produce the typed CommittedConflict: %+v", res2)
 	}
 }

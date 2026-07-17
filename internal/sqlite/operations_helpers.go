@@ -286,9 +286,9 @@ func (db *DB) requireAuthorityGovernsLocked(in journal.OperationInput, effectJID
 	if !governs {
 		return fmt.Errorf(
 			"%w: authority %d does not govern task %q at journal position %d — where: per-effect "+
-				"authorization (§9.3, §14.1); when: before commit; impact: nothing committed; fix: use an "+
-				"authority whose active assignment is on the task or a governing-parent ancestor, committed "+
-				"with a strictly smaller JournalID than the effect",
+				"authorization (§9.3, §14.1); when: before commit; impact: nothing committed; fix: use the "+
+				"bootstrap authority, or an assignment authority whose active episode is on this exact task, "+
+				"committed with a strictly smaller JournalID than the effect",
 			journal.ErrAuthorityScope, *in.AuthorityJournalID, task, effectJID)
 	}
 	return nil
@@ -296,10 +296,12 @@ func (db *DB) requireAuthorityGovernsLocked(in journal.OperationInput, effectJID
 
 // authorityGovernsTaskAtLocked answers whether the authority at authJID governs
 // targetTask for an effect committed at beforeJID (§9.3): a bootstrap authority
-// (the system root) governs every task; an assignment authority governs its own
-// active episode's task and any task reachable from it through the blocked-by
-// governing-parent chain. The authority must strictly precede the effect by
-// JournalID (never by RecordedAt, §12).
+// (the system root) governs every task; an assignment authority governs ONLY the
+// task of its own active episode. There is no edge-graph governance — a
+// scheduling edge such as blocked_by carries no ownership semantics, so a task
+// merely reachable through one is NOT governed (see the authority note in
+// docs/journal-relational-contract.md §14.1). The authority must strictly precede
+// the effect by JournalID (never by RecordedAt, §12).
 func (db *DB) authorityGovernsTaskAtLocked(authJID journal.JournalID, targetTask journal.TaskID, beforeJID int64) (bool, error) {
 	if int64(authJID) >= beforeJID {
 		return false, nil // authority does not precede the effect (§9.3)
@@ -343,26 +345,12 @@ func (db *DB) assignmentAuthorityGovernsLocked(authJID journal.JournalID, target
 	if err != nil {
 		return false, err
 	}
-	if authTask.String() == targetTask.String() {
-		return true, nil
-	}
-	// Governing-parent chain: is authTask an ancestor of targetTask reachable
-	// through blocked_by edges (targetTask blocked_by ... authTask)?
-	reachable := false
-	if err := sqlitex.Execute(db.conn,
-		`WITH RECURSIVE chain(t) AS (
-			SELECT ?1
-			UNION
-			SELECT e.target_id FROM edges e JOIN chain ON e.source_id = chain.t WHERE e.kind_id = ?3
-		 )
-		 SELECT 1 FROM chain WHERE t = ?2 LIMIT 1`,
-		&sqlitex.ExecOptions{
-			Args:       []any{targetTask.String(), authTask.String(), blockedByEdgeKindID},
-			ResultFunc: func(*zs.Stmt) error { reachable = true; return nil },
-		}); err != nil {
-		return false, fmt.Errorf("governing-parent chain: %w", err)
-	}
-	return reachable, nil
+	// An assignment authority governs ONLY the task of its own active episode. It
+	// grants no authority over any other task, including one merely reachable
+	// through a scheduling edge (blocked_by), which carries no ownership semantics.
+	// A broader governance chain (e.g. a genuine governing-parent relation) would
+	// require a contract amendment before implementation (§14.1 authority note).
+	return authTask.String() == targetTask.String(), nil
 }
 
 // validateClosesEndAssignmentsLocked rejects an operation that closes a task
@@ -458,6 +446,61 @@ func journalIDPtrEqual(a, b *journal.JournalID) bool {
 		return a == b
 	}
 	return *a == *b
+}
+
+// committedOutcomeForExistingLocked resolves the §9.4 outcome for an OperationID
+// that already has a committed row. An exact four-field identity match returns the
+// original committed result short-circuited (no re-execution, nil error). Any
+// mismatch returns the closed-sum CommittedConflict variant carrying the typed
+// *OperationConflict payload, alongside an error that wraps BOTH the
+// ErrOperationConflict sentinel and the *OperationConflict value with %w — so a
+// caller recovers it with errors.Is(err, ErrOperationConflict) or
+// errors.As(err, &*OperationConflict), and a caller switching on res.Kind sees
+// CommittedConflict (§11, §9.6). Shared by the Apply short-circuit and the
+// concurrent-insert race translation so both surface the identical typed shape.
+func (db *DB) committedOutcomeForExistingLocked(in journal.OperationInput, existing storedOperation) (journal.CommittedResult, error) {
+	if field, ok := identityMismatch(existing.identity, journal.StoredOperationIdentity{
+		ActorID:            in.ActorID,
+		AuthorityJournalID: in.AuthorityJournalID,
+		CommandDigest:      in.CommandDigest,
+		MutationDigest:     in.MutationDigest,
+	}); !ok {
+		conflict := &journal.OperationConflict{OperationID: in.OperationID, Field: field}
+		return journal.CommittedResult{Kind: journal.CommittedConflict, Conflict: conflict},
+			fmt.Errorf("%w: %w", journal.ErrOperationConflict, conflict)
+	}
+	res, err := db.reconstructCommittedLocked(existing.anchor)
+	if err != nil {
+		return journal.CommittedResult{}, err
+	}
+	res.ShortCircuited = true
+	return res, nil
+}
+
+// resolveOperationIDInsertRaceLocked implements §9.6's second bullet: when the
+// anchor insert violates journal_operations.OperationID UNIQUE because a
+// concurrent writer committed the same new OperationID first, the reducer catches
+// that violation and re-runs the §9.4 idempotent-replay comparison against the
+// now-committed row, returning the typed idempotent result or the typed
+// CommittedConflict — never the raw SQLite constraint error. Under the in-process
+// db.mu this is unreachable (Apply's §9.4 lookup observes the committed row before
+// ever reaching the insert); it is the defense-in-depth path for a future
+// multi-connection/multi-process writer.
+func (db *DB) resolveOperationIDInsertRaceLocked(in journal.OperationInput) (journal.CommittedResult, error) {
+	existing, found, err := db.lookupOperationLocked(in.OperationID)
+	if err != nil {
+		return journal.CommittedResult{}, err
+	}
+	if !found {
+		// The UNIQUE violation proved a row exists, but this transaction's read
+		// snapshot cannot see it (the winning writer committed on another
+		// connection after this transaction's snapshot began). Surface a typed
+		// conflict rather than the raw SQLite constraint error (§9.6).
+		conflict := &journal.OperationConflict{OperationID: in.OperationID, Field: "operation id (lost a concurrent insert)"}
+		return journal.CommittedResult{Kind: journal.CommittedConflict, Conflict: conflict},
+			fmt.Errorf("%w: %w", journal.ErrOperationConflict, conflict)
+	}
+	return db.committedOutcomeForExistingLocked(in, existing)
 }
 
 func (db *DB) reconstructCommittedLocked(anchor int64) (journal.CommittedResult, error) {

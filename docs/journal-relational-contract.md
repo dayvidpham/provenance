@@ -1120,6 +1120,37 @@ here (per the §14.3 convention) because the schema cannot express it;
 `authority_evidence.yaml` carries `ended-transition-without-started-rejected`
 and `ended-before-started-in-one-batch-rejected`.
 
+### 14.5 Authority governance scope
+
+§9.3/§14.1 fix *when* an authority is checked (against `Reduce(history, J_current
+− 1)`); this section fixes *what task* an authority governs — the scope the
+per-effect checkpoint evaluates:
+
+- A **bootstrap** authority (the genesis/system root, §4.6) governs **every**
+  task.
+- An **assignment** authority governs **only** the task of its own active
+  episode (a `started`-but-not-`ended` episode, §14.4). It grants no authority
+  over any other task.
+
+There is deliberately **no edge-graph governance**. A scheduling edge — in
+particular `blocked_by`, which elsewhere in this system means only "the target
+must be work that finishes before the source" (a dependency-ordering constraint,
+enforced acyclic) — carries **no** ownership, hierarchy, or governance meaning. A
+task merely reachable from an authority's episode-task through such an edge is
+**not** governed by that authority: treating `blocked_by` reachability as
+governance would let any active assignment on a shared prerequisite task (an
+infra fix, a shared-library bump, a review gate) silently acquire write authority
+over every organizationally unrelated task that lists it as a scheduling blocker
+— an unbounded authorization over-grant. `authority_evidence.yaml` /
+`blocked-by-scheduling-edge-does-not-grant-authority` pins this rejection.
+
+**Amendment gate.** Any broader governance chain — for example a genuine
+`governing-parent` relation over a *dedicated* non-scheduling task-hierarchy edge
+kind, or an assignment-to-assignment parent-citation model — is **not** part of
+this contract and MUST NOT be implemented until it is added here as a normative
+amendment (defining the concrete edge/citation mechanism, its scope, and its
+adversarial corpus cases). Until then, the two scopes above are exhaustive.
+
 ## 15. Projection invariants
 
 Restated from §8 for completeness: every projection (`tasks.*` current-state
