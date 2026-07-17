@@ -619,13 +619,14 @@ for query convenience rather than recomputed from `journal_authority_assignment_
 on every read.
 
 **S1.1 → S1.3 staging note.** At the journal-base layer (`dayvidpham/provenance#4`,
-S1.1) `tasks.LastJournalID` ships **nullable**: the pre-journal direct-write
-task-creation path predates the shared reducer, so existing and newly created
-tasks have no watermark to populate until every task write is routed through
-`Apply`/`Open` (§9). This is a deliberate staging gap, not a schema bug — the
-column is tightened to `NOT NULL` (as stated above) by the shared-reducer
-slice (`dayvidpham/provenance#5`, S1.3) once all task writes are
-journal-anchored.
+S1.1) and through the shared-reducer slice (`dayvidpham/provenance#5`, S1.2–S1.3)
+`tasks.LastJournalID` ships **nullable**: the pre-journal direct-write
+task-creation path predates the shared reducer and remains the library's existing
+public surface, so tasks have no watermark to populate until every task write is
+routed through `Apply`/`Open` (§9). This is a deliberate staging gap, not a
+schema bug. The column is tightened to `NOT NULL` (as stated above) only when the
+direct-write tracker path is retired as part of the Pasture task backend
+integration (`dayvidpham/pasture#14`).
 
 ### 8.2 `task_attributions`
 
@@ -845,17 +846,18 @@ boundary, before returning to the caller.
    `ProducedByOperationJournalID` is `NOT NULL` and refers to exactly one
    `journal_operations.JournalID`.
 
-   **S1.1 staging note.** At the journal-base layer (`dayvidpham/provenance#4`,
+   **S1.1 → S1.3 staging note.** At the journal-base layer (`dayvidpham/provenance#4`,
    S1.1) no `journal_operations` subtype table exists yet, so there is no
    operation anchor for a `task_event` row's `ProducedByOperationJournalID` to
    reference. `AppendTaskEvent` — the pre-operations base primitive the
    operations layer wraps — writes `task_event` rows with
-   `ProducedByOperationJournalID = NULL` uniformly, which does not yet satisfy
-   this rule. Rule 2's `NOT NULL` enforcement (and the `ProducedByOperationJournalID
-   → journal_operations.JournalID` foreign key from §2.1) takes hold starting
-   with the operations slice (`dayvidpham/provenance#5`, S1.2), when
-   `journal_operations` lands and every effect-producing operation anchors its
-   rows to it. `VerifyIntegrity`'s §10 rule 8 subtype-integrity guard does not
+   `ProducedByOperationJournalID = NULL` uniformly. This remains the case through
+   the shared-reducer slice (`dayvidpham/provenance#5`, S1.2–S1.3) because the
+   direct-write tracker path remains the library's existing public surface and does
+   not journal-anchor its writes. Rule 2's `NOT NULL` enforcement (and the
+   `ProducedByOperationJournalID → journal_operations.JournalID` foreign key from
+   §2.1) is scheduled for when the direct-write path is retired as part of the
+   Pasture task backend integration (`dayvidpham/pasture#14`). `VerifyIntegrity`'s §10 rule 8 subtype-integrity guard does not
    check rule 2 and is unaffected by this staging gap.
 3. Common fields (`JournalKind`, `ActorID`, `RecordedAt`) are never
    duplicated on a subtype row; a subtype row's only own attributes are the
