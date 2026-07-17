@@ -285,7 +285,8 @@ journal_authority_assignments_NAIVE(
     TaskID,
     SlotID,
     ActorID,
-    PredecessorAssignmentID
+    PredecessorAssignmentID,
+    ParentAssignmentID
 )
 ```
 
@@ -294,15 +295,16 @@ journal row, so it always gets a fresh `JournalID`) and `{AssignmentID,
 Transition}` (an episode has at most one `started` row and at most one `ended`
 row, enforced by `UNIQUE(AssignmentID, Transition)`).
 
-It is **not** in BCNF. `TaskID`, `SlotID`, `ActorID`, and
-`PredecessorAssignmentID` are invariant for the whole episode — a
-responsibility-assignment episode cannot change which task, slot, or actor it
-concerns between its `started` and `ended` rows; a change of task/slot/actor
-is by definition a **new** episode (a transfer), not a mutation of the old
-one. That gives the nontrivial FD
+It is **not** in BCNF. `TaskID`, `SlotID`, `ActorID`,
+`PredecessorAssignmentID`, and `ParentAssignmentID` are invariant for the
+whole episode — a responsibility-assignment episode cannot change which task,
+slot, actor, predecessor, or governing parent it concerns between its
+`started` and `ended` rows; a change of task/slot/actor is by definition a
+**new** episode (a transfer), not a mutation of the old one. That gives the
+nontrivial FD
 
 ```
-{AssignmentID} → {TaskID, SlotID, ActorID, PredecessorAssignmentID}
+{AssignmentID} → {TaskID, SlotID, ActorID, PredecessorAssignmentID, ParentAssignmentID}
 ```
 
 whose left side, `{AssignmentID}` alone, is **not** a superkey of this table
@@ -314,8 +316,9 @@ candidate key of the first table below, so it is a superkey of the split,
 which guarantees a lossless join per the standard BCNF decomposition
 theorem; it is dependency-preserving because each original FD lands wholly
 within one component — `{AssignmentID} → {TaskID, SlotID, ActorID,
-PredecessorAssignmentID}` in the episodes table and `{AssignmentID, Transition}
-→ {JournalID}` in the transitions table — and `{JournalID} →` the remaining
+PredecessorAssignmentID, ParentAssignmentID}` in the episodes table and
+`{AssignmentID, Transition} → {JournalID}` in the transitions table — and
+`{JournalID} →` the remaining
 attributes is then recoverable by transitivity through those preserved FDs, so
 no dependency is lost across the split):
 
@@ -327,20 +330,37 @@ no dependency is lost across the split):
 | `TaskID` | FK → `tasks.id` | no | the task the responsibility slot is on |
 | `SlotID` | FK → `assignment_slots.id` | no | e.g. `owner-responsibility`; extensible for future slots |
 | `ActorID` | FK → `agents.id` | no | the actor holding (or having held) the slot for this episode |
-| `PredecessorAssignmentID` | FK → `journal_authority_assignment_episodes.AssignmentID`, self | yes | the episode this one succeeds, for a CAS transfer; `UNIQUE` — see [§8.2](#82-single-consumption-ownership-assignment-evidence) |
+| `PredecessorAssignmentID` | FK → `journal_authority_assignment_episodes.AssignmentID`, self | yes | the episode this one **succeeds**, for a CAS transfer; `UNIQUE` — see [§8.2](#82-single-consumption-ownership-assignment-evidence) |
+| `ParentAssignmentID` | FK → `journal_authority_assignment_episodes.AssignmentID`, self | yes | the episode this one **is deliberately rooted under**, cited at start for delegated governance (§14.5); NOT `UNIQUE` — one parent may be cited by many children. Distinct from `PredecessorAssignmentID` (see below) |
 
-FDs: `{AssignmentID} → {TaskID, SlotID, ActorID, PredecessorAssignmentID}`;
+**`PredecessorAssignmentID` vs `ParentAssignmentID`.** These are two different
+self-references with different meanings. `PredecessorAssignmentID` is a
+*succession* edge along the **time** axis: the new episode replaces an ended
+episode on the *same* responsibility slot of the *same* task (a transfer), and
+it is `UNIQUE` because an ended episode is succeeded by at most one successor
+(§14.2). `ParentAssignmentID` is a *governance-citation* edge along the
+**ownership** axis: the new episode declares which other, still-active episode
+deliberately authorizes it — typically an episode on a *different* (higher)
+task — and it is not `UNIQUE` because one parent can delegate to many children.
+A given episode may carry both (it both succeeds a predecessor and is rooted
+under a parent), one, or neither. The governance predicate reads
+`ParentAssignmentID`; the transfer/single-consumption rules read
+`PredecessorAssignmentID` (§14.5, §14.2).
+
+FDs: `{AssignmentID} → {TaskID, SlotID, ActorID, PredecessorAssignmentID, ParentAssignmentID}`;
 and, over rows with `PredecessorAssignmentID` NOT NULL, the near-key
 partial-function dependency `{PredecessorAssignmentID} → {AssignmentID, TaskID,
 SlotID, ActorID}` induced by the `UNIQUE(PredecessorAssignmentID)` constraint
-(§14.2). A nullable `UNIQUE` column is not a candidate key in the strict
-relational sense — NULLs are permitted and are not compared equal — so it adds
-no candidate key and leaves BCNF unaffected. Candidate key / PK:
-`{AssignmentID}`. BCNF: trivial — the sole candidate key `{AssignmentID}` is
-literally the whole-episode identity; every FD determinant here is either
-`{AssignmentID}` itself or the near-key `{PredecessorAssignmentID}`, and the
-latter determines exactly the attributes a candidate key would, so no
-determinant is a proper subset of a key.
+(§14.2). `ParentAssignmentID` carries no `UNIQUE` constraint, so it induces no
+near-key dependency and adds no candidate key. A nullable `UNIQUE` column is
+not a candidate key in the strict relational sense — NULLs are permitted and
+are not compared equal — so it adds no candidate key and leaves BCNF
+unaffected. Candidate key / PK: `{AssignmentID}`. BCNF: trivial — the sole
+candidate key `{AssignmentID}` is literally the whole-episode identity; every
+FD determinant here is either `{AssignmentID}` itself (which determines
+`ParentAssignmentID` along with every other episode attribute) or the near-key
+`{PredecessorAssignmentID}`, and the latter determines exactly the attributes a
+candidate key would, so no determinant is a proper subset of a key.
 
 **`journal_authority_assignment_transitions`**
 
@@ -1203,6 +1223,25 @@ effect's own journal position — including effects from earlier in the same
 operation — never against a single pre-transaction snapshot reused for every
 child of a batch.
 
+**What "authorized" means (the governance predicate).** An operation cites one
+authority; that authority must *govern* the task each of its consuming effects
+mutates, evaluated at the effect's own journal position. Governance is decided
+by authority kind:
+
+- a **bootstrap** authority (the pasture-system root, §4.6) governs every task;
+- an **assignment** authority governs (a) the task of its own episode, and (b)
+  every task reachable from that episode by deliberate parent citations, with
+  whole-chain liveness — the full transitive rule is specified in §14.5.
+
+Governance is **deliberate citation**, never graph-topology inference. A task
+that is merely *reachable* from the authority's task through a `blocked_by`
+scheduling edge (or any other non-citation edge) is **not** governed: a
+scheduling edge orders work, it does not delegate ownership. The
+`blocked-by-scheduling-edge-does-not-grant-authority` corpus case pins this —
+an authority on a prereq task cannot mutate an unrelated dependent that merely
+lists the prereq as a blocker. The only cross-task reach an assignment
+authority has is the parent-citation chain of §14.5.
+
 ### 14.2 Single-consumption ownership-assignment evidence
 
 `journal_authority_assignment_episodes.PredecessorAssignmentID` carries a
@@ -1242,7 +1281,7 @@ here (per the §14.3 convention) because the schema cannot express it;
 `authority_evidence.yaml` carries `ended-transition-without-started-rejected`
 and `ended-before-started-in-one-batch-rejected`.
 
-### 14.5 Authority governance scope
+### 14.5 Parent-citation governance (deliberate ownership reach)
 
 §9.3/§14.1 fix *when* an authority is checked (against `Reduce(history, J_current
 − 1)`); this section fixes *what task* an authority governs — the scope the
@@ -1250,9 +1289,10 @@ per-effect checkpoint evaluates:
 
 - A **bootstrap** authority (the genesis/system root, §4.6) governs **every**
   task.
-- An **assignment** authority governs **only** the task of its own active
-  episode (a `started`-but-not-`ended` episode, §14.4). It grants no authority
-  over any other task.
+- An **assignment** authority governs (a) the task of its own active episode
+  (a `started`-but-not-`ended` episode, §14.4), and (b) every task reachable
+  from that episode by **deliberate parent citations**, with whole-chain
+  liveness (specified below). It grants no other cross-task authority.
 
 There is deliberately **no edge-graph governance**. A scheduling edge — in
 particular `blocked_by`, which elsewhere in this system means only "the target
@@ -1264,14 +1304,81 @@ governance would let any active assignment on a shared prerequisite task (an
 infra fix, a shared-library bump, a review gate) silently acquire write authority
 over every organizationally unrelated task that lists it as a scheduling blocker
 — an unbounded authorization over-grant. `authority_evidence.yaml` /
-`blocked-by-scheduling-edge-does-not-grant-authority` pins this rejection.
+`blocked-by-scheduling-edge-does-not-grant-authority` pins this rejection. The
+*only* cross-task reach an assignment authority has is the parent-citation chain
+defined here — a chain of deliberate ownership citations, categorically
+different from a scheduling edge.
 
-**Amendment gate.** Any broader governance chain — for example a genuine
-`governing-parent` relation over a *dedicated* non-scheduling task-hierarchy edge
-kind, or an assignment-to-assignment parent-citation model — is **not** part of
-this contract and MUST NOT be implemented until it is added here as a normative
-amendment (defining the concrete edge/citation mechanism, its scope, and its
-adversarial corpus cases). Until then, the two scopes above are exhaustive.
+An assignment authority reaches beyond its own task **only** through explicit
+parent citations. This is the delegated-ownership relation: a supervisor holding
+an episode on an epic can authorize work on a subtask precisely because the
+chain of episodes between them was deliberately declared, transition by
+transition — never because the tasks happen to be connected in some edge graph.
+
+**The relation.** An episode may cite one **parent episode** at start, recorded
+as `journal_authority_assignment_episodes.ParentAssignmentID` (§4.4), an
+optional nullable self-reference. The citation is a *deliberate act performed at
+the child episode's `started` transition*: it is invariant for the whole episode
+(like every other episode attribute) and is chosen by the caller starting the
+episode, who is asserting "this responsibility is delegated down from that
+parent." It is categorically different from `PredecessorAssignmentID`
+(§4.4): the predecessor edge records *succession in time* on one slot (a
+transfer replaces an ended episode); the parent edge records *governance
+lineage* across tasks (an active parent delegates to an active child). One is
+about who held this slot before; the other is about who this responsibility
+answers to.
+
+**Citation validity (checked in the start effect, §9.3).** When an episode's
+`started` transition cites `ParentAssignmentID = P`, the reducer requires, at
+that transition's own journal position `J`:
+
+1. `P` exists as an episode, and
+2. `P` is **active at `J`** — it has a `started` transition strictly before `J`
+   and no `ended` transition strictly before `J`. A citation of a
+   never-started, already-ended, or nonexistent parent is rejected before
+   commit (`ErrParentCitation`). You cannot deliberately root your work under an
+   authority that is not live at the moment you claim it.
+3. The citation does not create a **cycle**. Parent chains are finite and a new
+   episode cannot appear in its own ancestry — with citation-at-start the child
+   `AssignmentID` does not yet exist, so a genuine cycle is structurally
+   impossible unless an identifier is forged or a stored chain is corrupted.
+   The reducer still walks the cited parent's ancestry with a bounded, visited-
+   tracked traversal and fails closed on any cycle rather than trusting the
+   input's finiteness.
+
+**The governance predicate.** An assignment authority whose episode is `E`
+governs a target task `T`, evaluated at a consuming effect's journal position
+`J`, when:
+
+- **(a)** `E`'s own task is `T` and `E` is active at `J`; **or**
+- **(b)** some episode on `T` reaches `E` by following `ParentAssignmentID`
+  citations, and **every** episode on that chain — the child episode on `T`,
+  each cited ancestor, up to and including `E` — is active at `J`.
+
+Read the whole-chain liveness rule literally: the *entire* delegation chain must
+be live at the effect's own position. If any middle episode has ended by `J`,
+the delegated authority is cut immediately — a grandparent no longer governs a
+grandchild once the parent between them ends, even though the grandchild episode
+is still active and the parent citation still physically points at the ended
+parent. Liveness is `active at effect time` for the whole chain, not merely at
+citation time. The must-fail `parent-chain-middle-episode-ended-cuts-authority`
+corpus case pins this.
+
+**Implementation.** The predicate is a **recursive walk** over
+`ParentAssignmentID`. The walk is bounded and visited-tracked; a corrupted stored
+chain that forms a cycle (reachable only by bypassing citation validity, e.g. a
+direct schema corruption) fails closed with a typed error
+(`ErrCorruptParentChain`) rather than looping. The must-fail
+`corrupted-cyclic-parent-chain-fails-closed` corpus case drives this via an
+adversarial seam.
+
+**Amendment status.** This section **is** the §14 amendment the earlier build
+deferred behind a gate: the cross-task governing-parent reach — an
+assignment-to-assignment parent-citation model — is now designed and delivered
+here, so an assignment authority is no longer restricted to its own episode's
+task. The one reach it still does not have is topological: a task merely
+reachable through a scheduling edge is governed by nothing but its own citation
+lineage.
 
 ## 15. Projection invariants
 
