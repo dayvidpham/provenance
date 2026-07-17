@@ -168,9 +168,51 @@ Apply-commit time:
 | `ResultSlotID` | `TEXT` | no | part of PK; the caller's local handle name (e.g. `new-task-1`) |
 | `ProducedJournalID` | FK → `journal.JournalID` | no | the concrete produced row this slot resolved to |
 
-**FD:** `{JournalID, ResultSlotID} → {ProducedJournalID}`. **Candidate key /
-PK:** `{JournalID, ResultSlotID}`. **BCNF:** trivial — single composite key, one
-non-key attribute, no other determinant.
+**FD:** `{JournalID, ResultSlotID} → {ProducedJournalID}`. In addition, an
+induced FD `{ProducedJournalID} → {JournalID}` holds over the whole relation,
+*given* the own-operation integrity invariant below: `ProducedJournalID`
+identifies a `journal` row, and that row's own
+`ProducedByOperationJournalID` (§2.1) is fixed the moment the row is
+produced, so once a slot row names a `ProducedJournalID`, the `JournalID`
+determined by that produced row's `ProducedByOperationJournalID` is fixed
+too — the same derive-`JournalID`-from-the-produced-row's-`PBOJID`
+relationship used for the near-key FD in §4.4. This is a genuine functional
+dependency, not merely a restated foreign key: it holds because of the
+invariant, not because of the FK alone (the two FKs, `JournalID →
+journal_operations` and `ProducedJournalID → journal`, are independently
+satisfiable by a slot row whose `ProducedJournalID` points at a row produced
+by some *other* operation).
+
+**Own-operation integrity invariant (reducer-enforced):** a slot row's
+`ProducedJournalID` must identify a `journal` row whose own
+`ProducedByOperationJournalID` equals the slot row's own `JournalID` — i.e. a
+result slot may only map to a row produced by *its own* operation, never to a
+row produced by a different operation. Referential integrity alone (the two
+FKs above) cannot express this — it guarantees `ProducedJournalID` and
+`JournalID` each reference an *existing* row, not that they name the *same*
+operation. Left unenforced, a slot row could point at another operation's
+produced row, which would corrupt that operation's reconstructed
+`CanonicalMutationResult` (the §3.2 reconstruction query filters
+`WHERE JournalID = :anchor` and returns whatever `ProducedJournalID` sits in
+that row, trusting it belongs to the anchor's own operation). This is a
+reducer-level business rule the schema cannot express, in the same §14.3
+pattern as orphaned-evidence rejection: checked and rejected before commit,
+not merely assumed from the FKs. Codified as totality rule 9 (§10).
+
+**Candidate key / PK:** `{JournalID, ResultSlotID}`. Whether `ProducedJournalID`
+is itself a second candidate key depends on whether slot-aliasing (two
+`ResultSlotID`s within one operation resolving to the same `ProducedJournalID`)
+is permitted; this contract permits it (a caller may legitimately reference
+the same allocated row under two local handles), so `ProducedJournalID` is
+**not** `UNIQUE` and is **not** a second candidate key. Under that choice,
+`{ProducedJournalID} → {JournalID}` is a nontrivial FD whose determinant is
+not a superkey — the same controlled-denormalization shape as §2.1's
+`{ProducedByOperationJournalID} → {ActorID}`, pinned by the own-operation
+integrity invariant above rather than decomposed away. **BCNF:** not strictly
+satisfied on `{ProducedJournalID} → {JournalID}` for the reason just given;
+accepted as controlled redundancy on the same basis as §2.1, with the
+required agreement enforced as a reducer invariant rather than a normal-form
+decomposition.
 
 `CanonicalMutationResult` reconstructs as `SELECT ResultSlotID,
 ProducedJournalID, JournalKind FROM journal_operation_result_slots JOIN journal
@@ -350,6 +392,20 @@ cycle with exactly one narrow base case, mirroring the
   could mint a bootstrap authority under no authorization. Reducer invariants
   §10 rules 6–7 enforce the NULL-only-on-genesis, first-operation-only, and
   sole-bootstrap-effect rules.
+- **Precedence vs. §9.4's idempotent short-circuit.** The genesis operation
+  has an `OperationID` like any other operation, so a legitimate retry of it
+  (e.g. a network retry of first-boot, same `OperationID`, arriving after the
+  bootstrap authority already committed) is presented against a
+  now-non-empty journal. §9.4's `OperationID`-presence check is evaluated
+  **before** the "no `journal_operations` row yet exists" genesis-validity
+  check above: if `journal_operations` already holds a row for the proposed
+  `OperationID`, §9.4's four-field identity short-circuit fires first and
+  returns the original bootstrap authority unchanged — the genesis-validity
+  check above is never reached for that operation. The genesis-validity
+  check only ever rejects a genesis presenting a **new** (not-yet-seen)
+  `OperationID` against a non-empty journal — i.e. a distinct, illegitimate
+  second bootstrap attempt, not an idempotent retry of the first one. See
+  §9.4 and §10 rule 6 for the corresponding cross-references.
 - **Migration (§13) executes under a bootstrap authority.** A migration run
   first establishes (or requires already-established) the `pasture-system`
   bootstrap authority via one genesis operation as above; every per-task
@@ -358,9 +414,11 @@ cycle with exactly one narrow base case, mirroring the
   `JournalID`. Migration never writes a NULL-authority operation except the
   single genesis operation, and never fabricates an authority.
 
-`genesis_bootstrap.yaml` carries the must-pass genesis history and the must-fail
-histories (NULL authority on a non-genesis operation, a second genesis against a
-non-empty journal, and a genesis producing a non-bootstrap effect).
+`genesis_bootstrap.yaml` carries the must-pass genesis history, the
+same-`OperationID` genesis-retry-hits-§9.4-short-circuit must-pass history, and
+the must-fail histories (NULL authority on a non-genesis operation, a second
+genesis against a non-empty journal, and a genesis producing a non-bootstrap
+effect).
 
 ## 5. Task and domain events
 
@@ -712,6 +770,16 @@ effect closure (`§2.1`'s `ProducedByOperationJournalID` query) is returned
 unchanged. Any mismatch on the four-field identity is a typed conflict, never
 a re-execution and never a partial write.
 
+**Precedence vs. genesis validity (§4.6, §10 rule 6).** This `OperationID`-presence
+check is evaluated **before** any operation-kind-specific validity check,
+including §4.6/§10 rule 6's genesis "no `journal_operations` row yet exists"
+check. Concretely: a retry of the genesis operation itself (same
+`OperationID`, arriving after the journal is no longer empty) hits this
+short-circuit first and returns the original bootstrap authority; it never
+reaches rule 6's genesis-validity check, so it is not rejected as a "second
+genesis". Rule 6 only ever evaluates — and only ever rejects — a genesis
+presenting a **new** `OperationID` against a non-empty journal.
+
 ### 9.5 Fail-closed atomicity
 
 If effect-folding fails at effect $k$ of $N$ — whatever the cause, including
@@ -782,7 +850,12 @@ boundary, before returning to the caller.
    accepted only when no `journal_operations` row yet exists — i.e. it is the
    first operation in the journal. Any later operation presenting a `NULL`
    `AuthorityJournalID`, or any genesis attempted against a non-empty journal, is
-   rejected before commit.
+   rejected before commit. **Precedence:** this check is evaluated only after
+   §9.4's `OperationID`-presence short-circuit — a same-`OperationID` retry of
+   the genesis operation is resolved by §9.4 (returns the original bootstrap
+   authority) before this rule ever runs, so this rule rejects only a genesis
+   presenting a *new* `OperationID` against a non-empty journal, never an
+   idempotent retry of the first one. See §4.6's precedence note.
 7. **Genesis sole effect.** A genesis operation's only effect is exactly one
    `journal_authorities` row with `AuthorityKind = 'bootstrap'` (plus its
    `journal_authority_bootstraps` detail row): no task events, assignment
@@ -802,6 +875,12 @@ boundary, before returning to the caller.
    `subtype_integrity.yaml` carries the must-fail histories (no subtype, two
    subtypes, discriminator mismatch, and the authority-level
    bootstrap-with-transition mismatch).
+9. **Result-slot own-operation integrity.** A `journal_operation_result_slots`
+   row's `ProducedJournalID` must identify a `journal` row whose own
+   `ProducedByOperationJournalID` equals the slot row's own `JournalID` — a
+   result slot may only map to a row produced by its own operation (§3.2). The
+   two FKs alone permit a slot row pointing at another operation's produced
+   row; the reducer rejects this before commit.
 
 ## 11. OperationID doctrine
 
