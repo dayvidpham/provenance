@@ -1,0 +1,85 @@
+# Executable-scope partition for the adversarial proof corpus.
+#
+# The relational contract's proof corpus (docs/journal-relational-contract.md,
+# the sibling *.yaml files) spans the whole journal architecture. Only the
+# journal-base capabilities exist at this layer (issue dayvidpham/provenance#4):
+# the global JournalID-ordered journal, the task_event subtype and its context
+# edges, the actor-namespace reservation registry, the current-state/attribution
+# projections, and subtype-integrity totality for the task_event kind.
+#
+# This table maps every corpus operator to the implementation leaf that makes it
+# executable. The corpus harness (journal_corpus_test.go) consumes it to:
+#   * execute every `s1.1` operator against real journal-base production code,
+#   * assert every remaining operator is a recorded `s1.2`/`s1.3` obligation and
+#     is NOT yet executable — a checked partition, never a skipped/disabled test,
+#   * fail if any corpus operator is missing from this table, or if any table
+#     entry names an operator no corpus case uses (freshness in both directions).
+#
+# Slice meanings:
+#   s1.1 — journal base + task_event subtype + projections + actor namespace
+#          + task_event subtype-totality (this leaf, issue #4).
+#   s1.2 — operations, effects, results, authority lifecycle, genesis,
+#          per-effect authorization, assignment lifecycle (issue #5).
+#   s1.3 — shared Apply/Open reducer, replay, retry/reopen/cancellation,
+#          projection repair, legacy baseline migration, schema preflight
+#          and fail-closed topology detection (issue #5).
+operators:
+  # --- s1.1: executable now against journal-base production code -------------
+  - {operator: order-by-journalid,                          slice: s1.1}
+  - {operator: order-by-journalid-concurrent,               slice: s1.1}
+  - {operator: reject-non-journalid-order-request,          slice: s1.1}
+  - {operator: claim-two-disjoint-namespaces,               slice: s1.1}
+  - {operator: claim-overlapping-namespace,                 slice: s1.1}
+  - {operator: register-manifest-entry-out-of-range,        slice: s1.1}
+  - {operator: write-journal-row-missing-subtype,           slice: s1.1}
+
+  # --- s1.2: operations, authority, results (issue #5) ----------------------
+  - {operator: authorize-using-recordedat-not-journalid,    slice: s1.2, reason: authority ordering}
+  - {operator: apply-empty-batch,                           slice: s1.2, reason: operation anchoring}
+  - {operator: apply-zero-task-event-operation,             slice: s1.2, reason: operation anchoring}
+  - {operator: authority-precedence-by-journalid,           slice: s1.2, reason: authority}
+  - {operator: lookup-committed,                            slice: s1.2, reason: operation result lookup}
+  - {operator: apply-genesis-operation,                     slice: s1.2, reason: genesis operation/authority}
+  - {operator: apply-genesis-retry-same-operationid,        slice: s1.2, reason: genesis idempotency}
+  - {operator: apply-genesis-with-extra-effect,             slice: s1.2, reason: genesis sole-effect rule}
+  - {operator: apply-null-authority-after-genesis,          slice: s1.2, reason: null-authority discipline}
+  - {operator: apply-second-genesis,                        slice: s1.2, reason: genesis first-operation-only}
+  - {operator: lookup-committed-emitted-events-from-closure, slice: s1.2, reason: produced-row closure}
+  - {operator: lookup-committed-reconstruct-result-slots,   slice: s1.2, reason: result-slot reconstruction}
+  - {operator: authority-governing-parent,                  slice: s1.2, reason: authority}
+  - {operator: authority-unrelated,                         slice: s1.2, reason: authority}
+  - {operator: batch-ended-before-started,                  slice: s1.2, reason: assignment lifecycle order}
+  - {operator: end-episode-never-started,                   slice: s1.2, reason: assignment lifecycle order}
+  - {operator: fold-sequentially-check-effect2-sees-effect1, slice: s1.2, reason: per-effect authorization}
+  - {operator: produce-effect-with-actor-differing-from-anchor, slice: s1.2, reason: committing-actor agreement}
+  - {operator: start-with-orphaned-predecessor,             slice: s1.2, reason: orphaned-evidence rejection}
+  - {operator: two-successors-same-predecessor,             slice: s1.2, reason: single-consumption evidence}
+  - {operator: attribute-episode-occupant-not-committer,    slice: s1.2, reason: assignment-episode attribution}
+  - {operator: close-task-omit-ended-transition,            slice: s1.2, reason: assignment lifecycle}
+  - {operator: close-task-with-active-assignment,           slice: s1.2, reason: assignment lifecycle}
+  - {operator: concurrent-transfer-cas,                     slice: s1.2, reason: transfer CAS}
+  - {operator: write-journal-row-two-subtypes,              slice: s1.2, reason: needs decision/evidence subtype tables}
+  - {operator: write-subtype-mismatching-journalkind,       slice: s1.2, reason: needs operations subtype table}
+  - {operator: write-authority-detail-mismatching-authoritykind, slice: s1.2, reason: needs authority subtype tables}
+
+  # --- s1.3: shared reducer, replay, migration (issue #5) -------------------
+  - {operator: replay-with-ended-authority,                 slice: s1.3, reason: Open-time replay}
+  - {operator: replay-zero-task-event-operation,            slice: s1.3, reason: Open-time replay}
+  - {operator: apply-then-close-then-reopen-compare-projection, slice: s1.3, reason: Apply/Open convergence}
+  - {operator: cancel-mid-batch,                            slice: s1.3, reason: cancellation recovery}
+  - {operator: concurrent-open-then-reopen-converge,        slice: s1.3, reason: replay convergence}
+  - {operator: fault-then-retry-same-operation,             slice: s1.3, reason: failure recovery}
+  - {operator: reuse-operationid-different-mutation-digest, slice: s1.3, reason: idempotent replay short-circuit}
+  - {operator: fault-between-transfer-ended-and-started,    slice: s1.3, reason: transfer-crash atomicity}
+  - {operator: reopen-task,                                 slice: s1.3, reason: reopen recovery}
+  - {operator: migrate-legacy-task,                         slice: s1.3, reason: legacy baseline migration}
+  - {operator: migrate-legacy-task-with-fabricated-timestamp, slice: s1.3, reason: honest-timestamp migration}
+  - {operator: migrate-batch-with-one-unmappable-owner,     slice: s1.3, reason: migration fail-closed}
+  - {operator: migrate-then-extend-compare-to-native-only,  slice: s1.3, reason: migrated/native equivalence}
+  - {operator: migrate-then-remigrate-same-legacy-set,      slice: s1.3, reason: idempotent re-migration}
+  - {operator: schema-preflight,                            slice: s1.3, reason: external-schema preflight}
+  - {operator: schema-preflight-extra-column,               slice: s1.3, reason: external-schema preflight}
+  - {operator: schema-preflight-missing-column,             slice: s1.3, reason: external-schema preflight}
+  - {operator: schema-preflight-missing-table,              slice: s1.3, reason: external-schema preflight}
+  - {operator: fault-mid-migration,                         slice: s1.3, reason: migration fail-closed}
+  - {operator: concurrent-open-during-corruption,           slice: s1.3, reason: fail-closed topology detection}
