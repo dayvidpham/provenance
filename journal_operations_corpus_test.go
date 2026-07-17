@@ -33,14 +33,18 @@ var s12Operators = map[testcorpus.OperatorName]s11Handler{
 	"lookup-committed-emitted-events-from-closure":     opLookupCommittedEmittedEventsFromClosure,
 	"reject-result-slot-referencing-foreign-operation": opRejectResultSlotForeignOperation,
 	// authority_evidence.yaml (§9.3, §14)
-	"fold-sequentially-check-effect2-sees-effect1": opFoldSequentiallyEffect2SeesEffect1,
-	"start-with-orphaned-predecessor":              opStartWithOrphanedPredecessor,
-	"two-successors-same-predecessor":              opTwoSuccessorsSamePredecessor,
-	"authority-unrelated":                          opAuthorityUnrelated,
-	"blocked-by-edge-does-not-grant-authority":     opBlockedByEdgeDoesNotGrantAuthority,
-	"produce-subordinate-row-carrying-actor":       opProduceSubordinateRowCarryingActor,
-	"end-episode-never-started":                    opEndEpisodeNeverStarted,
-	"batch-ended-before-started":                   opBatchEndedBeforeStarted,
+	"fold-sequentially-check-effect2-sees-effect1":     opFoldSequentiallyEffect2SeesEffect1,
+	"start-with-orphaned-predecessor":                  opStartWithOrphanedPredecessor,
+	"two-successors-same-predecessor":                  opTwoSuccessorsSamePredecessor,
+	"authority-unrelated":                              opAuthorityUnrelated,
+	"blocked-by-edge-does-not-grant-authority":         opBlockedByEdgeDoesNotGrantAuthority,
+	"transitive-parent-citation-grants-authority":      opTransitiveParentCitationGrantsAuthority,
+	"parent-chain-middle-episode-ended-cuts-authority": opParentChainMiddleEndedCutsAuthority,
+	"citation-of-inactive-parent-at-start-rejected":    opCitationOfInactiveParentRejected,
+	"corrupted-cyclic-parent-chain-fails-closed":       opCorruptedCyclicParentChainFailsClosed,
+	"produce-subordinate-row-carrying-actor":           opProduceSubordinateRowCarryingActor,
+	"end-episode-never-started":                        opEndEpisodeNeverStarted,
+	"batch-ended-before-started":                       opBatchEndedBeforeStarted,
 	// owner_responsibility.yaml (§4.4, §8.1, §8.2, §9.6)
 	"close-task-with-active-assignment":        opCloseTaskWithActiveAssignment,
 	"close-task-omit-ended-transition":         opCloseTaskOmitEndedTransition,
@@ -162,6 +166,50 @@ func (e *opsEnv) startEpisode(t *testing.T, opID string, auth JournalID, task Ta
 		t.Fatalf("startEpisode %q produced no authority slot", opID)
 	}
 	return jid
+}
+
+// startEpisodeWithParent starts an owner-responsibility episode that cites
+// `parent` as its governing parent episode (§14.5). The start is authorized by
+// `auth` (typically the bootstrap authority, which governs every task); the
+// parent citation is separate metadata declared at start. Returns the started
+// transition's authority JournalID.
+func (e *opsEnv) startEpisodeWithParent(t *testing.T, opID string, auth JournalID, task TaskID, assignment, parent AssignmentID, occupant ActorID) JournalID {
+	res, err := e.tr.Journal().Apply(OperationInput{
+		OperationID:        OperationID(opID),
+		ActorID:            e.actor,
+		AuthorityJournalID: &auth,
+		CommandDigest:      e.digest(opID + "c"),
+		MutationDigest:     e.digest(opID + "m"),
+		Effects: []Effect{{
+			Sort: EffectAssignmentStart, AssignmentID: assignment, TaskID: task,
+			SlotID: SlotOwnerResponsibility, Occupant: occupant, Parent: parent, ResultSlot: "auth",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("startEpisodeWithParent %q: %v", opID, err)
+	}
+	jid, ok := slotJournalID(res, "auth")
+	if !ok {
+		t.Fatalf("startEpisodeWithParent %q produced no authority slot", opID)
+	}
+	return jid
+}
+
+// endEpisode ends an owner-responsibility episode on `task` under authority
+// `auth`.
+func (e *opsEnv) endEpisode(t *testing.T, opID string, auth JournalID, task TaskID, assignment AssignmentID) {
+	if _, err := e.tr.Journal().Apply(OperationInput{
+		OperationID:        OperationID(opID),
+		ActorID:            e.actor,
+		AuthorityJournalID: &auth,
+		CommandDigest:      e.digest(opID + "c"),
+		MutationDigest:     e.digest(opID + "m"),
+		Effects: []Effect{{
+			Sort: EffectAssignmentEnd, AssignmentID: assignment, TaskID: task, SlotID: SlotOwnerResponsibility,
+		}},
+	}); err != nil {
+		t.Fatalf("endEpisode %q: %v", opID, err)
+	}
 }
 
 func opID(input anyMap, fallback string) OperationID {
@@ -531,6 +579,101 @@ func opBlockedByEdgeDoesNotGrantAuthority(t *testing.T, input, expected anyMap, 
 		Effects: []Effect{{Sort: EffectTaskEvent, TaskID: dependent, EventKind: "provenance.task.updated"}},
 	})
 	return expectRejected(err, ErrAuthorityScope, "an authority reaching an unrelated task via a blocked_by scheduling edge")
+}
+
+// opTransitiveParentCitationGrantsAuthority proves the §14.5 transitive
+// deliberate-ownership reach: a supervisor@epic <- worker@story <- helper@subtask
+// parent-citation chain, all active, lets the supervisor's own assignment
+// authority govern an effect on the subtask (branch b of the governance predicate).
+func opTransitiveParentCitationGrantsAuthority(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
+	env := newOpsEnv(t)
+	boot := env.genesis(t, "op-genesis")
+	epic := env.taskFor(t, "epic")
+	story := env.taskFor(t, "story")
+	subtask := env.taskFor(t, "subtask")
+	// E-SUP on epic (no parent); its started transition is the supervisor authority.
+	supAuth := env.startEpisode(t, "op-start-sup", boot, epic, "E-SUP", env.actorFor(t, "supervisor"))
+	// E-WRK on story cites E-SUP; E-HLP on subtask cites E-WRK. Starts authorized
+	// by the bootstrap authority (which governs every task); citation is metadata.
+	env.startEpisodeWithParent(t, "op-start-wrk", boot, story, "E-WRK", "E-SUP", env.actorFor(t, "worker"))
+	env.startEpisodeWithParent(t, "op-start-hlp", boot, subtask, "E-HLP", "E-WRK", env.actorFor(t, "helper"))
+	// An effect on the subtask under the supervisor authority must be accepted: the
+	// subtask episode reaches E-SUP via the active citation chain.
+	if _, err := env.tr.Journal().Apply(OperationInput{
+		OperationID: opID(input, "op-grandparent-authorizes-subtask"), ActorID: env.actor, AuthorityJournalID: &supAuth,
+		CommandDigest: env.digest("c"), MutationDigest: env.digest("m"),
+		Effects: []Effect{{Sort: EffectTaskEvent, TaskID: subtask, EventKind: "provenance.task.updated"}},
+	}); err != nil {
+		return fmt.Errorf("supervisor authority rejected on the subtask despite an active citation chain: %w", err)
+	}
+	return nil
+}
+
+// opParentChainMiddleEndedCutsAuthority proves §14.5 whole-chain liveness: with
+// the middle (worker) episode ended, the supervisor no longer governs the subtask.
+func opParentChainMiddleEndedCutsAuthority(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
+	env := newOpsEnv(t)
+	boot := env.genesis(t, "op-genesis")
+	epic := env.taskFor(t, "epic")
+	story := env.taskFor(t, "story")
+	subtask := env.taskFor(t, "subtask")
+	supAuth := env.startEpisode(t, "op-start-sup", boot, epic, "E-SUP", env.actorFor(t, "supervisor"))
+	env.startEpisodeWithParent(t, "op-start-wrk", boot, story, "E-WRK", "E-SUP", env.actorFor(t, "worker"))
+	env.startEpisodeWithParent(t, "op-start-hlp", boot, subtask, "E-HLP", "E-WRK", env.actorFor(t, "helper"))
+	// End the MIDDLE episode; the subtask episode is still active but its chain to
+	// the supervisor is now broken by an inactive intermediate.
+	env.endEpisode(t, "op-end-wrk", boot, story, "E-WRK")
+	_, err := env.tr.Journal().Apply(OperationInput{
+		OperationID: opID(input, "op-grandchild-effect-after-middle-ended"), ActorID: env.actor, AuthorityJournalID: &supAuth,
+		CommandDigest: env.digest("c"), MutationDigest: env.digest("m"),
+		Effects: []Effect{{Sort: EffectTaskEvent, TaskID: subtask, EventKind: "provenance.task.updated"}},
+	})
+	return expectRejected(err, ErrAuthorityScope, "a grandchild effect after the middle chain episode ended")
+}
+
+// opCitationOfInactiveParentRejected proves §14.5 citation validity: citing an
+// ended (inactive) parent at start is rejected before commit.
+func opCitationOfInactiveParentRejected(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
+	env := newOpsEnv(t)
+	boot := env.genesis(t, "op-genesis")
+	epic := env.taskFor(t, "epic")
+	story := env.taskFor(t, "story")
+	// Start then END E-SUP so it is inactive at the citation below.
+	env.startEpisode(t, "op-start-sup", boot, epic, "E-SUP", env.actorFor(t, "supervisor"))
+	env.endEpisode(t, "op-end-sup", boot, epic, "E-SUP")
+	// Cite the now-ended E-SUP as the parent of a new episode on the story.
+	_, err := env.tr.Journal().Apply(OperationInput{
+		OperationID: opID(input, "op-cite-ended-parent"), ActorID: env.actor, AuthorityJournalID: &boot,
+		CommandDigest: env.digest("c"), MutationDigest: env.digest("m"),
+		Effects: []Effect{{
+			Sort: EffectAssignmentStart, AssignmentID: "E-WRK", TaskID: story,
+			SlotID: SlotOwnerResponsibility, Occupant: env.actorFor(t, "worker"), Parent: "E-SUP",
+		}},
+	})
+	return expectRejected(err, ErrParentCitation, "citing a parent episode that has already ended")
+}
+
+// opCorruptedCyclicParentChainFailsClosed proves §14.5's bounded, visited-tracked
+// governance walk fails closed on a corrupt cyclic parent chain seeded directly
+// (bypassing the start-effect cycle guard), rather than looping.
+func opCorruptedCyclicParentChainFailsClosed(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
+	env := newOpsEnv(t)
+	st, ok := env.tr.(*sqliteTracker)
+	if !ok {
+		return fmt.Errorf("expected *sqliteTracker, got %T", env.tr)
+	}
+	tX := env.taskFor(t, "tX")
+	tY := env.taskFor(t, "tY")
+	tZ := env.taskFor(t, "tZ")
+	zAuth, target, beforeJID, err := st.db.AdversarialCyclicParentChain(env.actor, tX, tY, tZ)
+	if err != nil {
+		return fmt.Errorf("seed corrupt cyclic parent chain: %w", err)
+	}
+	governs, err := st.db.AuthorityGovernsTaskAt(zAuth, target, beforeJID)
+	if governs {
+		return fmt.Errorf("governance walk returned true over a corrupt cyclic parent chain, want a fail-closed error")
+	}
+	return expectRejected(err, ErrCorruptParentChain, "a corrupt cyclic parent-citation chain")
 }
 
 func opProduceSubordinateRowCarryingActor(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {

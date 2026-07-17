@@ -206,6 +206,60 @@ func (db *DB) episodeTaskLocked(assignment journal.AssignmentID) (journal.TaskID
 	return journalParseTask(raw)
 }
 
+// episodeParentLocked returns the ParentAssignmentID citation of an episode
+// (§4.4, §14.5). hasParent is false when the episode cites no parent (NULL
+// parent_assignment_id) or does not exist.
+func (db *DB) episodeParentLocked(assignment journal.AssignmentID) (parent journal.AssignmentID, hasParent bool, err error) {
+	if execErr := sqlitex.Execute(db.conn,
+		`SELECT parent_assignment_id FROM journal_authority_assignment_episodes WHERE assignment_id = ?1`,
+		&sqlitex.ExecOptions{Args: []any{string(assignment)}, ResultFunc: func(stmt *zs.Stmt) error {
+			if stmt.ColumnType(0) != zs.TypeNull {
+				parent = journal.AssignmentID(stmt.ColumnText(0))
+				hasParent = parent != ""
+			}
+			return nil
+		}}); execErr != nil {
+		return "", false, fmt.Errorf("episode parent %q: %w", assignment, execErr)
+	}
+	return parent, hasParent, nil
+}
+
+// transitionExistsBeforeLocked reports whether the episode has the given
+// transition committed at a journal position strictly before beforeJID (§14.5
+// position-aware liveness). It is the position-scoped variant of
+// transitionExistsLocked, which considers transitions at any position.
+func (db *DB) transitionExistsBeforeLocked(assignment journal.AssignmentID, transitionID int, beforeJID int64) (bool, error) {
+	found := false
+	if err := sqlitex.Execute(db.conn,
+		`SELECT 1 FROM journal_authority_assignment_transitions
+		 WHERE assignment_id = ?1 AND transition_id = ?2 AND journal_id < ?3 LIMIT 1`,
+		&sqlitex.ExecOptions{Args: []any{string(assignment), transitionID, beforeJID}, ResultFunc: func(*zs.Stmt) error { found = true; return nil }}); err != nil {
+		return false, fmt.Errorf("transition-before %q/%d < %d: %w", assignment, transitionID, beforeJID, err)
+	}
+	return found, nil
+}
+
+// episodeActiveAtLocked reports whether episode `assignment` is active at journal
+// position beforeJID (§14.5 liveness): it has a started transition strictly before
+// beforeJID and no ended transition strictly before beforeJID. "Active at effect
+// time" — used both for the citation guard (at the start transition's own
+// position) and for whole-chain liveness in the governance walk (at the consuming
+// effect's position).
+func (db *DB) episodeActiveAtLocked(assignment journal.AssignmentID, beforeJID int64) (bool, error) {
+	started, err := db.transitionExistsBeforeLocked(assignment, transitionStartedID, beforeJID)
+	if err != nil {
+		return false, err
+	}
+	if !started {
+		return false, nil
+	}
+	ended, err := db.transitionExistsBeforeLocked(assignment, transitionEndedID, beforeJID)
+	if err != nil {
+		return false, err
+	}
+	return !ended, nil
+}
+
 func (db *DB) taskHasActiveOwnerEpisodeLocked(task journal.TaskID) (bool, error) {
 	found := false
 	if err := sqlitex.Execute(db.conn,
@@ -301,13 +355,15 @@ func (db *DB) requireAuthorityGovernsLocked(in journal.OperationInput, effectJID
 }
 
 // authorityGovernsTaskAtLocked answers whether the authority at authJID governs
-// targetTask for an effect committed at beforeJID (§9.3): a bootstrap authority
-// (the system root) governs every task; an assignment authority governs ONLY the
-// task of its own active episode. There is no edge-graph governance — a
-// scheduling edge such as blocked_by carries no ownership semantics, so a task
-// merely reachable through one is NOT governed (see the authority note in
-// docs/journal-relational-contract.md §14.1). The authority must strictly precede
-// the effect by JournalID (never by RecordedAt, §12).
+// targetTask for an effect committed at beforeJID (§9.3, §14.5): a bootstrap
+// authority (the system root) governs every task; an assignment authority governs
+// its own active episode's task PLUS every task whose episode reaches that episode
+// via a chain of deliberate ParentAssignmentID citations, with the whole chain
+// active at beforeJID. There is no edge-graph governance — a scheduling edge such
+// as blocked_by carries no ownership semantics, so a task merely reachable through
+// one is NOT governed (§14.1); only deliberate parent citations cross tasks. The
+// authority must strictly precede the effect by JournalID (never by RecordedAt,
+// §12).
 func (db *DB) authorityGovernsTaskAtLocked(authJID journal.JournalID, targetTask journal.TaskID, beforeJID int64) (bool, error) {
 	if int64(authJID) >= beforeJID {
 		return false, nil // authority does not precede the effect (§9.3)
@@ -322,41 +378,220 @@ func (db *DB) authorityGovernsTaskAtLocked(authJID journal.JournalID, targetTask
 	case authKindBootstrapID:
 		return true, nil
 	case authKindAssignmentID:
-		return db.assignmentAuthorityGovernsLocked(authJID, targetTask)
+		return db.assignmentAuthorityGovernsLocked(authJID, targetTask, beforeJID)
 	default:
 		return false, nil // unknown/absent authority governs nothing
 	}
 }
 
-func (db *DB) assignmentAuthorityGovernsLocked(authJID journal.JournalID, targetTask journal.TaskID) (bool, error) {
+// assignmentAuthorityGovernsLocked implements the §14.5 governance predicate for
+// an assignment authority at beforeJID: the authority's episode E governs
+// targetTask when (a) E's own task is targetTask and E is active at beforeJID, or
+// (b) some episode on targetTask reaches E by following ParentAssignmentID
+// citations with EVERY episode on that chain — the child through each cited
+// ancestor up to E — active at beforeJID. The walk is bounded and visited-tracked;
+// a corrupted stored chain that cycles fails closed with ErrCorruptParentChain
+// rather than looping.
+func (db *DB) assignmentAuthorityGovernsLocked(authJID journal.JournalID, targetTask journal.TaskID, beforeJID int64) (bool, error) {
 	// Resolve the assignment episode this authority (a transition row) belongs to.
-	var assignment string
+	var authEpisode string
 	if err := sqlitex.Execute(db.conn,
 		`SELECT assignment_id FROM journal_authority_assignment_transitions WHERE journal_id = ?1`,
-		&sqlitex.ExecOptions{Args: []any{int64(authJID)}, ResultFunc: func(stmt *zs.Stmt) error { assignment = stmt.ColumnText(0); return nil }}); err != nil {
+		&sqlitex.ExecOptions{Args: []any{int64(authJID)}, ResultFunc: func(stmt *zs.Stmt) error { authEpisode = stmt.ColumnText(0); return nil }}); err != nil {
 		return false, fmt.Errorf("authority assignment %d: %w", authJID, err)
 	}
-	if assignment == "" {
+	if authEpisode == "" {
 		return false, nil
 	}
-	// The assignment must still be active (a started-but-not-ended episode).
-	ended, exists, err := db.episodeEndedLocked(journal.AssignmentID(assignment))
+	authAssignment := journal.AssignmentID(authEpisode)
+	// The authority's own episode E must itself be active at the effect position:
+	// an ended authority governs nothing, directly or by delegation.
+	authActive, err := db.episodeActiveAtLocked(authAssignment, beforeJID)
 	if err != nil {
 		return false, err
 	}
-	if !exists || ended {
+	if !authActive {
 		return false, nil
 	}
-	authTask, err := db.episodeTaskLocked(journal.AssignmentID(assignment))
+	// (a) Direct: the authority's own episode task.
+	authTask, err := db.episodeTaskLocked(authAssignment)
 	if err != nil {
 		return false, err
 	}
-	// An assignment authority governs ONLY the task of its own active episode. It
-	// grants no authority over any other task, including one merely reachable
-	// through a scheduling edge (blocked_by), which carries no ownership semantics.
-	// A broader governance chain (e.g. a genuine governing-parent relation) would
-	// require a contract amendment before implementation (§14.1 authority note).
-	return authTask.String() == targetTask.String(), nil
+	if authTask.String() == targetTask.String() {
+		return true, nil
+	}
+	// (b) Transitive: some active episode on targetTask reaches E by parent
+	// citations, every episode on the chain active at beforeJID.
+	starts, err := db.episodesOnTaskLocked(targetTask)
+	if err != nil {
+		return false, err
+	}
+	for _, start := range starts {
+		active, err := db.episodeActiveAtLocked(start, beforeJID)
+		if err != nil {
+			return false, err
+		}
+		if !active {
+			continue // an inactive child episode roots no live delegation chain
+		}
+		reached, err := db.parentChainReachesLocked(start, authAssignment, beforeJID)
+		if err != nil {
+			return false, err // corrupted cyclic chain — fail closed (§14.5)
+		}
+		if reached {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// episodesOnTaskLocked returns every episode whose task is `task` (§14.5 walk
+// entry points). A task typically has few episodes.
+func (db *DB) episodesOnTaskLocked(task journal.TaskID) ([]journal.AssignmentID, error) {
+	var out []journal.AssignmentID
+	if err := sqlitex.Execute(db.conn,
+		`SELECT assignment_id FROM journal_authority_assignment_episodes WHERE task_id = ?1`,
+		&sqlitex.ExecOptions{Args: []any{task.String()}, ResultFunc: func(stmt *zs.Stmt) error {
+			out = append(out, journal.AssignmentID(stmt.ColumnText(0)))
+			return nil
+		}}); err != nil {
+		return nil, fmt.Errorf("episodes on task %q: %w", task, err)
+	}
+	return out, nil
+}
+
+// parentChainReachesLocked walks up the ParentAssignmentID chain from `start`,
+// returning true when it reaches `target` with every intermediate cited ancestor
+// active at beforeJID (the caller has already verified `start` and `target` are
+// active). It fails closed with ErrCorruptParentChain when a cycle is detected
+// (a revisited episode or a step past the bounded cap), so a corrupted stored
+// chain halts authorization rather than looping (§14.5).
+func (db *DB) parentChainReachesLocked(start, target journal.AssignmentID, beforeJID int64) (bool, error) {
+	visited := map[journal.AssignmentID]struct{}{}
+	cur := start
+	// Defense-in-depth bound: the number of episodes is a hard ceiling on any
+	// acyclic chain length; the visited set is the primary cycle guard.
+	maxSteps, err := db.countEpisodesLocked()
+	if err != nil {
+		return false, err
+	}
+	for step := 0; ; step++ {
+		if cur == target {
+			return true, nil
+		}
+		if _, seen := visited[cur]; seen || step > maxSteps {
+			return false, fmt.Errorf(
+				"%w: parent-citation walk from episode %q revisited %q before reaching %q — where: "+
+					"§14.5 governance walk; when: during per-effect authorization; impact: authorization "+
+					"fails closed and nothing is committed; fix: the stored parent_assignment_id chain is "+
+					"corrupt (a cycle only reachable by bypassing the start-effect citation guard); repair "+
+					"the journal", journal.ErrCorruptParentChain, start, cur, target)
+		}
+		visited[cur] = struct{}{}
+		parent, hasParent, err := db.episodeParentLocked(cur)
+		if err != nil {
+			return false, err
+		}
+		if !hasParent {
+			return false, nil // reached a citation root that is not the target
+		}
+		// Each cited ancestor on the chain must be active at the effect position;
+		// a chain broken by an ended middle episode delegates nothing past it.
+		active, err := db.episodeActiveAtLocked(parent, beforeJID)
+		if err != nil {
+			return false, err
+		}
+		if !active {
+			return false, nil
+		}
+		cur = parent
+	}
+}
+
+func (db *DB) countEpisodesLocked() (int, error) {
+	var n int
+	if err := sqlitex.Execute(db.conn, `SELECT COUNT(*) FROM journal_authority_assignment_episodes`,
+		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
+		return 0, fmt.Errorf("count episodes: %w", err)
+	}
+	return n, nil
+}
+
+// requireParentCitationValidLocked validates an assignment-start's
+// ParentAssignmentID citation (§14.5): the cited parent must exist and be active
+// at this start transition's own journal position startJID, and the citation must
+// not create a cycle. It returns nil for an empty (absent) citation.
+func (db *DB) requireParentCitationValidLocked(newEpisode, parent journal.AssignmentID, startJID int64) error {
+	if parent == "" {
+		return nil
+	}
+	exists, err := db.episodeExistsLocked(parent)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf(
+			"%w: assignment start cites parent episode %q which does not exist — where: assignment-start "+
+				"fold (§14.5); when: before commit; impact: nothing committed; fix: cite an existing, active "+
+				"episode, or omit the parent citation",
+			journal.ErrParentCitation, parent)
+	}
+	active, err := db.episodeActiveAtLocked(parent, startJID)
+	if err != nil {
+		return err
+	}
+	if !active {
+		return fmt.Errorf(
+			"%w: assignment start cites parent episode %q which is not active at journal position %d "+
+				"(never started, or already ended) — where: assignment-start fold (§14.5); when: before "+
+				"commit; impact: nothing committed; fix: root this episode under a parent whose episode is "+
+				"active at the moment of citation",
+			journal.ErrParentCitation, parent, startJID)
+	}
+	// Cycle guard: the new episode must not already appear in the parent's
+	// ancestry. With citation-at-start the new AssignmentID does not yet exist, so
+	// this is structurally impossible for honest input; the bounded, visited-
+	// tracked walk still fails closed on a forged/corrupt ancestry.
+	return db.requireNoParentCycleLocked(newEpisode, parent)
+}
+
+// requireNoParentCycleLocked walks the parent's existing ancestry and rejects a
+// citation that would place newEpisode in its own ancestry (a cycle), or that
+// traverses a pre-existing corrupt cycle (§14.5). Liveness is not consulted here —
+// a cycle is a structural property of the stored chain.
+func (db *DB) requireNoParentCycleLocked(newEpisode, parent journal.AssignmentID) error {
+	visited := map[journal.AssignmentID]struct{}{}
+	cur := parent
+	maxSteps, err := db.countEpisodesLocked()
+	if err != nil {
+		return err
+	}
+	for step := 0; ; step++ {
+		if cur == newEpisode {
+			return fmt.Errorf(
+				"%w: citing parent %q would make episode %q an ancestor of itself (a cycle) — where: "+
+					"assignment-start fold (§14.5); when: before commit; impact: nothing committed; fix: "+
+					"parent chains are finite; do not cite a descendant as a parent",
+				journal.ErrParentCitation, parent, newEpisode)
+		}
+		if _, seen := visited[cur]; seen || step > maxSteps {
+			return fmt.Errorf(
+				"%w: parent %q ancestry revisited %q — where: assignment-start cycle guard (§14.5); when: "+
+					"before commit; impact: nothing committed; fix: the stored parent_assignment_id chain is "+
+					"already corrupt (a cycle); repair the journal before citing into it",
+				journal.ErrCorruptParentChain, parent, cur)
+		}
+		visited[cur] = struct{}{}
+		next, hasParent, err := db.episodeParentLocked(cur)
+		if err != nil {
+			return err
+		}
+		if !hasParent {
+			return nil
+		}
+		cur = next
+	}
 }
 
 // validateClosesEndAssignmentsLocked rejects an operation that closes a task

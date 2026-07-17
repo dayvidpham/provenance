@@ -150,6 +150,8 @@ var (
 	ErrStaleEpisode        = journal.ErrStaleEpisode
 	ErrResultSlotIntegrity = journal.ErrResultSlotIntegrity
 	ErrCloseWithoutEnding  = journal.ErrCloseWithoutEnding
+	ErrParentCitation      = journal.ErrParentCitation
+	ErrCorruptParentChain  = journal.ErrCorruptParentChain
 
 	// Shared-reducer replay, migration, and preflight sentinels (§9, §13, §15).
 	ErrMigrationOwnerUnmappable    = journal.ErrMigrationOwnerUnmappable

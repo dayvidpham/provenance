@@ -213,6 +213,14 @@ type Effect struct {
 	SlotID       AssignmentSlotID
 	Occupant     ActorID      // episode occupant (start); attributed actor (§8.2)
 	Predecessor  AssignmentID // optional predecessor episode on a transfer start
+	// Parent, on an EffectAssignmentStart, optionally cites the episode this one
+	// is deliberately rooted under for delegated governance (§14.5): the cited
+	// parent must be an episode that is ACTIVE at this start's own journal
+	// position, and the citation must not create a cycle. It is the deliberate
+	// ownership-citation edge and is DISTINCT from Predecessor — Predecessor is
+	// succession in time on one slot (a transfer), Parent is governance lineage
+	// across tasks. An episode may carry both, one, or neither.
+	Parent AssignmentID
 
 	// decision (EffectDecision) / evidence (EffectEvidence)
 	DecisionKind  DecisionKind
@@ -370,4 +378,16 @@ var (
 	// owner-responsibility episode is not ended in the same operation (§8.1,
 	// owner_responsibility.yaml regression c).
 	ErrCloseWithoutEnding = errors.New("provenance: task closed without ending its active owner-responsibility episode")
+	// ErrParentCitation is returned when an assignment-start's ParentAssignmentID
+	// citation is invalid (§14.5): a cited parent that does not exist, is not
+	// active at the citation's journal position, or whose citation would create a
+	// cycle in the parent chain. Distinct from ErrOrphanedEvidence, which guards
+	// the predecessor (succession) edge.
+	ErrParentCitation = errors.New("provenance: assignment parent citation invalid")
+	// ErrCorruptParentChain is returned when the governance walk over
+	// ParentAssignmentID citations detects a cycle in the STORED chain (§14.5) —
+	// a corruption reachable only by bypassing the start-effect citation guard
+	// (e.g. direct schema corruption). The bounded, visited-tracked walk fails
+	// closed with this typed error rather than looping.
+	ErrCorruptParentChain = errors.New("provenance: corrupt cyclic assignment parent-citation chain")
 )

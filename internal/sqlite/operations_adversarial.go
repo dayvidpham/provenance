@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/dayvidpham/provenance/internal/journal"
+	zs "zombiezen.com/go/sqlite"
 	"zombiezen.com/go/sqlite/sqlitex"
 )
 
@@ -382,4 +383,67 @@ func (db *DB) AdversarialResolveOperationIDInsertRace(in journal.OperationInput)
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	return db.resolveOperationIDInsertRaceLocked(in)
+}
+
+// AdversarialCyclicParentChain seeds a CORRUPT cyclic parent-citation chain that
+// the production start-effect citation guard (§14.5) would reject, bypassing that
+// guard by writing directly: episode X on taskX and episode Y on taskY each carry
+// an active started transition, and their parent_assignment_id columns point at
+// each other (X→Y→X). It also seeds an unrelated active episode Z on taskZ whose
+// started transition is the authority the corpus queries. It returns Z's authority
+// JournalID, taskX (the governance target), and a beforeJID strictly greater than
+// every seeded journal row so the whole chain is live. The corpus then asks whether
+// Z's authority governs taskX; the §14.5 governance walk must fail closed with
+// ErrCorruptParentChain (bounded, visited-tracked traversal) rather than looping.
+func (db *DB) AdversarialCyclicParentChain(actor journal.ActorID, taskX, taskY, taskZ journal.TaskID) (zAuth journal.JournalID, target journal.TaskID, beforeJID journal.JournalID, err error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	var txErr error
+	endTx := sqlitex.Transaction(db.conn)
+	defer endTx(&txErr)
+	if _, txErr = db.seedActiveEpisodeLocked(actor, taskX, "cyclic-parent-X", nil); txErr != nil {
+		return 0, journal.TaskID{}, 0, txErr
+	}
+	if _, txErr = db.seedActiveEpisodeLocked(actor, taskY, "cyclic-parent-Y", "cyclic-parent-X"); txErr != nil {
+		return 0, journal.TaskID{}, 0, txErr
+	}
+	// Close the cycle: X.parent = Y. A production start effect can never write this
+	// (its cycle guard rejects it); the direct UPDATE is the corruption under test.
+	if txErr = sqlitex.Execute(db.conn,
+		`UPDATE journal_authority_assignment_episodes SET parent_assignment_id = ?1 WHERE assignment_id = ?2`,
+		&sqlitex.ExecOptions{Args: []any{"cyclic-parent-Y", "cyclic-parent-X"}}); txErr != nil {
+		return 0, journal.TaskID{}, 0, txErr
+	}
+	var jz int64
+	if jz, txErr = db.seedActiveEpisodeLocked(actor, taskZ, "cyclic-parent-Z", nil); txErr != nil {
+		return 0, journal.TaskID{}, 0, txErr
+	}
+	var maxJID int64
+	if txErr = sqlitex.Execute(db.conn, `SELECT COALESCE(MAX(journal_id), 0) FROM journal`,
+		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { maxJID = stmt.ColumnInt64(0); return nil }}); txErr != nil {
+		return 0, journal.TaskID{}, 0, txErr
+	}
+	return journal.JournalID(jz), taskX, journal.JournalID(maxJID + 1), nil
+}
+
+// seedActiveEpisodeLocked writes one active episode (a started transition + its
+// journal_authorities row + the episode row) on `task`, optionally citing a
+// parent, and returns the started transition's authority JournalID. It is the
+// shared adversarial builder for the §14.5 cycle seam; production episodes are
+// only ever written through foldAssignmentStartLocked.
+func (db *DB) seedActiveEpisodeLocked(actor journal.ActorID, task journal.TaskID, assignment journal.AssignmentID, parent any) (int64, error) {
+	jid, err := db.insertJournalRowLocked(journal.JournalKindAuthority, actor, 0, nil)
+	if err != nil {
+		return 0, err
+	}
+	if err := sqlitex.Execute(db.conn,
+		`INSERT INTO journal_authority_assignment_episodes (assignment_id, task_id, slot_id, actor_id, predecessor_assignment_id, parent_assignment_id)
+		 VALUES (?1, ?2, ?3, ?4, NULL, ?5)`,
+		&sqlitex.ExecOptions{Args: []any{string(assignment), task.String(), slotOwnerResponsibilityID, actor.String(), parent}}); err != nil {
+		return 0, fmt.Errorf("seed episode %q: %w", assignment, err)
+	}
+	if err := db.insertAuthorityAssignmentTransitionLocked(jid, assignment, transitionStartedID); err != nil {
+		return 0, err
+	}
+	return jid, nil
 }

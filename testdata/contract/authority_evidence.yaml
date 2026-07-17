@@ -145,6 +145,92 @@ cases:
       accepted: false
       reason: subordinate-row-carries-actor
 
+  - name: transitive-parent-citation-grants-authority
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#5 §14.5 parent-citation governance: transitive deliberate-ownership reach"}
+    mutation:
+      description: >-
+        Three episodes form a deliberate delegation chain by parent citation:
+        a supervisor episode on an epic (no parent), a worker episode on a
+        story citing the supervisor episode as its parent, and a helper
+        episode on a subtask citing the worker episode. Each start is
+        authorized by the bootstrap authority (which governs every task); the
+        parent citation is separate metadata declared at start. Because the
+        whole chain (helper -> worker -> supervisor) is active, the
+        supervisor's own assignment authority governs the subtask: an effect
+        on the subtask under the supervisor authority must be accepted, since
+        the subtask's episode reaches the supervisor episode via active parent
+        citations (§14.5 predicate branch b).
+      operator: transitive-parent-citation-grants-authority
+    input:
+      operationId: op-grandparent-authorizes-subtask
+      chain: [{episode: E-SUP, task: epic, parent: null}, {episode: E-WRK, task: story, parent: E-SUP}, {episode: E-HLP, task: subtask, parent: E-WRK}]
+      effectUnderAuthority: {authorityEpisode: E-SUP, targetTask: subtask}
+    expected:
+      accepted: true
+      reason: transitive-active-citation-chain-grants-authority
+
+  - name: parent-chain-middle-episode-ended-cuts-authority
+    classification: must-fail
+    provenance: {source: requirement, ref: "provenance#5 §14.5 whole-chain liveness: an ended middle episode cuts delegated authority"}
+    mutation:
+      description: >-
+        The same supervisor -> worker -> helper citation chain, but the middle
+        (worker) episode on the story is ended before the effect. Whole-chain
+        liveness (§14.5) requires EVERY episode on the delegation chain to be
+        active at the effect's journal position; with the worker episode ended,
+        the subtask's episode no longer reaches the supervisor through an
+        entirely-active chain. A grandparent no longer governs a grandchild
+        once the parent between them ends, so an effect on the subtask under the
+        supervisor authority must be rejected.
+      operator: parent-chain-middle-episode-ended-cuts-authority
+    input:
+      operationId: op-grandchild-effect-after-middle-ended
+      chain: [{episode: E-SUP, task: epic, parent: null}, {episode: E-WRK, task: story, parent: E-SUP}, {episode: E-HLP, task: subtask, parent: E-WRK}]
+      endedMiddleEpisode: E-WRK
+      effectUnderAuthority: {authorityEpisode: E-SUP, targetTask: subtask}
+    expected:
+      accepted: false
+      reason: whole-chain-liveness-broken-by-ended-middle-episode
+
+  - name: citation-of-inactive-parent-at-start-rejected
+    classification: must-fail
+    provenance: {source: requirement, ref: "provenance#5 §14.5 citation validity: the cited parent must be active at citation"}
+    mutation:
+      description: >-
+        An episode's start cites a parent that has already ended (is not active
+        at the citation's own journal position). A parent citation is a
+        deliberate claim to be governed by a LIVE authority; citing an ended
+        (or never-started, or nonexistent) parent is rejected before commit.
+      operator: citation-of-inactive-parent-at-start-rejected
+    input:
+      operationId: op-cite-ended-parent
+      parentEpisode: {episode: E-SUP, task: epic, endedBeforeCitation: true}
+      childEpisode: {episode: E-WRK, task: story, parent: E-SUP}
+    expected:
+      accepted: false
+      reason: cited-parent-not-active-at-citation
+
+  - name: corrupted-cyclic-parent-chain-fails-closed
+    classification: must-fail
+    provenance: {source: requirement, ref: "provenance#5 §14.5 bounded fail-closed walk over a corrupt cyclic parent chain"}
+    mutation:
+      description: >-
+        A corrupt cyclic parent-citation chain (episode X parent Y, episode Y
+        parent X) is written directly, bypassing the start-effect cycle guard
+        the production writer enforces. When the governance walk evaluates an
+        authority against a task whose episode enters the cycle, the bounded,
+        visited-tracked traversal must fail closed with a typed
+        corrupt-chain error rather than looping forever.
+      operator: corrupted-cyclic-parent-chain-fails-closed
+    input:
+      cyclicEpisodes: [{episode: X, task: tX, parent: Y}, {episode: Y, task: tY, parent: X}]
+      queryAuthorityEpisode: {episode: Z, task: tZ}
+      queryTargetTask: tX
+    expected:
+      accepted: false
+      reason: bounded-walk-fails-closed-on-corrupt-cycle
+
   - name: ended-transition-without-started-rejected
     classification: must-fail
     provenance: {source: requirement, ref: "provenance#4 amendment §14.4 assignment-transition lifecycle order"}

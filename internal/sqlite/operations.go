@@ -94,7 +94,11 @@ func (db *DB) ensureOperationsSchema() error {
 			task_id                   TEXT NOT NULL REFERENCES tasks(id),
 			slot_id                   INTEGER NOT NULL REFERENCES assignment_slots(id),
 			actor_id                  TEXT NOT NULL REFERENCES agents(id),
-			predecessor_assignment_id TEXT UNIQUE REFERENCES journal_authority_assignment_episodes(assignment_id)
+			predecessor_assignment_id TEXT UNIQUE REFERENCES journal_authority_assignment_episodes(assignment_id),
+			-- ParentAssignmentID (§14.5): deliberate governance-citation edge, cited at
+			-- start; NOT UNIQUE (one parent may govern many children), distinct from the
+			-- UNIQUE predecessor (succession) edge above.
+			parent_assignment_id      TEXT REFERENCES journal_authority_assignment_episodes(assignment_id)
 		) STRICT`,
 		`CREATE TABLE IF NOT EXISTS journal_authority_assignment_transitions (
 			journal_id     INTEGER PRIMARY KEY REFERENCES journal_authorities(journal_id),
@@ -122,6 +126,8 @@ func (db *DB) ensureOperationsSchema() error {
 		// build it, drop it, then rebuild it on a first open (§ single-owner index).
 		`CREATE INDEX IF NOT EXISTS idx_transitions_assignment ON journal_authority_assignment_transitions (assignment_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_episodes_task ON journal_authority_assignment_episodes (task_id)`,
+		// Covering index for the §14.5 governance walk over parent citations.
+		`CREATE INDEX IF NOT EXISTS idx_episodes_parent ON journal_authority_assignment_episodes (parent_assignment_id)`,
 	}
 	for _, stmt := range ddl {
 		if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
@@ -560,13 +566,24 @@ func (db *DB) foldAssignmentStartLocked(in journal.OperationInput, jid int64, ef
 		}
 		predecessor = string(eff.Predecessor)
 	}
+	// Parent citation (§14.5): the deliberate governance-lineage edge. The cited
+	// parent must exist and be ACTIVE at this start transition's own journal
+	// position, and the citation must not create a cycle. Validated per-effect at
+	// jid, distinct from the predecessor (succession) checks above.
+	var parent any
+	if eff.Parent != "" {
+		if err := db.requireParentCitationValidLocked(eff.AssignmentID, eff.Parent, jid); err != nil {
+			return err
+		}
+		parent = string(eff.Parent)
+	}
 	// Episode identity row (append-only; created once per AssignmentID). The
 	// UNIQUE(predecessor_assignment_id) constraint is the single-consumption
 	// backstop (§14.2); a second successor of the same predecessor fails here.
 	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO journal_authority_assignment_episodes (assignment_id, task_id, slot_id, actor_id, predecessor_assignment_id)
-		 VALUES (?1, ?2, ?3, ?4, ?5)`,
-		&sqlitex.ExecOptions{Args: []any{string(eff.AssignmentID), eff.TaskID.String(), slot, occupant.String(), predecessor}}); err != nil {
+		`INSERT INTO journal_authority_assignment_episodes (assignment_id, task_id, slot_id, actor_id, predecessor_assignment_id, parent_assignment_id)
+		 VALUES (?1, ?2, ?3, ?4, ?5, ?6)`,
+		&sqlitex.ExecOptions{Args: []any{string(eff.AssignmentID), eff.TaskID.String(), slot, occupant.String(), predecessor, parent}}); err != nil {
 		if eff.Predecessor != "" && isUniqueViolation(err) {
 			return fmt.Errorf("%w: predecessor episode %q is already consumed by another successor (§14.2)",
 				journal.ErrOrphanedEvidence, eff.Predecessor)
