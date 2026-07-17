@@ -25,6 +25,39 @@ import (
 type DB struct {
 	mu   sync.Mutex
 	conn *zs.Conn
+
+	// projTasksTable / projAttribTable name the tables the shared reducer's
+	// projection-WRITE steps target (docs/journal-relational-contract.md §8, §15).
+	// They are the real projection tables ("tasks", "task_attributions") during a
+	// live Apply, and are temporarily repointed at connection-scoped shadow tables
+	// during ReplayProjections' from-empty convergence check so the real rows are
+	// never mutated while the check runs (SHADOW DERIVATION — the real tables stay
+	// read-only during the check, so the check is constraint-independent and the
+	// NOT NULL tasks.last_journal_id tightening cannot be tripped by a clear-in-place
+	// scratch UPDATE). Both are always held under db.mu; the swap+restore is bracketed
+	// inside one locked ReplayProjections call so a live Apply never observes the
+	// shadow target. Empty is treated as the real default by projTasks/projAttribs.
+	projTasksTable  string
+	projAttribTable string
+}
+
+// projTasks returns the projection-write target table for tasks: the shadow table
+// during a from-empty replay derivation, else the real "tasks" table (§8, §15).
+func (db *DB) projTasks() string {
+	if db.projTasksTable == "" {
+		return "tasks"
+	}
+	return db.projTasksTable
+}
+
+// projAttribs returns the projection-write target table for task attributions:
+// the shadow table during a from-empty replay derivation, else the real
+// "task_attributions" table (§8.2, §15).
+func (db *DB) projAttribs() string {
+	if db.projAttribTable == "" {
+		return "task_attributions"
+	}
+	return db.projAttribTable
 }
 
 // Open opens (or creates) a SQLite database at dbPath and returns an

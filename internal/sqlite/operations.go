@@ -455,6 +455,8 @@ func (db *DB) foldEffectLocked(in journal.OperationInput, anchorJID int64, eff j
 		return 0, err
 	}
 	switch eff.Sort {
+	case journal.EffectTaskCreate:
+		return jid, db.foldTaskCreateLocked(in, jid, eff)
 	case journal.EffectTaskEvent:
 		return jid, db.foldTaskEventLocked(in, jid, eff)
 	case journal.EffectBootstrapAuthority:
@@ -470,6 +472,100 @@ func (db *DB) foldEffectLocked(in journal.OperationInput, anchorJID int64, eff j
 	default:
 		return 0, fmt.Errorf("Apply: operation %q effect %d has unknown sort %s", in.OperationID, index, eff.Sort)
 	}
+}
+
+// foldTaskCreateLocked journals the birth of a task (§8.1, §9.3): it authorizes the
+// creation against the operation's authority at this effect's own JournalID, INSERTs
+// the tasks row (status Open, watermark = this effect's journal id, so the row is
+// born with a non-NULL last_journal_id), then writes the provenance.task.created
+// journal_task_events row. The tasks INSERT precedes the journal_task_events INSERT
+// because journal_task_events.task_id references tasks(id). The shared reducer's
+// projectJournalRowLocked (run after the fold) seeds the status projection and the
+// creator attribution from this same created event, so Open's from-empty replay
+// re-derives the identical projection (§9.2).
+func (db *DB) foldTaskCreateLocked(in journal.OperationInput, jid int64, eff journal.Effect) error {
+	if eff.TaskID.Namespace == "" {
+		return fmt.Errorf(
+			"%w: operation %q task-create effect has an empty task id/namespace — where: task-create "+
+				"fold (§8.1); when: before commit; impact: nothing committed; fix: supply a namespaced TaskID",
+			journal.ErrActorPlacement, in.OperationID)
+	}
+	if !eff.Type.IsValid() || !eff.Priority.IsValid() || !eff.Phase.IsValid() {
+		return fmt.Errorf(
+			"provenance: operation %q task-create effect for %q has an invalid classification "+
+				"(type=%d priority=%d phase=%d) — where: task-create fold (§8.1); when: before commit; "+
+				"impact: nothing committed; fix: supply valid TaskType/Priority/Phase enum values",
+			in.OperationID, eff.TaskID, int(eff.Type), int(eff.Priority), int(eff.Phase))
+	}
+	// Authorize the creation against the operation's authority, exactly like a
+	// task_event (§9.3): a brand-new task is reached only by a system-root bootstrap
+	// authority (an assignment authority governs no task without an episode), so a
+	// create under a non-governing authority fails closed with ErrAuthorityScope.
+	if err := db.requireAuthorityGovernsLocked(in, jid, eff.TaskID); err != nil {
+		return err
+	}
+	// Existence guard: creating a task id that already has a row is a typed conflict,
+	// not a silent duplicate (the UNIQUE PK would otherwise surface a raw driver error).
+	exists := false
+	if err := sqlitex.Execute(db.conn,
+		`SELECT 1 FROM tasks WHERE id = ?1`,
+		&sqlitex.ExecOptions{Args: []any{eff.TaskID.String()}, ResultFunc: func(*zs.Stmt) error { exists = true; return nil }}); err != nil {
+		return fmt.Errorf("Apply: task-create existence check for %q: %w", eff.TaskID, err)
+	}
+	if exists {
+		return fmt.Errorf(
+			"provenance: operation %q task-create effect targets task %q which already exists — where: "+
+				"task-create fold (§8.1); when: before commit; impact: nothing committed; fix: create a task "+
+				"with a fresh id, or mutate the existing task via an update effect",
+			in.OperationID, eff.TaskID)
+	}
+	recordedAt := in.RecordedAt
+	if eff.RecordedAtOverride != nil {
+		recordedAt = *eff.RecordedAtOverride
+	}
+	if err := sqlitex.Execute(db.conn,
+		`INSERT INTO tasks
+			(id, namespace, title, description, status_id, priority_id, type_id,
+			 phase_id, owner_id, notes, created_at, updated_at, closed_at, close_reason, last_journal_id)
+		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, '', ?9, ?10, NULL, '', ?11)`,
+		&sqlitex.ExecOptions{Args: []any{
+			eff.TaskID.String(), eff.TaskID.Namespace, eff.Title, eff.Description,
+			statusOpenID, int(eff.Priority), int(eff.Type), int(eff.Phase),
+			recordedAt, recordedAt, jid,
+		}}); err != nil {
+		return fmt.Errorf("Apply: insert task row for %q: %w", eff.TaskID, err)
+	}
+	// The created event itself (provenance.task.created), forced to the canonical kind
+	// so the status=Open projection is derived from a fixed lifecycle mapping (§8.1).
+	payload := eff.Payload
+	if len(payload) == 0 {
+		payload = json.RawMessage(`{}`)
+	}
+	if !json.Valid(payload) {
+		return fmt.Errorf("Apply: task-create payload for %q is not valid JSON", eff.TaskID)
+	}
+	if err := sqlitex.Execute(db.conn,
+		`INSERT INTO journal_task_events (journal_id, task_id, event_kind, payload) VALUES (?1, ?2, ?3, ?4)`,
+		&sqlitex.ExecOptions{Args: []any{jid, eff.TaskID.String(), string(journal.EventKindTaskCreated), string(payload)}}); err != nil {
+		return fmt.Errorf("Apply: insert journal_task_events (task-create): %w", err)
+	}
+	contexts, err := journal.CanonicalEventContexts(eff.Contexts)
+	if err != nil {
+		return fmt.Errorf("Apply: canonical contexts (task-create): %w", err)
+	}
+	for _, ctx := range contexts {
+		ck, identity, encErr := journal.EncodeStoredEventContext(ctx)
+		if encErr != nil {
+			return fmt.Errorf("Apply: encode context (task-create): %w", encErr)
+		}
+		if err := sqlitex.Execute(db.conn,
+			`INSERT OR IGNORE INTO journal_task_event_contexts (event_journal_id, context_kind, context_identity, attached_by_journal_id)
+			 VALUES (?1, ?2, ?3, ?4)`,
+			&sqlitex.ExecOptions{Args: []any{jid, string(ck), identity, jid}}); err != nil {
+			return fmt.Errorf("Apply: insert context edge (task-create): %w", err)
+		}
+	}
+	return nil
 }
 
 func (db *DB) foldTaskEventLocked(in journal.OperationInput, jid int64, eff journal.Effect) error {

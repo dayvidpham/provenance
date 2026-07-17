@@ -95,6 +95,7 @@ const (
 	EffectAssignmentEnd      = journal.EffectAssignmentEnd
 	EffectDecision           = journal.EffectDecision
 	EffectEvidence           = journal.EffectEvidence
+	EffectTaskCreate         = journal.EffectTaskCreate
 
 	// Committed-result variants (§3.2, §9.4).
 	CommittedAbsent   = journal.CommittedAbsent

@@ -124,6 +124,13 @@ const (
 	EffectAssignmentEnd                        // JournalKindAuthority + AuthorityKindAssignment, ended
 	EffectDecision                             // JournalKindDecision
 	EffectEvidence                             // JournalKindEvidence
+	// EffectTaskCreate journals the birth of a task: it INSERTs the tasks row and
+	// emits a provenance.task.created task_event in one atomic fold, so a task's
+	// existence — like every later mutation — flows through the journal rather than a
+	// direct unjournaled write (§8.1, §9.3). Its produced journal row carries
+	// JournalKindTaskEvent (the created event), and the projection seeds status=Open.
+	// It must be ordered before any effect (or FK) that references the new task.
+	EffectTaskCreate // JournalKindTaskEvent (provenance.task.created), also inserts the tasks row
 )
 
 var effectSortStrings = [...]string{
@@ -133,6 +140,7 @@ var effectSortStrings = [...]string{
 	EffectAssignmentEnd:      "assignment_end",
 	EffectDecision:           "decision",
 	EffectEvidence:           "evidence",
+	EffectTaskCreate:         "task_create",
 }
 
 func (s EffectSort) String() string {
@@ -147,7 +155,7 @@ func (s EffectSort) String() string {
 // finer effect taxonomy to the closed JournalKind enum.
 func (s EffectSort) JournalKind() (JournalKind, error) {
 	switch s {
-	case EffectTaskEvent:
+	case EffectTaskEvent, EffectTaskCreate:
 		return JournalKindTaskEvent, nil
 	case EffectBootstrapAuthority, EffectAssignmentStart, EffectAssignmentEnd:
 		return JournalKindAuthority, nil
@@ -203,6 +211,18 @@ type Effect struct {
 	EventKind EventKind
 	Payload   json.RawMessage
 	Contexts  []EventContext
+
+	// task_create (EffectTaskCreate): the immutable birth metadata of the new task
+	// whose row this effect inserts (§8.1). TaskID (above) is the new task's id;
+	// the reducer forces EventKind to provenance.task.created, so the created event
+	// and its status=Open projection are canonical. Title and Description are free
+	// text; Type/Priority/Phase are the closed classification enums the tasks row
+	// stores.
+	Title       string
+	Description string
+	Type        TaskType
+	Priority    Priority
+	Phase       Phase
 
 	// bootstrap authority (EffectBootstrapAuthority)
 	BootstrapLabel       string

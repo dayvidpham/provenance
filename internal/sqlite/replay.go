@@ -1,7 +1,6 @@
 package sqlite
 
 import (
-	"errors"
 	"fmt"
 
 	"github.com/dayvidpham/provenance/internal/journal"
@@ -224,8 +223,10 @@ func (db *DB) projectTaskStatusLocked(task journal.TaskID, status journal.TaskSt
 	if status == journal.TaskStatusClosed {
 		closedAt = recordedAt
 	}
+	// Targets the real tasks table during a live Apply and the shadow tasks table
+	// during a from-empty replay derivation (§8.1, §15).
 	if err := sqlitex.Execute(db.conn,
-		`UPDATE tasks SET status_id = ?1, closed_at = ?2, last_journal_id = ?3 WHERE id = ?4`,
+		fmt.Sprintf(`UPDATE %s SET status_id = ?1, closed_at = ?2, last_journal_id = ?3 WHERE id = ?4`, db.projTasks()),
 		&sqlitex.ExecOptions{Args: []any{int(status), closedAt, jid, task.String()}}); err != nil {
 		return fmt.Errorf("project task status for %q: %w", task, err)
 	}
@@ -236,11 +237,17 @@ func (db *DB) projectTaskStatusLocked(task journal.TaskID, status journal.TaskSt
 // Open-time full replay (§9.2, §15)
 // ---------------------------------------------------------------------------
 
-// errReplayScratchRollback forces the from-empty scratch re-derivation savepoint
-// to roll back after its projections are captured, so ReplayProjections is a
-// read-only convergence CHECK that never persists the rebuild (it fails closed on
-// divergence rather than silently repairing). It never escapes ReplayProjections.
-var errReplayScratchRollback = errors.New("provenance: internal replay-scratch rollback (never surfaced)")
+// Shadow projection table names (§15 SHADOW DERIVATION). ReplayProjections folds
+// the whole journal into these connection-scoped temporary tables — which carry the
+// projection columns but NONE of the real tables' constraints (no NOT NULL on the
+// watermark, no foreign keys) — and diffs them against the real tables. The real
+// tasks / task_attributions rows are never mutated during the check, so the check is
+// constraint-independent (the NOT NULL tasks.last_journal_id tightening cannot break
+// a from-empty refold) and needs no scratch savepoint/rollback.
+const (
+	shadowTasksTable  = "shadow_tasks"
+	shadowAttribTable = "shadow_task_attributions"
+)
 
 // ReplayProjections re-derives EVERY projection from an EMPTY slate by folding the
 // entire journal in JournalID order through the same projectJournalRowLocked
@@ -249,14 +256,18 @@ var errReplayScratchRollback = errors.New("provenance: internal replay-scratch r
 // detects drift in a field some journal row actually writes, so an out-of-band
 // corruption on a field no row revisits — e.g. a hand-corrupted tasks.status_id on
 // a task with no status-changing lifecycle event — reads back unchanged and is
-// falsely reported as converged), this clears the projection to a blank slate in a
-// scratch savepoint, refolds, and compares the FULL projection set — owner, status,
-// watermark, AND task_attributions — for every journal-anchored task. It first runs
-// the external-schema preflight (§13). It is read-only and idempotent: the scratch
-// rebuild is always rolled back, so a converged database is left untouched and
-// returns the from-empty per-task projection. On genuine divergence it returns a
-// typed ProjectionDivergenceError naming the task, field, and stored-vs-derived
-// values, and writes nothing (§13.1 six-field actionable shape).
+// falsely reported as converged), this re-derives the projection from a blank slate
+// into connection-scoped SHADOW tables (§15 SHADOW DERIVATION), refolds, and compares
+// the FULL projection set — owner, status, watermark, AND task_attributions — for
+// every journal-anchored task. It first runs the external-schema preflight (§13). It
+// is read-only and idempotent: the from-empty refold derives into throwaway shadow
+// tables (which carry the projection columns but none of the real tables' constraints)
+// while the real tasks / task_attributions rows stay read-only, so a converged
+// database is left untouched, the check is constraint-independent (the NOT NULL
+// tasks.last_journal_id tightening cannot be tripped by the refold), and no scratch
+// savepoint/rollback is needed. On genuine divergence it returns a typed
+// ProjectionDivergenceError naming the task, field, and stored-vs-derived values, and
+// writes nothing (§13.1 six-field actionable shape).
 //
 // Scope during the direct-write staging window (pasture#14): convergence is
 // asserted for journal-anchored tasks — tasks with at least one journal row
@@ -276,11 +287,11 @@ func (db *DB) ReplayProjections() (journal.ReplayResult, error) {
 	}
 
 	// Snapshot the STORED projection before any change, keyed by task id.
-	storedTasks, err := db.snapshotTaskProjectionsLocked()
+	storedTasks, err := db.snapshotTaskProjectionsLocked("tasks")
 	if err != nil {
 		return journal.ReplayResult{}, err
 	}
-	storedAttribs, err := db.snapshotAttributionsLocked()
+	storedAttribs, err := db.snapshotAttributionsLocked("task_attributions")
 	if err != nil {
 		return journal.ReplayResult{}, err
 	}
@@ -289,9 +300,9 @@ func (db *DB) ReplayProjections() (journal.ReplayResult, error) {
 		return journal.ReplayResult{}, err
 	}
 
-	// Re-derive every projection from empty in a scratch savepoint that is always
-	// rolled back (read-only check).
-	derivedTasks, derivedAttribs, folded, err := db.rederiveProjectionsScratchLocked()
+	// Re-derive every projection from empty into connection-scoped shadow tables;
+	// the real tables stay read-only (SHADOW DERIVATION, §15).
+	derivedTasks, derivedAttribs, folded, err := db.rederiveProjectionsShadowLocked()
 	if err != nil {
 		return journal.ReplayResult{}, err
 	}
@@ -313,75 +324,114 @@ func (db *DB) ReplayProjections() (journal.ReplayResult, error) {
 	return result, nil
 }
 
-// rederiveProjectionsScratchLocked clears the projection to an empty slate and
-// refolds the whole journal through the single shared reducer step (§9.2), then
-// captures the from-empty projection and attribution snapshots. The scratch
-// rebuild runs inside a savepoint that is ALWAYS rolled back, so ReplayProjections
-// never persists the rebuild — it returns the derived state purely for comparison.
-func (db *DB) rederiveProjectionsScratchLocked() (
+// rederiveProjectionsShadowLocked re-derives every projection from an empty slate
+// into connection-scoped shadow tables and returns the derived projection and
+// attribution snapshots for comparison, WITHOUT mutating the real tables (§15 SHADOW
+// DERIVATION). It creates empty-slate shadow tables (one row per real task id, with
+// blank projection columns and NO real-table constraints), repoints the shared
+// reducer's projection-write target at them, folds the whole journal in JournalID
+// order through the same projectJournalRowLocked step Apply uses (§9.2), then captures
+// the from-empty snapshots from the shadow tables. The real tasks / task_attributions
+// rows are read-only throughout, so the check is constraint-independent (the NOT NULL
+// tasks.last_journal_id tightening is never tripped) and needs no savepoint/rollback.
+// The projection-write target and the shadow tables are always restored/dropped
+// before return, on every path.
+func (db *DB) rederiveProjectionsShadowLocked() (
 	tasks map[string]journal.TaskProjection,
 	attribs map[string]map[string]int64,
 	folded int,
 	err error,
 ) {
-	var txErr error
-	endTx := sqlitex.Save(db.conn)
+	if err = db.createProjectionShadowLocked(); err != nil {
+		return nil, nil, 0, fmt.Errorf("ReplayProjections: stage shadow projection tables: %w", err)
+	}
+	// Repoint the shared reducer's projection-write steps at the shadow tables, and
+	// unconditionally restore the real target + drop the shadow tables on return.
+	db.projTasksTable = shadowTasksTable
+	db.projAttribTable = shadowAttribTable
 	defer func() {
-		// Force the scratch rebuild to roll back even on the success path, so the
-		// destructive clear+refold is never durable.
-		if txErr == nil {
-			txErr = errReplayScratchRollback
+		db.projTasksTable = ""
+		db.projAttribTable = ""
+		if derr := db.dropProjectionShadowLocked(); derr != nil && err == nil {
+			err = fmt.Errorf("ReplayProjections: drop shadow projection tables: %w", derr)
 		}
-		endTx(&txErr)
 	}()
 
-	if txErr = db.clearProjectionsLocked(); txErr != nil {
-		return nil, nil, 0, fmt.Errorf("ReplayProjections: clear projections for from-empty replay: %w", txErr)
-	}
-
 	var order []int64
-	if txErr = sqlitex.Execute(db.conn,
+	if err = sqlitex.Execute(db.conn,
 		`SELECT journal_id FROM journal ORDER BY journal_id ASC`,
 		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 			order = append(order, stmt.ColumnInt64(0))
 			return nil
-		}}); txErr != nil {
-		return nil, nil, 0, fmt.Errorf("ReplayProjections: enumerate journal: %w", txErr)
+		}}); err != nil {
+		return nil, nil, 0, fmt.Errorf("ReplayProjections: enumerate journal: %w", err)
 	}
 	for _, jid := range order {
-		if txErr = db.projectJournalRowLocked(jid); txErr != nil {
-			return nil, nil, 0, fmt.Errorf("ReplayProjections: fold row %d: %w", jid, txErr)
+		if err = db.projectJournalRowLocked(jid); err != nil {
+			return nil, nil, 0, fmt.Errorf("ReplayProjections: fold row %d: %w", jid, err)
 		}
 		folded++
 	}
 
-	tasks, txErr = db.snapshotTaskProjectionsLocked()
-	if txErr != nil {
-		return nil, nil, 0, txErr
+	tasks, err = db.snapshotTaskProjectionsLocked(shadowTasksTable)
+	if err != nil {
+		return nil, nil, 0, err
 	}
-	attribs, txErr = db.snapshotAttributionsLocked()
-	if txErr != nil {
-		return nil, nil, 0, txErr
+	attribs, err = db.snapshotAttributionsLocked(shadowAttribTable)
+	if err != nil {
+		return nil, nil, 0, err
 	}
-	// txErr is nil here: the deferred rollback replaces it with the scratch
-	// sentinel so the rebuild is discarded; the captured snapshots survive.
 	return tasks, attribs, folded, nil
 }
 
-// clearProjectionsLocked resets every task's projection columns to the empty-slate
-// values (owner NULL, status open, closed_at NULL, watermark NULL) and empties the
-// task_attributions projection, so the subsequent refold rebuilds them SOLELY from
-// journal history rather than reading any value back from the pre-existing row
-// (§15: no projection is seeded/patched from a non-journal input). The journal-spine
-// subtype tables — the source of truth the reducer reads — are untouched.
-func (db *DB) clearProjectionsLocked() error {
-	if err := sqlitex.Execute(db.conn,
-		`UPDATE tasks SET owner_id = NULL, status_id = ?1, closed_at = NULL, last_journal_id = NULL`,
-		&sqlitex.ExecOptions{Args: []any{statusOpenID}}); err != nil {
-		return fmt.Errorf("clear tasks projection: %w", err)
+// createProjectionShadowLocked builds the connection-scoped empty-slate shadow
+// projection tables the from-empty refold derives into (§15). The shadow tasks table
+// is seeded with one blank-projection row per real task id (owner NULL, status open,
+// closed_at NULL, watermark NULL) so a lifecycle/watermark UPDATE folded during the
+// refold has a row to hit — exactly the empty-slate the retired clear-in-place scratch
+// produced, but on a throwaway table with NO constraints (no NOT NULL watermark, no
+// foreign keys), so the real tables are never touched. The shadow attribution table
+// starts empty. The journal-spine subtype tables the reducer READS are untouched.
+func (db *DB) createProjectionShadowLocked() error {
+	// Drop first in case a prior aborted run left them on the connection.
+	if err := db.dropProjectionShadowLocked(); err != nil {
+		return err
 	}
-	if err := sqlitex.Execute(db.conn, `DELETE FROM task_attributions`, nil); err != nil {
-		return fmt.Errorf("clear task_attributions projection: %w", err)
+	ddl := []string{
+		`CREATE TEMP TABLE shadow_tasks (
+			id              TEXT PRIMARY KEY,
+			owner_id        TEXT,
+			status_id       INTEGER,
+			closed_at       INTEGER,
+			last_journal_id INTEGER
+		)`,
+		`CREATE TEMP TABLE shadow_task_attributions (
+			task_id          TEXT NOT NULL,
+			actor_id         TEXT NOT NULL,
+			first_journal_id INTEGER NOT NULL,
+			PRIMARY KEY (task_id, actor_id)
+		)`,
+	}
+	for _, stmt := range ddl {
+		if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
+			return fmt.Errorf("create shadow projection table: %w", err)
+		}
+	}
+	if err := sqlitex.Execute(db.conn,
+		`INSERT INTO shadow_tasks (id, owner_id, status_id, closed_at, last_journal_id)
+		 SELECT id, NULL, ?1, NULL, NULL FROM tasks`,
+		&sqlitex.ExecOptions{Args: []any{statusOpenID}}); err != nil {
+		return fmt.Errorf("seed shadow_tasks empty slate: %w", err)
+	}
+	return nil
+}
+
+// dropProjectionShadowLocked removes the connection-scoped shadow projection tables.
+func (db *DB) dropProjectionShadowLocked() error {
+	for _, stmt := range []string{`DROP TABLE IF EXISTS shadow_tasks`, `DROP TABLE IF EXISTS shadow_task_attributions`} {
+		if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
+			return fmt.Errorf("drop shadow projection table: %w", err)
+		}
 	}
 	return nil
 }
@@ -409,12 +459,13 @@ func (db *DB) journalAnchoredTasksLocked() (map[string]struct{}, error) {
 }
 
 // snapshotTaskProjectionsLocked reads every task's current projection (owner,
-// status, watermark) keyed by task id, so a replay can compare its recomputed
-// state against the stored one (§15).
-func (db *DB) snapshotTaskProjectionsLocked() (map[string]journal.TaskProjection, error) {
+// status, watermark) keyed by task id from the named table, so a replay can compare
+// the stored projection ("tasks") against the from-empty re-derivation
+// ("shadow_tasks") (§15).
+func (db *DB) snapshotTaskProjectionsLocked(table string) (map[string]journal.TaskProjection, error) {
 	out := map[string]journal.TaskProjection{}
 	if err := sqlitex.Execute(db.conn,
-		`SELECT id, owner_id, status_id, last_journal_id FROM tasks`,
+		fmt.Sprintf(`SELECT id, owner_id, status_id, last_journal_id FROM %s`, table),
 		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 			taskRaw := stmt.ColumnText(0)
 			task, err := journalParseTask(taskRaw)
@@ -440,13 +491,14 @@ func (db *DB) snapshotTaskProjectionsLocked() (map[string]journal.TaskProjection
 	return out, nil
 }
 
-// snapshotAttributionsLocked reads the task_attributions projection as a nested
-// map task_id → (actor_id → first_journal_id), so a replay can compare the stored
-// attribution edges against the from-empty re-derivation (§8.2, §15).
-func (db *DB) snapshotAttributionsLocked() (map[string]map[string]int64, error) {
+// snapshotAttributionsLocked reads the attribution projection from the named table
+// as a nested map task_id → (actor_id → first_journal_id), so a replay can compare
+// the stored edges ("task_attributions") against the from-empty re-derivation
+// ("shadow_task_attributions") (§8.2, §15).
+func (db *DB) snapshotAttributionsLocked(table string) (map[string]map[string]int64, error) {
 	out := map[string]map[string]int64{}
 	if err := sqlitex.Execute(db.conn,
-		`SELECT task_id, actor_id, first_journal_id FROM task_attributions`,
+		fmt.Sprintf(`SELECT task_id, actor_id, first_journal_id FROM %s`, table),
 		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 			task := stmt.ColumnText(0)
 			if out[task] == nil {

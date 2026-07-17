@@ -19,6 +19,8 @@ type (
 	Status     = ptypes.Status
 	Phase      = ptypes.Phase
 	Stage      = ptypes.Stage
+	Priority   = ptypes.Priority
+	TaskType   = ptypes.TaskType
 	TaskID     = ptypes.TaskID
 	EdgeKind   = ptypes.EdgeKind
 	CommentID  = ptypes.CommentID

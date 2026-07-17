@@ -109,26 +109,32 @@ func (db *DB) requireResultSlotOwnOperationLocked(anchor, producedJID int64) err
 }
 
 func (db *DB) insertAttributionLocked(task journal.TaskID, actor journal.ActorID, jid int64) error {
+	// Targets the real task_attributions during a live Apply and the shadow
+	// attribution table during a from-empty replay derivation (§8.2, §15).
 	if err := sqlitex.Execute(db.conn,
-		`INSERT OR IGNORE INTO task_attributions (task_id, actor_id, first_journal_id) VALUES (?1, ?2, ?3)`,
+		fmt.Sprintf(`INSERT OR IGNORE INTO %s (task_id, actor_id, first_journal_id) VALUES (?1, ?2, ?3)`, db.projAttribs()),
 		&sqlitex.ExecOptions{Args: []any{task.String(), actor.String(), jid}}); err != nil {
-		return fmt.Errorf("update task_attributions: %w", err)
+		return fmt.Errorf("update %s: %w", db.projAttribs(), err)
 	}
 	return nil
 }
 
 func (db *DB) advanceWatermarkLocked(task journal.TaskID, jid int64) error {
+	// Targets the real tasks table during a live Apply and the shadow tasks table
+	// during a from-empty replay derivation (§8.1, §15).
 	if err := sqlitex.Execute(db.conn,
-		`UPDATE tasks SET last_journal_id = ?1 WHERE id = ?2`,
+		fmt.Sprintf(`UPDATE %s SET last_journal_id = ?1 WHERE id = ?2`, db.projTasks()),
 		&sqlitex.ExecOptions{Args: []any{jid, task.String()}}); err != nil {
-		return fmt.Errorf("advance tasks.last_journal_id: %w", err)
+		return fmt.Errorf("advance %s.last_journal_id: %w", db.projTasks(), err)
 	}
 	return nil
 }
 
 // recomputeTaskOwnerLocked materializes the owner-responsibility projection
 // (§8.1): tasks.owner_id becomes the current active owner episode's occupant, or
-// NULL when none is active. The watermark advances to jid.
+// NULL when none is active. The watermark advances to jid. The SELECT reads the
+// journal spine (the source of truth, untouched by replay); the UPDATE targets the
+// projection table — real during Apply, shadow during replay (§15).
 func (db *DB) recomputeTaskOwnerLocked(task journal.TaskID, jid int64) error {
 	var owner any
 	if err := sqlitex.Execute(db.conn,
@@ -146,9 +152,9 @@ func (db *DB) recomputeTaskOwnerLocked(task journal.TaskID, jid int64) error {
 		return fmt.Errorf("recompute task owner: %w", err)
 	}
 	if err := sqlitex.Execute(db.conn,
-		`UPDATE tasks SET owner_id = ?1, last_journal_id = ?2 WHERE id = ?3`,
+		fmt.Sprintf(`UPDATE %s SET owner_id = ?1, last_journal_id = ?2 WHERE id = ?3`, db.projTasks()),
 		&sqlitex.ExecOptions{Args: []any{owner, jid, task.String()}}); err != nil {
-		return fmt.Errorf("update tasks owner projection: %w", err)
+		return fmt.Errorf("update %s owner projection: %w", db.projTasks(), err)
 	}
 	return nil
 }
