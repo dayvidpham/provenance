@@ -68,11 +68,11 @@ exactly one subtype table selected by `JournalKind`.
 |---|---|---|---|
 | `JournalID` | `INTEGER` | no | database-generated (`AUTOINCREMENT`), PK |
 | `JournalKind` | FK → `journal_kinds.id` | no | discriminator: `operation` \| `task_event` \| `authority` \| `decision` \| `evidence` |
-| `ActorID` | FK → `agents.id` (ActorID domain) | no | the actor whose committed operation produced this row |
+| `ActorID` | FK → `agents.id` (ActorID domain) | yes | the actor whose committed operation produced this row; present **only** on an anchor row (`ProducedByOperationJournalID IS NULL` — an operation anchor, genesis, or migration baseline). A subordinate (operation-produced) row carries `ActorID` NULL and derives its actor from its anchor via the [§8.5](#85-journal_attributed-view-not-a-base-relation) self-join. `ActorID NOT NULL` **iff** `ProducedByOperationJournalID IS NULL`, enforced by a `CHECK` constraint and [§10 rule 5](#10-totality-rules) |
 | `RecordedAt` | `INTEGER` (UnixNano, UTC) | no | audit/display metadata only — see [§7](#7-recordedat-doctrine) |
-| `ProducedByOperationJournalID` | FK → `journal_operations.JournalID` | yes | the operation that produced this row; NULL **only** on the row that is itself the operation anchor (`JournalKind = 'operation'`) — see [§5](#5-totality-rules); **S1.1 staging note:** at the journal-base layer this column is uniformly NULL on `task_event` rows too (no `journal_operations` anchor exists yet to reference) — see the staging note after [§10 rule 2](#10-totality-rules) |
+| `ProducedByOperationJournalID` | FK → `journal_operations.JournalID` | yes | the operation that produced this row; NULL **only** on the row that is itself the operation anchor (`JournalKind = 'operation'`) — see [§5](#5-totality-rules); **S1.1 staging note:** at the journal-base layer this column is uniformly NULL on `task_event` rows too (no `journal_operations` anchor exists yet to reference), so at that layer every `task_event` row is an anchor and legitimately carries `ActorID` — see the staging note after [§10 rule 2](#10-totality-rules) |
 
-**Functional dependencies:** `{JournalID} → {JournalKind, ActorID, RecordedAt, ProducedByOperationJournalID}`. In addition, because `ActorID` is defined as the actor whose committed operation *produced* the row, every produced (non-anchor) row's actor equals its producing operation's actor: over rows with `ProducedByOperationJournalID` NOT NULL, `{ProducedByOperationJournalID} → {ActorID}`. (This FD does not hold over anchor rows, which share a NULL `ProducedByOperationJournalID` yet legitimately carry different actors.) `JournalID` is a surrogate with no other functional source (two rows may legitimately share identical `(JournalKind, ActorID, RecordedAt)`, e.g. a timestamp collision or two same-actor events in the same batch).
+**Functional dependencies:** `{JournalID} → {JournalKind, ActorID, RecordedAt, ProducedByOperationJournalID}`. `ActorID` is stored on **anchor rows only** (those with `ProducedByOperationJournalID IS NULL`); a subordinate row's `ActorID` column is NULL, and its effective actor is *derived*, not stored — it equals its anchor's `ActorID`, reachable by the self-join `journal j → journal anchor ON anchor.JournalID = j.ProducedByOperationJournalID`. There is therefore no `{ProducedByOperationJournalID} → {ActorID}` data dependency held *within* `journal` at all: the determinant column is populated on exactly the rows whose `ActorID` is NULL, so the stored relation carries no repeated actor to depend on. `JournalID` is a surrogate with no other functional source (two rows may legitimately share identical `(JournalKind, ActorID, RecordedAt)`, e.g. a timestamp collision or two same-actor anchors in the same batch).
 
 **Candidate keys:** `{JournalID}` only.
 
@@ -80,9 +80,9 @@ exactly one subtype table selected by `JournalKind`.
 
 **Foreign keys:** `JournalKind → journal_kinds(id)`; `ActorID → agents(id)`; `ProducedByOperationJournalID → journal_operations(JournalID)`.
 
-**Committing-actor model.** `ActorID` is the *committing* actor of the operation that produced the row — the actor who executed the operation, not necessarily the domain subject of the effect. A responsibility-slot occupant is carried separately on `journal_authority_assignment_episodes.ActorID` (§4.4) and may differ from the committing actor (a Pasture-system actor executing a transfer or a migration on behalf of an occupant, §13). Every row an operation produces therefore shares that operation's committing `ActorID`.
+**Committing-actor model.** The *committing* actor of an operation — the actor who executed the operation, not necessarily the domain subject of the effect — is recorded **once**, on the operation's anchor row. Every subordinate row the operation produces derives that same committing actor from the anchor (§8.5); it is never restamped on the produced row. A responsibility-slot occupant is carried separately on `journal_authority_assignment_episodes.ActorID` (§4.4) and may differ from the committing actor (a Pasture-system actor executing a transfer or a migration on behalf of an occupant, §13).
 
-**BCNF:** the surrogate `{JournalID}` is the only candidate key, but `{ProducedByOperationJournalID} → {ActorID}` (above) is a nontrivial FD whose determinant is **not** a candidate key of `journal`, so `journal` is deliberately **not** decomposed to BCNF on that FD. Decomposing `ActorID` out into a `(ProducedByOperationJournalID → ActorID)` table is impossible without loss — the anchor row carries `ActorID` with a NULL `ProducedByOperationJournalID`, so no such table could key an anchor's actor — and every read of a journal row needs its actor locally. The contract accepts this as controlled redundancy; the required agreement (every produced row's `ActorID` equals its anchor's `ActorID`) is a reducer invariant (§10 rule 5) the schema does not express, pinned by the must-fail history `authority_evidence.yaml` / `effect-actor-mismatches-anchor-rejected` in the §14.3 pattern, not by a normal-form decomposition. No other FD on `journal` violates BCNF.
+**BCNF.** The surrogate `{JournalID}` is the only candidate key, and every FD on `journal` — `{JournalID} → {JournalKind, ActorID, RecordedAt, ProducedByOperationJournalID}` — has that candidate key as its determinant, so **`journal` is in BCNF with no decomposition and no controlled redundancy**. This is the point of storing `ActorID` on anchor rows only: the earlier design that repeated each produced row's committing `ActorID` alongside its `ProducedByOperationJournalID` introduced the non-key FD `{ProducedByOperationJournalID} → {ActorID}` and the corresponding agreement obligation; removing the repeated column removes both. Actor–anchor *disagreement* is now structurally impossible — a subordinate row has no actor column to disagree with — rather than something a reducer invariant must forbid. The one placement invariant that remains (`ActorID NOT NULL` exactly on anchor rows) is expressed directly by a `CHECK` constraint and re-checked by [§10 rule 5](#10-totality-rules); its must-fail history is `authority_evidence.yaml` / `subordinate-row-carrying-actor-rejected`.
 
 This one column — `ProducedByOperationJournalID` — is the structural fix for
 the salvage regression where a superseded implementation stored operation
@@ -206,13 +206,17 @@ is permitted; this contract permits it (a caller may legitimately reference
 the same allocated row under two local handles), so `ProducedJournalID` is
 **not** `UNIQUE` and is **not** a second candidate key. Under that choice,
 `{ProducedJournalID} → {JournalID}` is a nontrivial FD whose determinant is
-not a superkey — the same controlled-denormalization shape as §2.1's
-`{ProducedByOperationJournalID} → {ActorID}`, pinned by the own-operation
-integrity invariant above rather than decomposed away. **BCNF:** not strictly
-satisfied on `{ProducedJournalID} → {JournalID}` for the reason just given;
-accepted as controlled redundancy on the same basis as §2.1, with the
-required agreement enforced as a reducer invariant rather than a normal-form
-decomposition.
+not a superkey, pinned by the own-operation integrity invariant above rather
+than decomposed away. This is the schema's **one** deliberate controlled
+denormalization: unlike §2.1's actor column — which is now stored on anchor
+rows only, so `journal` needs no controlled redundancy and no agreement
+invariant at all — a result-slot row genuinely needs `JournalID` (its owning
+operation anchor) present locally to key the slot, and the derived
+`{ProducedJournalID} → {JournalID}` relationship cannot be normalized away
+without losing that key. **BCNF:** not strictly satisfied on
+`{ProducedJournalID} → {JournalID}` for the reason just given; accepted as
+controlled redundancy with the required agreement enforced as the reducer
+invariant of §10 rule 9 rather than a normal-form decomposition.
 
 `CanonicalMutationResult` reconstructs as `SELECT ResultSlotID,
 ProducedJournalID, JournalKind FROM journal_operation_result_slots JOIN journal
@@ -648,16 +652,21 @@ ownership transfers.
 
 **Attribution function (per `JournalKind`).** Which `ActorID` a produced row
 attributes is fixed per kind, not left to the implementer — the two candidate
-actors (a row's committing `journal.ActorID` versus, for an assignment episode,
+actors (a row's *effective* committing actor versus, for an assignment episode,
 the occupant `journal_authority_assignment_episodes.ActorID`) can differ, so
-the choice is stated explicitly:
+the choice is stated explicitly. Because a subordinate row no longer stores its
+committing actor (§2.1), the "committing actor" a rule names below is the
+**derived effective actor** — `COALESCE(journal.ActorID, anchor.ActorID)` via
+the §8.5 anchor self-join, equivalently the `effective_actor_id` column of the
+`journal_attributed` view — never a hand-read of the (NULL) subordinate
+`journal.ActorID` column:
 
 | Produced row kind | Attributed `ActorID` |
 |---|---|
-| authority assignment episode (its `started` transition) | the episode's occupant, `journal_authority_assignment_episodes.ActorID` — **not** the committing `journal.ActorID` |
-| `journal_task_events` | the row's committing `journal.ActorID` (the authoring actor, per the committing-actor model of §2.1) |
-| `journal_evidence` | the row's committing `journal.ActorID` (the actor who attached it) |
-| `journal_decisions` with a non-NULL `TaskID` | the row's committing `journal.ActorID` |
+| authority assignment episode (its `started` transition) | the episode's occupant, `journal_authority_assignment_episodes.ActorID` — **not** the derived committing actor |
+| `journal_task_events` | the row's derived committing actor (the authoring actor, per the committing-actor model of §2.1) |
+| `journal_evidence` | the row's derived committing actor (the actor who attached it) |
+| `journal_decisions` with a non-NULL `TaskID` | the row's derived committing actor |
 | `journal_decisions` with `TaskID` NULL | no edge (attribution is per task; an untasked decision attributes nothing) |
 
 The committing actor of an operation does **not** earn an attribution edge
@@ -687,6 +696,39 @@ episode.AssignmentID AND started.Transition = 'started' WHERE episode.TaskID
 journal_authority_assignment_transitions ended WHERE ended.AssignmentID =
 episode.AssignmentID AND ended.Transition = 'ended') ORDER BY
 started.JournalID DESC LIMIT 1`. Also a view; also carries no independent key.
+
+### 8.5 `journal_attributed` (view, not a base relation)
+
+The base `journal` relation stores each committing actor exactly once, on the
+anchor row (§2.1). Because a subordinate row's `ActorID` is NULL, every consumer
+that wants "which actor is this row attributed to" would otherwise have to
+hand-write the anchor self-join and its `COALESCE`. `journal_attributed` is the
+single **read-only, denormalized** surface that does it once, so no consumer
+re-derives it:
+
+```
+CREATE VIEW journal_attributed AS
+SELECT j.JournalID                        AS JournalID,
+       j.JournalKind                      AS JournalKind,
+       COALESCE(j.ActorID, anchor.ActorID) AS EffectiveActorID,
+       j.RecordedAt                       AS RecordedAt,
+       j.ProducedByOperationJournalID     AS ProducedByOperationJournalID
+FROM journal j
+LEFT JOIN journal anchor
+  ON anchor.JournalID = j.ProducedByOperationJournalID
+```
+
+`EffectiveActorID` is `j.ActorID` on an anchor row (its own stored actor) and
+the anchor's `ActorID` on a subordinate row (the committing actor it derives).
+It is the consumer-facing attribution surface: internal query and attribution
+reads that need a row's actor (§8.2, §8.3, the ordered query surface of §8.3/§12)
+go through this view or the equivalent inline join, never through a bare read of
+the subordinate `journal.ActorID` column. Like §8.3/§8.4 it is a keyless,
+derived, reproducible projection — it carries no independent key beyond the
+`JournalID` it inherits, stores nothing, and is a pure function of `journal`, so
+it needs no FD/BCNF analysis of its own. It is `LEFT JOIN`, not `JOIN`, so an
+anchor row (whose `ProducedByOperationJournalID` is NULL) still appears, with
+`EffectiveActorID = j.ActorID`.
 
 ## 9. Shared reducer contract
 
@@ -862,11 +904,22 @@ boundary, before returning to the caller.
    ones that do not already exist on the supertype.
 4. `OperationID` is never a determinant of ordering and never a primary key
    anywhere in this schema (§3.1, §6).
-5. **Committing-actor agreement.** Every produced (non-anchor) journal row's
-   `ActorID` equals the `ActorID` of its producing operation's anchor row (the
-   committing-actor model of §2.1). The schema stores this redundantly rather
-   than decomposing it (§2.1 BCNF discussion); the reducer rejects any effect
-   row whose `ActorID` differs from its anchor's before commit.
+5. **Anchor-only actor placement.** A journal row carries a stored `ActorID`
+   **iff** it is an anchor row: `ActorID NOT NULL` exactly when
+   `ProducedByOperationJournalID IS NULL` (an operation anchor, genesis, or
+   migration baseline), and `ActorID NULL` on every subordinate (operation-produced)
+   row, whose committing actor is instead *derived* from its anchor (§2.1, §8.5).
+   The earlier committing-actor *agreement* rule — which forbade a produced row
+   restamping a **different** actor than its anchor — is retired: a subordinate
+   row has no `ActorID` column to disagree, so disagreement is structurally
+   impossible rather than reducer-guarded. This placement invariant is expressed
+   directly by a `CHECK ((ActorID IS NULL) = (ProducedByOperationJournalID IS NOT
+   NULL))` constraint on `journal` **and** re-checked by the reducer /
+   `VerifyIntegrity`: `Apply` rejects any input effect that would stamp an actor
+   on a subordinate row, and `VerifyIntegrity` scans for any stored subordinate
+   row carrying an `ActorID` (or any anchor row missing one) and rejects it. Its
+   must-fail history is `authority_evidence.yaml` /
+   `subordinate-row-carrying-actor-rejected`.
 6. **Genesis NULL-authority discipline.** `journal_operations.AuthorityJournalID`
    is `NULL` only on a **genesis operation** (§4.6), and a genesis operation is
    accepted only when no `journal_operations` row yet exists — i.e. it is the
@@ -952,11 +1005,15 @@ unique order regardless of how many legacy rows share an identical `created_at`
 The whole migration executes under the `pasture-system` bootstrap authority
 established by the genesis operation (§4.6): the genesis operation is the first
 row written, then per-task anchors follow, each an ordinary non-genesis
-operation citing that bootstrap authority. Every migration row's
-`journal.ActorID` is the Pasture system actor (the actor *executing* the
-migration, per the committing-actor model of §2.1), **never** the legacy owner
-— the legacy owner appears only as the occupant `ActorID` on the assignment
-episode (item 2). Each per-task baseline anchor's `OperationID` is a
+operation citing that bootstrap authority. Each per-task baseline **anchor**
+row stores `journal.ActorID` = the Pasture system actor (the actor *executing*
+the migration, per the committing-actor model of §2.1); every subordinate
+baseline row it produces (the migration-marker event, the assignment
+transitions) carries `ActorID` NULL and *derives* that same system actor from
+its anchor (§8.5) — the anchor-only placement of §2.1/§10 rule 5 applies to
+migration baselines exactly as to native operations. The system actor is
+**never** the legacy owner — the legacy owner appears only as the occupant
+`ActorID` on the assignment episode (item 2). Each per-task baseline anchor's `OperationID` is a
 deterministic function of the legacy task id — `provenance.migration.baseline--<legacy
 tasks.id>` — so a re-run after a partially-recovered migration (or an accidental
 second invocation) presents the identical `OperationID` per task and hits §9.4's
@@ -1147,7 +1204,7 @@ that first exposed it — never a Beads ID or a proposal/slice/phase label.
 | [`ordering.yaml`](../testdata/contract/ordering.yaml) | 5 | Timestamp collisions; wall-clock-vs-`JournalID` divergence; regression (a) foundation |
 | [`zero_event_operations.yaml`](../testdata/contract/zero_event_operations.yaml) | 5 | Zero-task-event operation anchoring; regression (b) |
 | [`retry_reopen_cancellation.yaml`](../testdata/contract/retry_reopen_cancellation.yaml) | 5 | Retry/reopen/cancellation; regression (e) |
-| [`authority_evidence.yaml`](../testdata/contract/authority_evidence.yaml) | 9 | Per-effect authority at each `JournalID`; orphaned/multiply-consumed evidence; committing-actor agreement; assignment-transition lifecycle order; regressions (a), (d) |
+| [`authority_evidence.yaml`](../testdata/contract/authority_evidence.yaml) | 9 | Per-effect authority at each `JournalID`; orphaned/multiply-consumed evidence; anchor-only actor placement (subordinate row carrying actor rejected); assignment-transition lifecycle order; regressions (a), (d) |
 | [`owner_responsibility.yaml`](../testdata/contract/owner_responsibility.yaml) | 6 | Owner-responsibility end bound to legal close; transfer-CAS and transfer-crash atomicity; occupant attribution; regression (c) |
 | [`baseline_migration.yaml`](../testdata/contract/baseline_migration.yaml) | 7 | Fresh/legacy-assigned/legacy-terminal/unmappable-owner baseline transitions; honest timestamps; actionable migration-error fields; migrated/native observational equivalence; idempotent re-run; regression (g) |
 | [`topology_corruption.yaml`](../testdata/contract/topology_corruption.yaml) | 6 | Fail-closed on missing/corrupted external schema (table + column, both directions); actionable preflight-error fields; regression (f) |

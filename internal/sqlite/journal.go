@@ -56,15 +56,25 @@ func (db *DB) ensureJournalSchema() error {
 		// Global journal supertype (§2.1). JournalID is the sole canonical order,
 		// database-generated via AUTOINCREMENT so a strictly ascending, gap-stable
 		// order survives concurrent same-RecordedAt commits.
+		//
+		// actor_id is stored on ANCHOR rows only (§2.1, §10 rule 5): a row carries a
+		// stored actor iff it is an anchor (produced_by_operation_journal_id IS NULL —
+		// an operation anchor, genesis, or migration baseline). A subordinate
+		// (operation-produced) row carries actor_id NULL and derives its committing
+		// actor from its anchor via the journal_attributed view (§8.5). The CHECK
+		// expresses that placement invariant structurally; §10 rule 5 / VerifyIntegrity
+		// re-check it. At the journal-base layer every task_event is an anchor
+		// (produced_by_operation_journal_id uniformly NULL), so all carry actor_id.
 		`CREATE TABLE IF NOT EXISTS journal (
 			JournalID   INTEGER PRIMARY KEY AUTOINCREMENT,
 			kind_id     INTEGER NOT NULL REFERENCES journal_kinds(id),
-			actor_id    TEXT NOT NULL REFERENCES agents(id),
+			actor_id    TEXT REFERENCES agents(id),
 			recorded_at INTEGER NOT NULL,
 			-- The producing operation (§2.1, §4.6). NULL at the journal-base layer;
 			-- the operations slice (dayvidpham/provenance#5) adds the FK to
 			-- journal_operations(JournalID) when that subtype table lands.
-			produced_by_operation_journal_id INTEGER
+			produced_by_operation_journal_id INTEGER,
+			CHECK ((actor_id IS NULL) = (produced_by_operation_journal_id IS NOT NULL))
 		) STRICT`,
 		`CREATE INDEX IF NOT EXISTS idx_journal_kind  ON journal (kind_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_journal_actor ON journal (actor_id)`,
@@ -109,6 +119,22 @@ func (db *DB) ensureJournalSchema() error {
 			first_journal_id INTEGER NOT NULL REFERENCES journal(JournalID),
 			PRIMARY KEY (task_id, actor_id)
 		) STRICT, WITHOUT ROWID`,
+		// journal_attributed (§8.5): the read-only denormalized attribution surface.
+		// effective_actor_id is a row's own stored actor on an anchor, or its anchor's
+		// actor on a subordinate row, resolved once via the anchor self-join so no
+		// consumer hand-writes the COALESCE. LEFT JOIN keeps anchor rows (whose
+		// produced_by_operation_journal_id is NULL) in the result. The view is stored
+		// SQL resolved at query time, so it survives the operations slice's journal
+		// table rebuild (completeJournalOperationFK) unchanged.
+		`CREATE VIEW IF NOT EXISTS journal_attributed AS
+			SELECT j.JournalID                            AS JournalID,
+			       j.kind_id                              AS kind_id,
+			       COALESCE(j.actor_id, anchor.actor_id)  AS effective_actor_id,
+			       j.recorded_at                          AS recorded_at,
+			       j.produced_by_operation_journal_id     AS produced_by_operation_journal_id
+			FROM journal j
+			LEFT JOIN journal anchor
+			  ON anchor.JournalID = j.produced_by_operation_journal_id`,
 	}
 	for _, stmt := range ddl {
 		if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
@@ -273,7 +299,58 @@ func (db *DB) AppendBareJournalRow(kind journal.JournalKind, actorID journal.Act
 func (db *DB) VerifyIntegrity() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	return db.verifySubtypeIntegrityLocked()
+	if err := db.verifySubtypeIntegrityLocked(); err != nil {
+		return err
+	}
+	return db.verifyActorPlacementLocked()
+}
+
+// verifyActorPlacementLocked enforces the anchor-only actor-placement invariant
+// (§2.1, §10 rule 5): a stored actor_id is present iff the row is an anchor
+// (produced_by_operation_journal_id IS NULL). It rejects a subordinate row that
+// carries an actor (the new-model violation the retired committing-actor-agreement
+// rule made structurally impossible on the input path) and, symmetrically, an
+// anchor row missing one. It backs the journal CHECK constraint that also enforces
+// this, and is the §15 convergence tool's placement guard. Returns
+// journal.ErrActorPlacement on any violation.
+func (db *DB) verifyActorPlacementLocked() error {
+	var (
+		badJID   int64
+		subord   bool
+		violated bool
+	)
+	if err := sqlitex.Execute(db.conn,
+		`SELECT JournalID, produced_by_operation_journal_id IS NOT NULL
+		 FROM journal
+		 WHERE (produced_by_operation_journal_id IS NOT NULL AND actor_id IS NOT NULL)
+		    OR (produced_by_operation_journal_id IS NULL     AND actor_id IS NULL)
+		 LIMIT 1`,
+		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
+			violated = true
+			badJID = stmt.ColumnInt64(0)
+			subord = stmt.ColumnInt64(1) == 1
+			return nil
+		}}); err != nil {
+		return fmt.Errorf("verifyActorPlacement: %w", err)
+	}
+	if !violated {
+		return nil
+	}
+	if subord {
+		return fmt.Errorf(
+			"%w: subordinate journal row %d (produced by an operation) carries a stored "+
+				"actor_id — where: actor-placement gate; when: before commit / at Open "+
+				"convergence; impact: the write is rolled back / the database is not accepted "+
+				"as converged; fix: a subordinate row must leave actor_id NULL and derive its "+
+				"committing actor from its anchor (§2.1, §8.5)",
+			journal.ErrActorPlacement, badJID)
+	}
+	return fmt.Errorf(
+		"%w: anchor journal row %d (produced_by_operation_journal_id NULL) is missing its "+
+			"actor_id — where: actor-placement gate; when: before commit / at Open "+
+			"convergence; impact: the write is rolled back / the database is not accepted as "+
+			"converged; fix: an anchor row must carry the committing actor",
+		journal.ErrActorPlacement, badJID)
 }
 
 // knownSubtypeTables maps each JournalKind to its subtype table. Only tables
@@ -393,8 +470,13 @@ func (db *DB) QueryTaskEvents(q journal.JournalQueryV1) (journal.JournalTaskEven
 	}
 
 	args := []any{snapshot, int64(q.AfterJournalID)}
-	sql := `SELECT j.JournalID, j.actor_id, j.recorded_at, te.task_id, te.event_kind, te.payload
-		FROM journal j JOIN journal_task_events te ON te.JournalID = j.JournalID
+	// Read the row's actor through journal_attributed (§8.5): effective_actor_id is
+	// the row's own stored actor on an anchor, or its derived anchor actor on a
+	// subordinate row — never a bare read of the (NULL-on-subordinate) actor_id
+	// column. At this layer every task_event is an anchor, so this equals the
+	// stored actor; the derived surface keeps the read correct once operations land.
+	sql := `SELECT j.JournalID, j.effective_actor_id, j.recorded_at, te.task_id, te.event_kind, te.payload
+		FROM journal_attributed j JOIN journal_task_events te ON te.JournalID = j.JournalID
 		WHERE j.JournalID <= ?1 AND j.JournalID > ?2`
 	next := 3
 	if len(q.TaskIDs) > 0 {
