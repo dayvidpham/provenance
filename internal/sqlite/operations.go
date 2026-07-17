@@ -1,0 +1,583 @@
+package sqlite
+
+import (
+	"encoding/json"
+	"fmt"
+
+	"github.com/dayvidpham/provenance/internal/journal"
+	zs "zombiezen.com/go/sqlite"
+	"zombiezen.com/go/sqlite/sqlitex"
+)
+
+// operations.go implements the mutation-time reducer for the operations,
+// effects, results, and authority-lifecycle layer
+// (docs/journal-relational-contract.md §2-§4, §9, §14). Apply commits one
+// logical operation as an atomic append plus domain mutation in a single SQLite
+// transaction (§9.5): it folds the operation's effects one at a time in caller
+// list order (§9.3.1), authorizing each against the state produced by all
+// earlier effects of the same operation (§9.3), and short-circuits an exact
+// same-OperationID replay (§9.4). The per-effect validation is written as
+// reusable *Locked reducer steps so the Open/replay reducer of a later slice
+// folds onto them rather than duplicating a second switch (§9.2).
+
+// Closed-lookup integer ids, matching the Go enum iota values so the SQL lookup
+// and the typed enum cannot drift.
+const (
+	authKindBootstrapID  = int(journal.AuthorityKindBootstrap)
+	authKindAssignmentID = int(journal.AuthorityKindAssignment)
+
+	slotOwnerResponsibilityID = 0
+
+	transitionStartedID = int(journal.TransitionStarted)
+	transitionEndedID   = int(journal.TransitionEnded)
+
+	// blockedByEdgeKindID is edge_kinds.id for 'blocked_by' (db.go seed). A
+	// task's governing-parent chain is walked over these edges: source blocked_by
+	// target means target is an ancestor that may govern source (§9.3 governance).
+	blockedByEdgeKindID = 0
+)
+
+// slotDBID maps a typed AssignmentSlotID to its assignment_slots.id. Only
+// owner-responsibility is seeded today (§4.5); an unknown slot is a typed error
+// rather than a silent zero.
+func slotDBID(slot journal.AssignmentSlotID) (int, error) {
+	switch slot {
+	case journal.SlotOwnerResponsibility, "":
+		return slotOwnerResponsibilityID, nil
+	default:
+		return 0, fmt.Errorf("provenance: unknown assignment slot %q — only %q is registered (§4.5)",
+			slot, journal.SlotOwnerResponsibility)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Schema (§3, §4) + the staged journal→journal_operations FK completion
+// ---------------------------------------------------------------------------
+
+// ensureOperationsSchema creates the operations/authority subtype relations and
+// their closed lookups, then completes the deferred journal.produced_by FK the
+// journal-base layer staged as NULL (§2.1 staging note, §10 rule 2). Idempotent.
+func (db *DB) ensureOperationsSchema() error {
+	ddl := []string{
+		// Closed lookups (§4.1, §4.5), same shape/BCNF as journal_kinds (§2.2).
+		`CREATE TABLE IF NOT EXISTS authority_kinds (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT`,
+		`CREATE TABLE IF NOT EXISTS assignment_slots (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT`,
+		`CREATE TABLE IF NOT EXISTS assignment_transitions (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT`,
+		// Committed operations (§3.1). OperationID is the UNIQUE alternate key,
+		// never the PK and never an ordering source (§11). The four-field replay
+		// identity (§9.4) is deliberately NOT a UNIQUE constraint here.
+		`CREATE TABLE IF NOT EXISTS journal_operations (
+			JournalID            INTEGER PRIMARY KEY REFERENCES journal(JournalID),
+			operation_id         TEXT NOT NULL UNIQUE,
+			authority_journal_id INTEGER REFERENCES journal_authorities(JournalID),
+			command_digest       BLOB NOT NULL,
+			mutation_digest      BLOB NOT NULL
+		) STRICT`,
+		// Slot-keyed committed-result mapping (§3.2). rule-9 own-operation
+		// integrity is reducer-enforced (the two FKs alone cannot express it).
+		`CREATE TABLE IF NOT EXISTS journal_operation_result_slots (
+			JournalID           INTEGER NOT NULL REFERENCES journal_operations(JournalID),
+			result_slot_id      TEXT NOT NULL,
+			produced_journal_id INTEGER NOT NULL REFERENCES journal(JournalID),
+			PRIMARY KEY (JournalID, result_slot_id)
+		) STRICT, WITHOUT ROWID`,
+		// Authority supertype (§4.2) and its bootstrap detail (§4.3).
+		`CREATE TABLE IF NOT EXISTS journal_authorities (
+			JournalID              INTEGER PRIMARY KEY REFERENCES journal(JournalID),
+			authority_kind_id      INTEGER NOT NULL REFERENCES authority_kinds(id),
+			operation_authority_id TEXT NOT NULL UNIQUE
+		) STRICT`,
+		`CREATE TABLE IF NOT EXISTS journal_authority_bootstraps (
+			JournalID INTEGER PRIMARY KEY REFERENCES journal_authorities(JournalID),
+			label     TEXT NOT NULL
+		) STRICT`,
+		// Assignment lifecycle BCNF decomposition (§4.4): whole-episode identity
+		// separate from per-transition journal rows. PredecessorAssignmentID is
+		// UNIQUE — single-consumption evidence (§14.2).
+		`CREATE TABLE IF NOT EXISTS journal_authority_assignment_episodes (
+			assignment_id             TEXT PRIMARY KEY,
+			task_id                   TEXT NOT NULL REFERENCES tasks(id),
+			slot_id                   INTEGER NOT NULL REFERENCES assignment_slots(id),
+			actor_id                  TEXT NOT NULL REFERENCES agents(id),
+			predecessor_assignment_id TEXT UNIQUE REFERENCES journal_authority_assignment_episodes(assignment_id)
+		) STRICT`,
+		`CREATE TABLE IF NOT EXISTS journal_authority_assignment_transitions (
+			JournalID     INTEGER PRIMARY KEY REFERENCES journal_authorities(JournalID),
+			assignment_id TEXT NOT NULL REFERENCES journal_authority_assignment_episodes(assignment_id),
+			transition_id INTEGER NOT NULL REFERENCES assignment_transitions(id),
+			UNIQUE (assignment_id, transition_id)
+		) STRICT`,
+		// Decisions (§6.1) and material-work evidence (§6.2).
+		`CREATE TABLE IF NOT EXISTS journal_decisions (
+			JournalID     INTEGER PRIMARY KEY REFERENCES journal(JournalID),
+			decision_kind TEXT NOT NULL,
+			task_id       TEXT REFERENCES tasks(id),
+			payload       TEXT NOT NULL CHECK (json_valid(payload))
+		) STRICT`,
+		`CREATE TABLE IF NOT EXISTS journal_evidence (
+			JournalID      INTEGER PRIMARY KEY REFERENCES journal(JournalID),
+			evidence_kind  TEXT NOT NULL,
+			task_id        TEXT REFERENCES tasks(id),
+			content_digest BLOB NOT NULL,
+			payload        TEXT NOT NULL CHECK (json_valid(payload))
+		) STRICT`,
+		`CREATE INDEX IF NOT EXISTS idx_journal_pboj ON journal (produced_by_operation_journal_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_transitions_assignment ON journal_authority_assignment_transitions (assignment_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_episodes_task ON journal_authority_assignment_episodes (task_id)`,
+	}
+	for _, stmt := range ddl {
+		if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
+			return fmt.Errorf("ensureOperationsSchema: %w — statement: %s", err, stmt[:min(len(stmt), 80)])
+		}
+	}
+	for id, name := range map[int]string{authKindBootstrapID: "bootstrap", authKindAssignmentID: "assignment"} {
+		if err := sqlitex.Execute(db.conn, `INSERT OR IGNORE INTO authority_kinds (id, name) VALUES (?1, ?2)`,
+			&sqlitex.ExecOptions{Args: []any{id, name}}); err != nil {
+			return fmt.Errorf("ensureOperationsSchema: seed authority_kinds: %w", err)
+		}
+	}
+	if err := sqlitex.Execute(db.conn, `INSERT OR IGNORE INTO assignment_slots (id, name) VALUES (?1, ?2)`,
+		&sqlitex.ExecOptions{Args: []any{slotOwnerResponsibilityID, string(journal.SlotOwnerResponsibility)}}); err != nil {
+		return fmt.Errorf("ensureOperationsSchema: seed assignment_slots: %w", err)
+	}
+	for id, name := range map[int]string{transitionStartedID: "started", transitionEndedID: "ended"} {
+		if err := sqlitex.Execute(db.conn, `INSERT OR IGNORE INTO assignment_transitions (id, name) VALUES (?1, ?2)`,
+			&sqlitex.ExecOptions{Args: []any{id, name}}); err != nil {
+			return fmt.Errorf("ensureOperationsSchema: seed assignment_transitions: %w", err)
+		}
+	}
+	return db.completeJournalOperationFK()
+}
+
+// completeJournalOperationFK completes the journal.produced_by_operation_journal_id
+// foreign key the journal-base layer staged without an FK (§2.1 staging note).
+// It rebuilds the journal table (the standard SQLite 12-step table rebuild)
+// preserving every child FK that references journal(JournalID), so an
+// operation-produced row can no longer name a producing operation that does not
+// exist. Idempotent: it is a no-op once the FK is present.
+func (db *DB) completeJournalOperationFK() error {
+	present, err := db.journalProducedByFKPresent()
+	if err != nil {
+		return err
+	}
+	if present {
+		return nil
+	}
+	// PRAGMA foreign_keys is a no-op inside a transaction, so toggle it around
+	// an explicit rebuild transaction. The journal is empty at first Open, so
+	// the row copy is trivial; child tables reference journal(JournalID) by name
+	// and remain valid across the drop+rename.
+	if err := sqlitex.ExecuteTransient(db.conn, `PRAGMA foreign_keys=OFF`, nil); err != nil {
+		return fmt.Errorf("completeJournalOperationFK: disable FK enforcement: %w", err)
+	}
+	rebuild := []string{
+		`BEGIN IMMEDIATE`,
+		`CREATE TABLE journal_new (
+			JournalID   INTEGER PRIMARY KEY AUTOINCREMENT,
+			kind_id     INTEGER NOT NULL REFERENCES journal_kinds(id),
+			actor_id    TEXT NOT NULL REFERENCES agents(id),
+			recorded_at INTEGER NOT NULL,
+			produced_by_operation_journal_id INTEGER REFERENCES journal_operations(JournalID)
+		) STRICT`,
+		`INSERT INTO journal_new (JournalID, kind_id, actor_id, recorded_at, produced_by_operation_journal_id)
+			SELECT JournalID, kind_id, actor_id, recorded_at, produced_by_operation_journal_id FROM journal`,
+		`DROP TABLE journal`,
+		`ALTER TABLE journal_new RENAME TO journal`,
+		`CREATE INDEX IF NOT EXISTS idx_journal_kind  ON journal (kind_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_journal_actor ON journal (actor_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_journal_pboj  ON journal (produced_by_operation_journal_id)`,
+		`COMMIT`,
+	}
+	for _, stmt := range rebuild {
+		if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
+			_ = sqlitex.ExecuteTransient(db.conn, `ROLLBACK`, nil)
+			_ = sqlitex.ExecuteTransient(db.conn, `PRAGMA foreign_keys=ON`, nil)
+			return fmt.Errorf("completeJournalOperationFK: rebuild step %q: %w", stmt[:min(len(stmt), 40)], err)
+		}
+	}
+	var violations int
+	if err := sqlitex.ExecuteTransient(db.conn, `PRAGMA foreign_key_check`,
+		&sqlitex.ExecOptions{ResultFunc: func(*zs.Stmt) error { violations++; return nil }}); err != nil {
+		return fmt.Errorf("completeJournalOperationFK: foreign_key_check: %w", err)
+	}
+	if err := sqlitex.ExecuteTransient(db.conn, `PRAGMA foreign_keys=ON`, nil); err != nil {
+		return fmt.Errorf("completeJournalOperationFK: re-enable FK enforcement: %w", err)
+	}
+	if violations > 0 {
+		return fmt.Errorf("completeJournalOperationFK: rebuild left %d foreign-key violations — "+
+			"where: journal FK completion; impact: the database is not converged; "+
+			"fix: this indicates a producing operation referenced by a journal row does not exist", violations)
+	}
+	return nil
+}
+
+func (db *DB) journalProducedByFKPresent() (bool, error) {
+	present := false
+	if err := sqlitex.ExecuteTransient(db.conn, `PRAGMA foreign_key_list(journal)`,
+		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
+			// columns: id, seq, table, from, to, on_update, on_delete, match
+			if stmt.ColumnText(3) == "produced_by_operation_journal_id" {
+				present = true
+			}
+			return nil
+		}}); err != nil {
+		return false, fmt.Errorf("journalProducedByFKPresent: %w", err)
+	}
+	return present, nil
+}
+
+// ---------------------------------------------------------------------------
+// Apply — the atomic operation write path (§9)
+// ---------------------------------------------------------------------------
+
+// Apply commits one logical operation atomically (§9.5). It first evaluates the
+// §9.4 idempotent-replay short-circuit; a new operation then validates genesis
+// discipline (§4.6), inserts its anchor, folds its effects in order with
+// per-effect authorization (§9.3), persists result slots (§3.2), and runs the
+// subtype-integrity and close-ends-assignment gates before commit.
+func (db *DB) Apply(in journal.OperationInput) (journal.CommittedResult, error) {
+	if err := journal.ValidateOperationID(in.OperationID); err != nil {
+		return journal.CommittedResult{}, fmt.Errorf("Apply: %w", err)
+	}
+	if in.ActorID.Namespace == "" {
+		return journal.CommittedResult{}, fmt.Errorf("Apply: operation %q: committing actor is required", in.OperationID)
+	}
+	if len(in.CommandDigest) == 0 || len(in.MutationDigest) == 0 {
+		return journal.CommittedResult{}, fmt.Errorf(
+			"Apply: operation %q: CommandDigest and MutationDigest are both required (§3.1) — "+
+				"where: Apply input validation; impact: nothing committed; fix: supply both opaque digests",
+			in.OperationID)
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	var txErr error
+	endTx := sqlitex.Transaction(db.conn)
+	defer endTx(&txErr)
+
+	// §9.4: OperationID-presence short-circuit, evaluated before any
+	// operation-kind-specific validity check (genesis rule 6 included, §4.6).
+	existing, found, lookErr := db.lookupOperationLocked(in.OperationID)
+	if lookErr != nil {
+		txErr = lookErr
+		return journal.CommittedResult{}, txErr
+	}
+	if found {
+		if field, ok := identityMismatch(existing.identity, journal.StoredOperationIdentity{
+			ActorID:            in.ActorID,
+			AuthorityJournalID: in.AuthorityJournalID,
+			CommandDigest:      in.CommandDigest,
+			MutationDigest:     in.MutationDigest,
+		}); !ok {
+			conflict := &journal.OperationConflict{OperationID: in.OperationID, Field: field}
+			txErr = fmt.Errorf("%w: %s", journal.ErrOperationConflict, conflict.Error())
+			return journal.CommittedResult{}, txErr
+		}
+		res, err := db.reconstructCommittedLocked(existing.anchor)
+		if err != nil {
+			txErr = err
+			return journal.CommittedResult{}, txErr
+		}
+		res.ShortCircuited = true
+		return res, nil // commit (no writes performed)
+	}
+
+	// New operation: genesis discipline (§4.6, §10 rules 6-7).
+	genesis := in.AuthorityJournalID == nil
+	if genesis {
+		if err := db.validateGenesisLocked(in); err != nil {
+			txErr = err
+			return journal.CommittedResult{}, txErr
+		}
+	} else if err := db.requireAuthorityExistsLocked(*in.AuthorityJournalID); err != nil {
+		txErr = err
+		return journal.CommittedResult{}, txErr
+	}
+
+	// Anchor row (§10 rule 1): kind=operation, PBOJID=NULL.
+	anchorJID, err := db.insertJournalRowLocked(journal.JournalKindOperation, in.ActorID, in.RecordedAt, nil)
+	if err != nil {
+		txErr = err
+		return journal.CommittedResult{}, txErr
+	}
+	if err := db.insertOperationRowLocked(anchorJID, in); err != nil {
+		txErr = err
+		return journal.CommittedResult{}, txErr
+	}
+
+	// Fold effects in caller list order (§9.3.1), authorizing each against the
+	// state produced by all earlier effects of this same operation (§9.3).
+	for i := range in.Effects {
+		eff := in.Effects[i]
+		producedJID, err := db.foldEffectLocked(in, anchorJID, eff, i)
+		if err != nil {
+			txErr = err
+			return journal.CommittedResult{}, txErr
+		}
+		if eff.ResultSlot != "" {
+			if err := db.insertResultSlotLocked(anchorJID, eff.ResultSlot, producedJID); err != nil {
+				txErr = err
+				return journal.CommittedResult{}, txErr
+			}
+		}
+	}
+
+	// Post-fold gates: subtype integrity (§10 rule 8) and close-ends-assignment
+	// (§8.1 / owner_responsibility regression c).
+	if txErr = db.verifySubtypeIntegrityLocked(); txErr != nil {
+		return journal.CommittedResult{}, txErr
+	}
+	if txErr = db.validateClosesEndAssignmentsLocked(anchorJID, in.Effects); txErr != nil {
+		return journal.CommittedResult{}, txErr
+	}
+
+	res, err := db.reconstructCommittedLocked(anchorJID)
+	if err != nil {
+		txErr = err
+		return journal.CommittedResult{}, txErr
+	}
+	return res, nil
+}
+
+// ---------------------------------------------------------------------------
+// Per-effect fold (§9.3) — the reusable reducer step
+// ---------------------------------------------------------------------------
+
+// foldEffectLocked validates and persists one effect, returning its produced
+// journal row's JournalID. It enforces committing-actor agreement (§10 rule 5)
+// and dispatches to the sort-specific reducer step, each of which authorizes
+// against current transaction state (all earlier effects already inserted, §9.3).
+func (db *DB) foldEffectLocked(in journal.OperationInput, anchorJID int64, eff journal.Effect, index int) (int64, error) {
+	if eff.ActorID.Namespace != "" && eff.ActorID != in.ActorID {
+		return 0, fmt.Errorf(
+			"%w: operation %q effect %d is stamped with actor %q but its anchor's actor is %q — "+
+				"where: per-effect fold (§9.3); when: before commit; impact: nothing committed; "+
+				"fix: every produced row must carry the committing operation's actor (§10 rule 5)",
+			journal.ErrEffectActorMismatch, in.OperationID, index, eff.ActorID.String(), in.ActorID.String())
+	}
+	kind, err := eff.Sort.JournalKind()
+	if err != nil {
+		return 0, err
+	}
+	jid, err := db.insertJournalRowLocked(kind, in.ActorID, in.RecordedAt, &anchorJID)
+	if err != nil {
+		return 0, err
+	}
+	switch eff.Sort {
+	case journal.EffectTaskEvent:
+		return jid, db.foldTaskEventLocked(in, jid, eff)
+	case journal.EffectBootstrapAuthority:
+		return jid, db.foldBootstrapAuthorityLocked(jid, eff)
+	case journal.EffectAssignmentStart:
+		return jid, db.foldAssignmentStartLocked(in, jid, eff)
+	case journal.EffectAssignmentEnd:
+		return jid, db.foldAssignmentEndLocked(in, jid, eff)
+	case journal.EffectDecision:
+		return jid, db.foldDecisionLocked(jid, eff)
+	case journal.EffectEvidence:
+		return jid, db.foldEvidenceLocked(jid, eff)
+	default:
+		return 0, fmt.Errorf("Apply: operation %q effect %d has unknown sort %s", in.OperationID, index, eff.Sort)
+	}
+}
+
+func (db *DB) foldTaskEventLocked(in journal.OperationInput, jid int64, eff journal.Effect) error {
+	if err := journal.ValidateEventKind(eff.EventKind); err != nil {
+		return err
+	}
+	if err := db.requireAuthorityGovernsLocked(in, jid, eff.TaskID); err != nil {
+		return err
+	}
+	payload := eff.Payload
+	if len(payload) == 0 {
+		payload = json.RawMessage(`{}`)
+	}
+	if !json.Valid(payload) {
+		return fmt.Errorf("Apply: task_event payload for %q is not valid JSON", eff.EventKind)
+	}
+	if err := sqlitex.Execute(db.conn,
+		`INSERT INTO journal_task_events (JournalID, task_id, event_kind, payload) VALUES (?1, ?2, ?3, ?4)`,
+		&sqlitex.ExecOptions{Args: []any{jid, eff.TaskID.String(), string(eff.EventKind), string(payload)}}); err != nil {
+		return fmt.Errorf("Apply: insert journal_task_events: %w", err)
+	}
+	contexts, err := journal.CanonicalEventContexts(eff.Contexts)
+	if err != nil {
+		return fmt.Errorf("Apply: canonical contexts: %w", err)
+	}
+	for _, ctx := range contexts {
+		ck, identity, encErr := journal.EncodeStoredEventContext(ctx)
+		if encErr != nil {
+			return fmt.Errorf("Apply: encode context: %w", encErr)
+		}
+		if err := sqlitex.Execute(db.conn,
+			`INSERT OR IGNORE INTO journal_task_event_contexts (event_journal_id, context_kind, context_identity, attached_by_journal_id)
+			 VALUES (?1, ?2, ?3, ?4)`,
+			&sqlitex.ExecOptions{Args: []any{jid, string(ck), identity, jid}}); err != nil {
+			return fmt.Errorf("Apply: insert context edge: %w", err)
+		}
+	}
+	// Attribution edge for the authoring (committing) actor (§8.2).
+	if err := db.insertAttributionLocked(eff.TaskID, in.ActorID, jid); err != nil {
+		return err
+	}
+	return db.advanceWatermarkLocked(eff.TaskID, jid)
+}
+
+func (db *DB) foldBootstrapAuthorityLocked(jid int64, eff journal.Effect) error {
+	authorityID := string(eff.OperationAuthorityID)
+	if authorityID == "" {
+		authorityID = fmt.Sprintf("authority--bootstrap--%d", jid)
+	}
+	if err := sqlitex.Execute(db.conn,
+		`INSERT INTO journal_authorities (JournalID, authority_kind_id, operation_authority_id) VALUES (?1, ?2, ?3)`,
+		&sqlitex.ExecOptions{Args: []any{jid, authKindBootstrapID, authorityID}}); err != nil {
+		return fmt.Errorf("Apply: insert journal_authorities (bootstrap): %w", err)
+	}
+	label := eff.BootstrapLabel
+	if label == "" {
+		label = "bootstrap"
+	}
+	if err := sqlitex.Execute(db.conn,
+		`INSERT INTO journal_authority_bootstraps (JournalID, label) VALUES (?1, ?2)`,
+		&sqlitex.ExecOptions{Args: []any{jid, label}}); err != nil {
+		return fmt.Errorf("Apply: insert journal_authority_bootstraps: %w", err)
+	}
+	return nil
+}
+
+func (db *DB) foldAssignmentStartLocked(in journal.OperationInput, jid int64, eff journal.Effect) error {
+	if err := db.requireAuthorityGovernsLocked(in, jid, eff.TaskID); err != nil {
+		return err
+	}
+	occupant := eff.Occupant
+	if occupant.Namespace == "" {
+		occupant = in.ActorID
+	}
+	slot, err := slotDBID(eff.SlotID)
+	if err != nil {
+		return err
+	}
+	// Orphaned/multiply-consumed predecessor evidence (§14.2, §14.3).
+	var predecessor any
+	if eff.Predecessor != "" {
+		ended, exists, err := db.episodeEndedLocked(eff.Predecessor)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return fmt.Errorf("%w: predecessor episode %q does not exist (§14.3)", journal.ErrOrphanedEvidence, eff.Predecessor)
+		}
+		if !ended {
+			return fmt.Errorf(
+				"%w: transfer start names predecessor %q which has no ended transition — "+
+					"where: assignment-start fold (§14.3); when: before commit; impact: nothing committed; "+
+					"fix: end the predecessor episode in this or an earlier operation before succeeding it",
+				journal.ErrOrphanedEvidence, eff.Predecessor)
+		}
+		predecessor = string(eff.Predecessor)
+	}
+	// Episode identity row (append-only; created once per AssignmentID). The
+	// UNIQUE(predecessor_assignment_id) constraint is the single-consumption
+	// backstop (§14.2); a second successor of the same predecessor fails here.
+	if err := sqlitex.Execute(db.conn,
+		`INSERT INTO journal_authority_assignment_episodes (assignment_id, task_id, slot_id, actor_id, predecessor_assignment_id)
+		 VALUES (?1, ?2, ?3, ?4, ?5)`,
+		&sqlitex.ExecOptions{Args: []any{string(eff.AssignmentID), eff.TaskID.String(), slot, occupant.String(), predecessor}}); err != nil {
+		if eff.Predecessor != "" && isUniqueViolation(err) {
+			return fmt.Errorf("%w: predecessor episode %q is already consumed by another successor (§14.2)",
+				journal.ErrOrphanedEvidence, eff.Predecessor)
+		}
+		return fmt.Errorf("Apply: insert assignment episode %q: %w", eff.AssignmentID, err)
+	}
+	if err := db.insertAuthorityAssignmentTransitionLocked(jid, eff.AssignmentID, transitionStartedID); err != nil {
+		return err
+	}
+	// Attribution credits the episode occupant, never the committing actor (§8.2).
+	if err := db.insertAttributionLocked(eff.TaskID, occupant, jid); err != nil {
+		return err
+	}
+	// Projection: current owner-responsibility occupant (§8.1).
+	if eff.SlotID == journal.SlotOwnerResponsibility || eff.SlotID == "" {
+		if err := db.recomputeTaskOwnerLocked(eff.TaskID, jid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (db *DB) foldAssignmentEndLocked(in journal.OperationInput, jid int64, eff journal.Effect) error {
+	// Lifecycle order (§14.4): a started transition must precede the ended one.
+	started, err := db.episodeStartedLocked(eff.AssignmentID)
+	if err != nil {
+		return err
+	}
+	if !started {
+		return fmt.Errorf(
+			"%w: episode %q has no started transition, so it cannot be ended — "+
+				"where: assignment-end fold (§14.4); when: before commit; impact: nothing committed; "+
+				"fix: a started transition must be committed with a strictly smaller JournalID first",
+			journal.ErrAssignmentLifecycle, eff.AssignmentID)
+	}
+	ended, _, err := db.episodeEndedLocked(eff.AssignmentID)
+	if err != nil {
+		return err
+	}
+	if ended {
+		// A concurrent transfer CAS loser observes the winner's committed ended
+		// transition here and is rejected with a typed stale-episode conflict
+		// (§9.6), writing nothing.
+		return fmt.Errorf(
+			"%w: episode %q is already ended — where: assignment-end fold (§9.6 CAS); "+
+				"when: before commit; impact: nothing committed for this operation; "+
+				"fix: the episode was ended by a concurrent winning transfer; re-read current state and retry",
+			journal.ErrStaleEpisode, eff.AssignmentID)
+	}
+	task, err := db.episodeTaskLocked(eff.AssignmentID)
+	if err != nil {
+		return err
+	}
+	if err := db.requireAuthorityGovernsLocked(in, jid, task); err != nil {
+		return err
+	}
+	if err := db.insertAuthorityAssignmentTransitionLocked(jid, eff.AssignmentID, transitionEndedID); err != nil {
+		return err
+	}
+	// Projection: recompute the current owner (cleared when this ended the active
+	// owner episode, §8.1).
+	return db.recomputeTaskOwnerLocked(task, jid)
+}
+
+func (db *DB) foldDecisionLocked(jid int64, eff journal.Effect) error {
+	payload := eff.Payload
+	if len(payload) == 0 {
+		payload = json.RawMessage(`{}`)
+	}
+	var taskID any
+	if eff.TaskID.Namespace != "" {
+		taskID = eff.TaskID.String()
+	}
+	if err := sqlitex.Execute(db.conn,
+		`INSERT INTO journal_decisions (JournalID, decision_kind, task_id, payload) VALUES (?1, ?2, ?3, ?4)`,
+		&sqlitex.ExecOptions{Args: []any{jid, string(eff.DecisionKind), taskID, string(payload)}}); err != nil {
+		return fmt.Errorf("Apply: insert journal_decisions: %w", err)
+	}
+	return nil
+}
+
+func (db *DB) foldEvidenceLocked(jid int64, eff journal.Effect) error {
+	payload := eff.Payload
+	if len(payload) == 0 {
+		payload = json.RawMessage(`{}`)
+	}
+	var taskID any
+	if eff.TaskID.Namespace != "" {
+		taskID = eff.TaskID.String()
+	}
+	if err := sqlitex.Execute(db.conn,
+		`INSERT INTO journal_evidence (JournalID, evidence_kind, task_id, content_digest, payload) VALUES (?1, ?2, ?3, ?4, ?5)`,
+		&sqlitex.ExecOptions{Args: []any{jid, string(eff.EvidenceKind), taskID, eff.ContentDigest, string(payload)}}); err != nil {
+		return fmt.Errorf("Apply: insert journal_evidence: %w", err)
+	}
+	return nil
+}

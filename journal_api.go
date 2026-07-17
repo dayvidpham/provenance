@@ -30,6 +30,24 @@ type (
 	FixedActorEntry        = journal.FixedActorEntry
 	UUIDRange              = journal.UUIDRange
 	NamespaceCodec         = journal.NamespaceCodec
+
+	// Operations, effects, results, and authority-lifecycle surface (§2-§4, §9).
+	OperationAuthorityID    = journal.OperationAuthorityID
+	AssignmentID            = journal.AssignmentID
+	ResultSlotID            = journal.ResultSlotID
+	AuthorityKind           = journal.AuthorityKind
+	AssignmentSlotID        = journal.AssignmentSlotID
+	AssignmentTransition    = journal.AssignmentTransition
+	EffectSort              = journal.EffectSort
+	Effect                  = journal.Effect
+	DecisionKind            = journal.DecisionKind
+	EvidenceKind            = journal.EvidenceKind
+	OperationInput          = journal.OperationInput
+	StoredOperationIdentity = journal.StoredOperationIdentity
+	CommittedResultKind     = journal.CommittedResultKind
+	ResultSlotBinding       = journal.ResultSlotBinding
+	CommittedResult         = journal.CommittedResult
+	OperationConflict       = journal.OperationConflict
 )
 
 // Closed enum values.
@@ -48,6 +66,26 @@ const (
 	EventContextKindGit      = journal.EventContextKindGit
 
 	OrdinalV1CodecName = journal.OrdinalV1CodecName
+
+	// Authority-kind and assignment-lifecycle closed enums (§4).
+	AuthorityKindBootstrap  = journal.AuthorityKindBootstrap
+	AuthorityKindAssignment = journal.AuthorityKindAssignment
+	SlotOwnerResponsibility = journal.SlotOwnerResponsibility
+	TransitionStarted       = journal.TransitionStarted
+	TransitionEnded         = journal.TransitionEnded
+
+	// Effect sorts (§9.3).
+	EffectTaskEvent          = journal.EffectTaskEvent
+	EffectBootstrapAuthority = journal.EffectBootstrapAuthority
+	EffectAssignmentStart    = journal.EffectAssignmentStart
+	EffectAssignmentEnd      = journal.EffectAssignmentEnd
+	EffectDecision           = journal.EffectDecision
+	EffectEvidence           = journal.EffectEvidence
+
+	// Committed-result variants (§3.2, §9.4).
+	CommittedAbsent   = journal.CommittedAbsent
+	CommittedExact    = journal.CommittedExact
+	CommittedConflict = journal.CommittedConflict
 )
 
 // Typed context and validation constructors.
@@ -71,6 +109,17 @@ var (
 	ErrNamespaceRange            = journal.ErrNamespaceRange
 	ErrEntryOutOfRange           = journal.ErrEntryOutOfRange
 	ErrNamespaceClaim            = journal.ErrNamespaceClaim
+
+	// Operations/authority sentinel errors (§4, §9, §14).
+	ErrOperationConflict   = journal.ErrOperationConflict
+	ErrGenesis             = journal.ErrGenesis
+	ErrEffectActorMismatch = journal.ErrEffectActorMismatch
+	ErrAuthorityScope      = journal.ErrAuthorityScope
+	ErrAssignmentLifecycle = journal.ErrAssignmentLifecycle
+	ErrOrphanedEvidence    = journal.ErrOrphanedEvidence
+	ErrStaleEpisode        = journal.ErrStaleEpisode
+	ErrResultSlotIntegrity = journal.ErrResultSlotIntegrity
+	ErrCloseWithoutEnding  = journal.ErrCloseWithoutEnding
 )
 
 // JournalAPI is the ordered global-journal surface: append task-event rows,
@@ -99,6 +148,20 @@ type JournalAPI interface {
 	RegisterFixedActorEntry(entry FixedActorEntry, fixedUUID [16]byte) error
 	// NamespaceClaims returns every registered claim.
 	NamespaceClaims() ([]ActorNamespaceClaim, error)
+
+	// Apply commits one logical operation atomically (§9.5): an atomic append
+	// plus domain mutation folding the operation's effects in caller list order
+	// with per-effect authorization (§9.3), the §9.4 idempotent-replay
+	// short-circuit, genesis discipline (§4.6), and the subtype-integrity gate.
+	Apply(in OperationInput) (CommittedResult, error)
+	// LookupCommitted returns the committed result for an OperationID: the closed
+	// Absent variant (no side effects) for a never-applied operation, or the
+	// Exact variant with the reconstructed EmittedEvents closure and slot map
+	// (§3.2, §9.4).
+	LookupCommitted(op OperationID) (CommittedResult, error)
+	// AuthorityGovernsTaskAt reports whether the authority at authJID governs
+	// task for an effect at beforeJID, ordering strictly by JournalID (§9.3, §12).
+	AuthorityGovernsTaskAt(authJID JournalID, task TaskID, beforeJID JournalID) (bool, error)
 }
 
 // Journal returns the ordered global-journal surface backed by the same SQLite

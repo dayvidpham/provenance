@@ -231,7 +231,10 @@ func (db *DB) ensureSchema(models []ptypes.ModelEntry) error {
 	if err := db.seedReferenceData(models); err != nil {
 		return err
 	}
-	return db.ensureJournalSchema()
+	if err := db.ensureJournalSchema(); err != nil {
+		return err
+	}
+	return db.ensureOperationsSchema()
 }
 
 // ---------------------------------------------------------------------------

@@ -359,6 +359,87 @@ func (db *DB) verifySubtypeIntegrityLocked() error {
 				journal.ErrSubtypeIntegrity, table, mismatch, kind)
 		}
 	}
+	// Exclusivity across subtype tables (§10 rule 8): a JournalID may appear in at
+	// most one subtype table. Checked explicitly so a second subtype row whose own
+	// discriminator happens to agree is still rejected (the per-table discriminator
+	// pass above only rejects a row disagreeing with its supertype).
+	if err := db.verifySubtypeExclusivityLocked(tables); err != nil {
+		return err
+	}
+	// Authority-level class-table inheritance (§10 rule 8, second level):
+	// journal_authorities → its bootstrap/assignment detail rows.
+	return db.verifyAuthorityDetailIntegrityLocked()
+}
+
+// verifySubtypeExclusivityLocked rejects a JournalID present in two subtype
+// tables at once (§10 rule 8 exclusivity). The subtype PKs are all JournalID, so
+// a pairwise existence probe over the present tables is exact.
+func (db *DB) verifySubtypeExclusivityLocked(tables map[journal.JournalKind]string) error {
+	names := make([]string, 0, len(tables))
+	for _, table := range tables {
+		names = append(names, table)
+	}
+	for i := 0; i < len(names); i++ {
+		for j := i + 1; j < len(names); j++ {
+			var dup int64
+			if err := sqlitex.Execute(db.conn,
+				fmt.Sprintf(`SELECT a.JournalID FROM %s a JOIN %s b ON a.JournalID = b.JournalID LIMIT 1`, names[i], names[j]),
+				&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { dup = stmt.ColumnInt64(0); return nil }},
+			); err != nil {
+				return fmt.Errorf("verifySubtypeExclusivity %s/%s: %w", names[i], names[j], err)
+			}
+			if dup != 0 {
+				return fmt.Errorf(
+					"%w: journal %d appears in both %s and %s subtype tables — where: subtype-integrity "+
+						"gate; when: before commit; impact: the write is rolled back; fix: a journal row "+
+						"must have exactly one subtype row selected by its JournalKind",
+					journal.ErrSubtypeIntegrity, dup, names[i], names[j])
+			}
+		}
+	}
+	return nil
+}
+
+// verifyAuthorityDetailIntegrityLocked enforces authority-level discriminator
+// agreement (§10 rule 8): a bootstrap authority carries a bootstrap detail row
+// and no assignment transition; an assignment authority carries a transition and
+// no bootstrap detail.
+func (db *DB) verifyAuthorityDetailIntegrityLocked() error {
+	var present bool
+	if err := sqlitex.Execute(db.conn,
+		`SELECT 1 FROM sqlite_master WHERE type='table' AND name='journal_authorities'`,
+		&sqlitex.ExecOptions{ResultFunc: func(*zs.Stmt) error { present = true; return nil }}); err != nil {
+		return fmt.Errorf("verifyAuthorityDetailIntegrity: probe journal_authorities: %w", err)
+	}
+	if !present {
+		return nil
+	}
+	checks := []struct {
+		detail string
+		join   string
+		want   int
+		label  string
+	}{
+		{"journal_authority_bootstraps", "journal_authority_bootstraps", 0, "bootstrap detail on a non-bootstrap authority"},
+		{"journal_authority_assignment_transitions", "journal_authority_assignment_transitions", 1, "assignment transition on a non-assignment authority"},
+	}
+	for _, c := range checks {
+		var bad int64
+		if err := sqlitex.Execute(db.conn,
+			fmt.Sprintf(`SELECT d.JournalID FROM %s d JOIN journal_authorities a ON a.JournalID = d.JournalID
+				WHERE a.authority_kind_id <> ?1 LIMIT 1`, c.detail),
+			&sqlitex.ExecOptions{Args: []any{c.want}, ResultFunc: func(stmt *zs.Stmt) error { bad = stmt.ColumnInt64(0); return nil }},
+		); err != nil {
+			return fmt.Errorf("verifyAuthorityDetailIntegrity %s: %w", c.detail, err)
+		}
+		if bad != 0 {
+			return fmt.Errorf(
+				"%w: authority %d has a %s — where: subtype-integrity gate (authority level); when: "+
+					"before commit; impact: the write is rolled back; fix: an authority's detail row must "+
+					"agree with its AuthorityKind",
+				journal.ErrSubtypeIntegrity, bad, c.label)
+		}
+	}
 	return nil
 }
 
