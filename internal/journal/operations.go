@@ -172,10 +172,12 @@ type Effect struct {
 	// produced row, persisted in journal_operation_result_slots (§3.2).
 	ResultSlot ResultSlotID
 
-	// ActorID, when set (non-zero namespace), is the committing actor stamped
-	// on this effect's journal row. It MUST equal the operation's anchor actor
-	// (§10 rule 5); a differing value is rejected. Left zero, the anchor actor
-	// is used.
+	// ActorID must be left zero: a produced (subordinate) row carries no stored
+	// actor. The committing actor is recorded once on the operation anchor and
+	// derived for produced rows (§2.1, §8.5, §10 rule 5). Apply rejects any effect
+	// that sets it (anchor-only actor placement). The field is retained only so a
+	// caller attempting the retired per-row-actor pattern gets an actionable
+	// rejection rather than silently mis-shaped input.
 	ActorID ActorID
 
 	// RecordedAtOverride, when non-nil, is a general-purpose per-effect audit/display
@@ -348,9 +350,6 @@ var (
 	// rules 6-7): a NULL authority off the first operation, a second genesis
 	// against a non-empty journal, or a genesis producing a non-bootstrap effect.
 	ErrGenesis = errors.New("provenance: genesis authority discipline violated")
-	// ErrEffectActorMismatch is returned when an effect row's committing actor
-	// differs from its operation anchor's actor (§10 rule 5).
-	ErrEffectActorMismatch = errors.New("provenance: effect actor differs from operation anchor")
 	// ErrAuthorityScope is returned when an operation's authority does not reach
 	// (govern) the task an effect mutates (§9.3, §14.1).
 	ErrAuthorityScope = errors.New("provenance: authority does not govern the effect's task")

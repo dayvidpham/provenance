@@ -177,12 +177,20 @@ func (db *DB) completeJournalOperationFK() error {
 	// including COMMIT. idx_journal_pboj is created here (its single owner).
 	rebuild := []string{
 		`BEGIN IMMEDIATE`,
+		// The journal_attributed view (§8.5) references journal; SQLite cannot rename
+		// journal_new→journal while a view points at the (dropped) journal table, so
+		// drop it before the rebuild and recreate it (below) once journal exists again.
+		`DROP VIEW IF EXISTS journal_attributed`,
+		// actor_id stays nullable with the anchor-only CHECK (§2.1, §10 rule 5): the
+		// rebuild only completes the produced_by FK, it does not relax the actor
+		// placement invariant the journal-base layer already established.
 		`CREATE TABLE journal_new (
 			JournalID   INTEGER PRIMARY KEY AUTOINCREMENT,
 			kind_id     INTEGER NOT NULL REFERENCES journal_kinds(id),
-			actor_id    TEXT NOT NULL REFERENCES agents(id),
+			actor_id    TEXT REFERENCES agents(id),
 			recorded_at INTEGER NOT NULL,
-			produced_by_operation_journal_id INTEGER REFERENCES journal_operations(JournalID)
+			produced_by_operation_journal_id INTEGER REFERENCES journal_operations(JournalID),
+			CHECK ((actor_id IS NULL) = (produced_by_operation_journal_id IS NOT NULL))
 		) STRICT`,
 		`INSERT INTO journal_new (JournalID, kind_id, actor_id, recorded_at, produced_by_operation_journal_id)
 			SELECT JournalID, kind_id, actor_id, recorded_at, produced_by_operation_journal_id FROM journal`,
@@ -191,6 +199,8 @@ func (db *DB) completeJournalOperationFK() error {
 		`CREATE INDEX IF NOT EXISTS idx_journal_kind  ON journal (kind_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_journal_actor ON journal (actor_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_journal_pboj  ON journal (produced_by_operation_journal_id)`,
+		// Recreate the §8.5 attribution view now that journal exists again.
+		journalAttributedViewDDL,
 	}
 	for _, stmt := range rebuild {
 		if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
@@ -378,9 +388,13 @@ func (db *DB) applyLocked(in journal.OperationInput, faultHook func(effectIndex 
 		}
 	}
 
-	// Post-fold gates: subtype integrity (§10 rule 8) and close-ends-assignment
-	// (§8.1 / owner_responsibility regression c).
+	// Post-fold gates: subtype integrity (§10 rule 8), anchor-only actor placement
+	// (§2.1, §10 rule 5), and close-ends-assignment (§8.1 / owner_responsibility
+	// regression c).
 	if txErr = db.verifySubtypeIntegrityLocked(); txErr != nil {
+		return journal.CommittedResult{}, txErr
+	}
+	if txErr = db.verifyActorPlacementLocked(); txErr != nil {
 		return journal.CommittedResult{}, txErr
 	}
 	if txErr = db.validateClosesEndAssignmentsLocked(anchorJID, in.Effects); txErr != nil {
@@ -400,16 +414,22 @@ func (db *DB) applyLocked(in journal.OperationInput, faultHook func(effectIndex 
 // ---------------------------------------------------------------------------
 
 // foldEffectLocked validates and persists one effect, returning its produced
-// journal row's JournalID. It enforces committing-actor agreement (§10 rule 5)
-// and dispatches to the sort-specific reducer step, each of which authorizes
-// against current transaction state (all earlier effects already inserted, §9.3).
+// journal row's JournalID. It enforces anchor-only actor placement (§10 rule 5)
+// on the input and dispatches to the sort-specific reducer step, each of which
+// authorizes against current transaction state (all earlier effects already
+// inserted, §9.3).
 func (db *DB) foldEffectLocked(in journal.OperationInput, anchorJID int64, eff journal.Effect, index int) (int64, error) {
-	if eff.ActorID.Namespace != "" && eff.ActorID != in.ActorID {
+	// A subordinate (operation-produced) row carries no stored actor: the committing
+	// actor lives once on the anchor and is derived (§2.1, §8.5). Apply therefore
+	// rejects any input effect that would stamp an actor on a produced row — the
+	// input-side of §10 rule 5, backing the CHECK constraint and VerifyIntegrity guard.
+	if eff.ActorID.Namespace != "" {
 		return 0, fmt.Errorf(
-			"%w: operation %q effect %d is stamped with actor %q but its anchor's actor is %q — "+
-				"where: per-effect fold (§9.3); when: before commit; impact: nothing committed; "+
-				"fix: every produced row must carry the committing operation's actor (§10 rule 5)",
-			journal.ErrEffectActorMismatch, in.OperationID, index, eff.ActorID.String(), in.ActorID.String())
+			"%w: operation %q effect %d supplies a per-row actor %q, but a produced row must not "+
+				"carry one — where: per-effect fold (§9.3); when: before commit; impact: nothing "+
+				"committed; fix: leave the effect's actor unset; the committing actor is taken once "+
+				"from the operation anchor and derived for produced rows (§2.1, §8.5)",
+			journal.ErrActorPlacement, in.OperationID, index, eff.ActorID.String())
 	}
 	kind, err := eff.Sort.JournalKind()
 	if err != nil {

@@ -22,13 +22,19 @@ import (
 // ---------------------------------------------------------------------------
 
 func (db *DB) insertJournalRowLocked(kind journal.JournalKind, actor journal.ActorID, recordedAt int64, pboj *int64) (int64, error) {
-	var pbojArg any
+	// Anchor-only actor placement (§2.1, §10 rule 5): a subordinate row (pboj set —
+	// produced by an operation) stores actor_id NULL and derives its committing actor
+	// from its anchor (§8.5); only an anchor row (pboj nil) stores the actor. The
+	// journal CHECK constraint enforces this same invariant structurally.
+	var pbojArg, actorArg any
 	if pboj != nil {
 		pbojArg = *pboj
+	} else {
+		actorArg = actor.String()
 	}
 	if err := sqlitex.Execute(db.conn,
 		`INSERT INTO journal (kind_id, actor_id, recorded_at, produced_by_operation_journal_id) VALUES (?1, ?2, ?3, ?4)`,
-		&sqlitex.ExecOptions{Args: []any{int(kind), actor.String(), recordedAt, pbojArg}}); err != nil {
+		&sqlitex.ExecOptions{Args: []any{int(kind), actorArg, recordedAt, pbojArg}}); err != nil {
 		return 0, fmt.Errorf("insert journal row (kind %s): %w", kind, err)
 	}
 	return db.conn.LastInsertRowID(), nil

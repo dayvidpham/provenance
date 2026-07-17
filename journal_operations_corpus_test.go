@@ -33,14 +33,14 @@ var s12Operators = map[testcorpus.OperatorName]s11Handler{
 	"lookup-committed-emitted-events-from-closure":     opLookupCommittedEmittedEventsFromClosure,
 	"reject-result-slot-referencing-foreign-operation": opRejectResultSlotForeignOperation,
 	// authority_evidence.yaml (§9.3, §14)
-	"fold-sequentially-check-effect2-sees-effect1":    opFoldSequentiallyEffect2SeesEffect1,
-	"start-with-orphaned-predecessor":                 opStartWithOrphanedPredecessor,
-	"two-successors-same-predecessor":                 opTwoSuccessorsSamePredecessor,
-	"authority-unrelated":                             opAuthorityUnrelated,
-	"blocked-by-edge-does-not-grant-authority":        opBlockedByEdgeDoesNotGrantAuthority,
-	"produce-effect-with-actor-differing-from-anchor": opProduceEffectActorMismatch,
-	"end-episode-never-started":                       opEndEpisodeNeverStarted,
-	"batch-ended-before-started":                      opBatchEndedBeforeStarted,
+	"fold-sequentially-check-effect2-sees-effect1": opFoldSequentiallyEffect2SeesEffect1,
+	"start-with-orphaned-predecessor":              opStartWithOrphanedPredecessor,
+	"two-successors-same-predecessor":              opTwoSuccessorsSamePredecessor,
+	"authority-unrelated":                          opAuthorityUnrelated,
+	"blocked-by-edge-does-not-grant-authority":     opBlockedByEdgeDoesNotGrantAuthority,
+	"produce-subordinate-row-carrying-actor":       opProduceSubordinateRowCarryingActor,
+	"end-episode-never-started":                    opEndEpisodeNeverStarted,
+	"batch-ended-before-started":                   opBatchEndedBeforeStarted,
 	// owner_responsibility.yaml (§4.4, §8.1, §8.2, §9.6)
 	"close-task-with-active-assignment":        opCloseTaskWithActiveAssignment,
 	"close-task-omit-ended-transition":         opCloseTaskOmitEndedTransition,
@@ -533,18 +533,40 @@ func opBlockedByEdgeDoesNotGrantAuthority(t *testing.T, input, expected anyMap, 
 	return expectRejected(err, ErrAuthorityScope, "an authority reaching an unrelated task via a blocked_by scheduling edge")
 }
 
-func opProduceEffectActorMismatch(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
+func opProduceSubordinateRowCarryingActor(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
+	// Part 1 — Apply's input-side guard rejects an effect that supplies a per-row
+	// actor (§10 rule 5, input side): under a valid authority so genesis discipline
+	// is not what rejects it.
+	{
+		env := newOpsEnv(t)
+		boot := env.genesis(t, "op-genesis")
+		task := env.taskFor(t, "t1")
+		alice := env.actorFor(t, "actor-alice")
+		_, applyErr := env.tr.Journal().Apply(OperationInput{
+			OperationID: opID(input, "op-subordinate-actor-input-1"), ActorID: alice, AuthorityJournalID: &boot,
+			CommandDigest: env.digest("c"), MutationDigest: env.digest("m"),
+			Effects: []Effect{{Sort: EffectTaskEvent, TaskID: task, EventKind: "provenance.task.updated", ActorID: alice}},
+		})
+		if applyErr == nil || !errors.Is(applyErr, ErrActorPlacement) {
+			return fmt.Errorf("Apply accepted an effect carrying a per-row actor (or rejected with %v), want ErrActorPlacement", applyErr)
+		}
+	}
+
+	// Part 2 — the must-fail case proper: a subordinate (operation-produced) journal
+	// row landed past the CHECK constraint via the adversarial seam, so the
+	// production VerifyIntegrity placement guard (§10 rule 5) is what rejects it.
 	env := newOpsEnv(t)
-	boot := env.genesis(t, "op-genesis")
 	task := env.taskFor(t, "t1")
 	alice := env.actorFor(t, "actor-alice")
-	bob := env.actorFor(t, "actor-bob")
-	_, err := env.tr.Journal().Apply(OperationInput{
-		OperationID: opID(input, "op-actor-mismatch-1"), ActorID: alice, AuthorityJournalID: &boot,
-		CommandDigest: env.digest("c"), MutationDigest: env.digest("m"),
-		Effects: []Effect{{Sort: EffectTaskEvent, TaskID: task, EventKind: "provenance.task.updated", ActorID: bob}},
-	})
-	return expectRejected(err, ErrEffectActorMismatch, "an effect actor differing from the anchor")
+	st, ok := env.tr.(*sqliteTracker)
+	if !ok {
+		return fmt.Errorf("expected *sqliteTracker, got %T", env.tr)
+	}
+	if _, err := st.db.AdversarialSubordinateRowCarryingActor(alice, task); err != nil {
+		return fmt.Errorf("write subordinate row carrying actor: %w", err)
+	}
+	err := env.tr.Journal().VerifyIntegrity()
+	return expectRejected(err, ErrActorPlacement, "a subordinate row carrying a stored actor")
 }
 
 func opEndEpisodeNeverStarted(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {

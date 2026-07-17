@@ -41,6 +41,60 @@ func (db *DB) AdversarialJournalRowTwoSubtypes(actor journal.ActorID) (journal.J
 	return journal.JournalID(jid), nil
 }
 
+// AdversarialSubordinateRowCarryingActor writes a valid operation anchor and then
+// a SUBORDINATE task_event row (produced_by_operation_journal_id = the anchor) that
+// illegally carries a stored actor_id — the anchor-only-actor-placement violation
+// (§2.1, §10 rule 5) a production writer never emits (insertJournalRowLocked writes
+// NULL on produced rows). The journal CHECK constraint normally blocks such a row,
+// so this seam sets PRAGMA ignore_check_constraints around the insert to land the
+// row past the CHECK, exercising the production VerifyIntegrity placement guard
+// directly (mirroring the missing-subtype seam). The subordinate row is given its
+// matching journal_task_events row so the ONLY violation is actor placement, not
+// subtype totality. Returns the offending subordinate JournalID; the caller is
+// expected to VerifyIntegrity and observe ErrActorPlacement.
+func (db *DB) AdversarialSubordinateRowCarryingActor(actor journal.ActorID, task journal.TaskID) (journal.JournalID, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	// Bypass the structural CHECK so the reducer-level placement guard is what
+	// catches the row (the CHECK is exercised on the production write path instead).
+	if err := sqlitex.ExecuteTransient(db.conn, `PRAGMA ignore_check_constraints=ON`, nil); err != nil {
+		return 0, fmt.Errorf("AdversarialSubordinateRowCarryingActor: disable CHECK enforcement: %w", err)
+	}
+	defer func() { _ = sqlitex.ExecuteTransient(db.conn, `PRAGMA ignore_check_constraints=OFF`, nil) }()
+
+	var txErr error
+	endTx := sqlitex.Transaction(db.conn)
+	defer endTx(&txErr)
+
+	// Valid operation anchor (actor stored, PBOJID NULL) so the subordinate row's
+	// producing-operation FK resolves.
+	anchorJID, err := db.insertJournalRowLocked(journal.JournalKindOperation, actor, 0, nil)
+	if err != nil {
+		txErr = err
+		return 0, txErr
+	}
+	if txErr = sqlitex.Execute(db.conn,
+		`INSERT INTO journal_operations (JournalID, operation_id, authority_journal_id, command_digest, mutation_digest)
+		 VALUES (?1, ?2, NULL, ?3, ?4)`,
+		&sqlitex.ExecOptions{Args: []any{anchorJID, fmt.Sprintf("adversarial-subord-op-%d", anchorJID), []byte("c"), []byte("m")}}); txErr != nil {
+		return 0, txErr
+	}
+	// Subordinate task_event row carrying an actor it must not: PBOJID set AND
+	// actor_id set. insertJournalRowLocked would write NULL, so insert directly.
+	if txErr = sqlitex.Execute(db.conn,
+		`INSERT INTO journal (kind_id, actor_id, recorded_at, produced_by_operation_journal_id) VALUES (?1, ?2, 0, ?3)`,
+		&sqlitex.ExecOptions{Args: []any{int(journal.JournalKindTaskEvent), actor.String(), anchorJID}}); txErr != nil {
+		return 0, txErr
+	}
+	subordinateJID := db.conn.LastInsertRowID()
+	if txErr = sqlitex.Execute(db.conn,
+		`INSERT INTO journal_task_events (JournalID, task_id, event_kind, payload) VALUES (?1, ?2, 'provenance.task.updated', '{}')`,
+		&sqlitex.ExecOptions{Args: []any{subordinateJID, task.String()}}); txErr != nil {
+		return 0, txErr
+	}
+	return journal.JournalID(subordinateJID), nil
+}
+
 // AdversarialSubtypeMismatchingKind writes one journal row of kind=decision that
 // (in addition to its matching journal_decisions row) carries a journal_operations
 // subtype row, violating discriminator agreement (§10 rule 8).

@@ -41,8 +41,13 @@ func (db *DB) projectJournalRowLocked(jid int64) error {
 		recordedAt int64
 	)
 	found := false
+	// Read the committing actor through journal_attributed (§8.5): a subordinate row
+	// stores actor_id NULL, so effective_actor_id derives it from the row's anchor —
+	// never a bare read of the NULL column. The single shared reducer step therefore
+	// attributes the same committing actor whether Apply folds a just-produced
+	// subordinate row or Open replays it (§9.2).
 	if err := sqlitex.Execute(db.conn,
-		`SELECT kind_id, actor_id, recorded_at FROM journal WHERE JournalID = ?1`,
+		`SELECT kind_id, effective_actor_id, recorded_at FROM journal_attributed WHERE JournalID = ?1`,
 		&sqlitex.ExecOptions{Args: []any{jid}, ResultFunc: func(stmt *zs.Stmt) error {
 			found = true
 			kind = stmt.ColumnInt(0)

@@ -43,6 +43,24 @@ func journalParseTask(s string) (journal.TaskID, error) {
 // Schema
 // ---------------------------------------------------------------------------
 
+// journalAttributedViewDDL creates the read-only denormalized attribution surface
+// (§8.5). effective_actor_id is a row's own stored actor on an anchor, or its
+// anchor's actor on a subordinate row, resolved once via the anchor self-join so no
+// consumer hand-writes the COALESCE. LEFT JOIN keeps anchor rows (whose
+// produced_by_operation_journal_id is NULL) in the result. It is defined as a shared
+// const because the operations slice's journal-table rebuild
+// (completeJournalOperationFK) must drop and recreate the view around the rebuild —
+// a view that references the table being renamed cannot dangle across the rename.
+const journalAttributedViewDDL = `CREATE VIEW IF NOT EXISTS journal_attributed AS
+	SELECT j.JournalID                            AS JournalID,
+	       j.kind_id                              AS kind_id,
+	       COALESCE(j.actor_id, anchor.actor_id)  AS effective_actor_id,
+	       j.recorded_at                          AS recorded_at,
+	       j.produced_by_operation_journal_id     AS produced_by_operation_journal_id
+	FROM journal j
+	LEFT JOIN journal anchor
+	  ON anchor.JournalID = j.produced_by_operation_journal_id`
+
 // ensureJournalSchema creates the journal-base relations and seeds the closed
 // journal_kinds lookup. Idempotent (CREATE TABLE IF NOT EXISTS / INSERT OR
 // IGNORE), mirroring the existing reference-data discipline.
@@ -120,21 +138,7 @@ func (db *DB) ensureJournalSchema() error {
 			PRIMARY KEY (task_id, actor_id)
 		) STRICT, WITHOUT ROWID`,
 		// journal_attributed (§8.5): the read-only denormalized attribution surface.
-		// effective_actor_id is a row's own stored actor on an anchor, or its anchor's
-		// actor on a subordinate row, resolved once via the anchor self-join so no
-		// consumer hand-writes the COALESCE. LEFT JOIN keeps anchor rows (whose
-		// produced_by_operation_journal_id is NULL) in the result. The view is stored
-		// SQL resolved at query time, so it survives the operations slice's journal
-		// table rebuild (completeJournalOperationFK) unchanged.
-		`CREATE VIEW IF NOT EXISTS journal_attributed AS
-			SELECT j.JournalID                            AS JournalID,
-			       j.kind_id                              AS kind_id,
-			       COALESCE(j.actor_id, anchor.actor_id)  AS effective_actor_id,
-			       j.recorded_at                          AS recorded_at,
-			       j.produced_by_operation_journal_id     AS produced_by_operation_journal_id
-			FROM journal j
-			LEFT JOIN journal anchor
-			  ON anchor.JournalID = j.produced_by_operation_journal_id`,
+		journalAttributedViewDDL,
 	}
 	for _, stmt := range ddl {
 		if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {

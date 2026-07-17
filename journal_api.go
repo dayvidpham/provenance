@@ -133,6 +133,7 @@ var (
 var (
 	ErrUnsupportedOrderDimension = journal.ErrUnsupportedOrderDimension
 	ErrSubtypeIntegrity          = journal.ErrSubtypeIntegrity
+	ErrActorPlacement            = journal.ErrActorPlacement
 	ErrNamespaceRange            = journal.ErrNamespaceRange
 	ErrEntryOutOfRange           = journal.ErrEntryOutOfRange
 	ErrNamespaceClaim            = journal.ErrNamespaceClaim
@@ -140,7 +141,6 @@ var (
 	// Operations/authority sentinel errors (§4, §9, §14).
 	ErrOperationConflict   = journal.ErrOperationConflict
 	ErrGenesis             = journal.ErrGenesis
-	ErrEffectActorMismatch = journal.ErrEffectActorMismatch
 	ErrAuthorityScope      = journal.ErrAuthorityScope
 	ErrAssignmentLifecycle = journal.ErrAssignmentLifecycle
 	ErrOrphanedEvidence    = journal.ErrOrphanedEvidence
