@@ -602,6 +602,13 @@ func (db *DB) foldTaskEventLocked(in journal.OperationInput, jid int64, eff jour
 		return err
 	}
 	payload := eff.Payload
+	// A forced TRANSITION lifecycle event records its FSM-bypass intent in the journal
+	// row itself (§8.1), so the coercion is reproducible from history and the shared
+	// reducer skips the FSM for exactly this row. Forced never applies to a
+	// non-transition kind, and never bypasses the authorization above.
+	if eff.Forced && journal.IsTransitionLifecycleKind(eff.EventKind) {
+		payload = journal.EncodeForcedTransitionPayload()
+	}
 	if len(payload) == 0 {
 		payload = json.RawMessage(`{}`)
 	}

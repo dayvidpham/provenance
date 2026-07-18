@@ -67,6 +67,10 @@ var s13Operators = map[testcorpus.OperatorName]s11Handler{
 	// authority_revocation.yaml (§9.4, §14.1) — UAT C8a authority-revocation family
 	"revoke-then-pinned-retry-uncommitted": opRevokeThenPinnedRetryUncommitted,
 	"revoke-then-exact-replay-committed":   opRevokeThenExactReplayCommitted,
+	// status_fsm.yaml (§8.1, §16) — static task-status FSM + forced escape hatch
+	"fsm-rejects-closed-to-in-progress": opFSMRejectsClosedToInProgress,
+	"fsm-stopped-transition-converges":  opFSMStoppedTransitionConverges,
+	"fsm-forced-coercion-converges":     opFSMForcedCoercionConverges,
 }
 
 // ---------------------------------------------------------------------------
@@ -1367,4 +1371,131 @@ func asBoolOK(m anyMap, key string) (bool, bool) {
 	}
 	b, ok := v.(bool)
 	return b, ok
+}
+
+// ---------------------------------------------------------------------------
+// status_fsm.yaml — static task-status FSM (§8.1, §16)
+// ---------------------------------------------------------------------------
+
+// fsmCloseTask closes an env task through one journaled provenance.task.closed
+// operation under the bootstrap authority. The task carries no owner episode, so no
+// ended transition is required (§8.1 close-ends-assignment applies only to an active
+// owner episode).
+func fsmCloseTask(t *testing.T, env *opsEnv, boot JournalID, task TaskID, opID string) error {
+	_, err := env.tr.Journal().Apply(OperationInput{
+		OperationID: OperationID(opID), ActorID: env.actor, AuthorityJournalID: &boot,
+		CommandDigest: env.digest(opID + "-c"), MutationDigest: env.digest(opID + "-m"),
+		Effects: []Effect{{Sort: EffectTaskEvent, TaskID: task, EventKind: EventKindTaskClosed}},
+	})
+	return err
+}
+
+func opFSMRejectsClosedToInProgress(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
+	env := newOpsEnv(t)
+	boot := env.genesis(t, "op-genesis")
+	task := env.taskFor(t, "t1")
+	if err := fsmCloseTask(t, env, boot, task, "op-close-for-illegal-start"); err != nil {
+		return fmt.Errorf("close before illegal start: %w", err)
+	}
+	// A direct closed→in_progress transition (Start) has no FSM arrow: a closed task
+	// reaches in_progress only by Reopen (→open) then Start. The reducer must fail closed.
+	_, err := env.tr.Journal().Apply(OperationInput{
+		OperationID: opID(input, "op-illegal-start"), ActorID: env.actor, AuthorityJournalID: &boot,
+		CommandDigest: env.digest("sc"), MutationDigest: env.digest("sm"),
+		Effects: []Effect{{Sort: EffectTaskEvent, TaskID: task, EventKind: EventKindTaskStarted}},
+	})
+	if e := expectRejected(err, ErrStatusTransition, "direct closed->in_progress transition"); e != nil {
+		return e
+	}
+	// Fail-closed: nothing committed, the task stays closed.
+	got, err := env.tr.Show(task)
+	if err != nil {
+		return err
+	}
+	if got.Status != StatusClosed {
+		return fmt.Errorf("task status = %v after rejected start, want closed (nothing committed)", got.Status)
+	}
+	return nil
+}
+
+func opFSMStoppedTransitionConverges(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
+	env := newOpsEnv(t)
+	boot := env.genesis(t, "op-genesis")
+	task := env.taskFor(t, "t1")
+	// Start (open → in_progress).
+	if _, err := env.tr.Journal().Apply(OperationInput{
+		OperationID: "op-start", ActorID: env.actor, AuthorityJournalID: &boot,
+		CommandDigest: env.digest("startc"), MutationDigest: env.digest("startm"),
+		Effects: []Effect{{Sort: EffectTaskEvent, TaskID: task, EventKind: EventKindTaskStarted}},
+	}); err != nil {
+		return fmt.Errorf("start: %w", err)
+	}
+	// Stop (in_progress → open) via the new provenance.task.stopped kind.
+	if _, err := env.tr.Journal().Apply(OperationInput{
+		OperationID: "op-stop", ActorID: env.actor, AuthorityJournalID: &boot,
+		CommandDigest: env.digest("stopc"), MutationDigest: env.digest("stopm"),
+		Effects: []Effect{{Sort: EffectTaskEvent, TaskID: task, EventKind: EventKindTaskStopped}},
+	}); err != nil {
+		return fmt.Errorf("stop: %w", err)
+	}
+	got, err := env.tr.Show(task)
+	if err != nil {
+		return err
+	}
+	if got.Status != StatusOpen {
+		return fmt.Errorf("status after stop = %v, want open", got.Status)
+	}
+	// Open's from-empty full replay folds the identical FSM rule and converges.
+	if _, err := env.tr.Journal().ReplayProjections(); err != nil {
+		return fmt.Errorf("from-empty replay after stop diverged: %w", err)
+	}
+	return nil
+}
+
+func opFSMForcedCoercionConverges(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
+	env := newOpsEnv(t)
+	boot := env.genesis(t, "op-genesis")
+	task := env.taskFor(t, "t1")
+	if err := fsmCloseTask(t, env, boot, task, "op-close-before-forced"); err != nil {
+		return fmt.Errorf("close before forced coercion: %w", err)
+	}
+	// A forced Start coerces the FSM-illegal closed→in_progress transition: the reducer
+	// skips the FSM for this one row and records a forced marker in the journal payload.
+	if _, err := env.tr.Journal().Apply(OperationInput{
+		OperationID: opID(input, "op-forced-start"), ActorID: env.actor, AuthorityJournalID: &boot,
+		CommandDigest: env.digest("fc"), MutationDigest: env.digest("fm"),
+		Effects: []Effect{{Sort: EffectTaskEvent, TaskID: task, EventKind: EventKindTaskStarted, Forced: true}},
+	}); err != nil {
+		return fmt.Errorf("forced coercion rejected: %w", err)
+	}
+	got, err := env.tr.Show(task)
+	if err != nil {
+		return err
+	}
+	if got.Status != StatusInProgress {
+		return fmt.Errorf("status after forced start = %v, want in_progress", got.Status)
+	}
+	// Audit-visible: the started event's payload carries the forced marker.
+	page, err := env.tr.Journal().QueryTaskEvents(JournalQueryV1{
+		TaskIDs: []TaskID{task}, EventKinds: []EventKind{EventKindTaskStarted},
+	})
+	if err != nil {
+		return err
+	}
+	if len(page.Events) != 1 {
+		return fmt.Errorf("found %d started events, want exactly 1", len(page.Events))
+	}
+	forced, derr := DecodeForcedTransition(page.Events[0].Payload)
+	if derr != nil {
+		return derr
+	}
+	if !forced {
+		return fmt.Errorf("forced started event payload %s does not carry the forced marker", string(page.Events[0].Payload))
+	}
+	// Journal-reproducible: from-empty replay reads the same marker, skips the FSM
+	// identically, and converges on the coerced in_progress status.
+	if _, err := env.tr.Journal().ReplayProjections(); err != nil {
+		return fmt.Errorf("from-empty replay after forced coercion diverged: %w", err)
+	}
+	return nil
 }

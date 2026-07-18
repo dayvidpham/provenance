@@ -240,6 +240,14 @@ type Effect struct {
 	UpdatePhase       *Phase
 	UpdateNotes       *string
 
+	// Forced, on a TRANSITION lifecycle task_event (started/stopped/closed/reopened,
+	// §8.1), requests the FSM escape hatch: the reducer records a forced marker in the
+	// produced row's payload (EncodeForcedTransitionPayload) and SKIPS the static status
+	// FSM for that one row, so an out-of-FSM coercion is committed, journal-reproducible,
+	// and audit-visible. It never bypasses authorization (§9.3), only the FSM, and it has
+	// no effect on a non-transition kind.
+	Forced bool
+
 	// bootstrap authority (EffectBootstrapAuthority)
 	BootstrapLabel       string
 	OperationAuthorityID OperationAuthorityID

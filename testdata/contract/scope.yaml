@@ -102,3 +102,6 @@ operators:
   - {operator: corrupt-noncontiguous-insert,                slice: s1.3, reason: "UAT C8a corrupted-spine family — bare-supertype-insert totality fail-closed"}
   - {operator: revoke-then-pinned-retry-uncommitted,        slice: s1.3, reason: "UAT C8a authority-revocation family — pinned retry under revoked authority"}
   - {operator: revoke-then-exact-replay-committed,          slice: s1.3, reason: "UAT C8a authority-revocation family — committed exact replay short-circuits"}
+  - {operator: fsm-rejects-closed-to-in-progress,          slice: s1.3, reason: "§8.1 status FSM — illegal closed→in_progress transition fails closed"}
+  - {operator: fsm-stopped-transition-converges,           slice: s1.3, reason: "§8.1 status FSM — in_progress→open stopped transition + from-empty convergence"}
+  - {operator: fsm-forced-coercion-converges,              slice: s1.3, reason: "§8.1/§16 forced FSM escape hatch — journal-reproducible, audit-visible coercion"}

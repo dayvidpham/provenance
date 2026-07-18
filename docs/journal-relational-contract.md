@@ -483,17 +483,25 @@ already drew, carried forward unchanged.
 **Fixed-mapping lifecycle kinds (`StatusForEventKind`).** A small **closed** set of
 `provenance.*` event kinds are the reducer's status-lifecycle vocabulary: their
 projection onto `tasks.status_id` is a fixed mapping, not an open payload read —
-`provenance.task.created` and `provenance.task.reopened` → `open`,
-`provenance.task.started` → `in_progress`, `provenance.task.closed` → `closed`. Any
-other `EventKind` (a caller-domain event) leaves status unchanged. `in_progress` is
-reachable natively **only** via `provenance.task.started` (added by `#5` as the
-completion of §15's status-divergence forward pointer, under §8.1's own "route that
-status change through a journal lifecycle event once the direct-write path retires"
-authority — not an open reversal of the ratified status model); the only other route
-to a non-`open` baseline is a migration marker's captured legacy status (§13). The
-generalized "status-from-payload" alternative was **rejected** to keep the lifecycle
-vocabulary a closed, statically-typed fixed mapping rather than an interpreted
-payload channel.
+`provenance.task.created`, `provenance.task.reopened`, and `provenance.task.stopped`
+→ `open`, `provenance.task.started` → `in_progress`, `provenance.task.closed` →
+`closed`. Any other `EventKind` (a caller-domain event) leaves status unchanged.
+`in_progress` is reachable natively **only** via `provenance.task.started` (added by
+`#5` as the completion of §15's status-divergence forward pointer, under §8.1's own
+"route that status change through a journal lifecycle event once the direct-write path
+retires" authority — not an open reversal of the ratified status model); the only
+other route to a non-`open` baseline is a migration marker's captured legacy status
+(§13). `provenance.task.stopped` is the `#5` lifecycle kind for the `in_progress` →
+`open` transition (`Session.Stop`) — halting active work without closing — added under
+the same authority. The generalized "status-from-payload" alternative was **rejected**
+to keep the lifecycle vocabulary a closed, statically-typed fixed mapping rather than
+an interpreted payload channel.
+
+Two kinds (`reopened`, `stopped`) share the `→ open` target; they are NOT
+disambiguated by the target status but by the **static status FSM** (§8.1), which fixes
+the legal *source* status of each transition kind — `stopped` only from `in_progress`,
+`reopened` only from `closed` — so the fixed target mapping and the source rule together
+keep every transition kind's meaning unambiguous.
 
 ### 5.2 `journal_task_event_contexts`
 
@@ -690,13 +698,48 @@ watermark invariant at the **schema level** exactly as a fresh one, not merely a
 migration instant; `VerifyIntegrity` (§15) additionally rejects any un-anchored
 (NULL-watermark) task row over stored rows. The
 lifecycle status baseline is the reducer zero (`open`) unless a **fixed-mapping
-lifecycle event** moves it: `provenance.task.created` / `provenance.task.reopened`
-→ `open`, `provenance.task.started` → `in_progress`, `provenance.task.closed` →
-`closed` (the fixed `StatusForEventKind` mapping, §5.1); `in_progress` is reachable
-natively only through `provenance.task.started`, or through a migration marker's
-captured legacy status (§13). Adding `provenance.task.started` is exactly the
-completion of §15's forward pointer ("route that status change through a journal
-lifecycle event once the direct-write path retires").
+lifecycle event** moves it: `provenance.task.created` / `provenance.task.reopened` /
+`provenance.task.stopped` → `open`, `provenance.task.started` → `in_progress`,
+`provenance.task.closed` → `closed` (the fixed `StatusForEventKind` mapping, §5.1);
+`in_progress` is reachable natively only through `provenance.task.started`, or through
+a migration marker's captured legacy status (§13). Adding `provenance.task.started`
+(and its `stopped` counterpart) is exactly the completion of §15's forward pointer
+("route that status change through a journal lifecycle event once the direct-write path
+retires").
+
+**Static status FSM.** The four TRANSITION lifecycle kinds
+(`started`/`stopped`/`closed`/`reopened`) move an EXISTING task between statuses under a
+**static finite-state machine** — a fixed transition table over the closed status enum,
+enforced in the shared reducer fold before the status projection is materialized. The
+legal arrows are exactly:
+
+| from | verb (kind) | to |
+|---|---|---|
+| `open` | `Start` (`started`) | `in_progress` |
+| `in_progress` | `Stop` (`stopped`) | `open` |
+| `open` | `CloseTask` (`closed`) | `closed` |
+| `in_progress` | `CloseTask` (`closed`) | `closed` |
+| `closed` | `Reopen` (`reopened`) | `open` |
+
+Every other `(from, kind)` pair is illegal, including a same-state repeat (e.g.
+closing an already-closed task) and the direct `closed → in_progress` jump (a closed
+task reaches `in_progress` only by `Reopen` then `Start`). An illegal transition fails
+closed with the typed `ErrInvalidStatusTransition{From, To}` and commits nothing. The
+baseline-seeding kinds (`created`, `migrated`) are NOT transitions and are not checked:
+`created` seeds `open` at birth, `migrated` seeds the captured legacy status (§13). The
+FSM is enforced in the SINGLE shared reducer step Apply and Open both run (§9.2), so a
+live `Apply` rejects an illegal transition before commit and Open's from-empty replay
+applies the identical rule to the identical row — a committed transition is by
+construction reproducible.
+
+**Forced escape hatch.** A transition may be committed OUT of the FSM by a **forced**
+coercion (the `Session` verbs invoked `WithForce`, the CLI `--force`): the reducer
+records a forced marker in the produced journal row's payload and SKIPS the FSM for
+exactly that one row. Because the marker lives in the journal row, the coercion is
+**journal-reproducible** (Open's from-empty replay reads the marker and skips the FSM
+identically) and **audit-visible** (the row's payload shows `forced:true`). Force
+bypasses the FSM ONLY — never authorization (§9.3): a forced transition is still
+authorized against the operation's authority at the effect's own `JournalID`.
 
 ### 8.2 `task_attributions`
 
@@ -1497,26 +1540,40 @@ journal-anchored and fully checked; a migration marker's captured legacy status
 
 `Session` is the mutation surface the Pasture task backend consumes. `Tracker.As(actor,
 authority)` binds a committing actor and a governing authority once, and exposes the
-eight task-tracker mutation verbs on one receiver. It sits on top of the low-level
+task-tracker mutation verbs on one receiver. It sits on top of the low-level
 `MutationContext`/`Apply` primitive (still public); reads stay on the `Tracker`
-interface unchanged.
+interface unchanged. Every verb is journaled: each builds one logical operation (§9) and
+commits it through `Apply`, so every birth, metadata change, status transition, closure,
+edge, label, and comment flows through the ordered journal and is reproducible from
+history (§8.1, §15).
 
-**Journaled verbs (`Create`, `Update`, `CloseTask`).** Each builds one logical
-operation (§9) and commits it through `Apply`, so every birth, metadata change, status
-transition, and closure flows through the ordered journal and is reproducible from
-history (§8.1, §15). `Create` mints a `TaskID` and commits one task-create effect (the
-task is born through the fold with a non-NULL watermark, §8.1). `Update` decomposes a
-partial `UpdateFields` into typed effects **within one operation**: the metadata fields
-(`Title`/`Description`/`Priority`/`Phase`/`Notes`) emit one `provenance.task.updated`
-event materializing those columns; a `Status` change emits the matching fixed-mapping
-lifecycle event (`in_progress` → `started`, `closed` → `closed`, `open` → `reopened`,
-§5.1), folded metadata-then-status; a same-status set is a journal-honest no-op. `Owner`
-is not settable through `Update` — ownership moves only through assignment episodes
-(§4.4). `CloseTask` commits a `provenance.task.closed` lifecycle event that also
-materializes the close reason. A journaled verb against a never-initialized (empty)
-journal returns an actionable `ErrGenesisRequired` (§4.6, §13) rather than a deep
-authority-not-found. `Atomic(build)` commits a caller-composed multi-effect operation in
-builder order with per-effect authorization (§9.3).
+**Task lifecycle (`Create`, `Update`, and the dedicated status verbs).** `Create` mints
+a `TaskID` and commits one task-create effect (the task is born through the fold with a
+non-NULL watermark, §8.1). `Update` is **metadata-only**: the fields
+`Title`/`Description`/`Priority`/`Phase`/`Notes` emit one `provenance.task.updated` event
+materializing those columns; it never changes status, and an `Update` with no field set
+is a journal-honest no-op. `Owner` is not settable through `Update` — ownership moves
+only through assignment episodes (§4.4). The status lifecycle is governed by **four
+dedicated verbs** under the static FSM (§8.1): `Start` (`open → in_progress`), `Stop`
+(`in_progress → open`), `CloseTask` (`{open,in_progress} → closed`, also materializing
+the close reason), and `Reopen` (`closed → open`). Each journals its own fixed-mapping
+lifecycle kind; the shared reducer rejects an illegal transition (a same-state repeat, or
+the direct `closed → in_progress`) with the typed `ErrInvalidStatusTransition{From, To}`.
+Any status verb may be invoked `WithForce` — the escape hatch (CLI `--force`) — to coerce
+the FSM: the coercion is journaled with a forced marker, skips the FSM ONLY (never
+authorization, §9.3), and is reproducible from history. A journaled verb against a
+never-initialized (empty) journal returns an actionable `ErrGenesisRequired` (§4.6, §13)
+rather than a deep authority-not-found. `Atomic(build)` commits a caller-composed
+multi-effect operation in builder order with per-effect authorization (§9.3).
+
+`Update` is deliberately narrowed to metadata: a status decomposition inside `Update`
+would let a status change ride a metadata call and blur the FSM's boundary. The dedicated
+verbs are the sole status surface, `Update(Status: …)` under the hood is exactly one such
+verb's single-effect operation, and the forced escape hatch is available on every one of
+them (per the recorded UAT Gate-2 ruling: dedicated verbs are the design; a forced
+`--force` argument admits deliberate out-of-FSM coercion). Because there are no journal
+consumers before launch, dropping the pre-`#5` `UpdateFields.Status` field is an accepted
+compatibility break, not a preserved shim.
 
 **Un-journaled verbs (`AddEdge`, `RemoveEdge`, `AddLabel`, `RemoveLabel`,
 `AddComment`) — honest §6 disclosure.** These five are **direct domain writes and
@@ -1569,6 +1626,7 @@ that first exposed it — never a Beads ID or a proposal/slice/phase label.
 | [`operation_results.yaml`](../testdata/contract/operation_results.yaml) | 3 | `ResultSlotID` → produced-row mapping reconstruction; EmittedEvents via the produced closure; rule-9 result-slot own-operation integrity (must-fail) |
 | [`subtype_integrity.yaml`](../testdata/contract/subtype_integrity.yaml) | 4 | Subtype totality/exclusivity/discriminator agreement (both inheritance levels) |
 | [`actor_namespace.yaml`](../testdata/contract/actor_namespace.yaml) | 3 | Namespace-claim range disjointness; entry-in-range validation |
+| [`status_fsm.yaml`](../testdata/contract/status_fsm.yaml) | 3 | Static status FSM (§8.1): illegal `closed→in_progress` fails closed; `in_progress→open` stopped transition + from-empty convergence; forced coercion commits, records the forced marker, and replays |
 
 **Seven regression obligations, each with at least one named history**
 (file → case name):

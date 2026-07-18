@@ -67,6 +67,18 @@ func (tt *testTracker) Update(id provenance.TaskID, fields provenance.UpdateFiel
 	return tt.s.Update(id, fields)
 }
 
+func (tt *testTracker) Start(id provenance.TaskID) (provenance.Task, error) {
+	return tt.s.Start(id)
+}
+
+func (tt *testTracker) Stop(id provenance.TaskID) (provenance.Task, error) {
+	return tt.s.Stop(id)
+}
+
+func (tt *testTracker) Reopen(id provenance.TaskID) (provenance.Task, error) {
+	return tt.s.Reopen(id)
+}
+
 func (tt *testTracker) CloseTask(id provenance.TaskID, reason string) (provenance.Task, error) {
 	return tt.s.CloseTask(id, reason)
 }

@@ -122,6 +122,7 @@ func DecodeLegacyStatus(payload []byte) (TaskStatus, bool, error) {
 const (
 	EventKindTaskCreated  EventKind = "provenance.task.created"
 	EventKindTaskStarted  EventKind = "provenance.task.started"
+	EventKindTaskStopped  EventKind = "provenance.task.stopped"
 	EventKindTaskClosed   EventKind = "provenance.task.closed"
 	EventKindTaskReopened EventKind = "provenance.task.reopened"
 	EventKindTaskMigrated EventKind = "provenance.task.migrated"
@@ -160,9 +161,16 @@ const (
 // generalized status-from-payload — so the closed lifecycle vocabulary stays
 // strongly typed (the migration marker's payload-captured status stays the sole
 // special case, §13).
+//
+// EventKindTaskStopped → open is the fixed-mapping lifecycle kind for the
+// in_progress → open transition (Session.Stop): a task that was started can be
+// halted back to open without closing it. Like reopened it projects to open; the
+// static FSM (ValidateStatusTransition) distinguishes the two by their legal source
+// status — stopped only from in_progress, reopened only from closed — so the target
+// status alone never has to disambiguate the two kinds.
 func StatusForEventKind(kind EventKind) (TaskStatus, bool) {
 	switch kind {
-	case EventKindTaskCreated, EventKindTaskReopened:
+	case EventKindTaskCreated, EventKindTaskReopened, EventKindTaskStopped:
 		return TaskStatusOpen, true
 	case EventKindTaskStarted:
 		return TaskStatusInProgress, true

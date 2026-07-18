@@ -110,6 +110,7 @@ const (
 	// Provenance lifecycle task-event kinds the reducer projects (§8.1, §13).
 	EventKindTaskCreated  = journal.EventKindTaskCreated
 	EventKindTaskStarted  = journal.EventKindTaskStarted
+	EventKindTaskStopped  = journal.EventKindTaskStopped
 	EventKindTaskClosed   = journal.EventKindTaskClosed
 	EventKindTaskReopened = journal.EventKindTaskReopened
 	EventKindTaskMigrated = journal.EventKindTaskMigrated
@@ -135,7 +136,19 @@ var (
 	MigrationBaselineOperationID  = journal.MigrationBaselineOperationID
 	MigrationBaselineAssignmentID = journal.MigrationBaselineAssignmentID
 	StatusForEventKind            = journal.StatusForEventKind
+
+	// Static status FSM surface (§8.1, §16): the transition table and its forced escape
+	// hatch, re-exported so callers can validate/inspect transitions and recover the
+	// typed rejection.
+	ValidateStatusTransition      = journal.ValidateStatusTransition
+	IsTransitionLifecycleKind     = journal.IsTransitionLifecycleKind
+	TransitionLifecycleKinds      = journal.TransitionLifecycleKinds
+	EncodeForcedTransitionPayload = journal.EncodeForcedTransitionPayload
+	DecodeForcedTransition        = journal.DecodeForcedTransition
 )
+
+// Status-FSM typed error + sentinel (§8.1).
+type InvalidStatusTransition = journal.InvalidStatusTransition
 
 // Journal sentinel errors, re-exported for errors.Is at call sites.
 var (
@@ -162,6 +175,7 @@ var (
 	ErrMigrationOwnerUnmappable    = journal.ErrMigrationOwnerUnmappable
 	ErrSchemaPreflight             = journal.ErrSchemaPreflight
 	ErrProjectionDivergence        = journal.ErrProjectionDivergence
+	ErrStatusTransition            = journal.ErrStatusTransition
 	ErrMigrationFault              = journal.ErrMigrationFault
 	ErrInjectedFault               = journal.ErrInjectedFault
 	ErrDishonestMigrationTimestamp = journal.ErrDishonestMigrationTimestamp

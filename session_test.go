@@ -118,7 +118,7 @@ func TestSession_UpdateMetadataMaterializesAndJournals(t *testing.T) {
 	}
 }
 
-func TestSession_UpdateStatusInProgressJournalsStarted(t *testing.T) {
+func TestSession_StartJournalsStarted(t *testing.T) {
 	tr, actor := newSessionTracker(t)
 	boot := establishGenesis(t, tr, actor)
 	s := tr.As(actor, boot)
@@ -126,21 +126,22 @@ func TestSession_UpdateStatusInProgressJournalsStarted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	inProgress := provenance.StatusInProgress
-	updated, err := s.Update(task.ID, provenance.UpdateFields{Status: &inProgress})
+	updated, err := s.Start(task.ID)
 	if err != nil {
-		t.Fatalf("Update(Status: InProgress): %v", err)
+		t.Fatalf("Start: %v", err)
 	}
 	if updated.Status != provenance.StatusInProgress {
 		t.Fatalf("Status = %v, want StatusInProgress", updated.Status)
 	}
 	// The native in_progress transition is journal-reproducible via the started event.
 	if _, err := tr.Journal().ReplayProjections(); err != nil {
-		t.Errorf("ReplayProjections after Update(Status: InProgress): %v", err)
+		t.Errorf("ReplayProjections after Start: %v", err)
 	}
 }
 
-func TestSession_UpdateSameStatusIsNoOp(t *testing.T) {
+// TestSession_StopHaltsInProgress covers the in_progress → open transition (Session.Stop,
+// provenance.task.stopped): an FSM arrow with no pre-tightening analogue.
+func TestSession_StopHaltsInProgress(t *testing.T) {
 	tr, actor := newSessionTracker(t)
 	boot := establishGenesis(t, tr, actor)
 	s := tr.As(actor, boot)
@@ -148,21 +149,80 @@ func TestSession_UpdateSameStatusIsNoOp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	open := provenance.StatusOpen
-	// The task is already open; setting it open again must not journal an operation.
+	if _, err := s.Start(task.ID); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	stopped, err := s.Stop(task.ID)
+	if err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if stopped.Status != provenance.StatusOpen {
+		t.Fatalf("Status = %v, want StatusOpen after Stop", stopped.Status)
+	}
+	if _, err := tr.Journal().ReplayProjections(); err != nil {
+		t.Errorf("ReplayProjections after Stop: %v", err)
+	}
+}
+
+// TestSession_IllegalTransitionRejected pins the static FSM: a same-state transition and
+// the direct closed → in_progress jump are rejected with the typed ErrStatusTransition,
+// and WithForce coerces the illegal transition while keeping the journal reproducible.
+func TestSession_IllegalTransitionRejected(t *testing.T) {
+	tr, actor := newSessionTracker(t)
+	boot := establishGenesis(t, tr, actor)
+	s := tr.As(actor, boot)
+	task, err := s.Create("aura", "t", "", provenance.TaskTypeTask, provenance.PriorityMedium, provenance.PhaseUnscoped)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// Reopen on an open task is a same-state (open→open) transition — rejected.
+	if _, err := s.Reopen(task.ID); !errors.Is(err, provenance.ErrStatusTransition) {
+		t.Errorf("Reopen(open task) err = %v, want ErrStatusTransition", err)
+	}
+	// Close, then the direct closed → in_progress jump is FSM-illegal (must Reopen then Start).
+	if _, err := s.CloseTask(task.ID, "done"); err != nil {
+		t.Fatalf("CloseTask: %v", err)
+	}
+	if _, err := s.Start(task.ID); !errors.Is(err, provenance.ErrStatusTransition) {
+		t.Errorf("Start(closed task) err = %v, want ErrStatusTransition", err)
+	}
+	// WithForce coerces the FSM-illegal closed → in_progress transition; the coercion is
+	// journaled with a forced marker and remains reproducible from history.
+	forced, err := s.Start(task.ID, provenance.WithForce())
+	if err != nil {
+		t.Fatalf("Start(WithForce) on closed task: %v", err)
+	}
+	if forced.Status != provenance.StatusInProgress {
+		t.Fatalf("Status = %v, want StatusInProgress after forced Start", forced.Status)
+	}
+	if _, err := tr.Journal().ReplayProjections(); err != nil {
+		t.Errorf("ReplayProjections after forced coercion: %v", err)
+	}
+}
+
+func TestSession_UpdateEmptyIsNoOp(t *testing.T) {
+	tr, actor := newSessionTracker(t)
+	boot := establishGenesis(t, tr, actor)
+	s := tr.As(actor, boot)
+	task, err := s.Create("aura", "t", "", provenance.TaskTypeTask, provenance.PriorityMedium, provenance.PhaseUnscoped)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// An Update carrying no metadata field must not journal an operation (Status is not
+	// an Update field; the lifecycle is governed by the dedicated verbs under the FSM).
 	before, err := tr.Journal().QueryTaskEvents(provenance.JournalQueryV1{})
 	if err != nil {
 		t.Fatalf("QueryTaskEvents before: %v", err)
 	}
-	if _, err := s.Update(task.ID, provenance.UpdateFields{Status: &open}); err != nil {
-		t.Fatalf("Update(same status): %v", err)
+	if _, err := s.Update(task.ID, provenance.UpdateFields{}); err != nil {
+		t.Fatalf("Update(empty): %v", err)
 	}
 	after, err := tr.Journal().QueryTaskEvents(provenance.JournalQueryV1{})
 	if err != nil {
 		t.Fatalf("QueryTaskEvents after: %v", err)
 	}
 	if len(after.Events) != len(before.Events) {
-		t.Errorf("same-status Update journaled %d new rows, want 0", len(after.Events)-len(before.Events))
+		t.Errorf("empty Update journaled %d new rows, want 0", len(after.Events)-len(before.Events))
 	}
 }
 
@@ -198,9 +258,9 @@ func TestSession_CloseTaskJournalsClosure(t *testing.T) {
 	if closed.CloseReason != "done" {
 		t.Errorf("CloseReason = %q, want done", closed.CloseReason)
 	}
-	// Closing an already-closed task is rejected.
-	if _, err := s.CloseTask(task.ID, "again"); !errors.Is(err, provenance.ErrAlreadyClosed) {
-		t.Errorf("re-close err = %v, want ErrAlreadyClosed", err)
+	// Closing an already-closed task is an FSM-illegal same-state transition.
+	if _, err := s.CloseTask(task.ID, "again"); !errors.Is(err, provenance.ErrStatusTransition) {
+		t.Errorf("re-close err = %v, want ErrStatusTransition", err)
 	}
 	if _, err := tr.Journal().ReplayProjections(); err != nil {
 		t.Errorf("ReplayProjections after CloseTask: %v", err)
@@ -218,10 +278,9 @@ func TestSession_CloseThenReopenConverges(t *testing.T) {
 	if _, err := s.CloseTask(task.ID, "done"); err != nil {
 		t.Fatalf("CloseTask: %v", err)
 	}
-	open := provenance.StatusOpen
-	reopened, err := s.Update(task.ID, provenance.UpdateFields{Status: &open})
+	reopened, err := s.Reopen(task.ID)
 	if err != nil {
-		t.Fatalf("Update(reopen): %v", err)
+		t.Fatalf("Reopen: %v", err)
 	}
 	if reopened.Status != provenance.StatusOpen {
 		t.Errorf("Status = %v, want StatusOpen after reopen", reopened.Status)

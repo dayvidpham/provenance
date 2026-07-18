@@ -121,9 +121,58 @@ func (db *DB) projectTaskEventRowLocked(jid int64, committing journal.ActorID, r
 		return db.advanceWatermarkLocked(task, jid)
 	}
 	if status, isLifecycle := journal.StatusForEventKind(journal.EventKind(kindStr)); isLifecycle {
+		// The static status FSM (§8.1) governs the four TRANSITION lifecycle kinds
+		// (started/stopped/closed/reopened). It is enforced HERE — in the single shared
+		// reducer step Apply and Open both run (§9.2) — so a live Apply rejects an illegal
+		// transition before commit and Open's from-empty replay applies the identical rule
+		// to the identical row. The current status is read from the projection target
+		// (real tasks during Apply, the shadow table during replay), which reflects the
+		// history strictly before this row. A forced coercion carries a marker in this
+		// row's payload and skips the FSM, so the coercion is reproducible either way.
+		if journal.IsTransitionLifecycleKind(journal.EventKind(kindStr)) {
+			forced, ferr := journal.DecodeForcedTransition(payload)
+			if ferr != nil {
+				return fmt.Errorf("project task_event %d: %w", jid, ferr)
+			}
+			if !forced {
+				current, cerr := db.readProjTaskStatusLocked(task)
+				if cerr != nil {
+					return cerr
+				}
+				if verr := journal.ValidateStatusTransition(current, journal.EventKind(kindStr)); verr != nil {
+					return fmt.Errorf("project task_event %d: %w", jid, verr)
+				}
+			}
+		}
 		return db.projectTaskStatusLocked(task, status, jid, recordedAt)
 	}
 	return db.advanceWatermarkLocked(task, jid)
+}
+
+// readProjTaskStatusLocked reads a task's current lifecycle status from the projection
+// target (the real tasks table during a live Apply, the shadow table during a from-empty
+// replay derivation), so the status FSM checks the transition against the status derived
+// from history strictly before the row being folded (§8.1, §15).
+func (db *DB) readProjTaskStatusLocked(task journal.TaskID) (journal.TaskStatus, error) {
+	var status journal.TaskStatus
+	found := false
+	if err := sqlitex.Execute(db.conn,
+		fmt.Sprintf(`SELECT status_id FROM %s WHERE id = ?1`, db.projTasks()),
+		&sqlitex.ExecOptions{Args: []any{task.String()}, ResultFunc: func(stmt *zs.Stmt) error {
+			found = true
+			status = journal.TaskStatus(stmt.ColumnInt(0))
+			return nil
+		}}); err != nil {
+		return 0, fmt.Errorf("read current status for %q: %w", task, err)
+	}
+	if !found {
+		return 0, fmt.Errorf(
+			"provenance: status FSM cannot read current status of task %q — where: shared-reducer "+
+				"status projection (§8.1); when: folding a transition lifecycle event; impact: nothing "+
+				"committed; fix: the task row must exist (born via Session.Create) before a lifecycle "+
+				"transition is folded against it", task)
+	}
+	return status, nil
 }
 
 // projectAuthorityRowLocked projects an authority row. A bootstrap authority
