@@ -3,6 +3,7 @@ package sqlite
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -55,6 +56,110 @@ func seedActorAndTask(t *testing.T, db *DB) (journal.ActorID, journal.TaskID) {
 	return actor, task.ID
 }
 
+// genesisBoot applies one genesis operation establishing the pasture-system bootstrap
+// authority — which governs every task (§14.1) — and returns its produced JournalID. In
+// #5 the operations-layer producer CHECK forbids bare (NULL-producer) task events, so
+// the query/ordering tests emit their events through operations under this authority
+// (the operation-anchored append), never the retired #4 AppendTaskEvent primitive. The
+// genesis consumes two journal rows: the operation anchor (journal_id 1) and the
+// bootstrap authority it produces (journal_id 2, the returned value).
+func genesisBoot(t *testing.T, db *DB, actor journal.ActorID) journal.JournalID {
+	t.Helper()
+	res, err := db.Apply(journal.OperationInput{
+		OperationID:    "op-genesis",
+		ActorID:        actor,
+		CommandDigest:  []byte("genesis-c"),
+		MutationDigest: []byte("genesis-m"),
+		RecordedAt:     time.Now().UTC().UnixNano(),
+		Effects:        []journal.Effect{{Sort: journal.EffectBootstrapAuthority, BootstrapLabel: "pasture-system", ResultSlot: "auth"}},
+	})
+	if err != nil {
+		t.Fatalf("genesisBoot: %v", err)
+	}
+	for i := range res.ResultSlots {
+		if string(res.ResultSlots[i].Slot) == "auth" {
+			return res.ResultSlots[i].ProducedJournalID
+		}
+	}
+	t.Fatal("genesisBoot: no bootstrap authority result slot")
+	return 0
+}
+
+// opEvent is one task event to emit through appendEventsOp.
+type opEvent struct {
+	kind       journal.EventKind
+	recordedAt time.Time
+	contexts   []journal.EventContext
+	payload    json.RawMessage
+}
+
+// appendEventsOp emits the given task events as ONE operation under boot (each event's
+// RecordedAt carried via a per-effect override, §12), the operation-anchored replacement
+// for a run of bare AppendTaskEvent calls. Because one operation produces one anchor row
+// then its N events contiguously, the returned task-event JournalIDs are contiguous
+// (offset past the genesis rows and this operation's anchor). Returns them in effect
+// order.
+func appendEventsOp(t *testing.T, db *DB, boot journal.JournalID, actor journal.ActorID, task journal.TaskID, opID string, evs []opEvent) []journal.JournalID {
+	t.Helper()
+	auth := boot
+	effects := make([]journal.Effect, len(evs))
+	for i := range evs {
+		ra := evs[i].recordedAt.UTC().UnixNano()
+		effects[i] = journal.Effect{
+			Sort:               journal.EffectTaskEvent,
+			TaskID:             task,
+			EventKind:          evs[i].kind,
+			Payload:            evs[i].payload,
+			Contexts:           evs[i].contexts,
+			RecordedAtOverride: &ra,
+			ResultSlot:         journal.ResultSlotID(fmt.Sprintf("e%d", i)),
+		}
+	}
+	res, err := db.Apply(journal.OperationInput{
+		OperationID:        journal.OperationID(opID),
+		ActorID:            actor,
+		AuthorityJournalID: &auth,
+		CommandDigest:      []byte(opID + "-c"),
+		MutationDigest:     []byte(opID + "-m"),
+		RecordedAt:         time.Now().UTC().UnixNano(),
+		Effects:            effects,
+	})
+	if err != nil {
+		t.Fatalf("appendEventsOp %q: %v", opID, err)
+	}
+	jids := make([]journal.JournalID, len(evs))
+	for i := range evs {
+		slot := journal.ResultSlotID(fmt.Sprintf("e%d", i))
+		ok := false
+		for j := range res.ResultSlots {
+			if res.ResultSlots[j].Slot == slot {
+				jids[i] = res.ResultSlots[j].ProducedJournalID
+				ok = true
+			}
+		}
+		if !ok {
+			t.Fatalf("appendEventsOp %q: no result slot %q", opID, slot)
+		}
+	}
+	return jids
+}
+
+// findEvent returns the queried task-event row with the given JournalID.
+func findEvent(t *testing.T, db *DB, jid journal.JournalID) journal.TaskEventRow {
+	t.Helper()
+	page, err := db.QueryTaskEvents(journal.JournalQueryV1{OrderBy: journal.OrderByJournalID})
+	if err != nil {
+		t.Fatalf("findEvent query: %v", err)
+	}
+	for _, ev := range page.Events {
+		if ev.JournalID == jid {
+			return ev
+		}
+	}
+	t.Fatalf("findEvent: no task event with JournalID %d", jid)
+	return journal.TaskEventRow{}
+}
+
 func TestJournalKindsSeededMatchGoEnum(t *testing.T) {
 	db := newJournalDB(t)
 	got := map[int]string{}
@@ -82,30 +187,22 @@ func TestJournalKindsSeededMatchGoEnum(t *testing.T) {
 func TestAppendTaskEventAdvancesProjections(t *testing.T) {
 	db := newJournalDB(t)
 	actor, task := seedActorAndTask(t, db)
+	boot := genesisBoot(t, db, actor)
 
 	ctx, err := journal.TaskContext(task)
 	if err != nil {
 		t.Fatal(err)
 	}
-	row, err := db.AppendTaskEvent(journal.AppendTaskEventInput{
-		ActorID:    actor,
-		TaskID:     task,
-		EventKind:  "provenance.task.created",
-		RecordedAt: time.Unix(1000, 0),
-		Payload:    json.RawMessage(`{"k":"v"}`),
-		Contexts:   []journal.EventContext{ctx, ctx}, // dedups to one
+	jids := appendEventsOp(t, db, boot, actor, task, "op-append-1", []opEvent{
+		{kind: "provenance.task.created", recordedAt: time.Unix(1000, 0),
+			payload: json.RawMessage(`{"k":"v"}`), contexts: []journal.EventContext{ctx, ctx}}, // dedups to one
 	})
-	if err != nil {
-		t.Fatalf("AppendTaskEvent: %v", err)
-	}
-	if row.JournalID != 1 {
-		t.Errorf("first JournalID = %d, want 1", row.JournalID)
-	}
-	if len(row.Contexts) != 1 {
-		t.Errorf("contexts = %d, want 1 (deduped)", len(row.Contexts))
+	evJID := jids[0]
+	if ev := findEvent(t, db, evJID); len(ev.Contexts) != 1 {
+		t.Errorf("contexts = %d, want 1 (deduped)", len(ev.Contexts))
 	}
 
-	// Watermark advanced on the projection.
+	// Watermark advanced on the projection to this event's JournalID.
 	var watermark int64
 	db.Lock()
 	_ = sqlitex.Execute(db.Conn(),
@@ -113,17 +210,15 @@ func TestAppendTaskEventAdvancesProjections(t *testing.T) {
 		&sqlitex.ExecOptions{Args: []any{task.String()},
 			ResultFunc: func(stmt *zs.Stmt) error { watermark = stmt.ColumnInt64(0); return nil }})
 	db.Unlock()
-	if watermark != int64(row.JournalID) {
-		t.Errorf("tasks.last_journal_id = %d, want %d", watermark, row.JournalID)
+	if watermark != int64(evJID) {
+		t.Errorf("tasks.last_journal_id = %d, want %d", watermark, evJID)
 	}
 
 	// Attribution is first-wins: a later event by the same actor must not move
 	// the FirstJournalID.
-	if _, err := db.AppendTaskEvent(journal.AppendTaskEventInput{
-		ActorID: actor, TaskID: task, EventKind: "provenance.task.updated", RecordedAt: time.Unix(2000, 0),
-	}); err != nil {
-		t.Fatalf("second append: %v", err)
-	}
+	appendEventsOp(t, db, boot, actor, task, "op-append-2", []opEvent{
+		{kind: "provenance.task.updated", recordedAt: time.Unix(2000, 0)},
+	})
 	attrs, err := db.TaskAttributions(task)
 	if err != nil {
 		t.Fatal(err)
@@ -131,25 +226,24 @@ func TestAppendTaskEventAdvancesProjections(t *testing.T) {
 	if len(attrs) != 1 {
 		t.Fatalf("attributions = %d, want 1", len(attrs))
 	}
-	if attrs[0].FirstJournalID != row.JournalID {
-		t.Errorf("attribution FirstJournalID = %d, want %d (append-only, first wins)", attrs[0].FirstJournalID, row.JournalID)
+	if attrs[0].FirstJournalID != evJID {
+		t.Errorf("attribution FirstJournalID = %d, want %d (append-only, first wins)", attrs[0].FirstJournalID, evJID)
 	}
 }
 
 func TestQueryTaskEventsOrdersByJournalIDWithPaging(t *testing.T) {
 	db := newJournalDB(t)
 	actor, task := seedActorAndTask(t, db)
+	boot := genesisBoot(t, db, actor)
 
-	// Append 5 events, deliberately backdating RecordedAt so a RecordedAt sort
-	// would reverse them.
-	for i := 0; i < 5; i++ {
-		if _, err := db.AppendTaskEvent(journal.AppendTaskEventInput{
-			ActorID: actor, TaskID: task, EventKind: "provenance.task.updated",
-			RecordedAt: time.Unix(int64(1000-i), 0),
-		}); err != nil {
-			t.Fatalf("append %d: %v", i, err)
-		}
+	// Emit 5 events as one operation, deliberately backdating RecordedAt so a
+	// RecordedAt sort would reverse them. One operation produces one anchor then its 5
+	// events contiguously, so the task-event JournalIDs are consecutive (jids[0..4]).
+	evs := make([]opEvent, 5)
+	for i := range evs {
+		evs[i] = opEvent{kind: "provenance.task.updated", recordedAt: time.Unix(int64(1000-i), 0)}
 	}
+	jids := appendEventsOp(t, db, boot, actor, task, "op-events", evs)
 
 	// Page size 2 across the snapshot.
 	page, err := db.QueryTaskEvents(journal.JournalQueryV1{OrderBy: journal.OrderByJournalID, Limit: 2})
@@ -159,11 +253,11 @@ func TestQueryTaskEventsOrdersByJournalIDWithPaging(t *testing.T) {
 	if len(page.Events) != 2 || page.Next == nil {
 		t.Fatalf("first page: got %d events, next=%v", len(page.Events), page.Next)
 	}
-	if page.Events[0].JournalID != 1 || page.Events[1].JournalID != 2 {
-		t.Errorf("first page JournalIDs = %d,%d; want 1,2", page.Events[0].JournalID, page.Events[1].JournalID)
+	if page.Events[0].JournalID != jids[0] || page.Events[1].JournalID != jids[1] {
+		t.Errorf("first page JournalIDs = %d,%d; want %d,%d", page.Events[0].JournalID, page.Events[1].JournalID, jids[0], jids[1])
 	}
-	if page.SnapshotMaxJournalID != 5 {
-		t.Errorf("snapshot = %d, want 5", page.SnapshotMaxJournalID)
+	if page.SnapshotMaxJournalID != jids[4] {
+		t.Errorf("snapshot = %d, want %d", page.SnapshotMaxJournalID, jids[4])
 	}
 
 	// Walk the rest with the exclusive cursor; assert strictly ascending.
@@ -198,18 +292,16 @@ func TestQueryTaskEventsOrdersByJournalIDWithPaging(t *testing.T) {
 func TestQueryTaskEventsTimelineWalkComposite(t *testing.T) {
 	db := newJournalDB(t)
 	actor, task := seedActorAndTask(t, db)
+	boot := genesisBoot(t, db, actor)
 
-	// Commit order (journal_id 1..4) deliberately disagrees with wall-clock:
-	// jid1 latest, jid2 earliest (backdated), jid3/jid4 an equal-timestamp tie.
+	// Commit order (jids[0..3], consecutive) deliberately disagrees with wall-clock:
+	// jids[0] latest, jids[1] earliest (backdated), jids[2]/jids[3] an equal-timestamp tie.
 	secs := []int64{300, 100, 200, 200}
-	for _, s := range secs {
-		if _, err := db.AppendTaskEvent(journal.AppendTaskEventInput{
-			ActorID: actor, TaskID: task, EventKind: "provenance.task.updated",
-			RecordedAt: time.Unix(s, 0),
-		}); err != nil {
-			t.Fatalf("append t=%d: %v", s, err)
-		}
+	evs := make([]opEvent, len(secs))
+	for i, s := range secs {
+		evs[i] = opEvent{kind: "provenance.task.updated", recordedAt: time.Unix(s, 0)}
 	}
+	jids := appendEventsOp(t, db, boot, actor, task, "op-events", evs)
 
 	// Timeline walk with page size 2 and a composite cursor.
 	var display []journal.JournalID
@@ -224,8 +316,8 @@ func TestQueryTaskEventsTimelineWalkComposite(t *testing.T) {
 			seen[ev.JournalID]++
 			display = append(display, ev.JournalID)
 		}
-		if p.SnapshotMaxJournalID != 4 {
-			t.Fatalf("timeline snapshot = %d, want 4 (journal_id-bounded)", p.SnapshotMaxJournalID)
+		if p.SnapshotMaxJournalID != jids[3] {
+			t.Fatalf("timeline snapshot = %d, want %d (journal_id-bounded)", p.SnapshotMaxJournalID, jids[3])
 		}
 		if p.Next == nil {
 			break
@@ -238,8 +330,8 @@ func TestQueryTaskEventsTimelineWalkComposite(t *testing.T) {
 		}
 	}
 
-	// (recorded_at, journal_id): jid2(100), jid3(200), jid4(200), jid1(300).
-	wantDisplay := []journal.JournalID{2, 3, 4, 1}
+	// (recorded_at, journal_id): jids[1](100), jids[2](200), jids[3](200), jids[0](300).
+	wantDisplay := []journal.JournalID{jids[1], jids[2], jids[3], jids[0]}
 	if !equalJournalIDs(display, wantDisplay) {
 		t.Errorf("timeline display order = %v, want %v", display, wantDisplay)
 	}
@@ -257,7 +349,7 @@ func TestQueryTaskEventsTimelineWalkComposite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantCanon := []journal.JournalID{1, 2, 3, 4}
+	wantCanon := []journal.JournalID{jids[0], jids[1], jids[2], jids[3]}
 	if !equalJournalIDs(journalIDsOf(canon.Events), wantCanon) {
 		t.Errorf("canonical order = %v, want %v (journal_id firewall intact)", journalIDsOf(canon.Events), wantCanon)
 	}
@@ -281,30 +373,15 @@ func TestQueryTaskEventsFiltersByContexts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// tagged: carries both the task context and the git context.
-	tagged, err := db.AppendTaskEvent(journal.AppendTaskEventInput{
-		ActorID: actor, TaskID: task, EventKind: "provenance.task.updated",
-		RecordedAt: time.Unix(1, 0), Contexts: []journal.EventContext{taskCtx, gitCtx},
+	// One operation emits the three events: tagged (task+git contexts), untagged (no
+	// contexts), actorTagged (actor context) — jids[0..2] consecutively.
+	boot := genesisBoot(t, db, actor)
+	jids := appendEventsOp(t, db, boot, actor, task, "op-ctx-events", []opEvent{
+		{kind: "provenance.task.updated", recordedAt: time.Unix(1, 0), contexts: []journal.EventContext{taskCtx, gitCtx}},
+		{kind: "provenance.task.updated", recordedAt: time.Unix(2, 0)},
+		{kind: "provenance.task.updated", recordedAt: time.Unix(3, 0), contexts: []journal.EventContext{actorCtx}},
 	})
-	if err != nil {
-		t.Fatalf("append tagged: %v", err)
-	}
-	// untagged: no contexts at all.
-	if _, err := db.AppendTaskEvent(journal.AppendTaskEventInput{
-		ActorID: actor, TaskID: task, EventKind: "provenance.task.updated",
-		RecordedAt: time.Unix(2, 0),
-	}); err != nil {
-		t.Fatalf("append untagged: %v", err)
-	}
-	// actorTagged: carries only the actor context (used to prove OR-within-dimension
-	// and to prove AND-across-dimensions against a second filter below).
-	actorTagged, err := db.AppendTaskEvent(journal.AppendTaskEventInput{
-		ActorID: actor, TaskID: task, EventKind: "provenance.task.updated",
-		RecordedAt: time.Unix(3, 0), Contexts: []journal.EventContext{actorCtx},
-	})
-	if err != nil {
-		t.Fatalf("append actor-tagged: %v", err)
-	}
+	taggedJID, actorTaggedJID := jids[0], jids[2]
 
 	// Positive: filtering by the git context returns only the tagged row.
 	page, err := db.QueryTaskEvents(journal.JournalQueryV1{
@@ -313,8 +390,8 @@ func TestQueryTaskEventsFiltersByContexts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query by git context: %v", err)
 	}
-	if len(page.Events) != 1 || page.Events[0].JournalID != tagged.JournalID {
-		t.Fatalf("git-context filter returned %v, want exactly [%d]", journalIDsOf(page.Events), tagged.JournalID)
+	if len(page.Events) != 1 || page.Events[0].JournalID != taggedJID {
+		t.Fatalf("git-context filter returned %v, want exactly [%d]", journalIDsOf(page.Events), taggedJID)
 	}
 
 	// Negative: filtering by a context no row carries returns an empty page.
@@ -341,7 +418,7 @@ func TestQueryTaskEventsFiltersByContexts(t *testing.T) {
 		t.Fatalf("query by OR contexts: %v", err)
 	}
 	gotIDs := journalIDsOf(page.Events)
-	wantIDs := []journal.JournalID{tagged.JournalID, actorTagged.JournalID}
+	wantIDs := []journal.JournalID{taggedJID, actorTaggedJID}
 	if !equalJournalIDs(gotIDs, wantIDs) {
 		t.Fatalf("OR-within-Contexts filter returned %v, want %v", gotIDs, wantIDs)
 	}
@@ -357,9 +434,9 @@ func TestQueryTaskEventsFiltersByContexts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query combined dimensions: %v", err)
 	}
-	if len(page.Events) != 1 || page.Events[0].JournalID != actorTagged.JournalID {
+	if len(page.Events) != 1 || page.Events[0].JournalID != actorTaggedJID {
 		t.Fatalf("combined Contexts+EventKinds filter returned %v, want exactly [%d]",
-			journalIDsOf(page.Events), actorTagged.JournalID)
+			journalIDsOf(page.Events), actorTaggedJID)
 	}
 }
 
@@ -392,36 +469,30 @@ func equalJournalIDs(a, b []journal.JournalID) bool {
 func TestQueryTaskEventsSnapshotWalkHidesLaterInserts(t *testing.T) {
 	db := newJournalDB(t)
 	actor, task := seedActorAndTask(t, db)
+	boot := genesisBoot(t, db, actor)
 
-	for i := 0; i < 5; i++ {
-		if _, err := db.AppendTaskEvent(journal.AppendTaskEventInput{
-			ActorID: actor, TaskID: task, EventKind: "provenance.task.updated",
-			RecordedAt: time.Unix(int64(i), 0),
-		}); err != nil {
-			t.Fatalf("seed append %d: %v", i, err)
-		}
+	evs := make([]opEvent, 5)
+	for i := range evs {
+		evs[i] = opEvent{kind: "provenance.task.updated", recordedAt: time.Unix(int64(i), 0)}
 	}
+	jids := appendEventsOp(t, db, boot, actor, task, "op-seed", evs)
 
-	// Page 1 pins the snapshot at JournalID 5.
+	// Page 1 pins the snapshot at the last seeded event's JournalID.
 	page, err := db.QueryTaskEvents(journal.JournalQueryV1{OrderBy: journal.OrderByJournalID, Limit: 2})
 	if err != nil {
 		t.Fatalf("page 1: %v", err)
 	}
-	if page.SnapshotMaxJournalID != 5 || page.Next == nil {
-		t.Fatalf("page 1 snapshot=%d next=%v, want snapshot=5 with a next cursor", page.SnapshotMaxJournalID, page.Next)
+	if page.SnapshotMaxJournalID != jids[4] || page.Next == nil {
+		t.Fatalf("page 1 snapshot=%d next=%v, want snapshot=%d with a next cursor", page.SnapshotMaxJournalID, page.Next, jids[4])
 	}
 
 	// A new row is appended after the snapshot was taken; it must never appear
 	// in the remaining pages of the walk started above.
-	inserted, err := db.AppendTaskEvent(journal.AppendTaskEventInput{
-		ActorID: actor, TaskID: task, EventKind: "provenance.task.updated",
-		RecordedAt: time.Unix(100, 0),
-	})
-	if err != nil {
-		t.Fatalf("post-snapshot append: %v", err)
-	}
-	if inserted.JournalID <= page.SnapshotMaxJournalID {
-		t.Fatalf("post-snapshot insert JournalID %d must exceed the pinned snapshot %d", inserted.JournalID, page.SnapshotMaxJournalID)
+	insertedJID := appendEventsOp(t, db, boot, actor, task, "op-post", []opEvent{
+		{kind: "provenance.task.updated", recordedAt: time.Unix(100, 0)},
+	})[0]
+	if insertedJID <= page.SnapshotMaxJournalID {
+		t.Fatalf("post-snapshot insert JournalID %d must exceed the pinned snapshot %d", insertedJID, page.SnapshotMaxJournalID)
 	}
 
 	seen := journalIDsOf(page.Events)
@@ -441,8 +512,8 @@ func TestQueryTaskEventsSnapshotWalkHidesLaterInserts(t *testing.T) {
 		t.Fatalf("snapshot walk saw %d events, want exactly the 5 pre-snapshot rows: %v", len(seen), seen)
 	}
 	for _, id := range seen {
-		if id == inserted.JournalID {
-			t.Fatalf("post-snapshot row %d leaked into the pinned-snapshot walk %v", inserted.JournalID, seen)
+		if id == insertedJID {
+			t.Fatalf("post-snapshot row %d leaked into the pinned-snapshot walk %v", insertedJID, seen)
 		}
 	}
 
@@ -452,18 +523,18 @@ func TestQueryTaskEventsSnapshotWalkHidesLaterInserts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fresh query: %v", err)
 	}
-	if fresh.SnapshotMaxJournalID != inserted.JournalID {
-		t.Fatalf("fresh query snapshot = %d, want %d (includes the new row)", fresh.SnapshotMaxJournalID, inserted.JournalID)
+	if fresh.SnapshotMaxJournalID != insertedJID {
+		t.Fatalf("fresh query snapshot = %d, want %d (includes the new row)", fresh.SnapshotMaxJournalID, insertedJID)
 	}
 	found := false
 	for _, ev := range fresh.Events {
-		if ev.JournalID == inserted.JournalID {
+		if ev.JournalID == insertedJID {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Fatalf("fresh query did not see the post-insert row %d among %v", inserted.JournalID, journalIDsOf(fresh.Events))
+		t.Fatalf("fresh query did not see the post-insert row %d among %v", insertedJID, journalIDsOf(fresh.Events))
 	}
 }
 
@@ -478,11 +549,13 @@ func TestQueryTaskEventsRejectsNonJournalIDOrder(t *testing.T) {
 func TestVerifyIntegrityCleanJournal(t *testing.T) {
 	db := newJournalDB(t)
 	actor, task := seedActorAndTask(t, db)
-	if _, err := db.AppendTaskEvent(journal.AppendTaskEventInput{
-		ActorID: actor, TaskID: task, EventKind: "provenance.task.created", RecordedAt: time.Now(),
-	}); err != nil {
-		t.Fatal(err)
-	}
+	boot := genesisBoot(t, db, actor)
+	// Operation-anchored append: the created event is produced by an operation, so it
+	// satisfies the producer CHECK, and it anchors the task's watermark, so the whole
+	// database (subtype totality, actor placement, watermark presence) is converged.
+	appendEventsOp(t, db, boot, actor, task, "op-ev", []opEvent{
+		{kind: "provenance.task.created", recordedAt: time.Now()},
+	})
 	if err := db.VerifyIntegrity(); err != nil {
 		t.Errorf("clean journal failed VerifyIntegrity: %v", err)
 	}
@@ -491,7 +564,10 @@ func TestVerifyIntegrityCleanJournal(t *testing.T) {
 func TestVerifyIntegrityRejectsBareJournalRow(t *testing.T) {
 	db := newJournalDB(t)
 	actor, _ := seedActorAndTask(t, db)
-	if _, err := db.AppendBareJournalRow(journal.JournalKindTaskEvent, actor, time.Now()); err != nil {
+	// A bare decision row (kind with a subtype table, but no subtype row) violates
+	// subtype totality. It uses a non-task-event kind because the operations-layer
+	// producer CHECK now forbids a NULL-producer task_event outright at insert time.
+	if _, err := db.AppendBareJournalRow(journal.JournalKindDecision, actor, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.VerifyIntegrity(); !errors.Is(err, journal.ErrSubtypeIntegrity) {

@@ -167,15 +167,19 @@ var (
 	ErrDishonestMigrationTimestamp = journal.ErrDishonestMigrationTimestamp
 )
 
-// JournalAPI is the ordered global-journal surface: append task-event rows,
-// query them in strictly ascending JournalID order with a snapshot watermark
+// JournalAPI is the ordered global-journal surface: commit operations (§9), query
+// task-event rows in strictly ascending JournalID order with a snapshot watermark
 // and exclusive JournalID cursor, read the cumulative attribution projection,
 // verify subtype integrity (§10 rule 8 / §15), and register the actor-namespace
 // reservation registry (§7).
+//
+// The bare AppendTaskEvent primitive is retired from this surface: every task event is
+// now produced by an operation (Session.Create/Update/CloseTask, an Atomic op, or a
+// migration baseline), which the operations-layer producer CHECK enforces
+// (produced_by_operation_journal_id NOT NULL for a task_event). The journal-base #4
+// layer keeps its NULL-producer append primitive at its own layer; it is not part of
+// this operations-layer public API.
 type JournalAPI interface {
-	// AppendTaskEvent appends one task-event row to the global journal and
-	// advances its projections in a single fail-closed transaction.
-	AppendTaskEvent(in AppendTaskEventInput) (TaskEventRow, error)
 	// QueryTaskEvents returns one page in the query's order: the readable-timeline
 	// (RecordedAt, JournalID) display order (the default) or the canonical JournalID
 	// order. An unexposed order dimension is rejected with ErrUnsupportedOrderDimension.

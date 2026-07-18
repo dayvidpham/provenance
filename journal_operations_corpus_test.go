@@ -1081,29 +1081,25 @@ func opAuthorizeUsingRecordedAtNotJournalID(t *testing.T, input, expected anyMap
 	env := newOpsEnv(t)
 	boot := env.genesis(t, "op-genesis")
 	task := env.taskFor(t, "t1")
-	// ev1 is committed first (smaller JournalID) with a LATER RecordedAt.
-	ev1, err := env.tr.Journal().AppendTaskEvent(AppendTaskEventInput{
-		ActorID: env.actor, TaskID: task, EventKind: "provenance.task.updated",
-		RecordedAt: time.Date(2026, 1, 5, 0, 0, 0, 0, time.UTC),
-	})
-	if err != nil {
-		return fmt.Errorf("append ev1: %w", err)
-	}
+	// ev1 is committed first (smaller JournalID) with a LATER RecordedAt, emitted as an
+	// operation-anchored append (the retired bare AppendTaskEvent is forbidden in #5).
+	ev1JID := appendEventViaOp(t, env.tr, boot, env.actor, task, "op-ev1", "provenance.task.updated",
+		time.Date(2026, 1, 5, 0, 0, 0, 0, time.UTC))
 	// auth1 (an assignment authority on t1) is committed AFTER ev1 (larger
 	// JournalID) but with an EARLIER RecordedAt.
 	occupant := env.actorFor(t, "occ")
 	auth1 := env.startEpisode(t, "op-auth1", boot, task, "AUTH1", occupant)
-	if auth1 <= ev1.JournalID {
-		return fmt.Errorf("test setup invalid: auth1 %d must be committed after ev1 %d", auth1, ev1.JournalID)
+	if auth1 <= ev1JID {
+		return fmt.Errorf("test setup invalid: auth1 %d must be committed after ev1 %d", auth1, ev1JID)
 	}
 	st := env.tr.(*sqliteTracker)
-	governs, err := st.db.AuthorityGovernsTaskAt(auth1, task, ev1.JournalID)
+	governs, err := st.db.AuthorityGovernsTaskAt(auth1, task, ev1JID)
 	if err != nil {
 		return err
 	}
 	if governs {
 		return fmt.Errorf("authority %d (later JournalID, earlier RecordedAt) authorized effect %d — "+
-			"authorization must order by JournalID, not RecordedAt (§12)", auth1, ev1.JournalID)
+			"authorization must order by JournalID, not RecordedAt (§12)", auth1, ev1JID)
 	}
 	return nil
 }

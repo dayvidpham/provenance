@@ -245,6 +245,62 @@ func newCorpusTaskID() TaskID {
 	return TaskID{Namespace: "provenance-test", UUID: uuid.Must(uuid.NewV7())}
 }
 
+// genesisBoot establishes the shared genesis bootstrap authority (which governs every
+// task, §14.1) and returns its produced JournalID, so the ordering operators can emit
+// operation-anchored task events on the base task. The #5 operations-layer producer
+// CHECK forbids the retired bare AppendTaskEvent (a NULL-producer task event), so every
+// task event flows through an operation.
+func (e *journalEnv) genesisBoot(t *testing.T) JournalID {
+	t.Helper()
+	res, err := e.tr.Journal().Apply(OperationInput{
+		OperationID:    "op-genesis",
+		ActorID:        e.actor,
+		CommandDigest:  []byte("genesis-c"),
+		MutationDigest: []byte("genesis-m"),
+		RecordedAt:     time.Now().UTC().UnixNano(),
+		Effects:        []Effect{{Sort: EffectBootstrapAuthority, BootstrapLabel: "pasture-system", ResultSlot: "auth"}},
+	})
+	if err != nil {
+		t.Fatalf("genesisBoot: %v", err)
+	}
+	if jid, ok := slotJournalID(res, "auth"); ok {
+		return jid
+	}
+	t.Fatal("genesisBoot: no bootstrap authority result slot")
+	return 0
+}
+
+// appendEventViaOp emits one task event on task as an operation under boot, returning
+// the produced event's JournalID — the operation-anchored replacement for the retired
+// bare AppendTaskEvent. The event's RecordedAt is carried honestly via a per-effect
+// override (§12); the operation anchor row is not a task event, so it never appears in
+// the QueryTaskEvents results these ordering operators assert over.
+func appendEventViaOp(t *testing.T, tr Tracker, boot JournalID, actor ActorID, task TaskID, opID string, kind EventKind, recordedAt time.Time) JournalID {
+	t.Helper()
+	auth := boot
+	ra := recordedAt.UTC().UnixNano()
+	res, err := tr.Journal().Apply(OperationInput{
+		OperationID:        OperationID(opID),
+		ActorID:            actor,
+		AuthorityJournalID: &auth,
+		CommandDigest:      []byte(opID + "-c"),
+		MutationDigest:     []byte(opID + "-m"),
+		RecordedAt:         time.Now().UTC().UnixNano(),
+		Effects: []Effect{{
+			Sort: EffectTaskEvent, TaskID: task, EventKind: kind,
+			RecordedAtOverride: &ra, ResultSlot: "ev",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("appendEventViaOp %q: %v", opID, err)
+	}
+	if jid, ok := slotJournalID(res, "ev"); ok {
+		return jid
+	}
+	t.Fatalf("appendEventViaOp %q: no result slot", opID)
+	return 0
+}
+
 // ---------------------------------------------------------------------------
 // Ordering operators (§8.3, §12)
 // ---------------------------------------------------------------------------
@@ -255,6 +311,7 @@ func opOrderByJournalID(t *testing.T, input, expected anyMap, _ testcorpus.Class
 	if err != nil {
 		return err
 	}
+	boot := env.genesisBoot(t)
 	labelByJID := map[JournalID]string{}
 	for _, r := range rows {
 		row, err := asMap(r)
@@ -269,16 +326,8 @@ func opOrderByJournalID(t *testing.T, input, expected anyMap, _ testcorpus.Class
 		if err != nil {
 			return err
 		}
-		out, err := env.tr.Journal().AppendTaskEvent(AppendTaskEventInput{
-			ActorID:    env.actor,
-			TaskID:     env.task,
-			EventKind:  "provenance.task.updated",
-			RecordedAt: recordedAt,
-		})
-		if err != nil {
-			return fmt.Errorf("append %q: %w", label, err)
-		}
-		labelByJID[out.JournalID] = label
+		jid := appendEventViaOp(t, env.tr, boot, env.actor, env.task, "op-ev-"+label, "provenance.task.updated", recordedAt)
+		labelByJID[jid] = label
 	}
 
 	page, err := env.tr.Journal().QueryTaskEvents(JournalQueryV1{OrderBy: OrderByJournalID})
@@ -315,19 +364,32 @@ func opOrderByJournalIDConcurrent(t *testing.T, input, expected anyMap, _ testco
 		return err
 	}
 
+	boot := env.genesisBoot(t)
 	var mu sync.Mutex
 	var ids []JournalID
 	var firstErr error
 	var wg sync.WaitGroup
 	wg.Add(n)
 	for i := 0; i < n; i++ {
-		go func() {
+		go func(i int) {
 			defer wg.Done()
-			out, err := env.tr.Journal().AppendTaskEvent(AppendTaskEventInput{
-				ActorID:    env.actor,
-				TaskID:     env.task,
-				EventKind:  "provenance.task.updated",
-				RecordedAt: recordedAt,
+			// Operation-anchored append (a distinct OperationID per goroutine); the
+			// journal write path serialises operations (§9.5), so concurrent appends
+			// still receive strictly-ascending unique JournalIDs. t.Fatalf is unsafe off
+			// the test goroutine, so errors are captured into firstErr.
+			auth := boot
+			ra := recordedAt.UTC().UnixNano()
+			res, err := env.tr.Journal().Apply(OperationInput{
+				OperationID:        OperationID(fmt.Sprintf("op-concurrent-%d", i)),
+				ActorID:            env.actor,
+				AuthorityJournalID: &auth,
+				CommandDigest:      []byte(fmt.Sprintf("cc-%d", i)),
+				MutationDigest:     []byte(fmt.Sprintf("cm-%d", i)),
+				RecordedAt:         time.Now().UTC().UnixNano(),
+				Effects: []Effect{{
+					Sort: EffectTaskEvent, TaskID: env.task, EventKind: "provenance.task.updated",
+					RecordedAtOverride: &ra, ResultSlot: "ev",
+				}},
 			})
 			mu.Lock()
 			defer mu.Unlock()
@@ -337,8 +399,15 @@ func opOrderByJournalIDConcurrent(t *testing.T, input, expected anyMap, _ testco
 				}
 				return
 			}
-			ids = append(ids, out.JournalID)
-		}()
+			jid, ok := slotJournalID(res, "ev")
+			if !ok {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("concurrent append produced no event result slot")
+				}
+				return
+			}
+			ids = append(ids, jid)
+		}(i)
 	}
 	wg.Wait()
 	if firstErr != nil {
@@ -407,6 +476,7 @@ func opOrderByRecordedAtTimeline(t *testing.T, input, expected anyMap, _ testcor
 	if err != nil {
 		return err
 	}
+	boot := env.genesisBoot(t)
 	labelByJID := map[JournalID]string{}
 	for _, r := range rows {
 		row, err := asMap(r)
@@ -421,16 +491,8 @@ func opOrderByRecordedAtTimeline(t *testing.T, input, expected anyMap, _ testcor
 		if err != nil {
 			return err
 		}
-		out, err := env.tr.Journal().AppendTaskEvent(AppendTaskEventInput{
-			ActorID:    env.actor,
-			TaskID:     env.task,
-			EventKind:  "provenance.task.updated",
-			RecordedAt: recordedAt,
-		})
-		if err != nil {
-			return fmt.Errorf("append %q: %w", label, err)
-		}
-		labelByJID[out.JournalID] = label
+		jid := appendEventViaOp(t, env.tr, boot, env.actor, env.task, "op-ev-"+label, "provenance.task.updated", recordedAt)
+		labelByJID[jid] = label
 	}
 
 	// Paginated timeline walk with the composite exclusive cursor.
@@ -603,7 +665,10 @@ func opWriteJournalRowMissingSubtype(t *testing.T, input, expected anyMap, _ tes
 	if !ok {
 		return fmt.Errorf("expected *sqliteTracker, got %T", env.tr)
 	}
-	if _, err := st.db.AppendBareJournalRow(JournalKindTaskEvent, env.actor, time.Now()); err != nil {
+	// A bare decision row (a kind with a subtype table but no subtype row) drives the
+	// totality violation; a task-event kind is no longer usable here because the #5
+	// operations-layer producer CHECK forbids a NULL-producer task event at insert time.
+	if _, err := st.db.AppendBareJournalRow(JournalKindDecision, env.actor, time.Now()); err != nil {
 		return fmt.Errorf("append bare journal row: %w", err)
 	}
 	err := env.tr.Journal().VerifyIntegrity()

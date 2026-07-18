@@ -190,15 +190,23 @@ func (db *DB) completeJournalOperationFK() error {
 		`DROP VIEW IF EXISTS journal_attributed`,
 		// actor_id stays nullable with the anchor-only CHECK (§2.1, §10 rule 5): the
 		// rebuild only completes the produced_by FK, it does not relax the actor
-		// placement invariant the journal-base layer already established.
-		`CREATE TABLE journal_new (
+		// placement invariant the journal-base layer already established. It ALSO adds
+		// the task-event producer CHECK: every task_event (kind_id = JournalKindTaskEvent)
+		// must be produced by an operation (produced_by_operation_journal_id NOT NULL). In
+		// the journaled model every task_event is emitted by an operation — a native
+		// create, an update/lifecycle event, or a migration baseline marker — so the only
+		// thing this rejects is a bare NULL-producer append (the retired #4 AppendTaskEvent
+		// path). The journal-base #4 layer keeps NULL-producer task_events (no FK, no this
+		// CHECK); the constraint is introduced only here in the operations-layer rebuild.
+		fmt.Sprintf(`CREATE TABLE journal_new (
 			journal_id   INTEGER PRIMARY KEY AUTOINCREMENT,
 			kind_id     INTEGER NOT NULL REFERENCES journal_kinds(id),
 			actor_id    TEXT REFERENCES agents(id),
 			recorded_at INTEGER NOT NULL,
 			produced_by_operation_journal_id INTEGER REFERENCES journal_operations(journal_id),
-			CHECK ((actor_id IS NULL) = (produced_by_operation_journal_id IS NOT NULL))
-		) STRICT`,
+			CHECK ((actor_id IS NULL) = (produced_by_operation_journal_id IS NOT NULL)),
+			CHECK (kind_id <> %d OR produced_by_operation_journal_id IS NOT NULL)
+		) STRICT`, int(journal.JournalKindTaskEvent)),
 		`INSERT INTO journal_new (journal_id, kind_id, actor_id, recorded_at, produced_by_operation_journal_id)
 			SELECT journal_id, kind_id, actor_id, recorded_at, produced_by_operation_journal_id FROM journal`,
 		`DROP TABLE journal`,
