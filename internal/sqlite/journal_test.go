@@ -49,7 +49,7 @@ func seedActorAndTask(t *testing.T, db *DB) (journal.ActorID, journal.TaskID) {
 		CreatedAt: time.Now().UTC(),
 		UpdatedAt: time.Now().UTC(),
 	}
-	if err := db.InsertTask(task); err != nil {
+	if err := db.SeedLegacyTaskRow(task); err != nil {
 		t.Fatalf("seed task: %v", err)
 	}
 	return actor, task.ID

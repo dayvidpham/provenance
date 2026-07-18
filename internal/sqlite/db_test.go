@@ -43,8 +43,8 @@ func TestSchemaTablesExist(t *testing.T) {
 
 	// Insert and retrieve a task to verify the schema is properly applied.
 	task := makeTask("test-ns", "Schema check")
-	if err := db.InsertTask(task); err != nil {
-		t.Fatalf("InsertTask failed (schema may be incomplete): %v", err)
+	if err := db.SeedLegacyTaskRow(task); err != nil {
+		t.Fatalf("SeedLegacyTaskRow failed (schema may be incomplete): %v", err)
 	}
 
 	got, found, err := db.GetTask(task.ID)
@@ -70,8 +70,8 @@ func TestInsertAndGetTask(t *testing.T) {
 	task.Description = "A test task"
 	task.Notes = "some notes"
 
-	if err := db.InsertTask(task); err != nil {
-		t.Fatalf("InsertTask error: %v", err)
+	if err := db.SeedLegacyTaskRow(task); err != nil {
+		t.Fatalf("SeedLegacyTaskRow error: %v", err)
 	}
 
 	got, found, err := db.GetTask(task.ID)
@@ -112,8 +112,8 @@ func TestUpdateTask(t *testing.T) {
 	db := openTestDB(t)
 
 	task := makeTask("ns", "Original Title")
-	if err := db.InsertTask(task); err != nil {
-		t.Fatalf("InsertTask error: %v", err)
+	if err := db.SeedLegacyTaskRow(task); err != nil {
+		t.Fatalf("SeedLegacyTaskRow error: %v", err)
 	}
 
 	newTitle := "Updated Title"
@@ -137,8 +137,8 @@ func TestCloseTask(t *testing.T) {
 	db := openTestDB(t)
 
 	task := makeTask("ns", "Task to close")
-	if err := db.InsertTask(task); err != nil {
-		t.Fatalf("InsertTask error: %v", err)
+	if err := db.SeedLegacyTaskRow(task); err != nil {
+		t.Fatalf("SeedLegacyTaskRow error: %v", err)
 	}
 
 	closed, err := db.CloseTask(task.ID, "done", time.Now().UTC())
@@ -162,8 +162,8 @@ func TestListTasks(t *testing.T) {
 	task1 := makeTask("ns", "Task 1")
 	task2 := makeTask("ns", "Task 2")
 	for _, task := range []ptypes.Task{task1, task2} {
-		if err := db.InsertTask(task); err != nil {
-			t.Fatalf("InsertTask error: %v", err)
+		if err := db.SeedLegacyTaskRow(task); err != nil {
+			t.Fatalf("SeedLegacyTaskRow error: %v", err)
 		}
 	}
 
@@ -184,8 +184,8 @@ func TestListTasksWithFilter(t *testing.T) {
 	task2 := makeTask("ns", "Feature task")
 	task2.Type = ptypes.TaskTypeFeature
 	for _, task := range []ptypes.Task{task1, task2} {
-		if err := db.InsertTask(task); err != nil {
-			t.Fatalf("InsertTask error: %v", err)
+		if err := db.SeedLegacyTaskRow(task); err != nil {
+			t.Fatalf("SeedLegacyTaskRow error: %v", err)
 		}
 	}
 
@@ -207,11 +207,11 @@ func TestReadyAndBlockedTasks(t *testing.T) {
 
 	parent := makeTask("ns", "Parent")
 	child := makeTask("ns", "Child")
-	if err := db.InsertTask(parent); err != nil {
-		t.Fatalf("InsertTask parent: %v", err)
+	if err := db.SeedLegacyTaskRow(parent); err != nil {
+		t.Fatalf("SeedLegacyTaskRow parent: %v", err)
 	}
-	if err := db.InsertTask(child); err != nil {
-		t.Fatalf("InsertTask child: %v", err)
+	if err := db.SeedLegacyTaskRow(child); err != nil {
+		t.Fatalf("SeedLegacyTaskRow child: %v", err)
 	}
 
 	// Before edge: both should be ready.
@@ -261,8 +261,8 @@ func TestInsertAndGetEdges(t *testing.T) {
 	task1 := makeTask("ns", "Task 1")
 	task2 := makeTask("ns", "Task 2")
 	for _, task := range []ptypes.Task{task1, task2} {
-		if err := db.InsertTask(task); err != nil {
-			t.Fatalf("InsertTask error: %v", err)
+		if err := db.SeedLegacyTaskRow(task); err != nil {
+			t.Fatalf("SeedLegacyTaskRow error: %v", err)
 		}
 	}
 
@@ -289,8 +289,8 @@ func TestDeleteEdge(t *testing.T) {
 	task1 := makeTask("ns", "Task 1")
 	task2 := makeTask("ns", "Task 2")
 	for _, task := range []ptypes.Task{task1, task2} {
-		if err := db.InsertTask(task); err != nil {
-			t.Fatalf("InsertTask error: %v", err)
+		if err := db.SeedLegacyTaskRow(task); err != nil {
+			t.Fatalf("SeedLegacyTaskRow error: %v", err)
 		}
 	}
 
@@ -318,8 +318,8 @@ func TestGetBlockedByEdges(t *testing.T) {
 	task1 := makeTask("ns", "Task 1")
 	task2 := makeTask("ns", "Task 2")
 	for _, task := range []ptypes.Task{task1, task2} {
-		if err := db.InsertTask(task); err != nil {
-			t.Fatalf("InsertTask error: %v", err)
+		if err := db.SeedLegacyTaskRow(task); err != nil {
+			t.Fatalf("SeedLegacyTaskRow error: %v", err)
 		}
 	}
 
@@ -353,8 +353,8 @@ func TestGetDepTree(t *testing.T) {
 	taskB := makeTask("ns", "B")
 	taskC := makeTask("ns", "C")
 	for _, task := range []ptypes.Task{taskA, taskB, taskC} {
-		if err := db.InsertTask(task); err != nil {
-			t.Fatalf("InsertTask error: %v", err)
+		if err := db.SeedLegacyTaskRow(task); err != nil {
+			t.Fatalf("SeedLegacyTaskRow error: %v", err)
 		}
 	}
 
@@ -383,8 +383,8 @@ func TestAddAndGetLabels(t *testing.T) {
 	db := openTestDB(t)
 
 	task := makeTask("ns", "Labeled task")
-	if err := db.InsertTask(task); err != nil {
-		t.Fatalf("InsertTask error: %v", err)
+	if err := db.SeedLegacyTaskRow(task); err != nil {
+		t.Fatalf("SeedLegacyTaskRow error: %v", err)
 	}
 
 	if err := db.AddLabel(task.ID, "priority:high"); err != nil {
@@ -414,8 +414,8 @@ func TestAddLabelIdempotent(t *testing.T) {
 	db := openTestDB(t)
 
 	task := makeTask("ns", "Labeled task")
-	if err := db.InsertTask(task); err != nil {
-		t.Fatalf("InsertTask error: %v", err)
+	if err := db.SeedLegacyTaskRow(task); err != nil {
+		t.Fatalf("SeedLegacyTaskRow error: %v", err)
 	}
 
 	// Adding the same label twice should not error.
@@ -439,8 +439,8 @@ func TestRemoveLabel(t *testing.T) {
 	db := openTestDB(t)
 
 	task := makeTask("ns", "Task")
-	if err := db.InsertTask(task); err != nil {
-		t.Fatalf("InsertTask error: %v", err)
+	if err := db.SeedLegacyTaskRow(task); err != nil {
+		t.Fatalf("SeedLegacyTaskRow error: %v", err)
 	}
 	if err := db.AddLabel(task.ID, "remove-me"); err != nil {
 		t.Fatalf("AddLabel error: %v", err)
@@ -466,8 +466,8 @@ func TestAddAndGetComments(t *testing.T) {
 	db := openTestDB(t)
 
 	task := makeTask("ns", "Commented task")
-	if err := db.InsertTask(task); err != nil {
-		t.Fatalf("InsertTask error: %v", err)
+	if err := db.SeedLegacyTaskRow(task); err != nil {
+		t.Fatalf("SeedLegacyTaskRow error: %v", err)
 	}
 
 	agent, err := db.RegisterHumanAgent("ns", "Alice", "alice@example.com")
@@ -743,8 +743,8 @@ func TestListTasksWithLabelFilter(t *testing.T) {
 	task1 := makeTask("ns", "Labeled")
 	task2 := makeTask("ns", "Unlabeled")
 	for _, task := range []ptypes.Task{task1, task2} {
-		if err := db.InsertTask(task); err != nil {
-			t.Fatalf("InsertTask error: %v", err)
+		if err := db.SeedLegacyTaskRow(task); err != nil {
+			t.Fatalf("SeedLegacyTaskRow error: %v", err)
 		}
 	}
 	if err := db.AddLabel(task1.ID, "epic:x"); err != nil {
@@ -939,8 +939,8 @@ func TestUpdateTask_YAMLPermutations(t *testing.T) {
 			task := makeTask("test-ns", "Original Title")
 			task.Description = "original description"
 			task.Notes = "original notes"
-			if err := db.InsertTask(task); err != nil {
-				t.Fatalf("InsertTask error: %v", err)
+			if err := db.SeedLegacyTaskRow(task); err != nil {
+				t.Fatalf("SeedLegacyTaskRow error: %v", err)
 			}
 
 			// Build UpdateFields from fixture field list.
@@ -1056,8 +1056,8 @@ func TestListTasks_YAMLPermutations(t *testing.T) {
 				task.Priority = ptypes.Priority(st.Priority)
 				task.Type = ptypes.TaskType(st.Type)
 				task.Phase = ptypes.Phase(st.Phase)
-				if err := db.InsertTask(task); err != nil {
-					t.Fatalf("InsertTask(%q) error: %v", st.Name, err)
+				if err := db.SeedLegacyTaskRow(task); err != nil {
+					t.Fatalf("SeedLegacyTaskRow(%q) error: %v", st.Name, err)
 				}
 				if st.Label != "" {
 					if err := db.AddLabel(task.ID, st.Label); err != nil {

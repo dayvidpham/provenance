@@ -10,29 +10,14 @@ import (
 	"zombiezen.com/go/sqlite/sqlitex"
 )
 
-// InsertTask inserts a task row into the tasks table. Acquires the DB mutex.
-func (db *DB) InsertTask(task ptypes.Task) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	var ownerVal any
-	if task.Owner != nil {
-		ownerVal = task.Owner.String()
-	}
-
-	return sqlitex.Execute(db.conn,
-		`INSERT INTO tasks
-			(id, namespace, title, description, status_id, priority_id, type_id,
-			 phase_id, owner_id, notes, created_at, updated_at, closed_at, close_reason)
-		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)`,
-		&sqlitex.ExecOptions{Args: []any{
-			task.ID.String(), task.ID.Namespace, task.Title, task.Description,
-			int(task.Status), int(task.Priority), int(task.Type), int(task.Phase),
-			ownerVal, task.Notes,
-			task.CreatedAt.UnixNano(), task.UpdatedAt.UnixNano(),
-			TimeToNullInt(task.ClosedAt), task.CloseReason,
-		}})
-}
+// The sole PRODUCTION tasks-row INSERT is the reducer fold's own watermark-carrying
+// insert (foldTaskCreateLocked in operations.go), which is reached only through a
+// journaled EffectTaskCreate (Session.Create / an Atomic op). The former direct-write
+// creation path (graph.Store.AddVertex → db.InsertTask, a bare NULL-watermark insert)
+// was retired: AddVertex no longer creates rows, and InsertTask is gone. Base-layer
+// tests that need an on-disk task row use the OLD-schema seeding seam
+// (db.SeedLegacyTaskRow / db.SeedLegacyTask, legacy_seed.go), never a production
+// creation call.
 
 // GetTask retrieves a task by ID. Returns (task, true, nil) if found,
 // (zero, false, nil) if not found, or (zero, false, err) on error. Acquires the DB mutex.

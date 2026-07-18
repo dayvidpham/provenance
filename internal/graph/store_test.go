@@ -1,6 +1,7 @@
 package graph_test
 
 import (
+	"errors"
 	"testing"
 
 	intgraph "github.com/dayvidpham/provenance/internal/graph"
@@ -16,6 +17,18 @@ func openTestDB(t *testing.T) *dbsqlite.DB { return testutil.OpenTestDB(t) }
 // makeTask delegates to shared testutil.MakeTask with a default title.
 func makeTask(ns string) ptypes.Task { return testutil.MakeTask(ns, "test task") }
 
+// seedTask puts a task row on disk via the OLD-schema legacy seeding seam. Task
+// creation is journaled, so the graph store no longer creates rows (AddVertex is
+// retired as a creation path); a base-layer graph test that needs a pre-existing
+// vertex seeds the underlying tasks row directly, exactly as a legacy database on disk
+// would carry it, and the store then sees it as a vertex (Vertex reads tasks(id)).
+func seedTask(t *testing.T, db *dbsqlite.DB, task ptypes.Task) {
+	t.Helper()
+	if err := db.SeedLegacyTaskRow(task); err != nil {
+		t.Fatalf("seedTask(%s): %v", task.ID.String(), err)
+	}
+}
+
 func TestNewStoreImplementsInterface(t *testing.T) {
 	db := openTestDB(t)
 	store := intgraph.NewStore(db)
@@ -27,24 +40,37 @@ func TestNewStoreImplementsInterface(t *testing.T) {
 	}
 }
 
-func TestAddVertexAndVertex(t *testing.T) {
+// TestAddVertexRejectsDirectCreate pins the retired creation semantics: AddVertex for a
+// task with no row is a direct-write creation attempt and fails with
+// ErrDirectVertexCreate; AddVertex for an already-seeded task is the dominikbraun
+// already-exists condition; neither writes a row.
+func TestAddVertexRejectsDirectCreate(t *testing.T) {
 	db := openTestDB(t)
 	store := intgraph.NewStore(db)
 
 	task := makeTask("test-ns")
 	hash := task.ID.String()
 
-	// AddVertex should succeed.
-	if err := store.AddVertex(hash, task, dgraph.VertexProperties{}); err != nil {
-		t.Fatalf("AddVertex() error: %v", err)
+	// No row yet: a creation attempt is rejected, structurally, naming Session.Create.
+	err := store.AddVertex(hash, task, dgraph.VertexProperties{})
+	if !errors.Is(err, intgraph.ErrDirectVertexCreate) {
+		t.Fatalf("AddVertex for uncreated task: got %v, want ErrDirectVertexCreate", err)
+	}
+	// It wrote nothing — the task is still absent.
+	if _, _, verr := store.Vertex(hash); verr != dgraph.ErrVertexNotFound {
+		t.Fatalf("Vertex after rejected AddVertex: got %v, want ErrVertexNotFound", verr)
 	}
 
-	// Vertex should return the task.
-	got, props, err := store.Vertex(hash)
+	// Once the task exists (journaled birth is modelled here by the legacy seam), a
+	// repeat AddVertex is the already-exists condition and Vertex returns the task.
+	seedTask(t, db, task)
+	if err := store.AddVertex(hash, task, dgraph.VertexProperties{}); err != dgraph.ErrVertexAlreadyExists {
+		t.Fatalf("AddVertex for existing task: got %v, want ErrVertexAlreadyExists", err)
+	}
+	got, _, err := store.Vertex(hash)
 	if err != nil {
 		t.Fatalf("Vertex() error: %v", err)
 	}
-	_ = props
 	if got.ID != task.ID {
 		t.Errorf("Vertex() ID = %v, want %v", got.ID, task.ID)
 	}
@@ -59,10 +85,14 @@ func TestAddVertexHashMismatch(t *testing.T) {
 
 	task := makeTask("test-ns")
 
-	// Use a mismatched hash.
+	// The hash/id consistency check runs before any existence lookup, so a mismatched
+	// hash is rejected regardless of whether the task row exists.
 	err := store.AddVertex("wrong-hash", task, dgraph.VertexProperties{})
 	if err == nil {
 		t.Fatal("AddVertex with mismatched hash should return error")
+	}
+	if errors.Is(err, intgraph.ErrDirectVertexCreate) {
+		t.Errorf("hash-mismatch error should not be ErrDirectVertexCreate: %v", err)
 	}
 }
 
@@ -108,15 +138,11 @@ func TestListVerticesAndVertexCount(t *testing.T) {
 		t.Errorf("VertexCount() initial = %d, want 0", count)
 	}
 
-	// Add two tasks.
+	// Seed two tasks.
 	t1 := makeTask("ns")
 	t2 := makeTask("ns")
-	if err := store.AddVertex(t1.ID.String(), t1, dgraph.VertexProperties{}); err != nil {
-		t.Fatalf("AddVertex t1 error: %v", err)
-	}
-	if err := store.AddVertex(t2.ID.String(), t2, dgraph.VertexProperties{}); err != nil {
-		t.Fatalf("AddVertex t2 error: %v", err)
-	}
+	seedTask(t, db, t1)
+	seedTask(t, db, t2)
 
 	hashes, err = store.ListVertices()
 	if err != nil {
@@ -141,12 +167,8 @@ func TestAddEdgeAndEdge(t *testing.T) {
 
 	t1 := makeTask("ns")
 	t2 := makeTask("ns")
-	if err := store.AddVertex(t1.ID.String(), t1, dgraph.VertexProperties{}); err != nil {
-		t.Fatalf("AddVertex t1 error: %v", err)
-	}
-	if err := store.AddVertex(t2.ID.String(), t2, dgraph.VertexProperties{}); err != nil {
-		t.Fatalf("AddVertex t2 error: %v", err)
-	}
+	seedTask(t, db, t1)
+	seedTask(t, db, t2)
 
 	edge := dgraph.Edge[string]{Source: t1.ID.String(), Target: t2.ID.String()}
 	if err := store.AddEdge(t1.ID.String(), t2.ID.String(), edge); err != nil {
@@ -171,12 +193,8 @@ func TestEdgeNotFound(t *testing.T) {
 
 	t1 := makeTask("ns")
 	t2 := makeTask("ns")
-	if err := store.AddVertex(t1.ID.String(), t1, dgraph.VertexProperties{}); err != nil {
-		t.Fatalf("AddVertex t1 error: %v", err)
-	}
-	if err := store.AddVertex(t2.ID.String(), t2, dgraph.VertexProperties{}); err != nil {
-		t.Fatalf("AddVertex t2 error: %v", err)
-	}
+	seedTask(t, db, t1)
+	seedTask(t, db, t2)
 
 	_, err := store.Edge(t1.ID.String(), t2.ID.String())
 	if err != dgraph.ErrEdgeNotFound {
@@ -190,12 +208,8 @@ func TestRemoveEdge(t *testing.T) {
 
 	t1 := makeTask("ns")
 	t2 := makeTask("ns")
-	if err := store.AddVertex(t1.ID.String(), t1, dgraph.VertexProperties{}); err != nil {
-		t.Fatalf("AddVertex t1 error: %v", err)
-	}
-	if err := store.AddVertex(t2.ID.String(), t2, dgraph.VertexProperties{}); err != nil {
-		t.Fatalf("AddVertex t2 error: %v", err)
-	}
+	seedTask(t, db, t1)
+	seedTask(t, db, t2)
 
 	edge := dgraph.Edge[string]{Source: t1.ID.String(), Target: t2.ID.String()}
 	if err := store.AddEdge(t1.ID.String(), t2.ID.String(), edge); err != nil {
@@ -220,9 +234,7 @@ func TestListEdges(t *testing.T) {
 	t2 := makeTask("ns")
 	t3 := makeTask("ns")
 	for _, task := range []ptypes.Task{t1, t2, t3} {
-		if err := store.AddVertex(task.ID.String(), task, dgraph.VertexProperties{}); err != nil {
-			t.Fatalf("AddVertex error: %v", err)
-		}
+		seedTask(t, db, task)
 	}
 
 	// Add two edges.
@@ -248,12 +260,8 @@ func TestNewGraphCycleDetection(t *testing.T) {
 
 	t1 := makeTask("ns")
 	t2 := makeTask("ns")
-	if err := g.AddVertex(t1); err != nil {
-		t.Fatalf("AddVertex t1: %v", err)
-	}
-	if err := g.AddVertex(t2); err != nil {
-		t.Fatalf("AddVertex t2: %v", err)
-	}
+	seedTask(t, db, t1)
+	seedTask(t, db, t2)
 
 	// t1 -> t2 (t1 blocked by t2).
 	if err := g.AddEdge(t1.ID.String(), t2.ID.String()); err != nil {
