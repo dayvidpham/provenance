@@ -398,27 +398,27 @@ func taskSlotID(res CommittedResult, slot string) (TaskID, bool) {
 // AddEdge creates a typed edge from sourceID to targetID (un-journaled, §6). For
 // EdgeBlockedBy, cycle detection is enforced (ErrCycleDetected).
 func (s *Session) AddEdge(sourceID TaskID, targetID string, kind EdgeKind) error {
-	return s.tr.AddEdge(sourceID, targetID, kind)
+	return s.tr.addEdge(sourceID, targetID, kind)
 }
 
 // RemoveEdge deletes the edge from sourceID to targetID (un-journaled, §6). Idempotent.
 func (s *Session) RemoveEdge(sourceID TaskID, targetID string, kind EdgeKind) error {
-	return s.tr.RemoveEdge(sourceID, targetID, kind)
+	return s.tr.removeEdge(sourceID, targetID, kind)
 }
 
 // AddLabel attaches a label to a task (un-journaled, §6). Idempotent.
 func (s *Session) AddLabel(id TaskID, label string) error {
-	return s.tr.AddLabel(id, label)
+	return s.tr.addLabel(id, label)
 }
 
 // RemoveLabel detaches a label from a task (un-journaled, §6). Idempotent.
 func (s *Session) RemoveLabel(id TaskID, label string) error {
-	return s.tr.RemoveLabel(id, label)
+	return s.tr.removeLabel(id, label)
 }
 
 // AddComment adds a comment to a task authored by authorID (un-journaled, §6).
 func (s *Session) AddComment(id TaskID, authorID AgentID, body string) (Comment, error) {
-	return s.tr.AddComment(id, authorID, body)
+	return s.tr.addComment(id, authorID, body)
 }
 
 // ---------------------------------------------------------------------------

@@ -618,8 +618,9 @@ func opBlockedByEdgeDoesNotGrantAuthority(t *testing.T, input, expected anyMap, 
 	prereq := env.taskFor(t, "unrelated-prereq")
 	dependent := env.taskFor(t, "unrelated-dependent")
 	// dependent blocked_by prereq: a pure scheduling constraint (prereq must
-	// finish before dependent), carrying no ownership/governance semantics.
-	if err := env.tr.AddEdge(dependent, prereq.String(), EdgeBlockedBy); err != nil {
+	// finish before dependent), carrying no ownership/governance semantics. The
+	// blocked_by edge is an un-journaled §6 relationship write on the Session SDK.
+	if err := env.tr.As(env.actor, boot).AddEdge(dependent, prereq.String(), EdgeBlockedBy); err != nil {
 		return fmt.Errorf("add blocked_by scheduling edge: %w", err)
 	}
 	occupant := env.actorFor(t, "occ")

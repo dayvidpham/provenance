@@ -336,10 +336,7 @@ func TestDemo_Persistence(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "provenance-demo.db")
 
 	// Session 1: create data
-	t1, err := provenance.OpenSQLite(dbPath)
-	if err != nil {
-		t.Fatalf("OpenSQLite session 1: %v", err)
-	}
+	t1 := openSQLiteSession(t, dbPath)
 	task := mustCreate(t, t1, "proj", "Persistent task", "", provenance.TaskTypeFeature, provenance.PriorityHigh, provenance.PhaseRequest)
 	taskID := task.ID
 	t1.Close()
@@ -359,10 +356,7 @@ func TestDemo_Persistence(t *testing.T) {
 	t2.Close()
 
 	// In-memory: data does NOT survive
-	mem, err := provenance.OpenMemory()
-	if err != nil {
-		t.Fatalf("OpenMemory: %v", err)
-	}
+	mem := openMemorySession(t)
 	memTask := mustCreate(t, mem, "proj", "Ephemeral", "", provenance.TaskTypeTask, provenance.PriorityMedium, provenance.PhaseRequest)
 	mem.Close()
 	mem2, err := provenance.OpenMemory()
@@ -529,10 +523,7 @@ func TestDemo_MultiProviderAgentsFromBestiary(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "bestiary-multi-provider.db")
 
 	// Open tracker — default registry backed by bestiary.Models()
-	tr, err := provenance.OpenSQLite(dbPath)
-	if err != nil {
-		t.Fatalf("OpenSQLite: %v", err)
-	}
+	tr := openSQLiteSession(t, dbPath)
 
 	// Explore the bestiary catalog: query by provider, look up known models
 	reg := provenance.DefaultModelRegistry()
@@ -638,7 +629,7 @@ func TestDemo_MultiProviderAgentsFromBestiary(t *testing.T) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-func mustCreate(t *testing.T, tr provenance.Tracker, namespace, title, description string, taskType provenance.TaskType, priority provenance.Priority, phase provenance.Phase) provenance.Task {
+func mustCreate(t *testing.T, tr *testTracker, namespace, title, description string, taskType provenance.TaskType, priority provenance.Priority, phase provenance.Phase) provenance.Task {
 	t.Helper()
 	task, err := tr.Create(namespace, title, description, taskType, priority, phase)
 	if err != nil {
@@ -647,7 +638,7 @@ func mustCreate(t *testing.T, tr provenance.Tracker, namespace, title, descripti
 	return task
 }
 
-func mustRegisterHumanAgent(t *testing.T, tr provenance.Tracker, namespace, name, contact string) provenance.HumanAgent {
+func mustRegisterHumanAgent(t *testing.T, tr *testTracker, namespace, name, contact string) provenance.HumanAgent {
 	t.Helper()
 	agent, err := tr.RegisterHumanAgent(namespace, name, contact)
 	if err != nil {
@@ -656,7 +647,7 @@ func mustRegisterHumanAgent(t *testing.T, tr provenance.Tracker, namespace, name
 	return agent
 }
 
-func mustRegisterMLAgent(t *testing.T, tr provenance.Tracker, namespace string, role provenance.Role, provider provenance.Provider, modelName provenance.ModelID) provenance.MLAgent {
+func mustRegisterMLAgent(t *testing.T, tr *testTracker, namespace string, role provenance.Role, provider provenance.Provider, modelName provenance.ModelID) provenance.MLAgent {
 	t.Helper()
 	agent, err := tr.RegisterMLAgent(namespace, role, provider, modelName)
 	if err != nil {
@@ -665,7 +656,7 @@ func mustRegisterMLAgent(t *testing.T, tr provenance.Tracker, namespace string, 
 	return agent
 }
 
-func mustStartActivity(t *testing.T, tr provenance.Tracker, agentID provenance.AgentID, phase provenance.Phase, stage provenance.Stage, notes string) provenance.Activity {
+func mustStartActivity(t *testing.T, tr *testTracker, agentID provenance.AgentID, phase provenance.Phase, stage provenance.Stage, notes string) provenance.Activity {
 	t.Helper()
 	act, err := tr.StartActivity(agentID, phase, stage, notes)
 	if err != nil {
@@ -674,7 +665,7 @@ func mustStartActivity(t *testing.T, tr provenance.Tracker, agentID provenance.A
 	return act
 }
 
-func mustCloseTask(t *testing.T, tr provenance.Tracker, id provenance.TaskID, reason string) provenance.Task {
+func mustCloseTask(t *testing.T, tr *testTracker, id provenance.TaskID, reason string) provenance.Task {
 	t.Helper()
 	task, err := tr.CloseTask(id, reason)
 	if err != nil {
@@ -683,14 +674,14 @@ func mustCloseTask(t *testing.T, tr provenance.Tracker, id provenance.TaskID, re
 	return task
 }
 
-func mustAddLabel(t *testing.T, tr provenance.Tracker, id provenance.TaskID, label string) {
+func mustAddLabel(t *testing.T, tr *testTracker, id provenance.TaskID, label string) {
 	t.Helper()
 	if err := tr.AddLabel(id, label); err != nil {
 		t.Fatalf("AddLabel(%v, %q) failed: %v", id, label, err)
 	}
 }
 
-func mustEndActivity(t *testing.T, tr provenance.Tracker, id provenance.ActivityID) provenance.Activity {
+func mustEndActivity(t *testing.T, tr *testTracker, id provenance.ActivityID) provenance.Activity {
 	t.Helper()
 	act, err := tr.EndActivity(id)
 	if err != nil {
@@ -699,7 +690,7 @@ func mustEndActivity(t *testing.T, tr provenance.Tracker, id provenance.Activity
 	return act
 }
 
-func mustAddComment(t *testing.T, tr provenance.Tracker, taskID provenance.TaskID, authorID provenance.AgentID, body string) provenance.Comment {
+func mustAddComment(t *testing.T, tr *testTracker, taskID provenance.TaskID, authorID provenance.AgentID, body string) provenance.Comment {
 	t.Helper()
 	comment, err := tr.AddComment(taskID, authorID, body)
 	if err != nil {
@@ -708,7 +699,7 @@ func mustAddComment(t *testing.T, tr provenance.Tracker, taskID provenance.TaskI
 	return comment
 }
 
-func mustAddEdge(t *testing.T, tr provenance.Tracker, sourceID provenance.TaskID, targetID string, kind provenance.EdgeKind) {
+func mustAddEdge(t *testing.T, tr *testTracker, sourceID provenance.TaskID, targetID string, kind provenance.EdgeKind) {
 	t.Helper()
 	if err := tr.AddEdge(sourceID, targetID, kind); err != nil {
 		t.Fatalf("AddEdge(%s -> %s, %s) failed: %v", sourceID, targetID, kind, err)

@@ -91,7 +91,31 @@ func main() {
 
 	// --- Provenance chain ---
 
-	task, err := tr.Create("aura", "REQUEST: Multi-provider demo", "",
+	// Task and edge mutations flow through the journaled Session SDK (Tracker.As):
+	// first establish the genesis bootstrap authority, then bind a Session to it.
+	sys, err := tr.RegisterSoftwareAgent("aura", "pasture-system", "0", "provenance")
+	if err != nil {
+		fatal("RegisterSoftwareAgent(system): %v", err)
+	}
+	genesis, err := tr.Journal().Apply(provenance.OperationInput{
+		OperationID:    "op-genesis",
+		ActorID:        sys.ID,
+		CommandDigest:  []byte("genesis-c"),
+		MutationDigest: []byte("genesis-m"),
+		Effects:        []provenance.Effect{{Sort: provenance.EffectBootstrapAuthority, BootstrapLabel: "pasture-system", ResultSlot: "auth"}},
+	})
+	if err != nil {
+		fatal("establish genesis: %v", err)
+	}
+	var bootJID provenance.JournalID
+	for i := range genesis.ResultSlots {
+		if string(genesis.ResultSlots[i].Slot) == "auth" {
+			bootJID = genesis.ResultSlots[i].ProducedJournalID
+		}
+	}
+	sess := tr.As(sys.ID, bootJID)
+
+	task, err := sess.Create("aura", "REQUEST: Multi-provider demo", "",
 		provenance.TaskTypeFeature, provenance.PriorityHigh, provenance.PhaseRequest)
 	if err != nil {
 		fatal("Create: %v", err)
@@ -102,9 +126,9 @@ func main() {
 	if err != nil {
 		fatal("StartActivity: %v", err)
 	}
-	tr.AddEdge(task.ID, activity.ID.String(), provenance.EdgeGeneratedBy)
-	tr.AddEdge(task.ID, architect.ID.String(), provenance.EdgeAttributedTo)
-	tr.AddEdge(task.ID, worker.ID.String(), provenance.EdgeAttributedTo)
+	sess.AddEdge(task.ID, activity.ID.String(), provenance.EdgeGeneratedBy)
+	sess.AddEdge(task.ID, architect.ID.String(), provenance.EdgeAttributedTo)
+	sess.AddEdge(task.ID, worker.ID.String(), provenance.EdgeAttributedTo)
 	tr.EndActivity(activity.ID)
 
 	fmt.Println("Provenance chain:")
