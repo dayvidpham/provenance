@@ -265,8 +265,56 @@ func (db *DB) migrateLockedWithFault(in journal.MigrationInput, faultHook func(t
 		resolved[i] = &o
 	}
 
+	// Anchor every legacy row in one whole-batch transaction (§9.5, §13).
+	result, err := db.anchorLegacyBaselinesLocked(in, ordered, resolved, faultHook)
+	if err != nil {
+		return journal.MigrationResult{}, err
+	}
+
+	// Re-tighten the watermark to schema-level NOT NULL (§8.1, §13) once EVERY task row
+	// carries a watermark. A full legacy migration anchors the whole tasks table, so this
+	// restores the same NOT NULL shape a fresh native database ships: the migrated database
+	// converges to structural enforcement, not merely data-level satisfaction, so a future
+	// un-journaled NULL-watermark write is rejected by the schema itself (not only detected
+	// later by VerifyIntegrity/ReplayProjections). If un-anchored legacy rows remain (the
+	// caller migrated only a subset), the table cannot yet satisfy NOT NULL, so the column
+	// stays at the legacy nullable shape and a later migration of the rest completes the
+	// tightening — the guard below keeps the rebuild fail-closed rather than erroring on a
+	// still-NULL row. The canonical SQLite table rebuild toggles PRAGMA foreign_keys, which
+	// is a no-op inside a transaction, so the rebuild runs its own FK-safe atomic
+	// transaction immediately after the anchor batch commits rather than nesting inside the
+	// anchor savepoint — still under the single held db.mu, so no other writer observes the
+	// intermediate shape. Should the rebuild itself fail, the committed anchors are left in
+	// the valid legacy nullable shape; a re-run is idempotent (§9.4) and re-applies it.
+	unanchored, err := db.countUnanchoredTasksLocked()
+	if err != nil {
+		return journal.MigrationResult{}, err
+	}
+	if unanchored == 0 {
+		if err := db.rebuildTasksWatermarkLocked(tasksWatermarkClause(true), true /*copyWatermark*/); err != nil {
+			return journal.MigrationResult{}, fmt.Errorf(
+				"MigrateLegacyBaseline: re-tighten tasks.last_journal_id to NOT NULL — where: post-anchor "+
+					"schema re-tightening (§8.1, §13); when: after every legacy row was anchored and its "+
+					"watermark populated; impact: the baseline anchors are committed but the watermark column "+
+					"remains at the legacy nullable shape; fix: re-run MigrateLegacyBaseline — the deterministic "+
+					"per-task OperationID makes the anchor phase idempotent and the re-tightening re-applies: %w", err)
+		}
+	}
+
+	return result, nil
+}
+
+// anchorLegacyBaselinesLocked folds one deterministic baseline operation per legacy task
+// as a single whole-batch savepoint transaction (§9.5, §13): a fault (an injected
+// faultHook or any apply error) rolls back every baseline written so far, committing
+// nothing for any task in the run. On success the savepoint commits when this function
+// returns, so the caller's subsequent watermark re-tightening rebuild — which needs the
+// foreign-keys pragma that is a no-op inside a transaction — runs cleanly against the
+// committed, fully-anchored table. Assumes db.mu is held; ordered/resolved are the
+// deterministically-ordered legacy rows and their pre-resolved owners.
+func (db *DB) anchorLegacyBaselinesLocked(in journal.MigrationInput, ordered []journal.LegacyTaskRow, resolved []*journal.ActorID, faultHook func(taskIndex int) error) (journal.MigrationResult, error) {
 	var txErr error
-	endTx := sqlitex.Save(db.conn) // outer whole-batch savepoint (§9.5, §13)
+	endTx := sqlitex.Save(db.conn) // whole-batch savepoint (§9.5, §13)
 	defer endTx(&txErr)
 
 	result := journal.MigrationResult{TasksMigrated: len(ordered)}

@@ -3,100 +3,82 @@
 #
 # Five targets with YAML-driven permutation test cases.
 #
-# Target 1: UpdateTask — 7 UpdateFields pointer fields, dynamic SET clause
+# Target 1: task metadata materialization — 5 fold-materialized columns, dynamic SET clause
 # Target 2: ListTasks — 6 ListFilter fields, dynamic WHERE clause
 # Target 3: RegisterMLAgent — Role × Provider × model_state cross-product
 # Target 4: StartActivity — Phase × Stage × notes cross-product (13×4×2 = 104)
 # Target 5: AgentKindMismatch — 3 getter functions × 3 agent kinds (3×3 = 9)
 
 # =================================
-# Target 1: UpdateTask permutations
+# Target 1: task metadata materialization permutations
 # =================================
 #
-# update_field_sets defines which UpdateFields pointer fields are set.
-# Each case names the fields that are non-nil. The test creates a task,
-# applies the update, re-fetches, and verifies all changed fields.
+# update_field_sets defines which materialized metadata columns a
+# provenance.task.updated journal event carries. Each case names the columns set
+# non-nil on the Effect. The test journal-creates a task, folds an update event
+# through db.Apply (the production path Session.Update reaches), re-fetches, and
+# verifies every changed column materialized and every unset column was preserved.
+#
+# These are exactly the columns the fold's materializeTaskEventColumnsLocked writes.
+# status and owner are NOT here: they are reducer-exclusive projections advanced by
+# lifecycle events / assignment episodes, never this materialization SET, and are
+# covered by the Session lifecycle/assignment tests.
 #
 # Field name → column mapping:
 #   title       → title (string)
 #   description → description (string)
-#   status      → status_id (int: 0=open, 1=in_progress, 2=closed)
 #   priority    → priority_id (int: 0=critical, 1=high, 2=medium, 3=low, 4=backlog)
 #   phase       → phase_id (int: 0=request … 12=unscoped)
 #   notes       → notes (string)
-#   owner       → owner_id (set from a pre-registered human agent)
 
 update_task:
   update_field_sets:
-    - name: all_fields
-      description: "All 7 fields set"
+    - name: all_metadata
+      description: "All 5 materialized metadata columns set"
       fields:
         - title
         - description
-        - status
         - priority
         - phase
         - notes
-        - owner
-
-    - name: no_fields
-      description: "No optional fields set — only updated_at changes"
-      fields: []
 
     - name: title_only
-      description: "Single string field"
+      description: "Single string column"
       fields:
         - title
 
-    - name: status_only
-      description: "Single enum field"
-      fields:
-        - status
-
     - name: priority_only
-      description: "Single enum field"
+      description: "Single enum column"
       fields:
         - priority
 
     - name: phase_only
-      description: "Single enum field"
+      description: "Single enum column"
       fields:
         - phase
 
     - name: description_only
-      description: "Single string field"
+      description: "Single string column"
       fields:
         - description
 
     - name: notes_only
-      description: "Single string field"
+      description: "Single string column"
       fields:
         - notes
 
-    - name: owner_only
-      description: "Single foreign-key field"
-      fields:
-        - owner
-
     - name: strings_only
-      description: "All string fields (title, description, notes)"
+      description: "All string columns (title, description, notes)"
       fields:
         - title
         - description
         - notes
 
     - name: enums_only
-      description: "All enum fields (status, priority, phase)"
+      description: "All enum columns (priority, phase)"
       fields:
-        - status
         - priority
         - phase
-
-    - name: status_and_priority
-      description: "Two enum fields"
-      fields:
-        - status
-        - priority
 
     - name: title_and_phase
       description: "One string + one enum"
@@ -104,54 +86,30 @@ update_task:
         - title
         - phase
 
-    - name: description_and_status
-      description: "One string + one enum"
-      fields:
-        - description
-        - status
-
-    - name: title_status_priority
-      description: "Mixed three fields"
-      fields:
-        - title
-        - status
-        - priority
-
-    - name: notes_phase_owner
-      description: "Mixed three fields including owner"
+    - name: notes_phase_priority
+      description: "Mixed three columns"
       fields:
         - notes
         - phase
-        - owner
+        - priority
 
-    - name: title_description_status_priority
-      description: "Four fields"
+    - name: title_description_priority
+      description: "Three columns"
       fields:
         - title
         - description
-        - status
         - priority
 
-    - name: status_phase_notes
-      description: "Two enums + notes"
-      fields:
-        - status
-        - phase
-        - notes
-
-  # Values used when setting each field.
-  # These are distinct from the default task values (open=0, medium=2, unscoped=12).
+  # Values used when setting each column.
+  # These are distinct from the default task values (medium=2, unscoped=12).
   field_values:
     title: "Updated Title"
     description: "Updated description"
-    # status: 1 = in_progress (default task starts at 0=open)
-    status: 1
     # priority: 0 = critical (default task starts at 2=medium)
     priority: 0
     # phase: 3 = review (default task starts at 12=unscoped)
     phase: 3
     notes: "Updated notes"
-    # owner: will be registered in the test as a human agent
 
 # =================================
 # Target 2: ListTasks permutations

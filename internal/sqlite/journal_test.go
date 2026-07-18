@@ -591,6 +591,112 @@ func TestTasksWatermarkSchemaIsNotNull(t *testing.T) {
 	}
 }
 
+// registerSoftwareActor raw-registers one software agent so it can act as a migration
+// committing actor or a resolved legacy owner (both are agents.id foreign keys).
+func registerSoftwareActor(t *testing.T, db *DB, name string) journal.ActorID {
+	t.Helper()
+	actor := ptypes.ActorID{Namespace: "provenance-test", UUID: uuid.New()}
+	db.Lock()
+	err := sqlitex.Execute(db.Conn(),
+		`INSERT INTO agents (id, kind_id) VALUES (?1, ?2)`,
+		&sqlitex.ExecOptions{Args: []any{actor.String(), int(ptypes.AgentKindSoftware)}})
+	if err == nil {
+		err = sqlitex.Execute(db.Conn(),
+			`INSERT INTO agents_software (agent_id, name, version, source) VALUES (?1,?2,?3,?4)`,
+			&sqlitex.ExecOptions{Args: []any{actor.String(), name, "0", "test"}})
+	}
+	db.Unlock()
+	if err != nil {
+		t.Fatalf("registerSoftwareActor %q: %v", name, err)
+	}
+	return actor
+}
+
+// TestMigrationReTightensWatermarkToNotNull proves the §8.1/§13 re-tightening: a legacy
+// database whose tasks table predates the last_journal_id column entirely is migrated —
+// the column is added (nullable), every row anchored, then the column RE-TIGHTENED back
+// to NOT NULL — so a migrated database carries the same schema-level enforcement as a
+// fresh one. It asserts the DDL notNull bit directly (not just data-level anchoring):
+// column-less legacy DB -> migrate -> schema NOT NULL AND the migrated row is anchored.
+func TestMigrationReTightensWatermarkToNotNull(t *testing.T) {
+	db := newJournalDB(t)
+	system := registerSoftwareActor(t, db, "pasture-system")
+	owner := registerSoftwareActor(t, db, "actor-frank")
+	boot := genesisBoot(t, db, system)
+
+	// Model a legacy database whose tasks table predates last_journal_id entirely, then
+	// confirm the column really is absent before migration (the column-add path fires).
+	if err := db.DowngradeTasksToColumnlessLegacy(); err != nil {
+		t.Fatalf("downgrade to column-less legacy: %v", err)
+	}
+	db.Lock()
+	present, _, err := db.tasksWatermarkColumnInfoLocked()
+	db.Unlock()
+	if err != nil {
+		t.Fatalf("watermark column info (pre-migration): %v", err)
+	}
+	if present {
+		t.Fatal("column-less legacy DB should have no last_journal_id column before migration")
+	}
+
+	migrated := journal.TaskID{Namespace: "provenance-test", UUID: uuid.Must(uuid.NewV7())}
+	base := time.Date(2025, 6, 10, 0, 0, 0, 0, time.UTC)
+	legacy := journal.LegacyTaskRow{
+		ID: migrated, RawOwner: "actor-frank", Status: journal.TaskStatusOpen, CreatedAt: base, UpdatedAt: base,
+	}
+	if err := db.SeedLegacyTask(legacy); err != nil {
+		t.Fatalf("seed column-less legacy task: %v", err)
+	}
+
+	if _, err := db.MigrateLegacyBaseline(journal.MigrationInput{
+		System: system, BootstrapAuthority: boot,
+		Owners: map[string]journal.ActorID{"actor-frank": owner},
+		Legacy: []journal.LegacyTaskRow{legacy},
+	}); err != nil {
+		t.Fatalf("migrate column-less legacy database: %v", err)
+	}
+
+	// The core assertion: the DDL is schema-level NOT NULL again post-migration, matching
+	// a fresh native database — not merely data-level satisfied.
+	db.Lock()
+	present, notNull, err := db.tasksWatermarkColumnInfoLocked()
+	db.Unlock()
+	if err != nil {
+		t.Fatalf("watermark column info (post-migration): %v", err)
+	}
+	if !present || !notNull {
+		t.Fatalf("post-migration watermark column present=%v notNull=%v, want present=true notNull=true", present, notNull)
+	}
+
+	// And every migrated row is anchored: it carries a non-null, non-zero watermark.
+	var watermark int64
+	db.Lock()
+	err = sqlitex.Execute(db.Conn(),
+		`SELECT last_journal_id FROM tasks WHERE id = ?1`,
+		&sqlitex.ExecOptions{Args: []any{migrated.String()}, ResultFunc: func(stmt *zs.Stmt) error {
+			watermark = stmt.ColumnInt64(0)
+			return nil
+		}})
+	db.Unlock()
+	if err != nil {
+		t.Fatalf("read migrated watermark: %v", err)
+	}
+	if watermark == 0 {
+		t.Fatalf("migrated task watermark = 0, want a non-zero anchored journal id")
+	}
+
+	// The schema is now tight, so a bare watermark-less insert is rejected at the schema
+	// level exactly as on a fresh database (the fresh-vs-migrated asymmetry is closed).
+	db.Lock()
+	insErr := sqlitex.Execute(db.Conn(),
+		`INSERT INTO tasks (id, namespace, title, phase_id, created_at, updated_at)
+		 VALUES ('provenance-test--bare','provenance-test','x',12,1,1)`, nil)
+	db.Unlock()
+	if insErr == nil {
+		t.Fatal("post-migration schema accepted a watermark-less tasks insert; NOT NULL was not restored")
+	}
+}
+
 // TestVerifyIntegrityRejectsUnwatermarkedTask proves the watermark-presence gate: the
 // legacy seam relaxes the schema and seeds a NULL-watermark row (a legacy task not yet
 // anchored); with no journal-row violations, VerifyIntegrity reaches the watermark gate

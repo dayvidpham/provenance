@@ -684,9 +684,11 @@ graph `Store.AddVertex` no longer creates rows, and the bare direct-write insert
 gone — so a fresh native database now ships `tasks.LastJournalID` **`NOT NULL`** and
 the only tasks-row `INSERT` is the reducer fold, which carries the watermark. A
 legacy database that predates the tightening is upgraded to the anchored,
-watermark-carrying shape by `MigrateLegacyBaseline` (§13); `VerifyIntegrity` (§15)
-rejects any un-anchored (NULL-watermark) task row over stored rows, so the invariant
-holds for migrated databases even where the physical column began nullable. The
+watermark-carrying shape by `MigrateLegacyBaseline` (§13), which re-tightens the column
+back to `NOT NULL` once every row is anchored — so a migrated database enforces the
+watermark invariant at the **schema level** exactly as a fresh one, not merely at the
+migration instant; `VerifyIntegrity` (§15) additionally rejects any un-anchored
+(NULL-watermark) task row over stored rows. The
 lifecycle status baseline is the reducer zero (`open`) unless a **fixed-mapping
 lifecycle event** moves it: `provenance.task.created` / `provenance.task.reopened`
 → `open`, `provenance.task.started` → `in_progress`, `provenance.task.closed` →
@@ -1124,10 +1126,23 @@ Migration upgrades such a database **in place**: it first ensures the `LastJourn
 column exists (the column-add path — a no-op when the column is already present, an
 `ALTER TABLE ... ADD COLUMN LastJournalID INTEGER REFERENCES journal(JournalID)` when
 it is absent), then journal-anchors every legacy row (the baseline events below),
-whose reducer projection populates each row's watermark. Post-migration every task
-row is anchored and carries a watermark, so the §8.1 `NOT NULL` invariant holds and
-`VerifyIntegrity` (§15) accepts the database; a fresh native database enforces the
-same invariant at the schema level from creation. The proof corpus models a legacy
+whose reducer projection populates each row's watermark, and finally **re-tightens the
+column back to `NOT NULL`** once no un-anchored task row remains. When a run anchors the
+whole table — the ordinary full-database migration — every task row then carries a
+watermark, so the `NOT NULL` constraint is restored at the **schema level** exactly as on
+a fresh native database: a migrated database is not merely data-level-satisfied at the
+migration instant but structurally protected from a later un-journaled `NULL`-watermark
+write, closing what would otherwise be a fresh-vs-migrated asymmetry. If the caller
+migrated only a subset and un-anchored legacy rows remain, the table cannot yet satisfy
+`NOT NULL`, so the column stays at the legacy nullable shape and a later migration of the
+rest completes the tightening (the gate keeps the step fail-closed rather than erroring on
+a still-`NULL` row). `VerifyIntegrity` (§15) additionally rejects any un-anchored row over
+stored data throughout. The re-tightening runs as its own foreign-key-safe atomic rebuild
+immediately after the anchor batch commits (the canonical SQLite table rebuild toggles
+`PRAGMA foreign_keys`, a no-op inside a transaction, so it cannot nest inside the anchor
+savepoint), under the single migration lock; if it fails, the committed anchors are left
+in the valid legacy nullable shape and an idempotent re-run re-applies the re-tightening.
+The proof corpus models a legacy
 database via a **test-only old-schema seeding seam** — `SeedLegacyTask` downgrades a
 native schema to the legacy nullable (or column-less) watermark shape and raw-inserts
 a pre-journal row, mirroring an on-disk legacy database, never routing through the

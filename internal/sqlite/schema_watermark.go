@@ -15,10 +15,15 @@ import (
 // tasks-row INSERT is the reducer fold, which always carries the watermark. A LEGACY
 // database predates the tightening (the journal-base #4 shape had a NULLABLE watermark,
 // and an even older database may lack the column entirely); such a database is upgraded
-// by MigrateLegacyBaseline, which anchors every legacy row and, if needed, adds the
-// column first. The test seams simulate legacy databases by DOWNGRADING a fresh native
-// schema to the legacy nullable shape (a row can then be seeded with no watermark),
-// exactly mirroring a pre-tightening database on disk (§13 CORPUS/TEST PATH).
+// by MigrateLegacyBaseline, which — if needed — adds the column first, anchors every
+// legacy row (populating each watermark), then RE-TIGHTENS the column back to NOT NULL
+// so a migrated database converges to the exact same schema-level enforcement a fresh
+// database ships (the enforcement is structural post-migration, not merely data-level).
+// The test seams simulate legacy databases by DOWNGRADING a fresh native schema to the
+// legacy nullable shape (a row can then be seeded with no watermark), exactly mirroring a
+// pre-tightening database on disk (§13 CORPUS/TEST PATH); post-migration the schema is
+// tight again, so a fresh downgrade seam is what a later test uses to model new legacy
+// state.
 
 // tasksTableColumns is the shared 14-column body of the tasks table — every column
 // except the last_journal_id watermark, whose nullability is the single axis that
@@ -100,6 +105,33 @@ func (db *DB) tasksWatermarkColumnInfoLocked() (present bool, notNull bool, err 
 		return false, false, fmt.Errorf("tasksWatermarkColumnInfo: %w", err)
 	}
 	return present, notNull, nil
+}
+
+// countUnanchoredTasksLocked reports how many tasks rows still carry a NULL watermark —
+// i.e. legacy rows not yet journal-anchored (§8.1, §13). Migration consults it to decide
+// whether the whole table can be re-tightened to NOT NULL: the rebuild is only safe (and
+// only meaningful) when zero un-anchored rows remain. A no-op when the column is absent
+// (the even-older column-less legacy shape) — a column-less table has no watermark to be
+// null, and migration adds the column before anchoring, so this runs after that add.
+// Assumes db.mu is held.
+func (db *DB) countUnanchoredTasksLocked() (int, error) {
+	present, _, err := db.tasksWatermarkColumnInfoLocked()
+	if err != nil {
+		return 0, err
+	}
+	if !present {
+		return 0, fmt.Errorf(
+			"countUnanchoredTasks: tasks table has no last_journal_id column — where: migration " +
+				"re-tightening gate (§8.1, §13); when: after the column-add path should have run; impact: " +
+				"nothing re-tightened; fix: this indicates the column-add path was skipped, which is a bug")
+	}
+	var n int
+	if err := sqlitex.Execute(db.conn,
+		`SELECT COUNT(*) FROM tasks WHERE last_journal_id IS NULL`,
+		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
+		return 0, fmt.Errorf("countUnanchoredTasks: %w", err)
+	}
+	return n, nil
 }
 
 // rebuildTasksWatermarkLocked runs the canonical SQLite table rebuild to change the
