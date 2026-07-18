@@ -73,10 +73,11 @@ var s13Operators = map[testcorpus.OperatorName]s11Handler{
 	"fsm-stopped-transition-converges":  opFSMStoppedTransitionConverges,
 	"fsm-forced-coercion-converges":     opFSMForcedCoercionConverges,
 	// mutation_families.yaml (§6 amendment) — journaled edges/labels/comments
-	"mutation-family-who-provenance":        opMutationFamilyWhoProvenance,
-	"mutation-family-unauthorized-rejected": opMutationFamilyUnauthorizedRejected,
-	"mutation-family-projections-replay":    opMutationFamilyProjectionsReplay,
-	"journaled-edge-grants-no-authority":    opJournaledEdgeGrantsNoAuthority,
+	"mutation-family-who-provenance":                   opMutationFamilyWhoProvenance,
+	"mutation-family-unauthorized-rejected":            opMutationFamilyUnauthorizedRejected,
+	"mutation-family-projections-replay":               opMutationFamilyProjectionsReplay,
+	"journaled-edge-grants-no-authority":               opJournaledEdgeGrantsNoAuthority,
+	"mutation-family-comment-body-corruption-detected": opMutationFamilyCommentBodyCorruptionDetected,
 }
 
 // ---------------------------------------------------------------------------
@@ -1719,6 +1720,70 @@ func opJournaledEdgeGrantsNoAuthority(t *testing.T, input, expected anyMap, _ te
 	}
 	if !governsSrc {
 		return fmt.Errorf("assignment authority does not govern its own episode task src")
+	}
+	return nil
+}
+
+// opMutationFamilyCommentBodyCorruptionDetected proves the §15 convergence check compares
+// the FULL comment tuple, not merely its id key: a committed comment's body is corrupted
+// out-of-band (past the shared reducer), and Open's from-empty replay — which re-derives the
+// body SOLELY from the journaled payload — MUST fail closed with a typed
+// ProjectionDivergenceError naming the comment body field. A key-only domain-projection
+// diff would read the tampered body back unchanged and falsely report convergence.
+func opMutationFamilyCommentBodyCorruptionDetected(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
+	env := newOpsEnv(t)
+	boot := env.genesis(t, "op-genesis")
+	task := env.taskFor(t, "commented")
+	commentID := CommentID{Namespace: task.Namespace, UUID: uuid.Must(uuid.NewV7())}
+	if _, err := env.tr.Journal().Apply(OperationInput{
+		OperationID: "op-mf-comment", ActorID: env.actor, AuthorityJournalID: &boot,
+		CommandDigest: env.digest("cbc"), MutationDigest: env.digest("cbm"),
+		Effects: []Effect{
+			{Sort: EffectCommentAdd, TaskID: task, CommentIdentity: commentID, CommentAuthor: env.actor, CommentBody: "the honest journaled body"},
+		},
+	}); err != nil {
+		return fmt.Errorf("journal comment: %w", err)
+	}
+	// Sanity: the clean projection converges before any corruption.
+	if _, err := env.tr.Journal().ReplayProjections(); err != nil {
+		return fmt.Errorf("pre-corruption replay unexpectedly diverged: %w", err)
+	}
+	// Corrupt the committed comment body directly, bypassing the shared reducer — the
+	// out-of-band content drift a key-only convergence check would miss.
+	st := env.tr.(*sqliteTracker)
+	if err := st.db.AdversarialCorruptCommentBody(commentID.String(), "TAMPERED body no journal row derives"); err != nil {
+		return fmt.Errorf("corrupt comment body: %w", err)
+	}
+	// From-empty replay re-derives the body from the journaled payload and MUST diverge.
+	_, err := env.tr.Journal().ReplayProjections()
+	if err == nil {
+		return fmt.Errorf("out-of-band comment-body corruption was accepted as converged; expected a fail-closed ProjectionDivergenceError")
+	}
+	if !errors.Is(err, ErrProjectionDivergence) {
+		return fmt.Errorf("comment-body corruption rejected with %v, want ErrProjectionDivergence", err)
+	}
+	var typed *ProjectionDivergenceError
+	if !errors.As(err, &typed) {
+		return fmt.Errorf("comment-body corruption: error is not a typed *ProjectionDivergenceError: %v", err)
+	}
+	wantField, err := asString(expected, "divergentField")
+	if err != nil {
+		return err
+	}
+	if typed.Field != wantField {
+		return fmt.Errorf("divergence named field %q, want %q", typed.Field, wantField)
+	}
+	if typed.Task.Namespace == "" {
+		return fmt.Errorf("ProjectionDivergenceError Task (what) is empty")
+	}
+	if fld := firstEmptyField(map[string]string{
+		"Operation": typed.Operation, "Field": typed.Field, "Stored": typed.Stored,
+		"Replayed": typed.Replayed, "Why": typed.Why, "Impact": typed.Impact, "Fix": typed.Fix,
+	}); fld != "" {
+		return fmt.Errorf("ProjectionDivergenceError field %q is empty (six-field actionable contract)", fld)
+	}
+	if !errorIsActionable(typed.Error()) {
+		return fmt.Errorf("ProjectionDivergenceError is not actionable (missing why/where/when/impact/fix): %v", typed)
 	}
 	return nil
 }

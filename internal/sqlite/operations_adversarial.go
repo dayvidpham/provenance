@@ -356,6 +356,25 @@ func (db *DB) AdversarialCorruptTaskProjection(task journal.TaskID, field Advers
 	return nil
 }
 
+// AdversarialCorruptCommentBody rewrites a committed comment's body directly in the
+// comments projection, BYPASSING the shared reducer — the out-of-band content corruption
+// the §15 FULL-TUPLE convergence check exists to detect on a fold-derived comment (a
+// key-only check reads the tampered body back unchanged and falsely reports convergence).
+// A production writer only ever materializes comments.body through
+// projectMutationFamilyRowLocked from the journaled comment payload, so this installs a
+// body no ordered journal history would derive. The comment id comes from the caller's
+// committed row; body is the corpus's chosen tamper value, never a column identifier.
+func (db *DB) AdversarialCorruptCommentBody(commentID, body string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if err := sqlitex.Execute(db.conn,
+		`UPDATE comments SET body = ?1 WHERE id = ?2`,
+		&sqlitex.ExecOptions{Args: []any{body, commentID}}); err != nil {
+		return fmt.Errorf("AdversarialCorruptCommentBody %q: %w", commentID, err)
+	}
+	return nil
+}
+
 // AdversarialInsertSpuriousAttribution writes a task_attributions edge directly,
 // BYPASSING the shared reducer, so the corpus can prove ReplayProjections detects a
 // spurious attribution edge no ordered journal history would derive (§8.2, §15).

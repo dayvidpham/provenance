@@ -59,6 +59,32 @@ cases:
     expected:
       converged: true
 
+  - name: comment-body-corruption-detected-full-tuple
+    classification: must-fail
+    provenance: {source: bug, ref: "key-only domain-projection convergence let a comment's body/author/task_id (and an edge's created_at) drift out-of-band undetected (§6.4/§15)"}
+    mutation:
+      description: >-
+        A comment is journaled and its projection converges from empty. Its stored body is
+        then corrupted directly in the comments projection, bypassing the shared reducer — a
+        non-key content column a key-only convergence check never revisits. Open's from-empty
+        full replay re-derives the body SOLELY from the journaled comment payload and MUST
+        fail closed with a typed ProjectionDivergenceError naming the comment body field,
+        proving the §15 convergence check compares the FULL comment tuple (task/author/body/
+        created_at), not merely its id key.
+      operator: mutation-family-comment-body-corruption-detected
+    input:
+      shape: journaled-comment-then-corrupt-body
+    expected:
+      accepted: false
+      errorType: ProjectionDivergenceError
+      divergentField: comment body
+      errorHasWhat: true
+      errorHasWhy: true
+      errorHasWhere: true
+      errorHasWhen: true
+      errorHasImpact: true
+      errorHasFix: true
+
   - name: journaled-blocked-by-edge-grants-no-authority
     classification: must-pass
     provenance: {source: requirement, ref: "provenance#5 §14.5 re-pin under the §6 amendment: journaled edge still delegates no ownership"}

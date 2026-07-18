@@ -109,3 +109,4 @@ operators:
   - {operator: mutation-family-unauthorized-rejected,      slice: s1.3, reason: "§6/§9.3 — edge/label/comment mutations obey per-effect authorization (must-fail per family)"}
   - {operator: mutation-family-projections-replay,         slice: s1.3, reason: "§6/§15 — edge/label/comment domain projections re-derive from empty and converge"}
   - {operator: journaled-edge-grants-no-authority,         slice: s1.3, reason: "§14.5 re-pin — journaled blocked_by edge still delegates no ownership authority"}
+  - {operator: mutation-family-comment-body-corruption-detected, slice: s1.3, reason: "§6.4/§15 — full-tuple domain-projection convergence detects out-of-band comment-body corruption a key-only check missed"}

@@ -706,34 +706,67 @@ func ownerString(o *journal.ActorID) string {
 
 // domainProjection is a from-a-slate snapshot of the journaled relationship/annotation
 // domain projections (§6 amendment): edges keyed by (source, target, kind), labels by
-// (task, name), comments by id. Each value is the task the projected row reports on, so a
-// divergence can name it. Because every edge/label/comment now flows through the journal,
-// these sets are compared WHOLE (not scoped to anchored tasks): a from-empty refold
-// reproduces exactly the journaled rows.
+// (task, name), comments by id. Each family maps its natural key to the FULL projected
+// tuple — the key AND every non-key content column — so the §15 convergence check compares
+// the COMPLETE row against the from-empty re-derivation, matching the full-tuple discipline
+// of diffTaskProjections/diffAttributions. A key-only comparison would let a comment's
+// task_id/author_id/body/created_at (or an edge's created_at) drift out-of-band undetected
+// — the exact corruption class §15's from-empty SHADOW derivation exists to catch; carrying
+// the whole tuple here closes that hole. Because every edge/label/comment now flows through
+// the journal, these sets are compared WHOLE (not scoped to anchored tasks): a from-empty
+// refold reproduces exactly the journaled rows.
 type domainProjection struct {
-	edges    map[string]journal.TaskID
-	labels   map[string]journal.TaskID
-	comments map[string]journal.TaskID
+	edges    map[string]domainEdge
+	labels   map[string]domainLabel
+	comments map[string]domainComment
 }
 
-// snapshotDomainProjectionsLocked reads the edge/label/comment key sets from the named
-// tables (the real tables, or the shadow tables during a from-empty derivation) so a
-// replay can diff the stored domain projection against the from-empty re-derivation (§15).
+// domainEdge is one projected edge keyed by (source, target, kind); created_at is its only
+// non-key content column. task names the reporting (source) task for a divergence message.
+type domainEdge struct {
+	task      journal.TaskID
+	createdAt int64
+}
+
+// domainLabel is one projected label keyed by (task, name). Labels are KEY-ONLY BY NATURE:
+// (task_id, name) are the projection's only columns, so key presence already IS the full
+// tuple and there is no non-key content column to diverge — hence domainLabel carries only
+// the task it names.
+type domainLabel struct {
+	task journal.TaskID
+}
+
+// domainComment is one projected comment keyed by its id; task_id, author_id, body, and
+// created_at are ALL non-key content a full-tuple compare must verify (the comment PK is id
+// alone, so its task_id is not part of the key).
+type domainComment struct {
+	task      journal.TaskID
+	author    string
+	body      string
+	createdAt int64
+}
+
+// snapshotDomainProjectionsLocked reads the FULL edge/label/comment tuples from the named
+// tables (the real tables, or the shadow tables during a from-empty derivation) so a replay
+// can diff the stored domain projection against the from-empty re-derivation across every
+// column, not merely the keys (§15). It selects the non-key content columns
+// (edges.created_at; comments.author_id/body/created_at) alongside the keys; labels have no
+// non-key column.
 func (db *DB) snapshotDomainProjectionsLocked(edgesT, labelsT, commentsT string) (domainProjection, error) {
 	dp := domainProjection{
-		edges:    map[string]journal.TaskID{},
-		labels:   map[string]journal.TaskID{},
-		comments: map[string]journal.TaskID{},
+		edges:    map[string]domainEdge{},
+		labels:   map[string]domainLabel{},
+		comments: map[string]domainComment{},
 	}
 	if err := sqlitex.Execute(db.conn,
-		fmt.Sprintf(`SELECT source_id, target_id, kind_id FROM %s`, edgesT),
+		fmt.Sprintf(`SELECT source_id, target_id, kind_id, created_at FROM %s`, edgesT),
 		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 			src, tgt, kind := stmt.ColumnText(0), stmt.ColumnText(1), stmt.ColumnInt(2)
 			task, err := journalParseTask(src)
 			if err != nil {
 				return err
 			}
-			dp.edges[fmt.Sprintf("%s\x00%s\x00%d", src, tgt, kind)] = task
+			dp.edges[fmt.Sprintf("%s\x00%s\x00%d", src, tgt, kind)] = domainEdge{task: task, createdAt: stmt.ColumnInt64(3)}
 			return nil
 		}}); err != nil {
 		return domainProjection{}, fmt.Errorf("snapshot edges %s: %w", edgesT, err)
@@ -746,20 +779,25 @@ func (db *DB) snapshotDomainProjectionsLocked(edgesT, labelsT, commentsT string)
 			if err != nil {
 				return err
 			}
-			dp.labels[fmt.Sprintf("%s\x00%s", taskRaw, name)] = task
+			dp.labels[fmt.Sprintf("%s\x00%s", taskRaw, name)] = domainLabel{task: task}
 			return nil
 		}}); err != nil {
 		return domainProjection{}, fmt.Errorf("snapshot labels %s: %w", labelsT, err)
 	}
 	if err := sqlitex.Execute(db.conn,
-		fmt.Sprintf(`SELECT id, task_id FROM %s`, commentsT),
+		fmt.Sprintf(`SELECT id, task_id, author_id, body, created_at FROM %s`, commentsT),
 		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 			id, taskRaw := stmt.ColumnText(0), stmt.ColumnText(1)
 			task, err := journalParseTask(taskRaw)
 			if err != nil {
 				return err
 			}
-			dp.comments[id] = task
+			dp.comments[id] = domainComment{
+				task:      task,
+				author:    stmt.ColumnText(2),
+				body:      stmt.ColumnText(3),
+				createdAt: stmt.ColumnInt64(4),
+			}
 			return nil
 		}}); err != nil {
 		return domainProjection{}, fmt.Errorf("snapshot comments %s: %w", commentsT, err)
@@ -767,31 +805,107 @@ func (db *DB) snapshotDomainProjectionsLocked(edgesT, labelsT, commentsT string)
 	return dp, nil
 }
 
-// diffDomainProjections asserts the stored edge/label/comment sets equal the from-empty
-// re-derivation (§6, §15): a stored row the fold does not reproduce, or a folded row the
-// stored projection lacks, fails closed with a typed ProjectionDivergenceError.
+// diffDomainProjections asserts the stored edge/label/comment projections equal the
+// from-empty re-derivation ACROSS THE FULL TUPLE (§6, §15): a stored row the fold does not
+// reproduce, a folded row the stored projection lacks, OR a row present in both whose
+// non-key content differs (an edge's created_at; a comment's task/author/body/created_at),
+// all fail closed with a typed ProjectionDivergenceError naming the divergent field. This
+// mirrors diffTaskProjections/diffAttributions, closing the key-only hole that let a
+// comment's body/author/task drift out-of-band undetected.
 func diffDomainProjections(stored, derived domainProjection) error {
-	if err := diffDomainSet("edge", stored.edges, derived.edges); err != nil {
+	if err := diffDomainEdges(stored.edges, derived.edges); err != nil {
 		return err
 	}
-	if err := diffDomainSet("label", stored.labels, derived.labels); err != nil {
+	if err := diffDomainLabels(stored.labels, derived.labels); err != nil {
 		return err
 	}
-	return diffDomainSet("comment", stored.comments, derived.comments)
+	return diffDomainComments(stored.comments, derived.comments)
 }
 
-func diffDomainSet(field string, stored, derived map[string]journal.TaskID) error {
-	for key, task := range stored {
+// diffDomainEdges compares the full edge tuple: key presence in both directions, then the
+// created_at content column for a key present in both.
+func diffDomainEdges(stored, derived map[string]domainEdge) error {
+	for key, s := range stored {
+		d, ok := derived[key]
+		if !ok {
+			return divergence(s.task, "edge",
+				fmt.Sprintf("edge %q present in the stored projection", key),
+				"absent from the from-empty fold")
+		}
+		if s.createdAt != d.createdAt {
+			return divergence(d.task, "edge created_at",
+				fmt.Sprintf("edge %q created_at %d", key, s.createdAt),
+				fmt.Sprintf("created_at %d", d.createdAt))
+		}
+	}
+	for key, d := range derived {
+		if _, ok := stored[key]; !ok {
+			return divergence(d.task, "edge",
+				fmt.Sprintf("edge %q absent from the stored projection", key),
+				"derived by the from-empty fold")
+		}
+	}
+	return nil
+}
+
+// diffDomainLabels compares labels by key presence only: (task_id, name) are the
+// projection's ONLY columns, so key presence IS the full tuple — there is no content column
+// to diverge (documented on domainLabel).
+func diffDomainLabels(stored, derived map[string]domainLabel) error {
+	for key, s := range stored {
 		if _, ok := derived[key]; !ok {
-			return divergence(task, field,
-				fmt.Sprintf("%s %q present in the stored projection", field, key),
+			return divergence(s.task, "label",
+				fmt.Sprintf("label %q present in the stored projection", key),
 				"absent from the from-empty fold")
 		}
 	}
-	for key, task := range derived {
+	for key, d := range derived {
 		if _, ok := stored[key]; !ok {
-			return divergence(task, field,
-				fmt.Sprintf("%s %q absent from the stored projection", field, key),
+			return divergence(d.task, "label",
+				fmt.Sprintf("label %q absent from the stored projection", key),
+				"derived by the from-empty fold")
+		}
+	}
+	return nil
+}
+
+// diffDomainComments compares the full comment tuple: key (id) presence in both directions,
+// then each non-key content column (task_id, author_id, body, created_at). A comment whose
+// stored body/author/task drifts from the from-empty re-derivation diverges here, naming the
+// specific field — the completeness gap this fix closes.
+func diffDomainComments(stored, derived map[string]domainComment) error {
+	for id, s := range stored {
+		d, ok := derived[id]
+		if !ok {
+			return divergence(s.task, "comment",
+				fmt.Sprintf("comment %q present in the stored projection", id),
+				"absent from the from-empty fold")
+		}
+		if s.task.String() != d.task.String() {
+			return divergence(d.task, "comment task",
+				fmt.Sprintf("comment %q task %s", id, s.task.String()),
+				fmt.Sprintf("task %s", d.task.String()))
+		}
+		if s.author != d.author {
+			return divergence(d.task, "comment author",
+				fmt.Sprintf("comment %q author %s", id, s.author),
+				fmt.Sprintf("author %s", d.author))
+		}
+		if s.body != d.body {
+			return divergence(d.task, "comment body",
+				fmt.Sprintf("comment %q body %q", id, s.body),
+				fmt.Sprintf("body %q", d.body))
+		}
+		if s.createdAt != d.createdAt {
+			return divergence(d.task, "comment created_at",
+				fmt.Sprintf("comment %q created_at %d", id, s.createdAt),
+				fmt.Sprintf("created_at %d", d.createdAt))
+		}
+	}
+	for id, d := range derived {
+		if _, ok := stored[id]; !ok {
+			return divergence(d.task, "comment",
+				fmt.Sprintf("comment %q absent from the stored projection", id),
 				"derived by the from-empty fold")
 		}
 	}
