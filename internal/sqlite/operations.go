@@ -3,6 +3,7 @@ package sqlite
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/dayvidpham/provenance/internal/journal"
 	zs "zombiezen.com/go/sqlite"
@@ -254,6 +255,23 @@ func (db *DB) journalProducedByFKPresent() (bool, error) {
 		return false, fmt.Errorf("journalProducedByFKPresent: %w", err)
 	}
 	return present, nil
+}
+
+// JournalIsEmpty reports whether the global journal holds no rows at all — i.e. no
+// genesis bootstrap authority has been established and no legacy baseline migrated
+// (§4.6, §13). The Session SDK consults it to turn a journaled mutation against a
+// never-initialized journal into an actionable genesis/migration-required error
+// rather than a raw authority-not-found rejection deep in Apply. Acquires db.mu.
+func (db *DB) JournalIsEmpty() (bool, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	empty := true
+	if err := sqlitex.Execute(db.conn,
+		`SELECT 1 FROM journal LIMIT 1`,
+		&sqlitex.ExecOptions{ResultFunc: func(*zs.Stmt) error { empty = false; return nil }}); err != nil {
+		return false, fmt.Errorf("JournalIsEmpty: %w", err)
+	}
+	return empty, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -603,9 +621,80 @@ func (db *DB) foldTaskEventLocked(in journal.OperationInput, jid int64, eff jour
 			return fmt.Errorf("Apply: insert context edge: %w", err)
 		}
 	}
+	// Materialize the tasks-row columns this event carries (§8.1). These are
+	// materialized-only projections — title/description/priority/phase/notes for a
+	// provenance.task.updated event, and close_reason for a provenance.task.closed
+	// event — never part of the §15 owner/status/watermark convergence set, so writing
+	// them directly in the fold (exactly as EffectTaskCreate writes Title) is safe:
+	// the from-empty replay never re-derives or compares them. status_id/closed_at/
+	// last_journal_id remain reducer-exclusive and are advanced by the shared
+	// projectJournalRowLocked step after this fold.
+	if err := db.materializeTaskEventColumnsLocked(in, jid, eff); err != nil {
+		return err
+	}
 	// Projections (attribution, watermark, and any lifecycle-status transition)
 	// are advanced by the shared reducer step projectJournalRowLocked after this
 	// row is inserted — the single fold Apply and Open both run (§9.2).
+	return nil
+}
+
+// materializeTaskEventColumnsLocked writes the materialized-only tasks-row columns a
+// task_event carries (§8.1): the provenance.task.updated metadata columns and the
+// provenance.task.closed close_reason. It touches nothing when the effect carries no
+// such column (a plain caller-domain event), and it updates updated_at to the effect's
+// recorded time so the mutable row's display timestamp stays honest. It runs only on
+// the live Apply fold, never during the read-only from-empty replay.
+func (db *DB) materializeTaskEventColumnsLocked(in journal.OperationInput, jid int64, eff journal.Effect) error {
+	recordedAt := in.RecordedAt
+	if eff.RecordedAtOverride != nil {
+		recordedAt = *eff.RecordedAtOverride
+	}
+	setClauses := []string{"updated_at = ?1"}
+	args := []any{recordedAt}
+	idx := 2
+	if eff.UpdateTitle != nil {
+		setClauses = append(setClauses, fmt.Sprintf("title = ?%d", idx))
+		args = append(args, *eff.UpdateTitle)
+		idx++
+	}
+	if eff.UpdateDescription != nil {
+		setClauses = append(setClauses, fmt.Sprintf("description = ?%d", idx))
+		args = append(args, *eff.UpdateDescription)
+		idx++
+	}
+	if eff.UpdatePriority != nil {
+		setClauses = append(setClauses, fmt.Sprintf("priority_id = ?%d", idx))
+		args = append(args, int(*eff.UpdatePriority))
+		idx++
+	}
+	if eff.UpdatePhase != nil {
+		setClauses = append(setClauses, fmt.Sprintf("phase_id = ?%d", idx))
+		args = append(args, int(*eff.UpdatePhase))
+		idx++
+	}
+	if eff.UpdateNotes != nil {
+		setClauses = append(setClauses, fmt.Sprintf("notes = ?%d", idx))
+		args = append(args, *eff.UpdateNotes)
+		idx++
+	}
+	if journal.EventKind(eff.EventKind) == journal.EventKindTaskClosed && eff.CloseReason != "" {
+		setClauses = append(setClauses, fmt.Sprintf("close_reason = ?%d", idx))
+		args = append(args, eff.CloseReason)
+		idx++
+	}
+	// Only updated_at would change (no metadata/close column): nothing material to
+	// write, so skip the UPDATE entirely (a bare updated_at bump on an unrelated event
+	// would be noise).
+	if len(setClauses) == 1 {
+		return nil
+	}
+	args = append(args, eff.TaskID.String())
+	query := fmt.Sprintf(`UPDATE tasks SET %s WHERE id = ?%d`, strings.Join(setClauses, ", "), idx)
+	if err := sqlitex.Execute(db.conn, query, &sqlitex.ExecOptions{Args: args}); err != nil {
+		return fmt.Errorf(
+			"Apply: operation %q materialize task-event columns for %q: %w",
+			in.OperationID, eff.TaskID, err)
+	}
 	return nil
 }
 

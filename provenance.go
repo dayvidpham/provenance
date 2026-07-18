@@ -14,6 +14,15 @@ type Tracker interface {
 	// verification, and the actor-namespace reservation registry.
 	Journal() JournalAPI
 
+	// As binds a committing actor and a governing authority (a bootstrap or
+	// assignment authority's JournalID, obtained from a genesis operation or a
+	// started assignment episode) and returns a Session: the mutation SDK over the
+	// journal. The Session's task-lifecycle verbs (Create/Update/CloseTask) are
+	// journaled single-operation wrappers over Apply; its relationship/annotation
+	// verbs (AddEdge/RemoveEdge/AddLabel/RemoveLabel/AddComment) are un-journaled
+	// direct domain writes (docs/journal-relational-contract.md §6). See Session.
+	As(actor ActorID, authority JournalID) *Session
+
 	// ---------------------------------------------------------------------------
 	// Task CRUD
 	// ---------------------------------------------------------------------------

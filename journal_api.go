@@ -109,9 +109,13 @@ const (
 
 	// Provenance lifecycle task-event kinds the reducer projects (§8.1, §13).
 	EventKindTaskCreated  = journal.EventKindTaskCreated
+	EventKindTaskStarted  = journal.EventKindTaskStarted
 	EventKindTaskClosed   = journal.EventKindTaskClosed
 	EventKindTaskReopened = journal.EventKindTaskReopened
 	EventKindTaskMigrated = journal.EventKindTaskMigrated
+	// EventKindTaskUpdated records a materialized-metadata mutation; it is NOT a
+	// status-changing lifecycle kind (§8.1).
+	EventKindTaskUpdated = journal.EventKindTaskUpdated
 )
 
 // Typed context and validation constructors.

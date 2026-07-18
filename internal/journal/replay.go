@@ -121,9 +121,19 @@ func DecodeLegacyStatus(payload []byte) (TaskStatus, bool, error) {
 // sprawling caller-domain switch — folded identically by Apply and Open.
 const (
 	EventKindTaskCreated  EventKind = "provenance.task.created"
+	EventKindTaskStarted  EventKind = "provenance.task.started"
 	EventKindTaskClosed   EventKind = "provenance.task.closed"
 	EventKindTaskReopened EventKind = "provenance.task.reopened"
 	EventKindTaskMigrated EventKind = "provenance.task.migrated"
+
+	// EventKindTaskUpdated records a materialized-metadata mutation (title,
+	// description, priority, phase, notes) of an existing task. It is a NON-lifecycle
+	// kind — StatusForEventKind returns ok=false for it, so it only attributes the
+	// committing actor and advances the watermark (§8.1, §8.2). The mutated columns it
+	// carries are materialized-only projections of the tasks row, written directly in
+	// the fold like the birth metadata EventKindTaskCreated writes, and are NOT part of
+	// the §15 owner/status/watermark convergence set.
+	EventKindTaskUpdated EventKind = "provenance.task.updated"
 )
 
 // StatusForEventKind reports the status a lifecycle task-event kind projects to,
@@ -139,11 +149,23 @@ const (
 // status to open. Because the captured status lives in the journal row, it remains
 // reproducible solely from journal history when Open re-derives from empty (§15);
 // StatusForEventKind stays the source of truth only for the fixed-mapping lifecycle
-// kinds (created/reopened/closed).
+// kinds (created/started/reopened/closed).
+//
+// EventKindTaskStarted → in_progress is a fixed-mapping lifecycle kind added under
+// §8.1's own forward pointer ("route that status change through a journal lifecycle
+// event once the direct-write path retires"): the tightening package IS that
+// retirement, and in_progress (statuses.id 1) is first-class in the native status
+// domain, so a native task reaches it through this journaled event rather than an
+// un-journaled direct write. It is a fixed kind→status mapping deliberately — NOT a
+// generalized status-from-payload — so the closed lifecycle vocabulary stays
+// strongly typed (the migration marker's payload-captured status stays the sole
+// special case, §13).
 func StatusForEventKind(kind EventKind) (TaskStatus, bool) {
 	switch kind {
 	case EventKindTaskCreated, EventKindTaskReopened:
 		return TaskStatusOpen, true
+	case EventKindTaskStarted:
+		return TaskStatusInProgress, true
 	case EventKindTaskClosed:
 		return TaskStatusClosed, true
 	default:
