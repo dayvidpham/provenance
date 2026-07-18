@@ -311,7 +311,46 @@ func (db *DB) VerifyIntegrity() error {
 	if err := db.verifySubtypeIntegrityLocked(); err != nil {
 		return err
 	}
-	return db.verifyActorPlacementLocked()
+	if err := db.verifyActorPlacementLocked(); err != nil {
+		return err
+	}
+	// Watermark presence is checked LAST: it is the §8.1 tightening (no un-journaled
+	// task row), a whole-database invariant a converged/native database satisfies,
+	// whereas the subtype and placement checks above localise a specific injected
+	// journal violation. Ordering it last lets the adversarial corpus assert those
+	// journal-row violations by their own sentinel without a coexisting legacy task
+	// row masking them.
+	return db.verifyWatermarkPresenceLocked()
+}
+
+// verifyWatermarkPresenceLocked enforces the §8.1 watermark tightening over stored
+// rows: every tasks row must carry a last_journal_id (no un-journaled task). It is a
+// no-op on an even-older legacy database whose tasks table predates the column entirely
+// (that database is not yet migrated; migration adds the column and anchors its rows,
+// §13). Returns journal.ErrWatermarkMissing on the first un-anchored row.
+func (db *DB) verifyWatermarkPresenceLocked() error {
+	present, _, err := db.tasksWatermarkColumnInfoLocked()
+	if err != nil {
+		return err
+	}
+	if !present {
+		return nil
+	}
+	var badID string
+	if err := sqlitex.Execute(db.conn,
+		`SELECT id FROM tasks WHERE last_journal_id IS NULL LIMIT 1`,
+		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { badID = stmt.ColumnText(0); return nil }}); err != nil {
+		return fmt.Errorf("verifyWatermarkPresence: %w", err)
+	}
+	if badID != "" {
+		return fmt.Errorf(
+			"%w: task %q has a NULL last_journal_id — where: watermark-presence gate; when: at "+
+				"VerifyIntegrity / §15 convergence; impact: the database is not accepted as converged; "+
+				"fix: a task is born through the journal fold (Session.Create) carrying its watermark, "+
+				"and a legacy row is anchored by MigrateLegacyBaseline — no task row may exist un-journaled",
+			journal.ErrWatermarkMissing, badID)
+	}
+	return nil
 }
 
 // verifyActorPlacementLocked enforces the anchor-only actor-placement invariant

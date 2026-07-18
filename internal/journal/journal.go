@@ -302,6 +302,13 @@ var (
 	// by Apply on the input, and by VerifyIntegrity over stored rows, backing the
 	// CHECK constraint that also enforces it.
 	ErrActorPlacement = errors.New("provenance: journal actor placement violated (actor present iff anchor row)")
+	// ErrWatermarkMissing is returned when a tasks row carries no last_journal_id
+	// watermark (§8.1): every task row must reflect a journal position, so an
+	// un-anchored (NULL-watermark) row is an un-journaled task the tightening forbids.
+	// A fresh native database enforces this at the schema level (NOT NULL); a legacy
+	// database reaches it by anchoring every row through MigrateLegacyBaseline (§13).
+	// VerifyIntegrity reports it over stored rows.
+	ErrWatermarkMissing = errors.New("provenance: task row has no journal watermark (un-journaled task)")
 	// ErrInvalidEventKind is returned for a malformed namespaced event kind.
 	ErrInvalidEventKind = errors.New("provenance: invalid event kind")
 )

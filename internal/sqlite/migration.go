@@ -221,6 +221,14 @@ func (db *DB) migrateLockedWithFault(in journal.MigrationInput, faultHook func(t
 		return journal.MigrationResult{}, err
 	}
 
+	// Column-add path (§13): a legacy database that predates last_journal_id gets the
+	// column added (nullable, with the journal FK) before any row is anchored, so the
+	// anchoring projection has a column to write each row's watermark into. Idempotent —
+	// a no-op when the column is already present (the pre-tightening nullable shape).
+	if err := db.ensureTasksWatermarkColumnLocked(); err != nil {
+		return journal.MigrationResult{}, err
+	}
+
 	// Deterministic pre-migration order: created_at ascending, then id ascending
 	// (id alone breaks every tie, §13). Sort a copy so the caller's slice is
 	// untouched and the order never depends on map/iteration nondeterminism.

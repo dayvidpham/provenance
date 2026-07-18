@@ -75,10 +75,14 @@ func (db *DB) SeedLegacyTask(row journal.LegacyTaskRow) error {
 }
 
 // insertLegacyTaskRowLocked is the single raw OLD-schema task-row INSERT both legacy
-// seams share (§13). The legacy tasks row predates last_journal_id, so it is written
-// without a watermark (NULL); migration ADDs the anchor and populates the watermark.
-// Assumes db.mu is held.
+// seams share (§13). It first DOWNGRADES the tasks table to the legacy nullable-watermark
+// shape (a no-op once already legacy-shaped), mirroring a pre-tightening database on
+// disk, so the legacy row can be written with no watermark (NULL); migration anchors it
+// and populates the watermark. Assumes db.mu is held.
 func (db *DB) insertLegacyTaskRowLocked(task ptypes.Task) error {
+	if err := db.downgradeTasksWatermarkToLegacyLocked(); err != nil {
+		return fmt.Errorf("provenance: SeedLegacyTaskRow downgrade tasks to legacy shape: %w", err)
+	}
 	var ownerVal any
 	if task.Owner != nil {
 		ownerVal = task.Owner.String()

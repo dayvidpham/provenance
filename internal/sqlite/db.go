@@ -187,31 +187,16 @@ func (db *DB) ensureSchema(models []ptypes.ModelEntry) error {
 			version  TEXT NOT NULL DEFAULT '',
 			source   TEXT NOT NULL DEFAULT ''
 		) STRICT, WITHOUT ROWID`,
-		`CREATE TABLE IF NOT EXISTS tasks (
-			id           TEXT PRIMARY KEY,
-			namespace    TEXT NOT NULL,
-			title        TEXT NOT NULL,
-			description  TEXT NOT NULL DEFAULT '',
-			status_id    INTEGER NOT NULL DEFAULT 0 REFERENCES statuses(id),
-			priority_id  INTEGER NOT NULL DEFAULT 2 REFERENCES priorities(id),
-			type_id      INTEGER NOT NULL DEFAULT 2 REFERENCES task_types(id),
-			phase_id     INTEGER NOT NULL REFERENCES phases(id),
-			owner_id     TEXT REFERENCES agents(id),
-			notes        TEXT NOT NULL DEFAULT '',
-			created_at   INTEGER NOT NULL,
-			updated_at   INTEGER NOT NULL,
-			closed_at    INTEGER,
-			close_reason TEXT NOT NULL DEFAULT '',
-			-- Projection watermark (docs/journal-relational-contract.md §8.1): the
-			-- JournalID whose ordered history this row's derived state reflects.
-			-- Nullable at the journal-base layer because the existing direct-write
-			-- task path predates the shared reducer; the reducer slice
-			-- (dayvidpham/provenance#5) makes every task write flow through Apply
-			-- and tightens this to NOT NULL. FK target journal(journal_id) is
-			-- created by ensureJournalSchema (SQLite resolves cross-table FKs at
-			-- row time, not at CREATE).
-			last_journal_id INTEGER REFERENCES journal(journal_id)
-		) STRICT`,
+		// tasks carries the last_journal_id projection watermark (§8.1): the JournalID
+		// whose ordered history this row's derived state reflects. A fresh native
+		// database ships it NOT NULL — every production tasks-row INSERT is the reducer
+		// fold, which carries the watermark, so no un-journaled task row can exist. A
+		// legacy database predates the tightening and is upgraded by MigrateLegacyBaseline
+		// (§13). The column body and shape live in schema_watermark.go so ensureSchema and
+		// every watermark rebuild share one source of truth. FK target journal(journal_id)
+		// is created by ensureJournalSchema (SQLite resolves cross-table FKs at row time).
+		fmt.Sprintf("CREATE TABLE IF NOT EXISTS tasks (\n\t\t\t%s,\n\t\t\t%s\n\t\t) STRICT",
+			tasksTableColumns, tasksWatermarkClause(true)),
 		`CREATE INDEX IF NOT EXISTS idx_tasks_namespace ON tasks (namespace)`,
 		`CREATE INDEX IF NOT EXISTS idx_tasks_status    ON tasks (status_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_tasks_priority  ON tasks (priority_id)`,

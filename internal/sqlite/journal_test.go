@@ -499,6 +499,34 @@ func TestVerifyIntegrityRejectsBareJournalRow(t *testing.T) {
 	}
 }
 
+// TestTasksWatermarkSchemaIsNotNull proves the §8.1 tightening: a fresh native database
+// enforces last_journal_id NOT NULL at the schema level, so a bare tasks-row insert
+// omitting the watermark is rejected. In production the only tasks-row INSERT is the
+// reducer fold, which always carries the watermark.
+func TestTasksWatermarkSchemaIsNotNull(t *testing.T) {
+	db := newJournalDB(t)
+	db.Lock()
+	err := sqlitex.Execute(db.Conn(),
+		`INSERT INTO tasks (id, namespace, title, phase_id, created_at, updated_at)
+		 VALUES ('provenance-test--x','provenance-test','x',12,1,1)`, nil)
+	db.Unlock()
+	if err == nil {
+		t.Fatal("expected the NOT NULL last_journal_id constraint to reject a watermark-less tasks insert")
+	}
+}
+
+// TestVerifyIntegrityRejectsUnwatermarkedTask proves the watermark-presence gate: the
+// legacy seam relaxes the schema and seeds a NULL-watermark row (a legacy task not yet
+// anchored); with no journal-row violations, VerifyIntegrity reaches the watermark gate
+// and rejects the un-journaled task with ErrWatermarkMissing.
+func TestVerifyIntegrityRejectsUnwatermarkedTask(t *testing.T) {
+	db := newJournalDB(t)
+	seedActorAndTask(t, db)
+	if err := db.VerifyIntegrity(); !errors.Is(err, journal.ErrWatermarkMissing) {
+		t.Errorf("un-anchored legacy task: got %v, want ErrWatermarkMissing", err)
+	}
+}
+
 func TestNamespaceClaimIdempotentAndConflict(t *testing.T) {
 	db := newJournalDB(t)
 	claim := journal.ActorNamespaceClaim{
