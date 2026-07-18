@@ -58,6 +58,15 @@ var s13Operators = map[testcorpus.OperatorName]s11Handler{
 	"replay-with-ended-authority": opReplayWithEndedAuthority,
 	// zero_event_operations.yaml (§9.4)
 	"replay-zero-task-event-operation": opReplayZeroTaskEventOperation,
+	// journal_spine_corruption.yaml (§10 rule 8, §15) — UAT C8a corrupted-journal-spine family
+	"verify-clean-spine":            opVerifyCleanSpine,
+	"corrupt-delete-subtype-row":    opCorruptDeleteSubtypeRow,
+	"corrupt-rewrite-discriminator": opCorruptRewriteDiscriminator,
+	"corrupt-truncate-tail":         opCorruptTruncateTail,
+	"corrupt-noncontiguous-insert":  opCorruptNoncontiguousInsert,
+	// authority_revocation.yaml (§9.4, §14.1) — UAT C8a authority-revocation family
+	"revoke-then-pinned-retry-uncommitted": opRevokeThenPinnedRetryUncommitted,
+	"revoke-then-exact-replay-committed":   opRevokeThenExactReplayCommitted,
 }
 
 // ---------------------------------------------------------------------------

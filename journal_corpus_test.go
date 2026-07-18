@@ -37,6 +37,8 @@ var contractCorpusFiles = []string{
 	"operation_results.yaml",
 	"subtype_integrity.yaml",
 	"actor_namespace.yaml",
+	"journal_spine_corruption.yaml",
+	"authority_revocation.yaml",
 }
 
 type anyMap = map[string]any
