@@ -99,6 +99,6 @@ operators:
   - {operator: corrupt-delete-subtype-row,                  slice: s1.3, reason: "UAT C8a corrupted-spine family — subtype-totality fail-closed"}
   - {operator: corrupt-rewrite-discriminator,               slice: s1.3, reason: "UAT C8a corrupted-spine family — discriminator-agreement fail-closed"}
   - {operator: corrupt-truncate-tail,                       slice: s1.3, reason: "UAT C8a corrupted-spine family — truncated-tail convergence fail-closed"}
-  - {operator: corrupt-noncontiguous-insert,                slice: s1.3, reason: "UAT C8a corrupted-spine family — non-contiguous-insert totality fail-closed"}
+  - {operator: corrupt-noncontiguous-insert,                slice: s1.3, reason: "UAT C8a corrupted-spine family — bare-supertype-insert totality fail-closed"}
   - {operator: revoke-then-pinned-retry-uncommitted,        slice: s1.3, reason: "UAT C8a authority-revocation family — pinned retry under revoked authority"}
   - {operator: revoke-then-exact-replay-committed,          slice: s1.3, reason: "UAT C8a authority-revocation family — committed exact replay short-circuits"}

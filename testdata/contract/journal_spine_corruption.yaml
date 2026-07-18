@@ -94,18 +94,20 @@ cases:
       silentRepair: false
       errorActionable: true
 
-  - name: noncontiguous-journalid-insert-orphan-supertype
+  - name: out-of-band-bare-supertype-insert-rejected
     classification: must-fail
-    provenance: {source: requirement, ref: "UAT C8a corrupted-journal-spine family — non-contiguous journal_id insert"}
+    provenance: {source: requirement, ref: "UAT C8a corrupted-journal-spine family — bare supertype insert totality variant"}
     mutation:
       description: >-
-        A bare supertype journal row is inserted out of band at a non-contiguous
-        JournalID (the current maximum plus a gap) with no subtype row. AUTOINCREMENT
-        permits a gap-stable ascending order, so the non-contiguous id is itself
-        legal; the corruption is that the inserted supertype row has zero subtype
-        rows. VerifyIntegrity's totality scan must fail closed with a typed
-        ErrSubtypeIntegrity naming the offending non-contiguous JournalID, and repair
-        nothing — a non-contiguous spine write is never silently accepted.
+        A bare supertype journal row is inserted out of band (not through the
+        production Apply path) at a non-contiguous JournalID with no subtype row.
+        This corruption tests SUBTYPE TOTALITY: every supertype row must carry
+        exactly one subtype row (§10 rule 8). Journal ID contiguity is deliberately
+        NOT a spine invariant — AUTOINCREMENT permits gaps and ascending order holds
+        without contiguity. The corruption here is that the inserted supertype row
+        has zero subtype rows. VerifyIntegrity's totality scan must fail closed with
+        a typed ErrSubtypeIntegrity naming the offending JournalID, and repair
+        nothing.
       operator: corrupt-noncontiguous-insert
     input:
       journalIdGap: 100

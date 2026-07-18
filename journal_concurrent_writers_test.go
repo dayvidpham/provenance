@@ -282,11 +282,16 @@ func TestConcurrentTwoSessionsDistinctOpsConverge(t *testing.T) {
 }
 
 // TestConcurrentAtomicOpsNoPartialFold races two live Sessions each committing a
-// MULTI-EFFECT atomic operation on its own task (start an owner episode, then close the
-// task ending it — three effects folded in one operation). Each operation is
-// all-or-nothing under §9.5, so after the race every task carries the COMPLETE effect
-// set of its operation (owner cleared, status closed) and the database converges — no
-// interleaving ever leaves a half-folded operation visible.
+// MULTI-EFFECT atomic operation on DISJOINT tasks (distinct assignment IDs: ATOMIC-A on
+// taskA, ATOMIC-B on taskB). Each operation is all-or-nothing under §9.5, so after the
+// race every task carries the COMPLETE effect set of its operation (owner cleared, status
+// closed) and the database converges. This test proves that independent-task atomic ops
+// do not cross-contaminate under concurrent scheduling pressure — no interleaving ever
+// commits half-folded effects of one task's operation to that task. Same-resource
+// multi-effect interleaving (a real shared-resource contention case) is covered by
+// TestRevocationVsTransferCASSingleWinner (2-effect transfer vs 1-effect revoke, both on
+// the same assignment CAS-A), and general fold-loop atomicity-under-fault is covered by
+// the sequential AdversarialApplyWithFault corpus cases (§8.1).
 func TestConcurrentAtomicOpsNoPartialFold(t *testing.T) {
 	r := newRaceTracker(t)
 	taskA := r.createTask(t, "atomic-a")
