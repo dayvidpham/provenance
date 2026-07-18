@@ -17,8 +17,8 @@
 // parallel commit ledger). OpenBorrowedSQLite shares one physical SQLite database
 // with a DBOS root.
 //
-// ARCHITECTURE DEVIATION (Option B; architect ruling on aura-plugins-9y8gt, flagged
-// for UAT ratification): issue #6 acceptance criterion #1 assumed Provenance
+// ARCHITECTURE DEVIATION (Option B; architect ruling for issue #6, flagged for UAT
+// ratification): issue #6 acceptance criterion #1 assumed Provenance
 // persisted through database/sql, so the borrowed *sql.DB could be the single
 // literal handle and migrations could run "through it". The delivered,
 // UAT-accepted journal foundation persists on zombiezen.com/go/sqlite, which cannot

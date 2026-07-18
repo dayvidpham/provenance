@@ -54,12 +54,14 @@ type CanonicalResultSlotV1 struct {
 
 // CanonicalMutationResultV1 is the journal-anchored canonical result of one
 // committed operation. EmittedEvents is the task_event closure in ascending
-// JournalID order; ResultSlots is slot-sorted and slot-unique.
+// JournalID order; ResultSlots is slot-sorted and slot-unique. Every field here is
+// canonical, journal-anchored state, so its natural equality (== / reflect.DeepEqual,
+// and canonicalResultsEqual) is honest — the per-call §9.4 replay flag deliberately
+// does NOT live here (see DBOSStepOutcomeV1.ShortCircuited).
 type CanonicalMutationResultV1 struct {
 	AnchorJournalID int64                   `json:"anchor_journal_id"`
 	EmittedEvents   []int64                 `json:"emitted_events"`
 	ResultSlots     []CanonicalResultSlotV1 `json:"result_slots"`
-	ShortCircuited  bool                    `json:"short_circuited"`
 }
 
 // ApplyFailureKind is the closed discriminator over every public journal failure
@@ -147,6 +149,12 @@ type DBOSStepOutcomeV1 struct {
 	MutationDigest []byte                     `json:"mutation_digest"`
 	Success        *CanonicalMutationResultV1 `json:"success,omitempty"`
 	Failure        *CanonicalApplyFailureV1   `json:"failure,omitempty"`
+	// ShortCircuited is a PER-CALL §9.4 replay flag, not journal-anchored canonical
+	// state (LookupCommitted, a pure read, never short-circuits anything), so it lives
+	// BESIDE the canonical result rather than inside CanonicalMutationResultV1 — keeping
+	// that struct's equality honest for any future == / reflect.DeepEqual user. It is
+	// informational (audit) only; post-validation compares canonical results, never it.
+	ShortCircuited bool `json:"short_circuited,omitempty"`
 }
 
 // encodeDBOSApplySuccess encodes a committed reducer result as a closed success
@@ -200,8 +208,8 @@ func encodeDBOSApplySuccess(operation journal.OperationID, mutation []byte, resu
 			AnchorJournalID: int64(result.AnchorJournalID),
 			EmittedEvents:   emitted,
 			ResultSlots:     slots,
-			ShortCircuited:  result.ShortCircuited,
 		},
+		ShortCircuited: result.ShortCircuited,
 	}, nil
 }
 

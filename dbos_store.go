@@ -4,8 +4,8 @@ package provenance
 // one physical SQLite database with a DBOS durable-execution root (issue
 // dayvidpham/provenance#6), plus the StoreUnavailableError lifecycle error.
 //
-// ARCHITECTURE DEVIATION (Option B, architect ruling on aura-plugins-9y8gt, flagged
-// for UAT ratification):
+// ARCHITECTURE DEVIATION (Option B; architect ruling for issue #6, flagged for UAT
+// ratification):
 //
 // Issue #6 acceptance criterion #1 was written assuming Provenance persisted through
 // database/sql, so the borrowed *sql.DB could be the single literal handle and
@@ -35,6 +35,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 )
 
 // StoreUnavailableError is returned by every borrowed-tracker read or write once
@@ -170,11 +171,26 @@ func (b *borrowedTracker) available(op string) error {
 func (b *borrowedTracker) Close() error { return b.inner.Close() }
 
 // As returns the mutation Session over the shared database. In borrowed mode the
-// durable, lifecycle-gated mutation path is the DBOS adapter (NewDBOSAdapter over
-// this tracker), whose domain writes flow through the gated Journal().Apply; a
-// Session obtained here is the standalone convenience surface.
+// Session is liveness-gated exactly like every other public borrowed operation: each
+// verb (the journaled Create/Update/CloseTask/Atomic AND the un-journaled
+// AddEdge/RemoveEdge/AddLabel/RemoveLabel/AddComment) first checks the borrowed
+// handle's liveness and returns a StoreUnavailableError once the owning DBOS root has
+// shut down — closing the sentinel bypass a raw inner Session would otherwise leave
+// open. Its writes also inherit the shared-WAL transient-lock retry, so a Session
+// obtained here honors the same durability contract the adapter path does.
 func (b *borrowedTracker) As(actor ActorID, authority JournalID) *Session {
-	return b.inner.As(actor, authority)
+	sess := b.inner.As(actor, authority)
+	sess.gate = b.available
+	sess.retry = borrowedSessionRetry
+	return sess
+}
+
+// borrowedSessionRetry adapts retryOnTransientLock to the Session's error-only write
+// hook so a gated Session's domain writes absorb the same shared-WAL contention the
+// borrowed journal surface does.
+func borrowedSessionRetry(op string, fn func() error) error {
+	_, err := retryOnTransientLock(op, func() (struct{}, error) { return struct{}{}, fn() })
+	return err
 }
 
 // Journal returns the liveness-gated ordered global-journal surface.
@@ -256,21 +272,27 @@ func (b *borrowedTracker) RegisterHumanAgent(namespace, name, contact string) (H
 	if err := b.available("RegisterHumanAgent"); err != nil {
 		return HumanAgent{}, err
 	}
-	return b.inner.RegisterHumanAgent(namespace, name, contact)
+	return retryOnTransientLock("RegisterHumanAgent", func() (HumanAgent, error) {
+		return b.inner.RegisterHumanAgent(namespace, name, contact)
+	})
 }
 
 func (b *borrowedTracker) RegisterMLAgent(namespace string, role Role, provider Provider, modelName ModelID) (MLAgent, error) {
 	if err := b.available("RegisterMLAgent"); err != nil {
 		return MLAgent{}, err
 	}
-	return b.inner.RegisterMLAgent(namespace, role, provider, modelName)
+	return retryOnTransientLock("RegisterMLAgent", func() (MLAgent, error) {
+		return b.inner.RegisterMLAgent(namespace, role, provider, modelName)
+	})
 }
 
 func (b *borrowedTracker) RegisterSoftwareAgent(namespace, name, version, source string) (SoftwareAgent, error) {
 	if err := b.available("RegisterSoftwareAgent"); err != nil {
 		return SoftwareAgent{}, err
 	}
-	return b.inner.RegisterSoftwareAgent(namespace, name, version, source)
+	return retryOnTransientLock("RegisterSoftwareAgent", func() (SoftwareAgent, error) {
+		return b.inner.RegisterSoftwareAgent(namespace, name, version, source)
+	})
 }
 
 func (b *borrowedTracker) Agent(id AgentID) (Agent, error) {
@@ -305,21 +327,27 @@ func (b *borrowedTracker) StartActivity(agentID AgentID, phase Phase, stage Stag
 	if err := b.available("StartActivity"); err != nil {
 		return Activity{}, err
 	}
-	return b.inner.StartActivity(agentID, phase, stage, notes)
+	return retryOnTransientLock("StartActivity", func() (Activity, error) {
+		return b.inner.StartActivity(agentID, phase, stage, notes)
+	})
 }
 
 func (b *borrowedTracker) StartActivityWithID(id ActivityID, agentID AgentID, phase Phase, stage Stage, notes string) (Activity, error) {
 	if err := b.available("StartActivityWithID"); err != nil {
 		return Activity{}, err
 	}
-	return b.inner.StartActivityWithID(id, agentID, phase, stage, notes)
+	return retryOnTransientLock("StartActivityWithID", func() (Activity, error) {
+		return b.inner.StartActivityWithID(id, agentID, phase, stage, notes)
+	})
 }
 
 func (b *borrowedTracker) EndActivity(id ActivityID) (Activity, error) {
 	if err := b.available("EndActivity"); err != nil {
 		return Activity{}, err
 	}
-	return b.inner.EndActivity(id)
+	return retryOnTransientLock("EndActivity", func() (Activity, error) {
+		return b.inner.EndActivity(id)
+	})
 }
 
 func (b *borrowedTracker) Activities(agentID *AgentID) ([]Activity, error) {
@@ -363,14 +391,20 @@ func (j *borrowedJournal) RegisterNamespaceClaim(claim ActorNamespaceClaim) erro
 	if err := j.owner.available("Journal.RegisterNamespaceClaim"); err != nil {
 		return err
 	}
-	return j.inner.RegisterNamespaceClaim(claim)
+	_, err := retryOnTransientLock("Journal.RegisterNamespaceClaim", func() (struct{}, error) {
+		return struct{}{}, j.inner.RegisterNamespaceClaim(claim)
+	})
+	return err
 }
 
 func (j *borrowedJournal) RegisterFixedActorEntry(entry FixedActorEntry, fixedUUID [16]byte) error {
 	if err := j.owner.available("Journal.RegisterFixedActorEntry"); err != nil {
 		return err
 	}
-	return j.inner.RegisterFixedActorEntry(entry, fixedUUID)
+	_, err := retryOnTransientLock("Journal.RegisterFixedActorEntry", func() (struct{}, error) {
+		return struct{}{}, j.inner.RegisterFixedActorEntry(entry, fixedUUID)
+	})
+	return err
 }
 
 func (j *borrowedJournal) NamespaceClaims() ([]ActorNamespaceClaim, error) {
@@ -384,7 +418,9 @@ func (j *borrowedJournal) Apply(in OperationInput) (CommittedResult, error) {
 	if err := j.owner.available("Journal.Apply"); err != nil {
 		return CommittedResult{}, err
 	}
-	return j.inner.Apply(in)
+	return retryOnTransientLock("Journal.Apply", func() (CommittedResult, error) {
+		return j.inner.Apply(in)
+	})
 }
 
 func (j *borrowedJournal) LookupCommitted(op OperationID) (CommittedResult, error) {
@@ -412,14 +448,18 @@ func (j *borrowedJournal) ReplayProjections() (ReplayResult, error) {
 	if err := j.owner.available("Journal.ReplayProjections"); err != nil {
 		return ReplayResult{}, err
 	}
-	return j.inner.ReplayProjections()
+	return retryOnTransientLock("Journal.ReplayProjections", func() (ReplayResult, error) {
+		return j.inner.ReplayProjections()
+	})
 }
 
 func (j *borrowedJournal) MigrateLegacyBaseline(in MigrationInput) (MigrationResult, error) {
 	if err := j.owner.available("Journal.MigrateLegacyBaseline"); err != nil {
 		return MigrationResult{}, err
 	}
-	return j.inner.MigrateLegacyBaseline(in)
+	return retryOnTransientLock("Journal.MigrateLegacyBaseline", func() (MigrationResult, error) {
+		return j.inner.MigrateLegacyBaseline(in)
+	})
 }
 
 // AsStoreUnavailable extracts a *StoreUnavailableError from err if present, so
@@ -430,4 +470,57 @@ func AsStoreUnavailable(err error) (*StoreUnavailableError, bool) {
 		return e, true
 	}
 	return nil, false
+}
+
+// ---------------------------------------------------------------------------
+// Shared-WAL transient-lock retry (borrowed-store write layer)
+// ---------------------------------------------------------------------------
+
+// retryOnTransientLock runs a borrowed-store write, retrying ONLY a transient
+// shared-WAL BUSY/LOCKED condition with bounded exponential backoff. Because the
+// borrowed bridge connection and the DBOS system connection share one WAL file, any
+// domain write can momentarily lose SQLite's single-writer lock while DBOS's own
+// background writers (queue runner, checkpointer) hold it; busy_timeout plus this
+// Go-level retry absorb it. This lives in the borrowed-store layer so EVERY public
+// write surface on a borrowed tracker — the journal Apply, the gated Session's verbs,
+// and the direct agent/activity/registration writes — gets the same protection, not
+// just the one path the DBOS adapter step happens to drive.
+//
+// A locked write is atomically rolled back (nothing committed), so a §9.4 replay
+// short-circuit keeps a pinned-OperationID retry idempotent. Non-transient errors
+// (including a shut-down store's StoreUnavailableError) return immediately. After the
+// bounded attempts the last transient error is returned wrapped in an actionable
+// error that STILL unwraps to the underlying SQLite result code (errors.As), so the
+// adapter's infrastructure-vs-domain classifier keeps treating it as a transient
+// infrastructure condition and never checkpoints it as a permanent domain failure.
+func retryOnTransientLock[T any](op string, fn func() (T, error)) (T, error) {
+	const maxAttempts = 12
+	backoff := 5 * time.Millisecond
+	const maxBackoff = 250 * time.Millisecond
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		result, err := fn()
+		if err == nil {
+			return result, nil
+		}
+		if !isTransientLock(err) {
+			var zero T
+			return zero, err
+		}
+		lastErr = err
+		time.Sleep(backoff)
+		if backoff < maxBackoff {
+			backoff *= 2
+		}
+	}
+	var zero T
+	return zero, fmt.Errorf(
+		"provenance: borrowed-store %s could not acquire the shared-WAL write lock after %d bounded "+
+			"retries — where: borrowed SQLite bridge write contending with the DBOS system connection on the "+
+			"shared WAL; why: both connections serialize on SQLite's single-writer lock and the peer held it "+
+			"past the backoff budget; when: after exhausting exponential backoff (5ms→250ms per attempt); "+
+			"impact: nothing was committed (the fold rolled back atomically, so a retry is idempotent); fix: "+
+			"retry the same operation once contention subsides, pinning the OperationID so a §9.4 replay "+
+			"short-circuits to the original result: %w",
+		op, maxAttempts, lastErr)
 }

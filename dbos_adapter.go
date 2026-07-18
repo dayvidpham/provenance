@@ -13,7 +13,6 @@ package provenance
 import (
 	"context"
 	"fmt"
-	"time"
 
 	dbos "github.com/dbos-inc/dbos-transact-golang/dbos"
 
@@ -183,33 +182,16 @@ func (a *DBOSAdapter) applyWorkflow(wfCtx dbos.DBOSContext, input DBOSApplyInput
 	return outcome, nil
 }
 
-// foldDomainMutation runs the atomic journal fold, retrying only a transient WAL
-// lock with bounded backoff. The borrowed bridge and the DBOS system connection
-// share one WAL file, so a domain commit can momentarily lose the single-writer
-// lock; SQLite's busy_timeout plus this retry absorb it. A transient lock that is
-// atomically rolled back leaves nothing committed, so the §9.4 replay short-circuit
-// keeps the retry idempotent. After exhaustion the transient error is returned
-// unchanged for the caller to classify as infrastructure.
+// foldDomainMutation runs the atomic journal fold through the tracker's journal. The
+// shared-WAL transient-lock bounded retry lives in the borrowed-store layer
+// (retryOnTransientLock, applied by borrowedJournal.Apply and the gated Session), so
+// EVERY public write surface on the borrowed tracker absorbs contention with the DBOS
+// system connection — not just this adapter step. A transient lock that survives the
+// bounded retry returns unchanged (it still unwraps to the SQLite result code), so the
+// workflow's isInfrastructureError classifier propagates it on the Go-error channel
+// rather than checkpointing a recoverable condition as a permanent domain failure.
 func (a *DBOSAdapter) foldDomainMutation(in journal.OperationInput) (CommittedResult, error) {
-	const maxAttempts = 12
-	backoff := 5 * time.Millisecond
-	const maxBackoff = 250 * time.Millisecond
-	var lastErr error
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		result, err := a.tracker.Journal().Apply(in)
-		if err == nil {
-			return result, nil
-		}
-		if !isTransientLock(err) {
-			return CommittedResult{}, err
-		}
-		lastErr = err
-		time.Sleep(backoff)
-		if backoff < maxBackoff {
-			backoff *= 2
-		}
-	}
-	return CommittedResult{}, lastErr
+	return a.tracker.Journal().Apply(in)
 }
 
 // isTransientLock reports whether err is a retryable SQLite BUSY/LOCKED condition
@@ -235,12 +217,10 @@ func isInfrastructureError(err error) bool {
 // writes nothing; a divergence returns CheckpointDivergenceError and writes
 // nothing; an unknown lookup variant fails closed.
 func (a *DBOSAdapter) postValidate(in journal.OperationInput, outcome DBOSStepOutcomeV1) (CommittedResult, error) {
-	success, decodeErr := outcome.Decode()
-	if decodeErr != nil {
-		// A failure outcome surfaces its typed journal error here (matrix
-		// present-failure-outcome row); a malformed outcome fails closed.
-		return CommittedResult{}, decodeErr
-	}
+	// Guard outcome identity BEFORE trusting either arm (defense-in-depth parity): a
+	// mis-keyed/forged outcome — success OR failure — must not be attributed to this
+	// operation. Applying it symmetrically means a decoded FAILURE outcome cannot
+	// surface its typed error under the wrong operation either.
 	if outcome.OperationID != string(in.OperationID) {
 		return CommittedResult{}, &CheckpointDivergenceError{
 			Operation: in.OperationID,
@@ -250,6 +230,12 @@ func (a *DBOSAdapter) postValidate(in journal.OperationInput, outcome DBOSStepOu
 			Cause: fmt.Errorf("outcome operation %q != requested %q",
 				outcome.OperationID, in.OperationID),
 		}
+	}
+	success, decodeErr := outcome.Decode()
+	if decodeErr != nil {
+		// A failure outcome surfaces its typed journal error here (matrix
+		// present-failure-outcome row); a malformed outcome fails closed.
+		return CommittedResult{}, decodeErr
 	}
 
 	looked, err := a.tracker.Journal().LookupCommitted(in.OperationID)
@@ -348,10 +334,11 @@ func awaitWorkflowResult[T any](
 
 // canonicalResultsEqual reports whether two canonical results name the same
 // journal-anchored committed operation: identical anchor, ordered emitted-event
-// closure, and slot-sorted bindings. ShortCircuited is deliberately EXCLUDED — it
-// is a per-call replay flag (LookupCommitted, a pure read, is never a short-circuit
-// of anything), not journal-anchored state, so comparing it would spuriously
-// diverge a legitimate §9.4 replay against its own committed record.
+// closure, and slot-sorted bindings. CanonicalMutationResultV1 holds only
+// journal-anchored fields (the per-call §9.4 ShortCircuited flag now lives on
+// DBOSStepOutcomeV1, not inside the canonical result), so this comparison — like the
+// struct's own == — never spuriously diverges a legitimate replay against its own
+// committed record.
 func canonicalResultsEqual(a, b CanonicalMutationResultV1) bool {
 	if a.AnchorJournalID != b.AnchorJournalID {
 		return false

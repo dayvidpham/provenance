@@ -109,6 +109,58 @@ func TestBorrowed_PostShutdown_StoreUnavailable(t *testing.T) {
 	}
 }
 
+// TestBorrowed_PostShutdown_SessionGated proves a Session obtained from a borrowed
+// tracker BEFORE the owning DBOS root shuts down is liveness-gated on EVERY verb
+// after shutdown — the sentinel-bypass the raw inner Session would otherwise leave
+// open (issue #6, review axes B/C). A Session across a shutdown boundary is ordinary
+// (a long-lived actor session, or one obtained just before a graceful redeploy), and
+// per the relational contract Session is the PRIMARY mutation path, so this is the
+// primary write surface, not a niche escape hatch.
+func TestBorrowed_PostShutdown_SessionGated(t *testing.T) {
+	db, _ := openFileDB(t)
+	tr, err := provenance.OpenBorrowedSQLite(db)
+	if err != nil {
+		t.Fatalf("OpenBorrowedSQLite: %v", err)
+	}
+	// Obtain the Session BEFORE shutdown.
+	sess := tr.As(nonZeroActor(), provenance.JournalID(1))
+
+	// The DBOS root shuts down, closing the borrowed handle (its pool).
+	if err := db.Close(); err != nil {
+		t.Fatalf("close borrowed handle: %v", err)
+	}
+
+	tid := provenance.TaskID{} // the liveness gate fires before the id is ever used
+	agentID := provenance.AgentID{}
+
+	_, createErr := sess.Create("aura", "t", "", provenance.TaskTypeTask, provenance.PriorityMedium, provenance.PhaseUnscoped)
+	mustStoreUnavailable(t, createErr, "Session.Create")
+
+	_, updateErr := sess.Update(tid, provenance.UpdateFields{})
+	mustStoreUnavailable(t, updateErr, "Session.Update")
+
+	_, closeErr := sess.CloseTask(tid, "done")
+	mustStoreUnavailable(t, closeErr, "Session.CloseTask")
+
+	_, atomicErr := sess.Atomic(func(op *provenance.Operation) {
+		op.CreateTask(tid, "t", "", provenance.TaskTypeTask, provenance.PriorityMedium, provenance.PhaseUnscoped)
+	})
+	mustStoreUnavailable(t, atomicErr, "Session.Atomic")
+
+	mustStoreUnavailable(t, sess.AddEdge(tid, "aura--x", provenance.EdgeBlockedBy), "Session.AddEdge")
+	mustStoreUnavailable(t, sess.RemoveEdge(tid, "aura--x", provenance.EdgeBlockedBy), "Session.RemoveEdge")
+	mustStoreUnavailable(t, sess.AddLabel(tid, "label"), "Session.AddLabel")
+	mustStoreUnavailable(t, sess.RemoveLabel(tid, "label"), "Session.RemoveLabel")
+
+	_, commentErr := sess.AddComment(tid, agentID, "body")
+	mustStoreUnavailable(t, commentErr, "Session.AddComment")
+
+	// Cleanup after shutdown is safe (closes only the bridge).
+	if err := tr.Close(); err != nil {
+		t.Errorf("Close after shutdown: %v", err)
+	}
+}
+
 func TestBorrowed_MigrationsCoexist_FreshExistingRepeat(t *testing.T) {
 	db, _ := openFileDB(t)
 	// Fresh open applies the schema.

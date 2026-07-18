@@ -52,11 +52,41 @@ type Session struct {
 	tr        *sqliteTracker
 	actor     ActorID
 	authority JournalID
+	// gate, when non-nil, is the borrowed-handle liveness precheck a borrowed Tracker
+	// installs (borrowedTracker.As): every public verb calls it FIRST so, once the
+	// owning DBOS root has shut down, every Session mutation returns a
+	// StoreUnavailableError instead of writing through the still-open bridge
+	// connection. A standalone Session (OpenSQLite/OpenMemory) leaves it nil.
+	gate func(op string) error
+	// retry, when non-nil, wraps a borrowed Session's domain writes in the shared-WAL
+	// transient-lock bounded retry so they absorb contention with the DBOS system
+	// connection exactly as the borrowed journal surface does. Nil for a standalone
+	// Session (no shared WAL, nothing to contend with).
+	retry func(op string, fn func() error) error
 }
 
 // As implements Tracker.As.
 func (t *sqliteTracker) As(actor ActorID, authority JournalID) *Session {
 	return &Session{tr: t, actor: actor, authority: authority}
+}
+
+// checkGate runs the borrowed liveness precheck (a no-op for a standalone Session),
+// returning a *StoreUnavailableError when the borrowed handle's owning root has shut
+// down. Every public Session verb calls it before touching the store.
+func (s *Session) checkGate(op string) error {
+	if s.gate == nil {
+		return nil
+	}
+	return s.gate("Session." + op)
+}
+
+// writeThrough runs a borrowed Session's domain write under the shared-WAL
+// transient-lock retry (a direct pass-through for a standalone Session).
+func (s *Session) writeThrough(op string, fn func() error) error {
+	if s.retry == nil {
+		return fn()
+	}
+	return s.retry("Session."+op, fn)
 }
 
 // ErrGenesisRequired is returned by a journaled Session verb invoked against a journal
@@ -150,7 +180,7 @@ func (s *Session) requireInitialized(verb string) error {
 // Session's actor and authority.
 func (s *Session) applyOne(cfg applyConfig, effects []Effect) (CommittedResult, error) {
 	auth := s.authority
-	return s.tr.db.Apply(OperationInput{
+	in := OperationInput{
 		OperationID:        cfg.opID,
 		ActorID:            s.actor,
 		AuthorityJournalID: &auth,
@@ -158,7 +188,14 @@ func (s *Session) applyOne(cfg applyConfig, effects []Effect) (CommittedResult, 
 		MutationDigest:     cfg.mutationDigest,
 		RecordedAt:         time.Now().UTC().UnixNano(),
 		Effects:            effects,
+	}
+	var res CommittedResult
+	err := s.writeThrough("Apply", func() error {
+		var e error
+		res, e = s.tr.db.Apply(in)
+		return e
 	})
+	return res, err
 }
 
 // ---------------------------------------------------------------------------
@@ -171,6 +208,9 @@ func (s *Session) applyOne(cfg applyConfig, effects []Effect) (CommittedResult, 
 // direct write. Returns ErrInvalidID for an empty namespace, ErrGenesisRequired if no
 // genesis authority exists yet.
 func (s *Session) Create(namespace, title, description string, taskType TaskType, priority Priority, phase Phase, opts ...ApplyOption) (Task, error) {
+	if err := s.checkGate("Create"); err != nil {
+		return Task{}, err
+	}
 	if namespace == "" {
 		return Task{}, fmt.Errorf(
 			"%w: Session.Create — namespace is empty — "+
@@ -228,6 +268,9 @@ func (s *Session) Create(namespace, title, description string, taskType TaskType
 // Owner is rejected with an actionable error. Returns ErrNotFound if the task does not
 // exist, ErrGenesisRequired if no genesis authority exists yet.
 func (s *Session) Update(id TaskID, fields UpdateFields, opts ...ApplyOption) (Task, error) {
+	if err := s.checkGate("Update"); err != nil {
+		return Task{}, err
+	}
 	if err := s.requireInitialized("Update"); err != nil {
 		return Task{}, err
 	}
@@ -292,6 +335,9 @@ func (s *Session) Update(id TaskID, fields UpdateFields, opts ...ApplyOption) (T
 // exist, ErrAlreadyClosed if it is already closed, ErrGenesisRequired if no genesis
 // authority exists yet.
 func (s *Session) CloseTask(id TaskID, reason string, opts ...ApplyOption) (Task, error) {
+	if err := s.checkGate("CloseTask"); err != nil {
+		return Task{}, err
+	}
 	if err := s.requireInitialized("CloseTask"); err != nil {
 		return Task{}, err
 	}
@@ -398,27 +444,48 @@ func taskSlotID(res CommittedResult, slot string) (TaskID, bool) {
 // AddEdge creates a typed edge from sourceID to targetID (un-journaled, §6). For
 // EdgeBlockedBy, cycle detection is enforced (ErrCycleDetected).
 func (s *Session) AddEdge(sourceID TaskID, targetID string, kind EdgeKind) error {
-	return s.tr.addEdge(sourceID, targetID, kind)
+	if err := s.checkGate("AddEdge"); err != nil {
+		return err
+	}
+	return s.writeThrough("AddEdge", func() error { return s.tr.addEdge(sourceID, targetID, kind) })
 }
 
 // RemoveEdge deletes the edge from sourceID to targetID (un-journaled, §6). Idempotent.
 func (s *Session) RemoveEdge(sourceID TaskID, targetID string, kind EdgeKind) error {
-	return s.tr.removeEdge(sourceID, targetID, kind)
+	if err := s.checkGate("RemoveEdge"); err != nil {
+		return err
+	}
+	return s.writeThrough("RemoveEdge", func() error { return s.tr.removeEdge(sourceID, targetID, kind) })
 }
 
 // AddLabel attaches a label to a task (un-journaled, §6). Idempotent.
 func (s *Session) AddLabel(id TaskID, label string) error {
-	return s.tr.addLabel(id, label)
+	if err := s.checkGate("AddLabel"); err != nil {
+		return err
+	}
+	return s.writeThrough("AddLabel", func() error { return s.tr.addLabel(id, label) })
 }
 
 // RemoveLabel detaches a label from a task (un-journaled, §6). Idempotent.
 func (s *Session) RemoveLabel(id TaskID, label string) error {
-	return s.tr.removeLabel(id, label)
+	if err := s.checkGate("RemoveLabel"); err != nil {
+		return err
+	}
+	return s.writeThrough("RemoveLabel", func() error { return s.tr.removeLabel(id, label) })
 }
 
 // AddComment adds a comment to a task authored by authorID (un-journaled, §6).
 func (s *Session) AddComment(id TaskID, authorID AgentID, body string) (Comment, error) {
-	return s.tr.addComment(id, authorID, body)
+	if err := s.checkGate("AddComment"); err != nil {
+		return Comment{}, err
+	}
+	var c Comment
+	err := s.writeThrough("AddComment", func() error {
+		var e error
+		c, e = s.tr.addComment(id, authorID, body)
+		return e
+	})
+	return c, err
 }
 
 // ---------------------------------------------------------------------------
@@ -474,6 +541,9 @@ func (o *Operation) EndEpisode(assignment AssignmentID, task TaskID) *Operation 
 // order with per-effect authorization (§9.3). It returns the committed result (anchor,
 // emitted-event closure, and result-slot bindings). An empty operation is rejected.
 func (s *Session) Atomic(build func(op *Operation), opts ...ApplyOption) (CommittedResult, error) {
+	if err := s.checkGate("Atomic"); err != nil {
+		return CommittedResult{}, err
+	}
 	if err := s.requireInitialized("Atomic"); err != nil {
 		return CommittedResult{}, err
 	}
