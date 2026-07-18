@@ -21,6 +21,7 @@ import (
 
 	dbsqlite "github.com/dayvidpham/provenance/internal/sqlite"
 	"github.com/dayvidpham/provenance/internal/testcorpus"
+	"github.com/google/uuid"
 )
 
 // s13Operators is the closed registry of executable S1.3 operators. Its key set
@@ -71,6 +72,11 @@ var s13Operators = map[testcorpus.OperatorName]s11Handler{
 	"fsm-rejects-closed-to-in-progress": opFSMRejectsClosedToInProgress,
 	"fsm-stopped-transition-converges":  opFSMStoppedTransitionConverges,
 	"fsm-forced-coercion-converges":     opFSMForcedCoercionConverges,
+	// mutation_families.yaml (§6 amendment) — journaled edges/labels/comments
+	"mutation-family-who-provenance":        opMutationFamilyWhoProvenance,
+	"mutation-family-unauthorized-rejected": opMutationFamilyUnauthorizedRejected,
+	"mutation-family-projections-replay":    opMutationFamilyProjectionsReplay,
+	"journaled-edge-grants-no-authority":    opJournaledEdgeGrantsNoAuthority,
 }
 
 // ---------------------------------------------------------------------------
@@ -1496,6 +1502,223 @@ func opFSMForcedCoercionConverges(t *testing.T, input, expected anyMap, _ testco
 	// identically, and converges on the coerced in_progress status.
 	if _, err := env.tr.Journal().ReplayProjections(); err != nil {
 		return fmt.Errorf("from-empty replay after forced coercion diverged: %w", err)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// mutation_families.yaml — journaled edges/labels/comments (§6 amendment)
+// ---------------------------------------------------------------------------
+
+// opMutationFamilyWhoProvenance adds an edge, a label, and a comment under the bootstrap
+// authority and asserts each is journaled as its fixed per-family kind, attributed to the
+// committing actor at a definite journal position, with operands decodable from the
+// payload (who-provenance), and that the domain projections take effect.
+func opMutationFamilyWhoProvenance(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
+	env := newOpsEnv(t)
+	boot := env.genesis(t, "op-genesis")
+	src := env.taskFor(t, "src")
+	tgt := env.taskFor(t, "tgt")
+	commentID := CommentID{Namespace: src.Namespace, UUID: uuid.Must(uuid.NewV7())}
+	if _, err := env.tr.Journal().Apply(OperationInput{
+		OperationID: "op-mf-writes", ActorID: env.actor, AuthorityJournalID: &boot,
+		CommandDigest: env.digest("mfc"), MutationDigest: env.digest("mfm"),
+		Effects: []Effect{
+			{Sort: EffectEdgeAdd, TaskID: src, EdgeTargetID: tgt.String(), EdgeRelKind: EdgeBlockedBy},
+			{Sort: EffectLabelAdd, TaskID: src, Label: "priority"},
+			{Sort: EffectCommentAdd, TaskID: src, CommentIdentity: commentID, CommentAuthor: env.actor, CommentBody: "looks good"},
+		},
+	}); err != nil {
+		return fmt.Errorf("journal edge/label/comment: %w", err)
+	}
+	// Who-provenance for the edge: the journal row names the committer, a definite
+	// position, and its operands.
+	page, err := env.tr.Journal().QueryTaskEvents(JournalQueryV1{
+		TaskIDs: []TaskID{src}, EventKinds: []EventKind{EventKindEdgeAdded},
+	})
+	if err != nil {
+		return err
+	}
+	if len(page.Events) != 1 {
+		return fmt.Errorf("edge-added events = %d, want 1", len(page.Events))
+	}
+	ev := page.Events[0]
+	if ev.ActorID.String() != env.actor.String() {
+		return fmt.Errorf("edge-added committer = %s, want %s", ev.ActorID.String(), env.actor.String())
+	}
+	if ev.JournalID == 0 {
+		return fmt.Errorf("edge-added carries no journal position")
+	}
+	ep, err := DecodeEdgeMutationPayload(ev.Payload)
+	if err != nil {
+		return err
+	}
+	if ep.Target != tgt.String() || ep.EdgeKind != EdgeBlockedBy {
+		return fmt.Errorf("edge payload = %+v, want target=%s blocked_by", ep, tgt.String())
+	}
+	// The domain projections took effect.
+	edges, err := env.tr.Edges(src, nil)
+	if err != nil || len(edges) != 1 {
+		return fmt.Errorf("Edges(src) = %v (err %v), want 1", edges, err)
+	}
+	labels, err := env.tr.Labels(src)
+	if err != nil || len(labels) != 1 {
+		return fmt.Errorf("Labels(src) = %v (err %v), want 1", labels, err)
+	}
+	comments, err := env.tr.Comments(src)
+	if err != nil || len(comments) != 1 {
+		return fmt.Errorf("Comments(src) = %v (err %v), want 1", comments, err)
+	}
+	return nil
+}
+
+// opMutationFamilyUnauthorizedRejected proves each mutation family is subject to the same
+// per-effect authorization as a task event (§9.3): an assignment authority scoped to
+// task X governs nothing on task Y, so every edge/label/comment mutation on Y under that
+// authority fails closed with ErrAuthorityScope and commits nothing.
+func opMutationFamilyUnauthorizedRejected(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
+	env := newOpsEnv(t)
+	boot := env.genesis(t, "op-genesis")
+	taskX := env.taskFor(t, "x")
+	taskY := env.taskFor(t, "y")
+	occupant := env.actorFor(t, "occ")
+	// An assignment authority whose episode is on taskX — it governs taskX only.
+	auth := env.startEpisode(t, "op-auth-x", boot, taskX, "AUTH-X", occupant)
+	commentID := CommentID{Namespace: taskY.Namespace, UUID: uuid.Must(uuid.NewV7())}
+	families := []struct {
+		name string
+		eff  Effect
+	}{
+		{"edge-add", Effect{Sort: EffectEdgeAdd, TaskID: taskY, EdgeTargetID: taskX.String(), EdgeRelKind: EdgeBlockedBy}},
+		{"edge-remove", Effect{Sort: EffectEdgeRemove, TaskID: taskY, EdgeTargetID: taskX.String(), EdgeRelKind: EdgeBlockedBy}},
+		{"label-add", Effect{Sort: EffectLabelAdd, TaskID: taskY, Label: "unauthorized"}},
+		{"label-remove", Effect{Sort: EffectLabelRemove, TaskID: taskY, Label: "unauthorized"}},
+		{"comment-add", Effect{Sort: EffectCommentAdd, TaskID: taskY, CommentIdentity: commentID, CommentAuthor: occupant, CommentBody: "no"}},
+	}
+	for i, f := range families {
+		_, err := env.tr.Journal().Apply(OperationInput{
+			OperationID: OperationID(fmt.Sprintf("op-mf-unauth-%d", i)), ActorID: env.actor, AuthorityJournalID: &auth,
+			CommandDigest: env.digest(fmt.Sprintf("uc%d", i)), MutationDigest: env.digest(fmt.Sprintf("um%d", i)),
+			Effects: []Effect{f.eff},
+		})
+		if e := expectRejected(err, ErrAuthorityScope, f.name+" on an ungoverned task"); e != nil {
+			return e
+		}
+	}
+	// Fail-closed: no edge/label/comment landed on taskY.
+	edges, err := env.tr.Edges(taskY, nil)
+	if err != nil {
+		return err
+	}
+	if len(edges) != 0 {
+		return fmt.Errorf("ungoverned edge attempts left %d edges, want 0", len(edges))
+	}
+	labels, err := env.tr.Labels(taskY)
+	if err != nil {
+		return err
+	}
+	if len(labels) != 0 {
+		return fmt.Errorf("ungoverned label attempts left %d labels, want 0", len(labels))
+	}
+	return nil
+}
+
+// opMutationFamilyProjectionsReplay proves the edge/label/comment domain projections are
+// re-derivable solely from ordered journal history (§6, §15): after a sequence of adds and
+// removes, Open's from-empty full replay reconstructs the identical projections and
+// converges with no divergence.
+func opMutationFamilyProjectionsReplay(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
+	env := newOpsEnv(t)
+	boot := env.genesis(t, "op-genesis")
+	a := env.taskFor(t, "a")
+	b := env.taskFor(t, "b")
+	c := env.taskFor(t, "c")
+	commentID := CommentID{Namespace: a.Namespace, UUID: uuid.Must(uuid.NewV7())}
+	// Add a->b and a->c blocked_by edges, two labels, one comment.
+	if _, err := env.tr.Journal().Apply(OperationInput{
+		OperationID: "op-mf-adds", ActorID: env.actor, AuthorityJournalID: &boot,
+		CommandDigest: env.digest("addc"), MutationDigest: env.digest("addm"),
+		Effects: []Effect{
+			{Sort: EffectEdgeAdd, TaskID: a, EdgeTargetID: b.String(), EdgeRelKind: EdgeBlockedBy},
+			{Sort: EffectEdgeAdd, TaskID: a, EdgeTargetID: c.String(), EdgeRelKind: EdgeBlockedBy},
+			{Sort: EffectLabelAdd, TaskID: a, Label: "keep"},
+			{Sort: EffectLabelAdd, TaskID: a, Label: "drop"},
+			{Sort: EffectCommentAdd, TaskID: a, CommentIdentity: commentID, CommentAuthor: env.actor, CommentBody: "hi"},
+		},
+	}); err != nil {
+		return fmt.Errorf("adds: %w", err)
+	}
+	// Remove one edge and one label.
+	if _, err := env.tr.Journal().Apply(OperationInput{
+		OperationID: "op-mf-removes", ActorID: env.actor, AuthorityJournalID: &boot,
+		CommandDigest: env.digest("remc"), MutationDigest: env.digest("remm"),
+		Effects: []Effect{
+			{Sort: EffectEdgeRemove, TaskID: a, EdgeTargetID: c.String(), EdgeRelKind: EdgeBlockedBy},
+			{Sort: EffectLabelRemove, TaskID: a, Label: "drop"},
+		},
+	}); err != nil {
+		return fmt.Errorf("removes: %w", err)
+	}
+	// Live projection: one edge (a->b), one label (keep), one comment.
+	edges, err := env.tr.Edges(a, nil)
+	if err != nil || len(edges) != 1 || edges[0].TargetID != b.String() {
+		return fmt.Errorf("Edges(a) = %v (err %v), want [a->b]", edges, err)
+	}
+	labels, err := env.tr.Labels(a)
+	if err != nil || len(labels) != 1 || labels[0] != "keep" {
+		return fmt.Errorf("Labels(a) = %v (err %v), want [keep]", labels, err)
+	}
+	// From-empty replay re-derives the identical edge/label/comment projections.
+	if _, err := env.tr.Journal().ReplayProjections(); err != nil {
+		return fmt.Errorf("from-empty replay of edge/label/comment projections diverged: %w", err)
+	}
+	return nil
+}
+
+// opJournaledEdgeGrantsNoAuthority re-pins §14.5 under the §6 amendment: a blocked_by
+// edge's CREATION is now journaled, but the edge still delegates NO ownership authority —
+// an assignment authority on the source task does not reach the target merely because a
+// blocked_by edge connects them.
+func opJournaledEdgeGrantsNoAuthority(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
+	env := newOpsEnv(t)
+	boot := env.genesis(t, "op-genesis")
+	src := env.taskFor(t, "src")
+	tgt := env.taskFor(t, "tgt")
+	occupant := env.actorFor(t, "occ")
+	// Journal a blocked_by edge src->tgt under the bootstrap authority.
+	if _, err := env.tr.Journal().Apply(OperationInput{
+		OperationID: "op-edge-journaled", ActorID: env.actor, AuthorityJournalID: &boot,
+		CommandDigest: env.digest("ec"), MutationDigest: env.digest("em"),
+		Effects: []Effect{{Sort: EffectEdgeAdd, TaskID: src, EdgeTargetID: tgt.String(), EdgeRelKind: EdgeBlockedBy}},
+	}); err != nil {
+		return fmt.Errorf("journal blocked_by edge: %w", err)
+	}
+	// The edge IS journaled (its creation is recorded).
+	page, err := env.tr.Journal().QueryTaskEvents(JournalQueryV1{
+		TaskIDs: []TaskID{src}, EventKinds: []EventKind{EventKindEdgeAdded},
+	})
+	if err != nil {
+		return err
+	}
+	if len(page.Events) != 1 {
+		return fmt.Errorf("expected the blocked_by edge creation to be journaled, found %d rows", len(page.Events))
+	}
+	// An assignment authority on src governs src, but the edge grants it NO reach to tgt.
+	auth := env.startEpisode(t, "op-auth-src", boot, src, "AUTH-SRC", occupant)
+	governsTgt, err := env.tr.Journal().AuthorityGovernsTaskAt(auth, tgt, JournalID(1<<30))
+	if err != nil {
+		return err
+	}
+	if governsTgt {
+		return fmt.Errorf("assignment authority on src reached tgt through a blocked_by edge — §14.5 violated")
+	}
+	// Sanity: the same authority DOES govern its own episode's task (src).
+	governsSrc, err := env.tr.Journal().AuthorityGovernsTaskAt(auth, src, JournalID(1<<30))
+	if err != nil {
+		return err
+	}
+	if !governsSrc {
+		return fmt.Errorf("assignment authority does not govern its own episode task src")
 	}
 	return nil
 }

@@ -135,6 +135,20 @@ const (
 	// the fold like the birth metadata EventKindTaskCreated writes, and are NOT part of
 	// the §15 owner/status/watermark convergence set.
 	EventKindTaskUpdated EventKind = "provenance.task.updated"
+
+	// Journaled relationship / annotation mutation-family kinds (§6, as amended by #5).
+	// Each is a fixed per-family kind — never a payload-generalized dispatch — carried on
+	// a journal_task_events row, so who added/removed an edge/label/comment, under which
+	// authority, at which journal position is queryable from the journal (who-provenance).
+	// The operands (edge target/kind, label text, comment id/author/body) live in the
+	// row payload; the shared reducer folds them into the edges/labels/comments domain
+	// projections (§6, §15 convergence), never into status. They are NON-lifecycle, so
+	// StatusForEventKind returns ok=false for them.
+	EventKindEdgeAdded    EventKind = "provenance.edge.added"
+	EventKindEdgeRemoved  EventKind = "provenance.edge.removed"
+	EventKindLabelAdded   EventKind = "provenance.label.added"
+	EventKindLabelRemoved EventKind = "provenance.label.removed"
+	EventKindCommentAdded EventKind = "provenance.comment.added"
 )
 
 // StatusForEventKind reports the status a lifecycle task-event kind projects to,

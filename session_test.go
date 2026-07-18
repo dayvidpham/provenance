@@ -320,7 +320,10 @@ func TestSession_PinnedOperationIDIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestSession_UnjournaledVerbsWriteDomainOnly(t *testing.T) {
+// TestSession_RelationshipVerbsAreJournaled pins the §6 amendment: edge/label/comment
+// verbs journal one mutation-family event each (who-provenance), the domain projections
+// take effect, and the whole history replays from empty (convergence).
+func TestSession_RelationshipVerbsAreJournaled(t *testing.T) {
 	tr, actor := newSessionTracker(t)
 	boot := establishGenesis(t, tr, actor)
 	s := tr.As(actor, boot)
@@ -349,11 +352,36 @@ func TestSession_UnjournaledVerbsWriteDomainOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("QueryTaskEvents: %v", err)
 	}
-	// §6: relationship/annotation writes journal nothing.
-	if len(after.Events) != len(before.Events) {
-		t.Errorf("un-journaled verbs added %d journal rows, want 0", len(after.Events)-len(before.Events))
+	// §6 amendment: each relationship/annotation verb journals exactly one row.
+	if got := len(after.Events) - len(before.Events); got != 3 {
+		t.Errorf("relationship verbs journaled %d rows, want 3 (edge+label+comment)", got)
 	}
-	// But the domain writes took effect.
+	// Who-provenance: the edge-add row is attributed to the committing actor at a
+	// definite journal position, and its operands decode from the journal payload.
+	edgePage, err := tr.Journal().QueryTaskEvents(provenance.JournalQueryV1{
+		TaskIDs: []provenance.TaskID{b.ID}, EventKinds: []provenance.EventKind{provenance.EventKindEdgeAdded},
+	})
+	if err != nil {
+		t.Fatalf("QueryTaskEvents(edge): %v", err)
+	}
+	if len(edgePage.Events) != 1 {
+		t.Fatalf("edge-added events = %d, want 1", len(edgePage.Events))
+	}
+	ev := edgePage.Events[0]
+	if ev.ActorID.String() != actor.String() {
+		t.Errorf("edge-added committer = %s, want %s", ev.ActorID.String(), actor.String())
+	}
+	if ev.JournalID == 0 {
+		t.Errorf("edge-added has no journal position")
+	}
+	edgePayload, err := provenance.DecodeEdgeMutationPayload(ev.Payload)
+	if err != nil {
+		t.Fatalf("decode edge payload: %v", err)
+	}
+	if edgePayload.Target != a.ID.String() || edgePayload.EdgeKind != provenance.EdgeBlockedBy {
+		t.Errorf("edge payload = %+v, want target=%s kind=blocked_by", edgePayload, a.ID.String())
+	}
+	// The domain projections took effect.
 	edges, err := tr.Edges(b.ID, nil)
 	if err != nil || len(edges) != 1 {
 		t.Errorf("Edges(b) = %v (err %v), want 1 edge", edges, err)
@@ -361,6 +389,15 @@ func TestSession_UnjournaledVerbsWriteDomainOnly(t *testing.T) {
 	labels, err := tr.Labels(a.ID)
 	if err != nil || len(labels) != 1 {
 		t.Errorf("Labels(a) = %v (err %v), want 1 label", labels, err)
+	}
+	comments, err := tr.Comments(a.ID)
+	if err != nil || len(comments) != 1 {
+		t.Errorf("Comments(a) = %v (err %v), want 1 comment", comments, err)
+	}
+	// The whole journaled history — task births plus edge/label/comment — replays from
+	// empty and converges (the domain projections are journal-reproducible).
+	if _, err := tr.Journal().ReplayProjections(); err != nil {
+		t.Errorf("ReplayProjections after relationship verbs: %v", err)
 	}
 }
 

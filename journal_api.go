@@ -97,6 +97,13 @@ const (
 	EffectEvidence           = journal.EffectEvidence
 	EffectTaskCreate         = journal.EffectTaskCreate
 
+	// Journaled relationship / annotation mutation-family effect sorts (§6 amendment).
+	EffectEdgeAdd     = journal.EffectEdgeAdd
+	EffectEdgeRemove  = journal.EffectEdgeRemove
+	EffectLabelAdd    = journal.EffectLabelAdd
+	EffectLabelRemove = journal.EffectLabelRemove
+	EffectCommentAdd  = journal.EffectCommentAdd
+
 	// Committed-result variants (§3.2, §9.4).
 	CommittedAbsent   = journal.CommittedAbsent
 	CommittedExact    = journal.CommittedExact
@@ -117,6 +124,13 @@ const (
 	// EventKindTaskUpdated records a materialized-metadata mutation; it is NOT a
 	// status-changing lifecycle kind (§8.1).
 	EventKindTaskUpdated = journal.EventKindTaskUpdated
+
+	// Journaled relationship / annotation mutation-family kinds (§6 amendment).
+	EventKindEdgeAdded    = journal.EventKindEdgeAdded
+	EventKindEdgeRemoved  = journal.EventKindEdgeRemoved
+	EventKindLabelAdded   = journal.EventKindLabelAdded
+	EventKindLabelRemoved = journal.EventKindLabelRemoved
+	EventKindCommentAdded = journal.EventKindCommentAdded
 )
 
 // Typed context and validation constructors.
@@ -145,6 +159,16 @@ var (
 	TransitionLifecycleKinds      = journal.TransitionLifecycleKinds
 	EncodeForcedTransitionPayload = journal.EncodeForcedTransitionPayload
 	DecodeForcedTransition        = journal.DecodeForcedTransition
+
+	// Journaled relationship / annotation mutation-family surface (§6 amendment):
+	// classification + payload codecs, re-exported so who-provenance queries can decode
+	// an edge/label/comment row's operands straight from the journal.
+	IsMutationFamilyKind         = journal.IsMutationFamilyKind
+	MutationFamilyKinds          = journal.MutationFamilyKinds
+	MutationFamilyKindForSort    = journal.MutationFamilyKindForSort
+	DecodeEdgeMutationPayload    = journal.DecodeEdgeMutationPayload
+	DecodeLabelMutationPayload   = journal.DecodeLabelMutationPayload
+	DecodeCommentMutationPayload = journal.DecodeCommentMutationPayload
 )
 
 // Status-FSM typed error + sentinel (§8.1).

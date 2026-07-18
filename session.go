@@ -20,14 +20,14 @@ package provenance
 // reproducible from history.
 //
 // Relationship / annotation verbs — AddEdge, RemoveEdge, AddLabel, RemoveLabel,
-// AddComment — are UN-JOURNALED direct domain writes. The ratified contract §6
-// deliberately scopes the journal to the seven task-lifecycle mutation families
-// (+authority/decision/evidence) and classifies typed dependency edges as relationship
-// targets; labels and comments carry no journal-provenance model. These verbs therefore
-// write the domain tables directly and record nothing in the journal. Their signatures
-// are forward-compatible with a future (user-approved, separately reviewed) decision to
-// journal them as first-class effect sorts (contract §6 amendment): adding a variadic
-// option parameter or an internal journaling step is a non-breaking upgrade.
+// AddComment — are ALSO journaled (§6, as amended by #5): each commits one typed
+// mutation-family effect (provenance.edge.added/removed, provenance.label.added/removed,
+// provenance.comment.added) under the same per-effect authorization discipline as task
+// events, so who added/removed an edge/label/comment, under which authority, at which
+// journal position, is queryable from the journal (who-provenance). The edges/labels/
+// comments domain tables are shared-reducer projections re-derivable from journal history;
+// the verb signatures are unchanged. A journaled edge's CREATION being recorded does NOT
+// make the edge grant authority — §14.5 (a blocked_by edge delegates no ownership) stands.
 //
 // Retry caveat (LOUD): every journaled verb defaults to a fresh UUIDv7 OperationID, so
 // a naive retry after an ambiguous failure commits a SECOND operation. To make a
@@ -417,40 +417,101 @@ func taskSlotID(res CommittedResult, slot string) (TaskID, bool) {
 }
 
 // ---------------------------------------------------------------------------
-// Un-journaled relationship / annotation verbs (contract §6)
+// Journaled relationship / annotation verbs (contract §6, as amended by #5)
 // ---------------------------------------------------------------------------
 //
-// These five verbs are direct domain writes and record NOTHING in the journal.
-// Typed dependency edges are §6 relationship targets (explicitly rejected as an
-// authorization-reach mechanism in §14.5), and labels and comments have no
-// journal-provenance model. Their behavior mirrors the pre-Session tracker verbs
-// exactly; only the provenance status differs. See the package doc for the
-// forward-compatibility note on a future journaling upgrade.
+// These five verbs are journaled single-effect wrappers over Apply: each commits one
+// typed mutation-family effect (provenance.edge.added/removed, provenance.label.added/
+// removed, provenance.comment.added) under this Session's actor and authority, so who
+// added/removed the relationship, under which authority, at which journal position is
+// queryable from the journal (who-provenance). The signatures are UNCHANGED from the
+// pre-#5 un-journaled forms. The edges/labels/comments domain tables are shared-reducer
+// projections re-derivable from journal history (§6, §15). Authorization is the same
+// per-effect discipline as a task event (§9.3): the source/subject task must be governed.
+// A journaled edge's CREATION being recorded does NOT make the edge grant authority —
+// §14.5 (a blocked_by edge delegates no ownership) is unchanged.
 
-// AddEdge creates a typed edge from sourceID to targetID (un-journaled, §6). For
-// EdgeBlockedBy, cycle detection is enforced (ErrCycleDetected).
+// AddEdge journals a typed edge from sourceID to targetID (§6). For EdgeBlockedBy, the
+// fold enforces cycle detection (ErrCycleDetected). Adding an edge that already exists is
+// a journal-honest re-assertion whose projection is idempotent.
 func (s *Session) AddEdge(sourceID TaskID, targetID string, kind EdgeKind) error {
-	return s.tr.addEdge(sourceID, targetID, kind)
+	if err := s.requireInitialized("AddEdge"); err != nil {
+		return err
+	}
+	cfg := s.resolve(nil, "edge-add", sourceID.String(), targetID, fmt.Sprintf("k=%d", int(kind)))
+	if _, err := s.applyOne(cfg, []Effect{{
+		Sort: EffectEdgeAdd, TaskID: sourceID, EdgeTargetID: targetID, EdgeRelKind: kind,
+	}}); err != nil {
+		return fmt.Errorf("provenance.Session.AddEdge: %w", err)
+	}
+	return nil
 }
 
-// RemoveEdge deletes the edge from sourceID to targetID (un-journaled, §6). Idempotent.
+// RemoveEdge journals the removal of the edge from sourceID to targetID (§6). Idempotent:
+// removing an absent edge journals the intent and projects a no-op.
 func (s *Session) RemoveEdge(sourceID TaskID, targetID string, kind EdgeKind) error {
-	return s.tr.removeEdge(sourceID, targetID, kind)
+	if err := s.requireInitialized("RemoveEdge"); err != nil {
+		return err
+	}
+	cfg := s.resolve(nil, "edge-remove", sourceID.String(), targetID, fmt.Sprintf("k=%d", int(kind)))
+	if _, err := s.applyOne(cfg, []Effect{{
+		Sort: EffectEdgeRemove, TaskID: sourceID, EdgeTargetID: targetID, EdgeRelKind: kind,
+	}}); err != nil {
+		return fmt.Errorf("provenance.Session.RemoveEdge: %w", err)
+	}
+	return nil
 }
 
-// AddLabel attaches a label to a task (un-journaled, §6). Idempotent.
+// AddLabel journals attaching a label to a task (§6). Idempotent.
 func (s *Session) AddLabel(id TaskID, label string) error {
-	return s.tr.addLabel(id, label)
+	if err := s.requireInitialized("AddLabel"); err != nil {
+		return err
+	}
+	cfg := s.resolve(nil, "label-add", id.String(), label)
+	if _, err := s.applyOne(cfg, []Effect{{Sort: EffectLabelAdd, TaskID: id, Label: label}}); err != nil {
+		return fmt.Errorf("provenance.Session.AddLabel: %w", err)
+	}
+	return nil
 }
 
-// RemoveLabel detaches a label from a task (un-journaled, §6). Idempotent.
+// RemoveLabel journals detaching a label from a task (§6). Idempotent.
 func (s *Session) RemoveLabel(id TaskID, label string) error {
-	return s.tr.removeLabel(id, label)
+	if err := s.requireInitialized("RemoveLabel"); err != nil {
+		return err
+	}
+	cfg := s.resolve(nil, "label-remove", id.String(), label)
+	if _, err := s.applyOne(cfg, []Effect{{Sort: EffectLabelRemove, TaskID: id, Label: label}}); err != nil {
+		return fmt.Errorf("provenance.Session.RemoveLabel: %w", err)
+	}
+	return nil
 }
 
-// AddComment adds a comment to a task authored by authorID (un-journaled, §6).
+// AddComment journals a comment on a task authored by authorID (§6). A UUIDv7 CommentID
+// is minted and carried in the journal payload so a from-empty replay reproduces the SAME
+// comment. The committing actor (this Session's actor) is the who-provenance witness; the
+// authored-by actor may differ and is recorded on the comment.
 func (s *Session) AddComment(id TaskID, authorID AgentID, body string) (Comment, error) {
-	return s.tr.addComment(id, authorID, body)
+	if err := s.requireInitialized("AddComment"); err != nil {
+		return Comment{}, err
+	}
+	commentID := CommentID{Namespace: id.Namespace, UUID: uuid.Must(uuid.NewV7())}
+	cfg := s.resolve(nil, "comment-add", id.String(), commentID.String(), authorID.String(), body)
+	if _, err := s.applyOne(cfg, []Effect{{
+		Sort: EffectCommentAdd, TaskID: id, CommentIdentity: commentID, CommentAuthor: authorID, CommentBody: body,
+	}}); err != nil {
+		return Comment{}, fmt.Errorf("provenance.Session.AddComment: %w", err)
+	}
+	comment, found, err := s.tr.db.GetComment(commentID)
+	if err != nil {
+		return Comment{}, fmt.Errorf("provenance.Session.AddComment: read back comment %q: %w", commentID.String(), err)
+	}
+	if !found {
+		return Comment{}, fmt.Errorf(
+			"provenance.Session.AddComment: comment %q was committed but could not be read back — "+
+				"where: AddComment read-back; impact: the comment was journaled but the returned value is "+
+				"empty; fix: re-open the tracker and list the task's comments", commentID.String())
+	}
+	return comment, nil
 }
 
 // ---------------------------------------------------------------------------

@@ -105,3 +105,7 @@ operators:
   - {operator: fsm-rejects-closed-to-in-progress,          slice: s1.3, reason: "§8.1 status FSM — illegal closed→in_progress transition fails closed"}
   - {operator: fsm-stopped-transition-converges,           slice: s1.3, reason: "§8.1 status FSM — in_progress→open stopped transition + from-empty convergence"}
   - {operator: fsm-forced-coercion-converges,              slice: s1.3, reason: "§8.1/§16 forced FSM escape hatch — journal-reproducible, audit-visible coercion"}
+  - {operator: mutation-family-who-provenance,             slice: s1.3, reason: "§6 amendment — edge/label/comment journaled who-provenance (committer, authority, position, operands)"}
+  - {operator: mutation-family-unauthorized-rejected,      slice: s1.3, reason: "§6/§9.3 — edge/label/comment mutations obey per-effect authorization (must-fail per family)"}
+  - {operator: mutation-family-projections-replay,         slice: s1.3, reason: "§6/§15 — edge/label/comment domain projections re-derive from empty and converge"}
+  - {operator: journaled-edge-grants-no-authority,         slice: s1.3, reason: "§14.5 re-pin — journaled blocked_by edge still delegates no ownership authority"}

@@ -11,7 +11,6 @@ package provenance
 
 import (
 	"fmt"
-	"time"
 
 	intgraph "github.com/dayvidpham/provenance/internal/graph"
 	"github.com/dayvidpham/provenance/internal/helpers"
@@ -96,65 +95,15 @@ func (t *sqliteTracker) List(filter ListFilter) ([]Task, error) {
 }
 
 // ---------------------------------------------------------------------------
-// Typed Dependency Edges (un-journaled §6 relationship writes)
+// Typed Dependency Edges (journaled §6 relationship writes)
 // ---------------------------------------------------------------------------
 //
-// addEdge/removeEdge are the domain-write implementations behind the Session SDK's
-// un-journaled edge verbs (Session.AddEdge/RemoveEdge). Typed dependency edges are
-// §6 relationship targets — explicitly rejected as an authorization-reach mechanism
-// (§14.5) — so they are written directly and record nothing in the journal. The
-// Edges read stays on the Tracker interface.
-
-func (t *sqliteTracker) addEdge(sourceID TaskID, targetID string, kind EdgeKind) error {
-	if kind == EdgeBlockedBy {
-		if err := t.graph.AddEdge(sourceID.String(), targetID); err != nil {
-			if dgraph.ErrEdgeCreatesCycle == err {
-				return fmt.Errorf(
-					"%w: AddEdge — adding blocked-by edge from %q to %q would create a cycle — "+
-						"the target must be work that finishes BEFORE the source; "+
-						"use DepTree or Ancestors to inspect the current dependency graph",
-					ErrCycleDetected, sourceID.String(), targetID,
-				)
-			}
-			return fmt.Errorf(
-				"provenance.Tracker.AddEdge: failed to add blocked-by edge %q->%q: %w",
-				sourceID.String(), targetID, err,
-			)
-		}
-		return nil
-	}
-
-	if err := t.db.InsertEdge(sourceID, targetID, kind, time.Now().UTC()); err != nil {
-		return fmt.Errorf(
-			"provenance.Tracker.AddEdge: failed to insert edge %q->%q kind=%s: %w",
-			sourceID.String(), targetID, kind.String(), err,
-		)
-	}
-	return nil
-}
-
-func (t *sqliteTracker) removeEdge(sourceID TaskID, targetID string, kind EdgeKind) error {
-	if kind == EdgeBlockedBy {
-		if err := t.graph.RemoveEdge(sourceID.String(), targetID); err != nil {
-			if dgraph.ErrEdgeNotFound == err {
-				return nil
-			}
-			return fmt.Errorf(
-				"provenance.Tracker.RemoveEdge: failed to remove blocked-by edge %q->%q: %w",
-				sourceID.String(), targetID, err,
-			)
-		}
-		return nil
-	}
-
-	if err := t.db.DeleteEdge(sourceID, targetID, kind); err != nil {
-		return fmt.Errorf(
-			"provenance.Tracker.RemoveEdge: failed to delete edge %q->%q kind=%s: %w",
-			sourceID.String(), targetID, kind.String(), err,
-		)
-	}
-	return nil
-}
+// Edge MUTATIONS (AddEdge/RemoveEdge) are journaled and live on the Session SDK
+// (Tracker.As → Session.AddEdge/RemoveEdge): each commits one typed edge mutation-family
+// effect through Apply, and the shared reducer folds it into the edges projection the
+// graph store reads (§6, as amended by #5). Cycle detection for blocked_by edges is
+// enforced in the reducer fold. There is no direct-write edge-mutation path on the
+// Tracker; the Edges read stays on the Tracker interface, backed by the same projection.
 
 func (t *sqliteTracker) Edges(id TaskID, kind *EdgeKind) ([]Edge, error) {
 	edges, err := t.db.GetEdges(id, kind)
@@ -201,19 +150,12 @@ func (t *sqliteTracker) Descendants(id TaskID) ([]Task, error) {
 }
 
 // ---------------------------------------------------------------------------
-// Labels (un-journaled §6 annotation writes)
+// Labels (journaled §6 annotation writes)
 // ---------------------------------------------------------------------------
 //
-// addLabel/removeLabel back the Session SDK's un-journaled label verbs; labels have
-// no journal-provenance model (§6). Labels reads stay on the Tracker interface.
-
-func (t *sqliteTracker) addLabel(id TaskID, label string) error {
-	return t.db.AddLabel(id, label)
-}
-
-func (t *sqliteTracker) removeLabel(id TaskID, label string) error {
-	return t.db.RemoveLabel(id, label)
-}
+// Label MUTATIONS (AddLabel/RemoveLabel) are journaled on the Session SDK (Tracker.As);
+// each commits one label mutation-family effect and the shared reducer folds it into the
+// labels projection (§6, as amended by #5). Labels reads stay on the Tracker interface.
 
 func (t *sqliteTracker) Labels(id TaskID) ([]string, error) {
 	labels, err := t.db.GetLabels(id)
@@ -224,19 +166,12 @@ func (t *sqliteTracker) Labels(id TaskID) ([]string, error) {
 }
 
 // ---------------------------------------------------------------------------
-// Comments (un-journaled §6 annotation write)
+// Comments (journaled §6 annotation write)
 // ---------------------------------------------------------------------------
 //
-// addComment backs the Session SDK's un-journaled comment verb; comments have no
-// journal-provenance model (§6). Comments reads stay on the Tracker interface.
-
-func (t *sqliteTracker) addComment(id TaskID, authorID AgentID, body string) (Comment, error) {
-	comment, err := t.db.AddComment(id, authorID, body)
-	if err != nil {
-		return Comment{}, fmt.Errorf("provenance.Tracker.AddComment: %w", err)
-	}
-	return comment, nil
-}
+// Comment MUTATION (AddComment) is journaled on the Session SDK (Tracker.As); it commits
+// one comment mutation-family effect and the shared reducer folds it into the comments
+// projection (§6, as amended by #5). Comments reads stay on the Tracker interface.
 
 func (t *sqliteTracker) Comments(id TaskID) ([]Comment, error) {
 	comments, err := t.db.GetComments(id)

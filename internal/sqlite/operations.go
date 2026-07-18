@@ -495,6 +495,9 @@ func (db *DB) foldEffectLocked(in journal.OperationInput, anchorJID int64, eff j
 		return jid, db.foldDecisionLocked(in, jid, eff)
 	case journal.EffectEvidence:
 		return jid, db.foldEvidenceLocked(in, jid, eff)
+	case journal.EffectEdgeAdd, journal.EffectEdgeRemove,
+		journal.EffectLabelAdd, journal.EffectLabelRemove, journal.EffectCommentAdd:
+		return jid, db.foldMutationFamilyLocked(in, jid, eff)
 	default:
 		return 0, fmt.Errorf("Apply: operation %q effect %d has unknown sort %s", in.OperationID, index, eff.Sort)
 	}

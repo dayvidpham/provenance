@@ -1,0 +1,77 @@
+# Adversarial histories for the journaled relationship/annotation mutation families
+# (docs/journal-relational-contract.md §6, as amended by #5). Edge-add/edge-remove/
+# label-add/label-remove/comment-add are now typed effect sorts journaled on a
+# journal_task_events row carrying a fixed per-family kind, so who added/removed a
+# relationship, under which authority, at which journal position is queryable from the
+# journal (who-provenance). The edges/labels/comments domain tables are shared-reducer
+# projections re-derivable from ordered journal history (§15). The §14.5 ruling stands
+# unchanged: a blocked_by edge grants no ownership authority even though its creation is
+# now journaled.
+cases:
+  - name: edge-label-comment-are-journaled-who-provenance
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#5 §6 amendment: edges/labels/comments journaled for who-provenance"}
+    mutation:
+      description: >-
+        An edge, a label, and a comment are added under the bootstrap authority. Each is
+        journaled as its fixed per-family kind (provenance.edge.added /
+        provenance.label.added / provenance.comment.added), attributed to the committing
+        actor at a definite journal position, with its operands decodable from the row
+        payload — who added it, under which authority, at which position, all derivable
+        from the journal. The edges/labels/comments projections take effect.
+      operator: mutation-family-who-provenance
+    input:
+      shape: edge-plus-label-plus-comment
+    expected:
+      journaledRows: 3
+      whoProvenance: true
+
+  - name: mutation-families-obey-per-effect-authorization
+    classification: must-fail
+    provenance: {source: requirement, ref: "provenance#5 §6/§9.3: edge/label/comment mutations authorized like task events"}
+    mutation:
+      description: >-
+        An assignment authority scoped to task X governs nothing on task Y. Every
+        relationship/annotation family — edge-add, edge-remove, label-add, label-remove,
+        comment-add — attempted on task Y under that authority is rejected with
+        ErrAuthorityScope and commits nothing, exactly as a task event on an ungoverned
+        task is (§9.3). Fail-closed: no edge or label lands on Y.
+      operator: mutation-family-unauthorized-rejected
+    input:
+      shape: assignment-authority-scoped-to-other-task
+    expected:
+      accepted: false
+      errorType: ErrAuthorityScope
+
+  - name: edge-label-comment-projections-replay-from-empty
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#5 §6/§15: edge/label/comment projections re-derivable from journal history"}
+    mutation:
+      description: >-
+        A sequence of edge/label/comment adds followed by an edge-remove and a
+        label-remove is journaled. The live domain projection is one edge, one label, one
+        comment; Open's from-empty full replay reconstructs the identical edge/label/
+        comment projections purely from ordered journal history and converges with no
+        divergence.
+      operator: mutation-family-projections-replay
+    input:
+      shape: adds-then-removes
+    expected:
+      converged: true
+
+  - name: journaled-blocked-by-edge-grants-no-authority
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#5 §14.5 re-pin under the §6 amendment: journaled edge still delegates no ownership"}
+    mutation:
+      description: >-
+        A blocked_by edge src->tgt is journaled (its creation is now recorded). An
+        assignment authority whose episode is on src governs src, but the journaled edge
+        grants it NO reach to tgt — a scheduling edge orders work, it does not delegate
+        ownership (§14.5). The ruling is unchanged by the edge's creation becoming
+        journaled.
+      operator: journaled-edge-grants-no-authority
+    input:
+      shape: blocked-by-edge-plus-source-episode
+    expected:
+      edgeIsJournaled: true
+      authorityReachesTarget: false

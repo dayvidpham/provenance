@@ -574,8 +574,59 @@ The reducer consults this table's presence, not any status field, before
 accepting an `update`/`status`/`phase`/`owner`/`assignment`/`close`/`reopen`
 mutation against a `TaskID`: presence of a row rejects the mutation
 outright. A snapshot task remains an ordinary `TaskID` for relationship
-targets (edges, attribution, evidence) — only the seven listed mutation
-families are closed off.
+targets (attribution, evidence) — the listed lifecycle mutation families
+are closed off.
+
+### 6.4 Journaled relationship/annotation mutation families (`#5` amendment)
+
+**Amendment (reductive).** Earlier drafts classified typed dependency **edges**,
+**labels**, and **comments** as un-journaled *relationship/annotation targets* outside the
+journal's mutation-family scope — the journal recorded only the task-lifecycle families
+(create/update/status/close/reopen) plus authority/decision/evidence, and the Session
+exposed the five relationship/annotation verbs as honest un-journaled direct writes. That
+classification is **superseded**: per the recorded UAT Gate-1 ruling ("edges, labels, and
+comments should become journaled — this would enable who-provenance"), edge-add,
+edge-remove, label-add, label-remove, and comment-add are now **first-class journaled
+mutation families**. The "relationship-target-only, un-journaled" classification of
+edges/labels/comments — and the §16 un-journaled disclosure that documented it — are
+**void**. What is NOT changed: §14.5 (a `blocked_by` edge grants no ownership authority)
+stands unchanged — an edge's *creation* is now journaled, but the edge still delegates no
+authority (see §14.5).
+
+**Shape (fixed-kind pattern).** Each family is journaled ON a `journal_task_events` row
+(§5.1) carrying a **fixed per-family `EventKind`** — `provenance.edge.added`,
+`provenance.edge.removed`, `provenance.label.added`, `provenance.label.removed`,
+`provenance.comment.added` — never a payload-generalized dispatch (the same closed-kind
+discipline as the lifecycle kinds, §5.1, and the Gate-2 FSM precedent). The row's `TaskID`
+is the **source/subject** task; it is authorized against the operation's authority at the
+effect's own `JournalID` exactly like any task event (§9.3), and attributed to the
+committing actor (§8.2). The operands live in the row **payload**, encoded from closed
+shapes:
+
+| Family kind | Payload FD (operands) |
+|---|---|
+| `provenance.edge.added` / `provenance.edge.removed` | `{JournalID} → {Target, EdgeKind}` |
+| `provenance.label.added` / `provenance.label.removed` | `{JournalID} → {Label}` |
+| `provenance.comment.added` | `{JournalID} → {CommentID, Author, Body}` |
+
+The `journal_task_events` PK/BCNF of §5.1 applies unchanged (candidate key `{JournalID}`;
+`EventKind`/`Payload` opaque-to-the-supertype). **Who-provenance** is therefore
+journal-derivable: *who* added/removed a relationship (the anchor's committing actor),
+*under which authority* (the producing operation's `AuthorityJournalID`, §3.1), *at which
+position* (the row's `JournalID`), and *what* (the payload operands).
+
+**Domain projections (BCNF, re-derivable).** The `edges`, `labels`, and `comments` base
+tables are now **shared-reducer projections** — the current materialization of the
+journaled families — exactly as `tasks` (§8.1) is the projection of the lifecycle events.
+The shared reducer step folds each family row into its projection (an edge-add `INSERT`, an
+edge-remove `DELETE`, and so on), and the §15 from-empty convergence check covers them: a
+full replay re-derives the identical `edges`/`labels`/`comments` sets from ordered journal
+history. Their keys are unchanged — `edges{SourceID, TargetID, EdgeKind}`,
+`labels{TaskID, Name}`, `comments{CommentID}` (with FD `{CommentID} → {TaskID, Author,
+Body, CreatedAt}`). A `blocked_by` edge-add is **cycle-checked in the reducer fold** before
+it commits (the graph store reads the same `edges` projection, so a cycle-free journal
+keeps the graph acyclic); the comment's `CommentID` is minted once by the caller and
+carried in the payload so a replay reproduces the SAME id.
 
 ## 7. Actor domain
 
@@ -1415,6 +1466,14 @@ over every organizationally unrelated task that lists it as a scheduling blocker
 defined here — a chain of deliberate ownership citations, categorically
 different from a scheduling edge.
 
+**Re-pin under the §6.4 amendment.** Journaling an edge's *creation* (§6.4) does not
+change this: a `blocked_by` edge now has a journaled birth (who added it, under which
+authority, at which position), but the edge itself still delegates **no** ownership
+authority. Governance flows only through parent citations, never through a journaled — or
+any — scheduling edge. `mutation_families.yaml` /
+`journaled-blocked-by-edge-grants-no-authority` pins that the ruling survives the
+amendment; `blocked-by-scheduling-edge-does-not-grant-authority` remains authoritative.
+
 An assignment authority reaches beyond its own task **only** through explicit
 parent citations. This is the delegated-ownership relation: a supervisor holding
 an episode on an epic can authorize work on a subtask precisely because the
@@ -1575,22 +1634,20 @@ them (per the recorded UAT Gate-2 ruling: dedicated verbs are the design; a forc
 consumers before launch, dropping the pre-`#5` `UpdateFields.Status` field is an accepted
 compatibility break, not a preserved shim.
 
-**Un-journaled verbs (`AddEdge`, `RemoveEdge`, `AddLabel`, `RemoveLabel`,
-`AddComment`) — honest §6 disclosure.** These five are **direct domain writes and
-record nothing in the journal.** The ratified §6 deliberately scopes the journal to the
-seven task-lifecycle mutation families (plus authority/decision/evidence) and classifies
-typed dependency edges as *relationship targets* (explicitly rejected as an
-authorization-reach mechanism in §14.5); labels and comments carry no journal-provenance
-model at all. Exposing them on the same `Session` receiver is an ergonomic unity, **not**
-a claim that they are journaled — the SDK documents each as un-journaled at its call
-site. Their signatures are **forward-compatible**: a future, separately-reviewed decision
-to journal edges/labels/comments as first-class effect sorts (a §6 amendment) is a
-non-breaking internal upgrade (an added variadic option or an internal journaling step),
-not a signature change. Whether to make that change — journal the five as first-class
-effect sorts, versus keep them un-journaled per §6 — is a recorded user gate for the UAT
-final decision, deliberately **not** decided here; the tightening's correctness (no
-un-journaled task **row**) needs only the three tasks-row writers (`Create`/`Update`/
-`CloseTask`) journaled, which they are.
+**Journaled relationship/annotation verbs (`AddEdge`, `RemoveEdge`, `AddLabel`,
+`RemoveLabel`, `AddComment`) — §6.4.** Per the UAT Gate-1 ruling these five are now
+**journaled** (the earlier un-journaled disclosure is void): each commits one typed
+mutation-family effect (`provenance.edge.added`/`removed`, `provenance.label.added`/
+`removed`, `provenance.comment.added`) under this Session's actor and authority, so who
+added/removed the relationship, under which authority, at which journal position is
+derivable from the journal (who-provenance, §6.4). The `edges`/`labels`/`comments` domain
+tables are shared-reducer projections re-derivable from history (§6.4, §15), and
+authorization is the same per-effect discipline as a task event (§9.3). The verb
+**signatures are unchanged** — the forward-compatibility the earlier draft preserved made
+this a non-breaking internal upgrade. A `blocked_by` edge-add is cycle-checked in the
+reducer fold. The edge's *creation* being journaled does NOT make the edge grant
+authority — §14.5 (a scheduling edge delegates no ownership) is unchanged. All eight
+Session mutation verbs are thus journaled.
 
 **OperationID and retry safety.** Every journaled verb defaults to a fresh UUIDv7
 `OperationID`, so a naive retry after an ambiguous failure commits a **second**
@@ -1627,6 +1684,7 @@ that first exposed it — never a Beads ID or a proposal/slice/phase label.
 | [`subtype_integrity.yaml`](../testdata/contract/subtype_integrity.yaml) | 4 | Subtype totality/exclusivity/discriminator agreement (both inheritance levels) |
 | [`actor_namespace.yaml`](../testdata/contract/actor_namespace.yaml) | 3 | Namespace-claim range disjointness; entry-in-range validation |
 | [`status_fsm.yaml`](../testdata/contract/status_fsm.yaml) | 3 | Static status FSM (§8.1): illegal `closed→in_progress` fails closed; `in_progress→open` stopped transition + from-empty convergence; forced coercion commits, records the forced marker, and replays |
+| [`mutation_families.yaml`](../testdata/contract/mutation_families.yaml) | 4 | Journaled edges/labels/comments (§6.4): who-provenance (committer, position, payload operands); per-effect authorization must-fail per family (§9.3); edge/label/comment projections replay from empty (§15); journaled `blocked_by` edge still grants no authority (§14.5 re-pin) |
 
 **Seven regression obligations, each with at least one named history**
 (file → case name):
