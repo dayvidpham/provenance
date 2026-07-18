@@ -775,7 +775,8 @@ legal arrows are exactly:
 Every other `(from, kind)` pair is illegal, including a same-state repeat (e.g.
 closing an already-closed task) and the direct `closed → in_progress` jump (a closed
 task reaches `in_progress` only by `Reopen` then `Start`). An illegal transition fails
-closed with the typed `ErrInvalidStatusTransition{From, To}` and commits nothing. The
+closed with the typed `InvalidStatusTransition{From, To, Kind}` (wrapping the
+`ErrStatusTransition` sentinel, recoverable with `errors.Is`) and commits nothing. The
 baseline-seeding kinds (`created`, `migrated`) are NOT transitions and are not checked:
 `created` seeds `open` at birth, `migrated` seeds the captured legacy status (§13). The
 FSM is enforced in the SINGLE shared reducer step Apply and Open both run (§9.2), so a
@@ -1617,7 +1618,8 @@ dedicated verbs** under the static FSM (§8.1): `Start` (`open → in_progress`)
 (`in_progress → open`), `CloseTask` (`{open,in_progress} → closed`, also materializing
 the close reason), and `Reopen` (`closed → open`). Each journals its own fixed-mapping
 lifecycle kind; the shared reducer rejects an illegal transition (a same-state repeat, or
-the direct `closed → in_progress`) with the typed `ErrInvalidStatusTransition{From, To}`.
+the direct `closed → in_progress`) with the typed `InvalidStatusTransition{From, To, Kind}`
+(wrapping the `ErrStatusTransition` sentinel).
 Any status verb may be invoked `WithForce` — the escape hatch (CLI `--force`) — to coerce
 the FSM: the coercion is journaled with a forced marker, skips the FSM ONLY (never
 authorization, §9.3), and is reproducible from history. A journaled verb against a

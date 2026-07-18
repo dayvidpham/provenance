@@ -200,6 +200,99 @@ func TestSession_IllegalTransitionRejected(t *testing.T) {
 	}
 }
 
+// TestSession_ForcedTransitionUnderNonGoverningAuthorityRejected is the direct regression
+// pinning the authz-before-forced-branch ordering (§9.3, §8.1): WithForce coerces the FSM
+// ONLY — never authorization. A Session bound to an assignment authority scoped to task X
+// attempts a forced Start on a CLOSED task Y that authority does NOT govern; it must fail
+// with ErrAuthorityScope and commit nothing, so a future refactor that reordered the forced
+// branch ahead of the per-effect authorization check is caught immediately.
+// TestSession_IllegalTransitionRejected only forces under the all-governing bootstrap
+// authority, so it never proves this negative (force + wrong authority => still rejected).
+func TestSession_ForcedTransitionUnderNonGoverningAuthorityRejected(t *testing.T) {
+	tr, actor := newSessionTracker(t)
+	boot := establishGenesis(t, tr, actor)
+	sBoot := tr.As(actor, boot)
+
+	// Two tasks born under the bootstrap authority.
+	taskX, err := sBoot.Create("aura", "governed task X", "", provenance.TaskTypeTask, provenance.PriorityMedium, provenance.PhaseUnscoped)
+	if err != nil {
+		t.Fatalf("Create taskX: %v", err)
+	}
+	taskY, err := sBoot.Create("aura", "ungoverned task Y", "", provenance.TaskTypeTask, provenance.PriorityMedium, provenance.PhaseUnscoped)
+	if err != nil {
+		t.Fatalf("Create taskY: %v", err)
+	}
+	// Close taskY so a plain Start (closed → in_progress) is FSM-illegal — only WithForce
+	// could coerce it. That makes the forced branch genuinely in play, so the test proves
+	// authorization is checked BEFORE (not bypassed by) that branch, not merely that an
+	// unforced illegal transition is rejected on other grounds.
+	if _, err := sBoot.CloseTask(taskY.ID, "done"); err != nil {
+		t.Fatalf("CloseTask taskY: %v", err)
+	}
+
+	// An assignment authority whose episode is on taskX — it governs taskX ONLY.
+	authX := startAssignmentAuthority(t, tr, actor, boot, taskX.ID, "AUTH-X")
+	sAssignX := tr.As(actor, authX)
+
+	// Forced Start on the ungoverned taskY must fail with ErrAuthorityScope: force skips the
+	// FSM, NEVER the §9.3 per-effect authorization check that runs unconditionally first.
+	if _, err := sAssignX.Start(taskY.ID, provenance.WithForce()); !errors.Is(err, provenance.ErrAuthorityScope) {
+		t.Fatalf("forced Start on ungoverned task err = %v, want ErrAuthorityScope", err)
+	}
+
+	// Nothing committed: taskY stays closed and no started event landed on it.
+	got, err := tr.Show(taskY.ID)
+	if err != nil {
+		t.Fatalf("Show taskY: %v", err)
+	}
+	if got.Status != provenance.StatusClosed {
+		t.Errorf("taskY status = %v, want StatusClosed (the forced write must not have landed)", got.Status)
+	}
+	page, err := tr.Journal().QueryTaskEvents(provenance.JournalQueryV1{
+		TaskIDs:    []provenance.TaskID{taskY.ID},
+		EventKinds: []provenance.EventKind{provenance.EventKindTaskStarted},
+	})
+	if err != nil {
+		t.Fatalf("QueryTaskEvents taskY started: %v", err)
+	}
+	if len(page.Events) != 0 {
+		t.Errorf("rejected forced Start committed %d started events on taskY, want 0", len(page.Events))
+	}
+	// The whole journal remains reproducible from history.
+	if _, err := tr.Journal().ReplayProjections(); err != nil {
+		t.Errorf("ReplayProjections after rejected forced Start: %v", err)
+	}
+}
+
+// startAssignmentAuthority starts one owner-responsibility episode on `task` under `auth`
+// through the public Journal().Apply path and returns the started transition's authority
+// JournalID — an assignment authority governing ONLY `task`, for binding a Session with a
+// bounded governance scope.
+func startAssignmentAuthority(t *testing.T, tr provenance.Tracker, actor provenance.ActorID, auth provenance.JournalID, task provenance.TaskID, assignment provenance.AssignmentID) provenance.JournalID {
+	t.Helper()
+	res, err := tr.Journal().Apply(provenance.OperationInput{
+		OperationID:        provenance.OperationID("op-start-" + string(assignment)),
+		ActorID:            actor,
+		AuthorityJournalID: &auth,
+		CommandDigest:      []byte("start-" + string(assignment) + "-c"),
+		MutationDigest:     []byte("start-" + string(assignment) + "-m"),
+		Effects: []provenance.Effect{{
+			Sort: provenance.EffectAssignmentStart, AssignmentID: assignment, TaskID: task,
+			SlotID: provenance.SlotOwnerResponsibility, Occupant: actor, ResultSlot: "auth",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("startAssignmentAuthority %q: %v", assignment, err)
+	}
+	for i := range res.ResultSlots {
+		if string(res.ResultSlots[i].Slot) == "auth" {
+			return res.ResultSlots[i].ProducedJournalID
+		}
+	}
+	t.Fatalf("startAssignmentAuthority %q produced no authority slot", assignment)
+	return 0
+}
+
 func TestSession_UpdateEmptyIsNoOp(t *testing.T) {
 	tr, actor := newSessionTracker(t)
 	boot := establishGenesis(t, tr, actor)
