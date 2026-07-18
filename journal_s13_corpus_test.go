@@ -119,6 +119,7 @@ func opApplyCloseReopenCompareProjection(t *testing.T, input, expected anyMap, _
 	}
 	actor, task := s13SeedActorTask(t, tr, "t1")
 	boot := s13Genesis(t, tr, actor)
+	s13CreateTask(t, tr, boot, actor, task, "t1")
 	s13StartOwner(t, tr, boot, actor, task, "A", actor)
 	// Close: end the active episode and record the close event in one operation.
 	if _, err := tr.Journal().Apply(OperationInput{
@@ -183,11 +184,12 @@ func opConcurrentOpenThenReopenConverge(t *testing.T, input, expected anyMap, _ 
 	legacy := make([]LegacyTaskRow, 0, 5)
 	base := time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC)
 	for i := 0; i < 5; i++ {
-		task := env.taskFor(t, fmt.Sprintf("legacy-%d", i))
-		legacy = append(legacy, LegacyTaskRow{
-			ID: task, Status: TaskStatusOpen,
+		lt := LegacyTaskRow{
+			ID: newCorpusTaskID(), Status: TaskStatusOpen,
 			CreatedAt: base.Add(time.Duration(i) * time.Hour), UpdatedAt: base.Add(time.Duration(i) * time.Hour),
-		})
+		}
+		env.seedLegacyTask(t, lt)
+		legacy = append(legacy, lt)
 	}
 	in := MigrationInput{System: system, BootstrapAuthority: boot, Legacy: legacy}
 
@@ -487,9 +489,12 @@ func opMigrateThenExtendCompareNativeOnly(t *testing.T, input, expected anyMap, 
 	// value was the original gap). It is a status a native history can also reach.
 	legacyStatus := parseTaskStatus(mustMap(input, "legacyTask"))
 
-	// Migrated history: baseline episode, then a native transfer chaining off it.
-	migrated := env.taskFor(t, "t8")
+	// Migrated history: a pre-journal legacy row seeded via the raw OLD-schema seam,
+	// then migration anchors it, then a native transfer chaining off the baseline
+	// episode. The legacy input is never journal-created (§13.2).
+	migrated := newCorpusTaskID()
 	base := time.Date(2025, 6, 10, 0, 0, 0, 0, time.UTC)
+	env.seedLegacyTask(t, LegacyTaskRow{ID: migrated, RawOwner: "actor-frank", Status: legacyStatus, CreatedAt: base, UpdatedAt: base})
 	if _, err := env.tr.Journal().MigrateLegacyBaseline(MigrationInput{
 		System: system, BootstrapAuthority: boot,
 		Owners: map[string]ActorID{"actor-frank": frank},
@@ -589,8 +594,9 @@ func opMigrateThenRemigrateSameSet(t *testing.T, input, expected anyMap, _ testc
 	heidi := env.actorFor(t, "actor-heidi")
 	st := env.tr.(*sqliteTracker)
 
-	task := env.taskFor(t, "t9")
+	task := newCorpusTaskID()
 	base := time.Date(2025, 6, 11, 0, 0, 0, 0, time.UTC)
+	env.seedLegacyTask(t, LegacyTaskRow{ID: task, RawOwner: "actor-heidi", Status: TaskStatusOpen, CreatedAt: base, UpdatedAt: base})
 	in := MigrationInput{
 		System: system, BootstrapAuthority: boot,
 		Owners: map[string]ActorID{"actor-heidi": heidi},
@@ -643,8 +649,7 @@ func opMigrateTwoIdenticalCreatedAtTieBreak(t *testing.T, input, expected anyMap
 		if err != nil {
 			return err
 		}
-		label, err := asString(m, "id")
-		if err != nil {
+		if _, err := asString(m, "id"); err != nil {
 			return err
 		}
 		createdAt, err := asTime(m, "createdAt")
@@ -652,8 +657,9 @@ func opMigrateTwoIdenticalCreatedAtTieBreak(t *testing.T, input, expected anyMap
 			return err
 		}
 		createdAts = append(createdAts, createdAt)
-		task := env.taskFor(t, "tie-"+label)
-		legacy = append(legacy, LegacyTaskRow{ID: task, Status: TaskStatusOpen, CreatedAt: createdAt, UpdatedAt: createdAt})
+		lt := LegacyTaskRow{ID: newCorpusTaskID(), Status: TaskStatusOpen, CreatedAt: createdAt, UpdatedAt: createdAt}
+		env.seedLegacyTask(t, lt)
+		legacy = append(legacy, lt)
 	}
 	if !createdAts[0].Equal(createdAts[1]) {
 		return fmt.Errorf("tie-break case must use identical created_at for both tasks (got %v vs %v)", createdAts[0], createdAts[1])
@@ -764,8 +770,9 @@ func opFaultMidMigration(t *testing.T, input, expected anyMap, _ testcorpus.Clas
 	var legacy []LegacyTaskRow
 	base := time.Date(2025, 7, 1, 0, 0, 0, 0, time.UTC)
 	for i := 0; i < n; i++ {
-		task := env.taskFor(t, fmt.Sprintf("fault-legacy-%d", i))
-		legacy = append(legacy, LegacyTaskRow{ID: task, Status: TaskStatusOpen, CreatedAt: base.Add(time.Duration(i) * time.Hour), UpdatedAt: base.Add(time.Duration(i) * time.Hour)})
+		lt := LegacyTaskRow{ID: newCorpusTaskID(), Status: TaskStatusOpen, CreatedAt: base.Add(time.Duration(i) * time.Hour), UpdatedAt: base.Add(time.Duration(i) * time.Hour)}
+		env.seedLegacyTask(t, lt)
+		legacy = append(legacy, lt)
 	}
 	in := MigrationInput{System: system, BootstrapAuthority: boot, Legacy: legacy}
 	_, err = st.db.AdversarialMigrateWithFault(in, faultAfter)
@@ -1190,12 +1197,14 @@ func (e *opsEnv) parseLegacyTask(t *testing.T, m anyMap) (LegacyTaskRow, map[str
 	if err != nil {
 		return LegacyTaskRow{}, nil, "", err
 	}
-	task := e.taskFor(t, "legacy-"+label)
 	updatedAt, err := asTime(m, "updatedAt")
 	if err != nil {
 		return LegacyTaskRow{}, nil, "", err
 	}
-	lt := LegacyTaskRow{ID: task, Status: parseTaskStatus(m), CreatedAt: updatedAt, UpdatedAt: updatedAt}
+	// A legacy task is a pre-journal on-disk row, minted with a fresh id and seeded
+	// through the raw OLD-schema seam (never journal-created), so migration anchors a
+	// genuine legacy row rather than one already born through the journal (§13, §13.2).
+	lt := LegacyTaskRow{ID: newCorpusTaskID(), Status: parseTaskStatus(m), CreatedAt: updatedAt, UpdatedAt: updatedAt}
 	if closedAt, err := asTime(m, "closedAt"); err == nil {
 		c := closedAt
 		lt.ClosedAt = &c
@@ -1210,6 +1219,7 @@ func (e *opsEnv) parseLegacyTask(t *testing.T, m anyMap) (LegacyTaskRow, map[str
 			owners[raw] = e.actorFor(t, raw)
 		}
 	}
+	e.seedLegacyTask(t, lt)
 	return lt, owners, label, nil
 }
 
@@ -1239,19 +1249,34 @@ func parseTaskStatus(m anyMap) TaskStatus {
 	}
 }
 
-// s13SeedActorTask registers an actor and creates a task on a bare tracker (used
-// by the file-based reopen operator, which cannot reuse the OpenMemory env).
+// s13SeedActorTask registers an actor and mints a fresh task id on a bare tracker
+// (used by the file-based reopen operator, which cannot reuse the OpenMemory env).
+// The task row is not written here: a native task is born journaled via
+// s13CreateTask once the genesis authority governing it exists (§8.1).
 func s13SeedActorTask(t *testing.T, tr Tracker, label string) (ActorID, TaskID) {
 	t.Helper()
 	agent, err := tr.RegisterSoftwareAgent("provenance-test", "s13-"+label, "0", "test")
 	if err != nil {
 		t.Fatalf("register actor: %v", err)
 	}
-	task, err := tr.Create("provenance-test", "task "+label, "", TaskTypeTask, PriorityMedium, PhaseUnscoped)
-	if err != nil {
-		t.Fatalf("create task: %v", err)
+	return agent.ID, newCorpusTaskID()
+}
+
+// s13CreateTask journals the birth of a native task (EffectTaskCreate) under the
+// genesis bootstrap authority on a bare tracker (§8.1), replacing the direct-write
+// Tracker.Create the file-based reopen operator previously used.
+func s13CreateTask(t *testing.T, tr Tracker, boot JournalID, actor ActorID, task TaskID, label string) {
+	t.Helper()
+	if _, err := tr.Journal().Apply(OperationInput{
+		OperationID: OperationID("op-create-" + label), ActorID: actor, AuthorityJournalID: &boot,
+		CommandDigest: []byte("cc-" + label), MutationDigest: []byte("cm-" + label),
+		Effects: []Effect{{
+			Sort: EffectTaskCreate, TaskID: task, Title: "task " + label,
+			Type: TaskTypeTask, Priority: PriorityMedium, Phase: PhaseUnscoped,
+		}},
+	}); err != nil {
+		t.Fatalf("journaled create task %q: %v", label, err)
 	}
-	return agent.ID, task.ID
 }
 
 func s13Genesis(t *testing.T, tr Tracker, actor ActorID) JournalID {

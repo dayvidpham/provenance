@@ -96,6 +96,11 @@ func (e *opsEnv) actorFor(t *testing.T, label string) ActorID {
 	return sa.ID
 }
 
+// taskFor returns the concrete TaskID for a symbolic label, journaling the birth
+// of a fresh native task through Apply (EffectTaskCreate) on first use (§8.1). The
+// creation runs under a single shared genesis bootstrap authority the env
+// lazily establishes (ensureBoot), so a task is born through the journal exactly as
+// production code will birth it once the direct-write Tracker.Create is retired.
 func (e *opsEnv) taskFor(t *testing.T, label string) TaskID {
 	if label == "" {
 		return e.task
@@ -103,12 +108,69 @@ func (e *opsEnv) taskFor(t *testing.T, label string) TaskID {
 	if tk, ok := e.tasks[label]; ok {
 		return tk
 	}
-	tsk, err := e.tr.Create("provenance-test", "task "+label, "", TaskTypeTask, PriorityMedium, PhaseUnscoped)
-	if err != nil {
-		t.Fatalf("create task %q: %v", label, err)
+	boot := e.ensureBoot(t)
+	id := newCorpusTaskID()
+	e.seq++
+	if _, err := e.tr.Journal().Apply(OperationInput{
+		OperationID:        OperationID(fmt.Sprintf("op-taskcreate-%s-%d", label, e.seq)),
+		ActorID:            e.actor,
+		AuthorityJournalID: &boot,
+		CommandDigest:      e.digest("create-" + label + "-c"),
+		MutationDigest:     e.digest("create-" + label + "-m"),
+		Effects: []Effect{{
+			Sort:     EffectTaskCreate,
+			TaskID:   id,
+			Title:    "task " + label,
+			Type:     TaskTypeTask,
+			Priority: PriorityMedium,
+			Phase:    PhaseUnscoped,
+		}},
+	}); err != nil {
+		t.Fatalf("journaled create task %q: %v", label, err)
 	}
-	e.tasks[label] = tsk.ID
-	return tsk.ID
+	e.tasks[label] = id
+	return id
+}
+
+// ensureBoot lazily establishes the single genesis bootstrap authority shared by
+// journaled task creation and any operator that needs a governing authority,
+// returning its produced JournalID. It is idempotent: the genesis operation is
+// applied at most once per env (a second genesis against a non-empty journal is a
+// discipline violation, §4.6), so operators and taskFor coexist on one root.
+func (e *opsEnv) ensureBoot(t *testing.T) JournalID {
+	if e.boot != nil {
+		return *e.boot
+	}
+	res, err := e.tr.Journal().Apply(OperationInput{
+		OperationID:    "op-genesis-shared",
+		ActorID:        e.actor,
+		CommandDigest:  e.digest("genesis-shared-c"),
+		MutationDigest: e.digest("genesis-shared-m"),
+		Effects:        []Effect{{Sort: EffectBootstrapAuthority, BootstrapLabel: "pasture-system", ResultSlot: "auth"}},
+	})
+	if err != nil {
+		t.Fatalf("ensureBoot genesis: %v", err)
+	}
+	jid, ok := slotJournalID(res, "auth")
+	if !ok {
+		t.Fatalf("ensureBoot genesis produced no bootstrap authority slot")
+	}
+	e.boot = &jid
+	return jid
+}
+
+// seedLegacyTask writes one pre-journal (OLD-schema) task row via the raw seeding
+// seam (§13), the corpus analogue of a legacy database on disk. Legacy tasks are
+// NEVER journal-created — doing so would collapse the migration-vs-native contrast
+// (§13.2) — so migration operators seed their legacy inputs here, not via taskFor.
+func (e *opsEnv) seedLegacyTask(t *testing.T, lt LegacyTaskRow) {
+	st, ok := e.tr.(*sqliteTracker)
+	if !ok {
+		t.Fatalf("seedLegacyTask: tracker is not *sqliteTracker")
+	}
+	if err := st.db.SeedLegacyTask(lt); err != nil {
+		t.Fatalf("seed legacy task %q: %v", lt.ID, err)
+	}
 }
 
 func (e *opsEnv) digest(s string) []byte { return []byte("digest--" + s) }
@@ -117,22 +179,12 @@ func (e *opsEnv) digest(s string) []byte { return []byte("digest--" + s) }
 // operation (§4.6) and returns its produced authority JournalID, which as the
 // system root governs every task.
 func (e *opsEnv) genesis(t *testing.T, opID string) JournalID {
-	res, err := e.tr.Journal().Apply(OperationInput{
-		OperationID:    OperationID(opID),
-		ActorID:        e.actor,
-		CommandDigest:  e.digest(opID + "-cmd"),
-		MutationDigest: e.digest(opID + "-mut"),
-		Effects:        []Effect{{Sort: EffectBootstrapAuthority, BootstrapLabel: "pasture-system", ResultSlot: "auth"}},
-	})
-	if err != nil {
-		t.Fatalf("genesis %q: %v", opID, err)
-	}
-	jid, ok := slotJournalID(res, "auth")
-	if !ok {
-		t.Fatalf("genesis %q produced no bootstrap authority slot", opID)
-	}
-	e.boot = &jid
-	return jid
+	// The env holds a single genesis root shared with journaled task creation
+	// (§4.6): establishing it is idempotent, so an operator that also births tasks
+	// via taskFor never trips the second-genesis discipline. opID is retained for
+	// call-site readability; the shared root's identity is fixed by ensureBoot.
+	_ = opID
+	return e.ensureBoot(t)
 }
 
 func slotJournalID(res CommittedResult, slot string) (JournalID, bool) {

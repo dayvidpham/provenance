@@ -225,11 +225,24 @@ func newJournalEnv(t *testing.T) *journalEnv {
 	if err != nil {
 		t.Fatalf("RegisterSoftwareAgent: %v", err)
 	}
-	task, err := tr.Create("provenance-test", "corpus task", "", TaskTypeTask, PriorityMedium, PhaseUnscoped)
-	if err != nil {
-		t.Fatalf("Create task: %v", err)
+	// The base journal-query / #4-primitive operators need a real task row to append
+	// task-events onto (AppendTaskEvent projects onto an existing tasks row). Seed it
+	// as a pre-journal (legacy-shape) row via the raw seeding seam rather than through
+	// a journaled creation, so the shared env.task carries no creation operation that
+	// would pollute the whole-journal ordering queries these operators assert over.
+	taskID := newCorpusTaskID()
+	now := time.Now().UTC()
+	st := tr.(*sqliteTracker)
+	if err := st.db.SeedLegacyTask(LegacyTaskRow{ID: taskID, Status: TaskStatusOpen, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("seed base env task: %v", err)
 	}
-	return &journalEnv{tr: tr, actor: agent.ID, task: task.ID}
+	return &journalEnv{tr: tr, actor: agent.ID, task: taskID}
+}
+
+// newCorpusTaskID mints a fresh namespaced UUIDv7 TaskID for the corpus harness,
+// replacing the id the retired Tracker.Create previously assigned.
+func newCorpusTaskID() TaskID {
+	return TaskID{Namespace: "provenance-test", UUID: uuid.Must(uuid.NewV7())}
 }
 
 // ---------------------------------------------------------------------------
