@@ -480,6 +480,21 @@ kinds (`pasture.review.recorded`) that Provenance never enumerates in
 advance. This is the same open/closed distinction the historical `#4` body
 already drew, carried forward unchanged.
 
+**Fixed-mapping lifecycle kinds (`StatusForEventKind`).** A small **closed** set of
+`provenance.*` event kinds are the reducer's status-lifecycle vocabulary: their
+projection onto `tasks.status_id` is a fixed mapping, not an open payload read —
+`provenance.task.created` and `provenance.task.reopened` → `open`,
+`provenance.task.started` → `in_progress`, `provenance.task.closed` → `closed`. Any
+other `EventKind` (a caller-domain event) leaves status unchanged. `in_progress` is
+reachable natively **only** via `provenance.task.started` (added by `#5` as the
+completion of §15's status-divergence forward pointer, under §8.1's own "route that
+status change through a journal lifecycle event once the direct-write path retires"
+authority — not an open reversal of the ratified status model); the only other route
+to a non-`open` baseline is a migration marker's captured legacy status (§13). The
+generalized "status-from-payload" alternative was **rejected** to keep the lifecycle
+vocabulary a closed, statically-typed fixed mapping rather than an interpreted
+payload channel.
+
 ### 5.2 `journal_task_event_contexts`
 
 | Attribute | Domain | Nullable | Notes |
@@ -659,15 +674,27 @@ outside `Apply`/`Open` — it is the "current occupant of the
 for query convenience rather than recomputed from `journal_authority_assignment_episodes`
 on every read.
 
-**S1.1 → S1.3 staging note.** At the journal-base layer (`dayvidpham/provenance#4`,
-S1.1) and through the shared-reducer slice (`dayvidpham/provenance#5`, S1.2–S1.3)
-`tasks.LastJournalID` ships **nullable**: the pre-journal direct-write
-task-creation path predates the shared reducer and remains the library's existing
-public surface, so tasks have no watermark to populate until every task write is
-routed through `Apply`/`Open` (§9). This is a deliberate staging gap, not a
-schema bug. The column is tightened to `NOT NULL` (as stated above) only when the
-direct-write tracker path is retired as part of the Pasture task backend
-integration (`dayvidpham/pasture#14`).
+**S1.1 → S1.3 staging note — RESOLVED (`dayvidpham/provenance#5`).** At the
+journal-base layer (`#4`, S1.1) `tasks.LastJournalID` shipped **nullable**: the
+pre-journal direct-write task-creation path predated the shared reducer, so tasks
+had no watermark to populate until every task write flowed through `Apply`/`Open`
+(§9). The tightening slice (`#5`) **retired that direct-write task path** — task
+creation, update, and closure are journaled through the Session SDK (§16), the
+graph `Store.AddVertex` no longer creates rows, and the bare direct-write insert is
+gone — so a fresh native database now ships `tasks.LastJournalID` **`NOT NULL`** and
+the only tasks-row `INSERT` is the reducer fold, which carries the watermark. A
+legacy database that predates the tightening is upgraded to the anchored,
+watermark-carrying shape by `MigrateLegacyBaseline` (§13); `VerifyIntegrity` (§15)
+rejects any un-anchored (NULL-watermark) task row over stored rows, so the invariant
+holds for migrated databases even where the physical column began nullable. The
+lifecycle status baseline is the reducer zero (`open`) unless a **fixed-mapping
+lifecycle event** moves it: `provenance.task.created` / `provenance.task.reopened`
+→ `open`, `provenance.task.started` → `in_progress`, `provenance.task.closed` →
+`closed` (the fixed `StatusForEventKind` mapping, §5.1); `in_progress` is reachable
+natively only through `provenance.task.started`, or through a migration marker's
+captured legacy status (§13). Adding `provenance.task.started` is exactly the
+completion of §15's forward pointer ("route that status change through a journal
+lifecycle event once the direct-write path retires").
 
 ### 8.2 `task_attributions`
 
@@ -925,19 +952,21 @@ boundary, before returning to the caller.
    `ProducedByOperationJournalID` is `NOT NULL` and refers to exactly one
    `journal_operations.JournalID`.
 
-   **S1.1 → S1.3 staging note.** At the journal-base layer (`dayvidpham/provenance#4`,
-   S1.1) no `journal_operations` subtype table exists yet, so there is no
-   operation anchor for a `task_event` row's `ProducedByOperationJournalID` to
-   reference. `AppendTaskEvent` — the pre-operations base primitive the
-   operations layer wraps — writes `task_event` rows with
-   `ProducedByOperationJournalID = NULL` uniformly. This remains the case through
-   the shared-reducer slice (`dayvidpham/provenance#5`, S1.2–S1.3) because the
-   direct-write tracker path remains the library's existing public surface and does
-   not journal-anchor its writes. Rule 2's `NOT NULL` enforcement (and the
-   `ProducedByOperationJournalID → journal_operations.JournalID` foreign key from
-   §2.1) is scheduled for when the direct-write path is retired as part of the
-   Pasture task backend integration (`dayvidpham/pasture#14`). `VerifyIntegrity`'s §10 rule 8 subtype-integrity guard does not
-   check rule 2 and is unaffected by this staging gap.
+   **S1.1 staging note — RESOLVED (`dayvidpham/provenance#5`).** At the
+   journal-base layer (`#4`, S1.1) no `journal_operations` subtype table exists
+   yet, so `AppendTaskEvent` — the pre-operations base primitive — writes
+   `task_event` rows with `ProducedByOperationJournalID = NULL` uniformly, and that
+   NULL-producer shape is valid **at that layer** (its standalone tests stay green).
+   The operations layer (`#5`) completes the `ProducedByOperationJournalID →
+   journal_operations.JournalID` foreign key AND adds the **task-event producer
+   `CHECK`** to the same journal rebuild: `CHECK (JournalKind <> 'task_event' OR
+   ProducedByOperationJournalID IS NOT NULL)`. Every task event is now produced by
+   an operation (a native create/update/lifecycle event, or a migration baseline
+   marker), so the only thing the `CHECK` rejects is the retired bare NULL-producer
+   append; the base primitive's method shape is unchanged (the layering holds
+   because only *which callers remain legal* changes under `#5`'s schema), and the
+   bare-append public path is retired from the operations-layer `JournalAPI`.
+   `VerifyIntegrity`'s §10 rule 8 subtype-integrity guard is orthogonal to rule 2.
 3. Common fields (`JournalKind`, `ActorID`, `RecordedAt`) are never
    duplicated on a subtype row; a subtype row's only own attributes are the
    ones that do not already exist on the supertype.
@@ -1086,6 +1115,25 @@ exists yet). Because `legacy id` is `tasks.id`, the existing table's own
 primary key, it is globally unique, so `(created_at, id)` is already a total,
 unique order regardless of how many legacy rows share an identical `created_at`
 — `id` alone breaks every tie.
+
+**Legacy-schema upgrade (`#5`).** A legacy database exists **on disk with the old
+schema** — it is never built through the new API. Its `tasks` table predates the
+`#5` `LastJournalID` tightening: the watermark column is nullable, or (for a database
+older than the journal-base layer) absent entirely, and its rows carry no watermark.
+Migration upgrades such a database **in place**: it first ensures the `LastJournalID`
+column exists (the column-add path — a no-op when the column is already present, an
+`ALTER TABLE ... ADD COLUMN LastJournalID INTEGER REFERENCES journal(JournalID)` when
+it is absent), then journal-anchors every legacy row (the baseline events below),
+whose reducer projection populates each row's watermark. Post-migration every task
+row is anchored and carries a watermark, so the §8.1 `NOT NULL` invariant holds and
+`VerifyIntegrity` (§15) accepts the database; a fresh native database enforces the
+same invariant at the schema level from creation. The proof corpus models a legacy
+database via a **test-only old-schema seeding seam** — `SeedLegacyTask` downgrades a
+native schema to the legacy nullable (or column-less) watermark shape and raw-inserts
+a pre-journal row, mirroring an on-disk legacy database, never routing through the
+public API — so the migration path is exercised against exactly the input it upgrades
+in production, and §13.2's migrated/native equivalence compares fully-anchored
+post-migration state on both sides.
 
 The whole migration executes under the `pasture-system` bootstrap authority
 established by the genesis operation (§4.6): the genesis operation is the first
@@ -1414,21 +1462,72 @@ payload (§13 item 1), and the reducer seeds status from **that captured journal
 value**, never from the mutable `tasks` row, so a migrated-but-never-relifecycled
 task's status remains reproducible solely from journal history.
 
-**Staging scope (pasture#14).** Convergence is asserted for **journal-anchored**
-tasks — those with at least one journal-spine row (a `journal_task_events`,
-`journal_authority_*` episode, `journal_decisions`, or `journal_evidence` row) —
-so their owner, status, watermark, and attributions are all journal-reproducible.
-A **pure direct-write task with zero journal rows** has no journal history to
-reduce over, so it is outside the checkable set until the direct-write task path
-retires (the same honest-staging coupling already accepted for
-`tasks.LastJournalID` and the `produced_by_operation_journal_id` FK). A migrated
-task **is** journal-anchored and fully checked. A status set purely by the
-direct-write path (`tracker.Update`) on a task that **is** journal-anchored but
-carries no status-changing lifecycle event or migration marker is, by
-construction, not reproducible from journal history and so is reported as a
-divergence — which is the correct reading of this invariant, not a false
-positive: the fix is to route that status change through a journal lifecycle
-event once the direct-write path retires.
+**Staging scope — RESOLVED (`dayvidpham/provenance#5`).** Convergence is asserted
+for **journal-anchored** tasks — those with at least one journal-spine row (a
+`journal_task_events`, `journal_authority_*` episode, `journal_decisions`, or
+`journal_evidence` row) — so their owner, status, watermark, and attributions are
+all journal-reproducible. The direct-write task path is **retired**: task creation,
+update, and closure flow through the Session SDK (§16) and are journaled, so a
+"pure direct-write task with zero journal rows" is no longer produced — a native
+task is born through the fold with a `provenance.task.created` event, and
+`VerifyIntegrity` (§15/§8.1) rejects any un-anchored task row. The status-divergence
+forward pointer is discharged: a native `in_progress` transition now routes through
+the fixed-mapping `provenance.task.started` lifecycle event (§5.1, §8.1), so the
+status is journal-reproducible and convergence holds — `Session.Update(Status:
+in_progress)` emits `started`, never a direct column write. A migrated task **is**
+journal-anchored and fully checked; a migration marker's captured legacy status
+(§13) is the one non-native route to a baseline status.
+
+## 16. Mutation SDK (`Session`)
+
+`Session` is the mutation surface the Pasture task backend consumes. `Tracker.As(actor,
+authority)` binds a committing actor and a governing authority once, and exposes the
+eight task-tracker mutation verbs on one receiver. It sits on top of the low-level
+`MutationContext`/`Apply` primitive (still public); reads stay on the `Tracker`
+interface unchanged.
+
+**Journaled verbs (`Create`, `Update`, `CloseTask`).** Each builds one logical
+operation (§9) and commits it through `Apply`, so every birth, metadata change, status
+transition, and closure flows through the ordered journal and is reproducible from
+history (§8.1, §15). `Create` mints a `TaskID` and commits one task-create effect (the
+task is born through the fold with a non-NULL watermark, §8.1). `Update` decomposes a
+partial `UpdateFields` into typed effects **within one operation**: the metadata fields
+(`Title`/`Description`/`Priority`/`Phase`/`Notes`) emit one `provenance.task.updated`
+event materializing those columns; a `Status` change emits the matching fixed-mapping
+lifecycle event (`in_progress` → `started`, `closed` → `closed`, `open` → `reopened`,
+§5.1), folded metadata-then-status; a same-status set is a journal-honest no-op. `Owner`
+is not settable through `Update` — ownership moves only through assignment episodes
+(§4.4). `CloseTask` commits a `provenance.task.closed` lifecycle event that also
+materializes the close reason. A journaled verb against a never-initialized (empty)
+journal returns an actionable `ErrGenesisRequired` (§4.6, §13) rather than a deep
+authority-not-found. `Atomic(build)` commits a caller-composed multi-effect operation in
+builder order with per-effect authorization (§9.3).
+
+**Un-journaled verbs (`AddEdge`, `RemoveEdge`, `AddLabel`, `RemoveLabel`,
+`AddComment`) — honest §6 disclosure.** These five are **direct domain writes and
+record nothing in the journal.** The ratified §6 deliberately scopes the journal to the
+seven task-lifecycle mutation families (plus authority/decision/evidence) and classifies
+typed dependency edges as *relationship targets* (explicitly rejected as an
+authorization-reach mechanism in §14.5); labels and comments carry no journal-provenance
+model at all. Exposing them on the same `Session` receiver is an ergonomic unity, **not**
+a claim that they are journaled — the SDK documents each as un-journaled at its call
+site. Their signatures are **forward-compatible**: a future, separately-reviewed decision
+to journal edges/labels/comments as first-class effect sorts (a §6 amendment) is a
+non-breaking internal upgrade (an added variadic option or an internal journaling step),
+not a signature change. Whether to make that change — journal the five as first-class
+effect sorts, versus keep them un-journaled per §6 — is a recorded user gate for the UAT
+final decision, deliberately **not** decided here; the tightening's correctness (no
+un-journaled task **row**) needs only the three tasks-row writers (`Create`/`Update`/
+`CloseTask`) journaled, which they are.
+
+**OperationID and retry safety.** Every journaled verb defaults to a fresh UUIDv7
+`OperationID`, so a naive retry after an ambiguous failure commits a **second**
+operation. To make a journaled mutation idempotent, pin a stable `OperationID`
+(`WithOperationID`) and reuse it verbatim on the retry: an exact same-identity replay
+short-circuits to the original committed result (§9.4); a reused id presenting different
+arguments is a typed conflict (§11). (`Create` mints a fresh `TaskID` on every call, so
+even a pinned-id `Create` retry is idempotent only through the §9.4 short-circuit, which
+returns the original task.)
 
 ## Adversarial proof corpus
 
