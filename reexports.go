@@ -160,11 +160,12 @@ const (
 // ---------------------------------------------------------------------------
 
 var (
-	ErrNotFound          = ptypes.ErrNotFound
-	ErrCycleDetected     = ptypes.ErrCycleDetected
-	ErrAlreadyClosed     = ptypes.ErrAlreadyClosed
-	ErrInvalidID         = ptypes.ErrInvalidID
-	ErrAgentKindMismatch = ptypes.ErrAgentKindMismatch
+	ErrNotFound           = ptypes.ErrNotFound
+	ErrCycleDetected      = ptypes.ErrCycleDetected
+	ErrAlreadyClosed      = ptypes.ErrAlreadyClosed
+	ErrInvalidID          = ptypes.ErrInvalidID
+	ErrAgentKindMismatch  = ptypes.ErrAgentKindMismatch
+	ErrAgentAlreadyExists = ptypes.ErrAgentAlreadyExists
 )
 
 // ---------------------------------------------------------------------------

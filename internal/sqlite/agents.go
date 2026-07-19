@@ -3,6 +3,7 @@ package sqlite
 import (
 	"fmt"
 
+	"github.com/dayvidpham/provenance/internal/journal"
 	"github.com/dayvidpham/provenance/pkg/ptypes"
 	"github.com/google/uuid"
 	zs "zombiezen.com/go/sqlite"
@@ -111,6 +112,122 @@ func (db *DB) RegisterSoftwareAgent(namespace, name, version, source string) (pt
 		return ptypes.SoftwareAgent{}, fmt.Errorf(
 			"sqlite.RegisterSoftwareAgent: failed to insert software agent row: %w", err,
 		)
+	}
+	return ptypes.SoftwareAgent{
+		Agent:   ptypes.Agent{ID: id, Kind: ptypes.AgentKindSoftware},
+		Name:    name,
+		Version: version,
+		Source:  source,
+	}, nil
+}
+
+// RegisterSoftwareAgentWithID registers a new software agent using a
+// CALLER-SUPPLIED AgentID, instead of the random UUIDv7 RegisterSoftwareAgent
+// mints. This is the fixed-ID software-agent registration seam of
+// docs/journal-relational-contract.md §7: it exists so a caller can create the
+// agents/agents_software row a fixed_actor_manifest_entries row's ActorID FK
+// (§7.2) must reference — RegisterFixedActorEntry alone cannot satisfy that FK,
+// since no other released path creates an agents row with a caller-chosen id.
+//
+// A dedicated method (rather than a WithAgentID functional option on
+// RegisterSoftwareAgent) was chosen to keep the common random-UUIDv7 path's
+// signature and behavior completely unchanged, and because the fixed-ID path
+// has different failure semantics that would be surprising bolted onto the
+// existing call: it requires a pre-existing actor_namespace_claims row and
+// rejects out-of-range ids, neither of which the random-ID path has any
+// reason to check. This mirrors the codebase's existing WithID-suffix idiom
+// (StartActivityWithID) for "same verb, caller-supplied identity" — but the
+// conflict behavior is deliberately the opposite: StartActivityWithID
+// collapses a replay to an idempotent no-op, while a second call here with the
+// same id is a typed conflict (ptypes.ErrAgentAlreadyExists), since an agent
+// identity must be unique, never silently reused.
+//
+// Namespace-claim consistency (§7.1-7.2, §7.3 rule 2): id.Namespace MUST have
+// a registered actor_namespace_claims row, and id.UUID MUST decode, under that
+// claim's Codec, to an ordinal inside [RangeMin, RangeMax]. Fixed IDs OUTSIDE
+// every claim are deliberately NOT permitted — the only released caller of a
+// fixed ID is the fixed_actor_manifest_entries seam, and every manifest entry
+// must already satisfy entry-in-range (§7.3 rule 2), so requiring the same
+// containment at agent-registration time keeps the two tables consistent by
+// construction: a fixed-ID agent can never be registered unless a manifest
+// entry could legally reference it, and never left in a state that could not
+// have come from a legitimate claimed range.
+//
+// Returns:
+//   - ptypes.ErrInvalidID if id.Namespace is empty (malformed shape).
+//   - journal.ErrNamespaceClaim if id.Namespace has no registered claim.
+//   - journal.ErrEntryOutOfRange if id.UUID does not decode inside the claim's
+//     range under its codec.
+//   - ptypes.ErrAgentAlreadyExists if an agent with id already exists.
+//
+// Acquires the DB mutex.
+func (db *DB) RegisterSoftwareAgentWithID(id ptypes.AgentID, name, version, source string) (ptypes.SoftwareAgent, error) {
+	if id.Namespace == "" {
+		return ptypes.SoftwareAgent{}, fmt.Errorf(
+			"%w: RegisterSoftwareAgentWithID — id %q has an empty namespace — "+
+				"where: sqlite.RegisterSoftwareAgentWithID, fixed-ID validation; "+
+				"when: before any row is written; impact: the agent cannot be "+
+				"registered, since the wire format requires a non-empty namespace; "+
+				"fix: supply an id of the form ptypes.AgentID{Namespace: \"pasture-system\", "+
+				"UUID: ...} with a non-empty Namespace",
+			ptypes.ErrInvalidID, id.String(),
+		)
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	claim, found, err := db.getNamespaceClaimLocked(id.Namespace)
+	if err != nil {
+		return ptypes.SoftwareAgent{}, err
+	}
+	if !found {
+		return ptypes.SoftwareAgent{}, fmt.Errorf(
+			"%w: RegisterSoftwareAgentWithID — namespace %q has no registered "+
+				"actor_namespace_claims row — where: sqlite.RegisterSoftwareAgentWithID, "+
+				"namespace-claim lookup; when: before the agent insert; impact: a "+
+				"fixed-ID agent outside every claim is rejected, since no "+
+				"fixed_actor_manifest_entries row could ever legally reference it "+
+				"(§7.3 rule 2); fix: call RegisterNamespaceClaim for %q first, or use "+
+				"RegisterSoftwareAgent instead if this agent does not need a fixed ID",
+			journal.ErrNamespaceClaim, id.Namespace, id.Namespace,
+		)
+	}
+	if err := journal.CheckEntryInRange(claim, id.Namespace, [16]byte(id.UUID)); err != nil {
+		return ptypes.SoftwareAgent{}, fmt.Errorf("sqlite.RegisterSoftwareAgentWithID: %w", err)
+	}
+
+	var txErr error
+	endTx := sqlitex.Transaction(db.conn)
+	defer endTx(&txErr)
+	if txErr = sqlitex.Execute(db.conn,
+		`INSERT INTO agents (id, kind_id) VALUES (?1, 2)`,
+		&sqlitex.ExecOptions{Args: []any{id.String()}}); txErr != nil {
+		if isUniqueViolation(txErr) {
+			txErr = fmt.Errorf(
+				"%w: RegisterSoftwareAgentWithID — agent %q is already registered — "+
+					"where: sqlite.RegisterSoftwareAgentWithID, agents insert; when: "+
+					"agents primary-key conflict; impact: the duplicate registration "+
+					"is rejected rather than silently reusing or overwriting the "+
+					"existing agent identity; fix: choose a distinct fixed id, or call "+
+					"Agent/SoftwareAgent to fetch the existing row instead of "+
+					"re-registering it",
+				ptypes.ErrAgentAlreadyExists, id.String(),
+			)
+			return ptypes.SoftwareAgent{}, txErr
+		}
+		txErr = fmt.Errorf(
+			"sqlite.RegisterSoftwareAgentWithID: failed to insert base agent row: %w", txErr,
+		)
+		return ptypes.SoftwareAgent{}, txErr
+	}
+	if txErr = sqlitex.Execute(db.conn,
+		`INSERT INTO agents_software (agent_id, name, version, source) VALUES (?1, ?2, ?3, ?4)`,
+		&sqlitex.ExecOptions{Args: []any{id.String(), name, version, source}}); txErr != nil {
+		txErr = fmt.Errorf(
+			"sqlite.RegisterSoftwareAgentWithID: failed to insert software agent row: %w", txErr,
+		)
+		return ptypes.SoftwareAgent{}, txErr
 	}
 	return ptypes.SoftwareAgent{
 		Agent:   ptypes.Agent{ID: id, Kind: ptypes.AgentKindSoftware},

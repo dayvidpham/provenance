@@ -111,6 +111,18 @@ type Tracker interface {
 	// RegisterSoftwareAgent registers a new software agent with a UUIDv7 ID.
 	RegisterSoftwareAgent(namespace, name, version, source string) (SoftwareAgent, error)
 
+	// RegisterSoftwareAgentWithID registers a new software agent using a
+	// CALLER-SUPPLIED AgentID (the fixed-ID software-agent registration seam of
+	// docs/journal-relational-contract.md §7). id.Namespace must have a
+	// registered actor-namespace claim (Journal().RegisterNamespaceClaim), and
+	// id.UUID must decode, under that claim's codec, to an ordinal inside its
+	// claimed range (§7.3 rule 2) — fixed IDs outside every claim are rejected.
+	// Returns ErrAgentAlreadyExists if id is already registered. This is the
+	// path a caller uses to create the agents row a subsequent
+	// Journal().RegisterFixedActorEntry(entry, fixedUUID) call's ActorID FK
+	// (§7.2) must reference.
+	RegisterSoftwareAgentWithID(id AgentID, name, version, source string) (SoftwareAgent, error)
+
 	// Agent returns the base agent (kind only) by ID.
 	// Returns ErrNotFound if the agent does not exist.
 	Agent(id AgentID) (Agent, error)

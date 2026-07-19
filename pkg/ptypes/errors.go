@@ -40,4 +40,14 @@ var (
 	// To fix: call Agent() first to inspect the Kind field, then call the
 	// appropriate typed method (HumanAgent, MLAgent, or SoftwareAgent).
 	ErrAgentKindMismatch = error(errSentinel("provenance: agent kind mismatch"))
+
+	// ErrAgentAlreadyExists is returned by a caller-supplied-ID registration
+	// (e.g. RegisterSoftwareAgentWithID) when an agent with that exact ID is
+	// already registered. Unlike StartActivityWithID, a fixed agent identity is
+	// never collapsed to an idempotent no-op: a duplicate registration is a
+	// typed conflict, since silently reusing or overwriting an existing agent
+	// identity would be a correctness hazard for the actor domain (§7).
+	// To fix: choose a distinct fixed ID, or fetch the existing agent via
+	// Agent/SoftwareAgent instead of re-registering it.
+	ErrAgentAlreadyExists = error(errSentinel("provenance: agent already registered"))
 )

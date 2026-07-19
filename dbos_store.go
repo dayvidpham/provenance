@@ -295,6 +295,15 @@ func (b *borrowedTracker) RegisterSoftwareAgent(namespace, name, version, source
 	})
 }
 
+func (b *borrowedTracker) RegisterSoftwareAgentWithID(id AgentID, name, version, source string) (SoftwareAgent, error) {
+	if err := b.available("RegisterSoftwareAgentWithID"); err != nil {
+		return SoftwareAgent{}, err
+	}
+	return retryOnTransientLock("RegisterSoftwareAgentWithID", func() (SoftwareAgent, error) {
+		return b.inner.RegisterSoftwareAgentWithID(id, name, version, source)
+	})
+}
+
 func (b *borrowedTracker) Agent(id AgentID) (Agent, error) {
 	if err := b.available("Agent"); err != nil {
 		return Agent{}, err
