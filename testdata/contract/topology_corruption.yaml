@@ -115,6 +115,33 @@ cases:
       errorHasImpact: true
       errorHasFix: true
 
+  - name: extra-unexpected-table-fails-closed
+    classification: must-fail
+    provenance: {source: requirement, ref: "provenance#4 amendment §13 external-schema preflight (table presence, both directions)"}
+    mutation:
+      description: >-
+        A recognized database has gained an unaccounted-for extra
+        journal-spine-named table (a stray migration artifact, a manually
+        created table, or a future schema version's table left behind after a
+        downgrade) — the symmetric direction to the extra-unexpected-column
+        case. Preflight verifies exact expected shape in BOTH directions for
+        tables as well as columns, so an unrecognized journal-spine table must
+        also fail closed before any write, with a typed SchemaPreflightError.
+      operator: schema-preflight-extra-table
+    input:
+      markerPresent: true
+      extraTable: {table: journal_unreviewed}
+    expected:
+      preflightPassed: false
+      writesAttempted: 0
+      errorType: SchemaPreflightError
+      errorHasWhat: true
+      errorHasWhy: true
+      errorHasWhere: true
+      errorHasWhen: true
+      errorHasImpact: true
+      errorHasFix: true
+
   - name: missing-expected-column-fails-closed
     classification: must-fail
     provenance: {source: requirement, ref: "provenance#4 amendment §13 external-schema preflight (column presence, both directions)"}

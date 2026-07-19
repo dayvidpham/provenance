@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dayvidpham/provenance/internal/journal"
 	"github.com/dayvidpham/provenance/internal/sqlite"
 	"github.com/dayvidpham/provenance/internal/testutil"
 	"github.com/dayvidpham/provenance/pkg/ptypes"
@@ -19,6 +20,77 @@ func openTestDB(t *testing.T) *sqlite.DB { return testutil.OpenTestDB(t) }
 
 // makeTask delegates to shared testutil.MakeTask.
 func makeTask(ns, title string) ptypes.Task { return testutil.MakeTask(ns, title) }
+
+// journalFold sets up the production journaled fold for db.Apply-driven tests: it
+// registers a committing actor and establishes the pasture-system bootstrap authority
+// (which governs every task, §14.1), returning both. Task creation, update, and closure
+// are driven through db.Apply exactly as Session.Create/Update/CloseTask reach it — the
+// sole production tasks-row write path now that the direct-write db mutators are retired.
+func journalFold(t *testing.T, db *sqlite.DB) (ptypes.ActorID, journal.JournalID) {
+	t.Helper()
+	actor, err := db.RegisterSoftwareAgent("test-ns", "committer", "0", "test")
+	if err != nil {
+		t.Fatalf("RegisterSoftwareAgent: %v", err)
+	}
+	res, err := db.Apply(journal.OperationInput{
+		OperationID:    "op-genesis",
+		ActorID:        actor.ID,
+		CommandDigest:  []byte("genesis-c"),
+		MutationDigest: []byte("genesis-m"),
+		RecordedAt:     time.Now().UTC().UnixNano(),
+		Effects:        []journal.Effect{{Sort: journal.EffectBootstrapAuthority, BootstrapLabel: "pasture-system", ResultSlot: "auth"}},
+	})
+	if err != nil {
+		t.Fatalf("genesis: %v", err)
+	}
+	for i := range res.ResultSlots {
+		if string(res.ResultSlots[i].Slot) == "auth" {
+			return actor.ID, res.ResultSlots[i].ProducedJournalID
+		}
+	}
+	t.Fatal("genesis produced no bootstrap authority slot")
+	return ptypes.ActorID{}, 0
+}
+
+// journalCreate journal-creates a task through the fold (EffectTaskCreate), the production
+// birth path, and returns its id.
+func journalCreate(t *testing.T, db *sqlite.DB, actor ptypes.ActorID, boot journal.JournalID, ns, title, description string, tt ptypes.TaskType, pr ptypes.Priority, ph ptypes.Phase) ptypes.TaskID {
+	t.Helper()
+	id := ptypes.TaskID{Namespace: ns, UUID: uuid.Must(uuid.NewV7())}
+	op := journal.OperationID("op-create--" + id.String())
+	if _, err := db.Apply(journal.OperationInput{
+		OperationID:        op,
+		ActorID:            actor,
+		AuthorityJournalID: &boot,
+		CommandDigest:      []byte(string(op) + "-c"),
+		MutationDigest:     []byte(string(op) + "-m"),
+		RecordedAt:         time.Now().UTC().UnixNano(),
+		Effects: []journal.Effect{{
+			Sort: journal.EffectTaskCreate, TaskID: id, Title: title, Description: description,
+			Type: tt, Priority: pr, Phase: ph,
+		}},
+	}); err != nil {
+		t.Fatalf("journal create %q: %v", title, err)
+	}
+	return id
+}
+
+// journalApply folds one operation carrying the given effects under boot, failing the
+// test on rejection.
+func journalApply(t *testing.T, db *sqlite.DB, actor ptypes.ActorID, boot journal.JournalID, opID string, effects []journal.Effect) {
+	t.Helper()
+	if _, err := db.Apply(journal.OperationInput{
+		OperationID:        journal.OperationID(opID),
+		ActorID:            actor,
+		AuthorityJournalID: &boot,
+		CommandDigest:      []byte(opID + "-c"),
+		MutationDigest:     []byte(opID + "-m"),
+		RecordedAt:         time.Now().UTC().UnixNano(),
+		Effects:            effects,
+	}); err != nil {
+		t.Fatalf("journal apply %q: %v", opID, err)
+	}
+}
 
 // ---------------------------------------------------------------------------
 // Schema verification
@@ -43,8 +115,8 @@ func TestSchemaTablesExist(t *testing.T) {
 
 	// Insert and retrieve a task to verify the schema is properly applied.
 	task := makeTask("test-ns", "Schema check")
-	if err := db.InsertTask(task); err != nil {
-		t.Fatalf("InsertTask failed (schema may be incomplete): %v", err)
+	if err := db.SeedLegacyTaskRow(task); err != nil {
+		t.Fatalf("SeedLegacyTaskRow failed (schema may be incomplete): %v", err)
 	}
 
 	got, found, err := db.GetTask(task.ID)
@@ -70,8 +142,8 @@ func TestInsertAndGetTask(t *testing.T) {
 	task.Description = "A test task"
 	task.Notes = "some notes"
 
-	if err := db.InsertTask(task); err != nil {
-		t.Fatalf("InsertTask error: %v", err)
+	if err := db.SeedLegacyTaskRow(task); err != nil {
+		t.Fatalf("SeedLegacyTaskRow error: %v", err)
 	}
 
 	got, found, err := db.GetTask(task.ID)
@@ -108,50 +180,74 @@ func TestGetTaskNotFound(t *testing.T) {
 	}
 }
 
-func TestUpdateTask(t *testing.T) {
+// TestFoldUpdateMaterializesMetadata drives a task metadata update through the production
+// journaled fold (EffectTaskEvent / provenance.task.updated), the path Session.Update
+// reaches, and asserts the materialized-only columns land while the reducer-exclusive
+// status projection is untouched. The retired db.UpdateTask direct-write mutator is gone.
+func TestFoldUpdateMaterializesMetadata(t *testing.T) {
 	db := openTestDB(t)
-
-	task := makeTask("ns", "Original Title")
-	if err := db.InsertTask(task); err != nil {
-		t.Fatalf("InsertTask error: %v", err)
-	}
+	actor, boot := journalFold(t, db)
+	id := journalCreate(t, db, actor, boot, "ns", "Original Title", "original description",
+		ptypes.TaskTypeTask, ptypes.PriorityMedium, ptypes.PhaseUnscoped)
 
 	newTitle := "Updated Title"
-	newStatus := ptypes.StatusInProgress
-	updated, err := db.UpdateTask(task.ID, ptypes.UpdateFields{
-		Title:  &newTitle,
-		Status: &newStatus,
-	}, time.Now().UTC())
-	if err != nil {
-		t.Fatalf("UpdateTask error: %v", err)
+	newNotes := "Updated notes"
+	journalApply(t, db, actor, boot, "op-update--"+id.String(), []journal.Effect{{
+		Sort:        journal.EffectTaskEvent,
+		TaskID:      id,
+		EventKind:   journal.EventKindTaskUpdated,
+		UpdateTitle: &newTitle,
+		UpdateNotes: &newNotes,
+	}})
+
+	got, found, err := db.GetTask(id)
+	if err != nil || !found {
+		t.Fatalf("GetTask(found=%v): %v", found, err)
 	}
-	if updated.Title != "Updated Title" {
-		t.Errorf("Title = %q, want %q", updated.Title, "Updated Title")
+	if got.Title != "Updated Title" {
+		t.Errorf("Title = %q, want %q", got.Title, "Updated Title")
 	}
-	if updated.Status != ptypes.StatusInProgress {
-		t.Errorf("Status = %v, want StatusInProgress", updated.Status)
+	if got.Notes != "Updated notes" {
+		t.Errorf("Notes = %q, want %q", got.Notes, "Updated notes")
+	}
+	// status is a reducer-exclusive projection: a metadata update never touches it.
+	if got.Status != ptypes.StatusOpen {
+		t.Errorf("Status = %v, want unchanged StatusOpen", got.Status)
+	}
+	// A column not carried by the update event is preserved.
+	if got.Description != "original description" {
+		t.Errorf("Description = %q, want unchanged %q", got.Description, "original description")
 	}
 }
 
-func TestCloseTask(t *testing.T) {
+// TestFoldCloseMaterializes drives a task closure through the production journaled fold
+// (EffectTaskEvent / provenance.task.closed), the path Session.CloseTask reaches: the
+// reducer projects status → closed and stamps closed_at, and the fold materializes the
+// close reason. The retired db.CloseTask direct-write mutator is gone.
+func TestFoldCloseMaterializes(t *testing.T) {
 	db := openTestDB(t)
+	actor, boot := journalFold(t, db)
+	id := journalCreate(t, db, actor, boot, "ns", "Task to close", "",
+		ptypes.TaskTypeTask, ptypes.PriorityMedium, ptypes.PhaseUnscoped)
 
-	task := makeTask("ns", "Task to close")
-	if err := db.InsertTask(task); err != nil {
-		t.Fatalf("InsertTask error: %v", err)
-	}
+	journalApply(t, db, actor, boot, "op-close--"+id.String(), []journal.Effect{{
+		Sort:        journal.EffectTaskEvent,
+		TaskID:      id,
+		EventKind:   journal.EventKindTaskClosed,
+		CloseReason: "done",
+	}})
 
-	closed, err := db.CloseTask(task.ID, "done", time.Now().UTC())
-	if err != nil {
-		t.Fatalf("CloseTask error: %v", err)
+	got, found, err := db.GetTask(id)
+	if err != nil || !found {
+		t.Fatalf("GetTask(found=%v): %v", found, err)
 	}
-	if closed.Status != ptypes.StatusClosed {
-		t.Errorf("Status = %v, want StatusClosed", closed.Status)
+	if got.Status != ptypes.StatusClosed {
+		t.Errorf("Status = %v, want StatusClosed", got.Status)
 	}
-	if closed.CloseReason != "done" {
-		t.Errorf("CloseReason = %q, want %q", closed.CloseReason, "done")
+	if got.CloseReason != "done" {
+		t.Errorf("CloseReason = %q, want %q", got.CloseReason, "done")
 	}
-	if closed.ClosedAt == nil {
+	if got.ClosedAt == nil {
 		t.Error("ClosedAt should not be nil after closing")
 	}
 }
@@ -162,8 +258,8 @@ func TestListTasks(t *testing.T) {
 	task1 := makeTask("ns", "Task 1")
 	task2 := makeTask("ns", "Task 2")
 	for _, task := range []ptypes.Task{task1, task2} {
-		if err := db.InsertTask(task); err != nil {
-			t.Fatalf("InsertTask error: %v", err)
+		if err := db.SeedLegacyTaskRow(task); err != nil {
+			t.Fatalf("SeedLegacyTaskRow error: %v", err)
 		}
 	}
 
@@ -184,8 +280,8 @@ func TestListTasksWithFilter(t *testing.T) {
 	task2 := makeTask("ns", "Feature task")
 	task2.Type = ptypes.TaskTypeFeature
 	for _, task := range []ptypes.Task{task1, task2} {
-		if err := db.InsertTask(task); err != nil {
-			t.Fatalf("InsertTask error: %v", err)
+		if err := db.SeedLegacyTaskRow(task); err != nil {
+			t.Fatalf("SeedLegacyTaskRow error: %v", err)
 		}
 	}
 
@@ -207,11 +303,11 @@ func TestReadyAndBlockedTasks(t *testing.T) {
 
 	parent := makeTask("ns", "Parent")
 	child := makeTask("ns", "Child")
-	if err := db.InsertTask(parent); err != nil {
-		t.Fatalf("InsertTask parent: %v", err)
+	if err := db.SeedLegacyTaskRow(parent); err != nil {
+		t.Fatalf("SeedLegacyTaskRow parent: %v", err)
 	}
-	if err := db.InsertTask(child); err != nil {
-		t.Fatalf("InsertTask child: %v", err)
+	if err := db.SeedLegacyTaskRow(child); err != nil {
+		t.Fatalf("SeedLegacyTaskRow child: %v", err)
 	}
 
 	// Before edge: both should be ready.
@@ -261,8 +357,8 @@ func TestInsertAndGetEdges(t *testing.T) {
 	task1 := makeTask("ns", "Task 1")
 	task2 := makeTask("ns", "Task 2")
 	for _, task := range []ptypes.Task{task1, task2} {
-		if err := db.InsertTask(task); err != nil {
-			t.Fatalf("InsertTask error: %v", err)
+		if err := db.SeedLegacyTaskRow(task); err != nil {
+			t.Fatalf("SeedLegacyTaskRow error: %v", err)
 		}
 	}
 
@@ -289,8 +385,8 @@ func TestDeleteEdge(t *testing.T) {
 	task1 := makeTask("ns", "Task 1")
 	task2 := makeTask("ns", "Task 2")
 	for _, task := range []ptypes.Task{task1, task2} {
-		if err := db.InsertTask(task); err != nil {
-			t.Fatalf("InsertTask error: %v", err)
+		if err := db.SeedLegacyTaskRow(task); err != nil {
+			t.Fatalf("SeedLegacyTaskRow error: %v", err)
 		}
 	}
 
@@ -318,8 +414,8 @@ func TestGetBlockedByEdges(t *testing.T) {
 	task1 := makeTask("ns", "Task 1")
 	task2 := makeTask("ns", "Task 2")
 	for _, task := range []ptypes.Task{task1, task2} {
-		if err := db.InsertTask(task); err != nil {
-			t.Fatalf("InsertTask error: %v", err)
+		if err := db.SeedLegacyTaskRow(task); err != nil {
+			t.Fatalf("SeedLegacyTaskRow error: %v", err)
 		}
 	}
 
@@ -353,8 +449,8 @@ func TestGetDepTree(t *testing.T) {
 	taskB := makeTask("ns", "B")
 	taskC := makeTask("ns", "C")
 	for _, task := range []ptypes.Task{taskA, taskB, taskC} {
-		if err := db.InsertTask(task); err != nil {
-			t.Fatalf("InsertTask error: %v", err)
+		if err := db.SeedLegacyTaskRow(task); err != nil {
+			t.Fatalf("SeedLegacyTaskRow error: %v", err)
 		}
 	}
 
@@ -383,8 +479,8 @@ func TestAddAndGetLabels(t *testing.T) {
 	db := openTestDB(t)
 
 	task := makeTask("ns", "Labeled task")
-	if err := db.InsertTask(task); err != nil {
-		t.Fatalf("InsertTask error: %v", err)
+	if err := db.SeedLegacyTaskRow(task); err != nil {
+		t.Fatalf("SeedLegacyTaskRow error: %v", err)
 	}
 
 	if err := db.AddLabel(task.ID, "priority:high"); err != nil {
@@ -414,8 +510,8 @@ func TestAddLabelIdempotent(t *testing.T) {
 	db := openTestDB(t)
 
 	task := makeTask("ns", "Labeled task")
-	if err := db.InsertTask(task); err != nil {
-		t.Fatalf("InsertTask error: %v", err)
+	if err := db.SeedLegacyTaskRow(task); err != nil {
+		t.Fatalf("SeedLegacyTaskRow error: %v", err)
 	}
 
 	// Adding the same label twice should not error.
@@ -439,8 +535,8 @@ func TestRemoveLabel(t *testing.T) {
 	db := openTestDB(t)
 
 	task := makeTask("ns", "Task")
-	if err := db.InsertTask(task); err != nil {
-		t.Fatalf("InsertTask error: %v", err)
+	if err := db.SeedLegacyTaskRow(task); err != nil {
+		t.Fatalf("SeedLegacyTaskRow error: %v", err)
 	}
 	if err := db.AddLabel(task.ID, "remove-me"); err != nil {
 		t.Fatalf("AddLabel error: %v", err)
@@ -466,8 +562,8 @@ func TestAddAndGetComments(t *testing.T) {
 	db := openTestDB(t)
 
 	task := makeTask("ns", "Commented task")
-	if err := db.InsertTask(task); err != nil {
-		t.Fatalf("InsertTask error: %v", err)
+	if err := db.SeedLegacyTaskRow(task); err != nil {
+		t.Fatalf("SeedLegacyTaskRow error: %v", err)
 	}
 
 	agent, err := db.RegisterHumanAgent("ns", "Alice", "alice@example.com")
@@ -743,8 +839,8 @@ func TestListTasksWithLabelFilter(t *testing.T) {
 	task1 := makeTask("ns", "Labeled")
 	task2 := makeTask("ns", "Unlabeled")
 	for _, task := range []ptypes.Task{task1, task2} {
-		if err := db.InsertTask(task); err != nil {
-			t.Fatalf("InsertTask error: %v", err)
+		if err := db.SeedLegacyTaskRow(task); err != nil {
+			t.Fatalf("SeedLegacyTaskRow error: %v", err)
 		}
 	}
 	if err := db.AddLabel(task1.ID, "epic:x"); err != nil {
@@ -795,7 +891,6 @@ type updateFieldSet struct {
 type updateFieldValues struct {
 	Title       string `yaml:"title"`
 	Description string `yaml:"description"`
-	Status      int    `yaml:"status"`
 	Priority    int    `yaml:"priority"`
 	Phase       int    `yaml:"phase"`
 	Notes       string `yaml:"notes"`
@@ -919,79 +1014,72 @@ func loadSQLiteFixtures(t *testing.T) sqliteFixtures {
 }
 
 // ---------------------------------------------------------------------------
-// Target 1: UpdateTask — Dynamic SET clause permutations
+// Target 1: task metadata materialization — the journaled fold's dynamic SET clause
 // ---------------------------------------------------------------------------
 
-func TestUpdateTask_YAMLPermutations(t *testing.T) {
+// TestFoldUpdate_YAMLPermutations exercises the production fold's dynamic materialized-
+// column SET construction (materializeTaskEventColumnsLocked) over every combination of
+// the metadata columns a provenance.task.updated event carries — title, description,
+// priority, phase, notes. It drives db.Apply directly, the same fold Session.Update
+// reaches; the retired db.UpdateTask direct-write mutator is gone. status and owner are
+// reducer-exclusive projections advanced by lifecycle events / assignment episodes, not
+// this materialization SET, and are covered by the Session lifecycle/assignment tests.
+func TestFoldUpdate_YAMLPermutations(t *testing.T) {
 	fix := loadSQLiteFixtures(t)
 
 	for _, fs := range fix.UpdateTask.UpdateFieldSets {
 		fs := fs // capture
 		t.Run(fs.Name, func(t *testing.T) {
 			db := openTestDB(t)
+			actor, boot := journalFold(t, db)
+			id := journalCreate(t, db, actor, boot, "test-ns", "Original Title", "original description",
+				ptypes.TaskTypeTask, ptypes.PriorityMedium, ptypes.PhaseUnscoped)
+			// Seed a baseline notes value through the fold so an "unchanged notes" case is
+			// observable (EffectTaskCreate carries no notes column).
+			origNotes := "original notes"
+			journalApply(t, db, actor, boot, "op-seed-notes--"+id.String(), []journal.Effect{{
+				Sort: journal.EffectTaskEvent, TaskID: id, EventKind: journal.EventKindTaskUpdated, UpdateNotes: &origNotes,
+			}})
 
-			// Register an owner agent to use when "owner" field is in the set.
-			agent, err := db.RegisterHumanAgent("test-ns", "OwnerAgent", "owner@example.com")
-			if err != nil {
-				t.Fatalf("RegisterHumanAgent error: %v", err)
-			}
-
-			task := makeTask("test-ns", "Original Title")
-			task.Description = "original description"
-			task.Notes = "original notes"
-			if err := db.InsertTask(task); err != nil {
-				t.Fatalf("InsertTask error: %v", err)
-			}
-
-			// Build UpdateFields from fixture field list.
 			vals := fix.UpdateTask.FieldValues
-			fields := ptypes.UpdateFields{}
 			fieldSet := make(map[string]bool, len(fs.Fields))
 			for _, f := range fs.Fields {
 				fieldSet[f] = true
 			}
+			eff := journal.Effect{Sort: journal.EffectTaskEvent, TaskID: id, EventKind: journal.EventKindTaskUpdated}
 			if fieldSet["title"] {
 				v := vals.Title
-				fields.Title = &v
+				eff.UpdateTitle = &v
 			}
 			if fieldSet["description"] {
 				v := vals.Description
-				fields.Description = &v
-			}
-			if fieldSet["status"] {
-				v := ptypes.Status(vals.Status)
-				fields.Status = &v
+				eff.UpdateDescription = &v
 			}
 			if fieldSet["priority"] {
 				v := ptypes.Priority(vals.Priority)
-				fields.Priority = &v
+				eff.UpdatePriority = &v
 			}
 			if fieldSet["phase"] {
 				v := ptypes.Phase(vals.Phase)
-				fields.Phase = &v
+				eff.UpdatePhase = &v
 			}
 			if fieldSet["notes"] {
 				v := vals.Notes
-				fields.Notes = &v
+				eff.UpdateNotes = &v
 			}
-			if fieldSet["owner"] {
-				fields.Owner = &agent.ID
+			journalApply(t, db, actor, boot, "op-update--"+id.String(), []journal.Effect{eff})
+
+			updated, found, err := db.GetTask(id)
+			if err != nil || !found {
+				t.Fatalf("GetTask(found=%v): %v", found, err)
 			}
 
-			updated, err := db.UpdateTask(task.ID, fields, time.Now().UTC())
-			if err != nil {
-				t.Fatalf("UpdateTask error: %v", err)
-			}
-
-			// Verify each field that was set.
+			// Each field in the set was materialized.
 			if fieldSet["title"] && updated.Title != vals.Title {
 				t.Errorf("Title = %q, want %q", updated.Title, vals.Title)
 			}
 			if fieldSet["description"] && updated.Description != vals.Description {
 				t.Errorf("Description = %q, want %q", updated.Description, vals.Description)
-			}
-			if fieldSet["status"] && updated.Status != ptypes.Status(vals.Status) {
-				t.Errorf("Status = %v, want %v", updated.Status, ptypes.Status(vals.Status))
 			}
 			if fieldSet["priority"] && updated.Priority != ptypes.Priority(vals.Priority) {
 				t.Errorf("Priority = %v, want %v", updated.Priority, ptypes.Priority(vals.Priority))
@@ -1002,23 +1090,13 @@ func TestUpdateTask_YAMLPermutations(t *testing.T) {
 			if fieldSet["notes"] && updated.Notes != vals.Notes {
 				t.Errorf("Notes = %q, want %q", updated.Notes, vals.Notes)
 			}
-			if fieldSet["owner"] {
-				if updated.Owner == nil {
-					t.Error("Owner = nil, want non-nil")
-				} else if *updated.Owner != agent.ID {
-					t.Errorf("Owner = %v, want %v", updated.Owner, agent.ID)
-				}
-			}
 
-			// Fields NOT in the set must remain at their original values.
+			// Columns NOT in the set stay at their baseline.
 			if !fieldSet["title"] && updated.Title != "Original Title" {
 				t.Errorf("Title changed unexpectedly: got %q, want %q", updated.Title, "Original Title")
 			}
 			if !fieldSet["description"] && updated.Description != "original description" {
 				t.Errorf("Description changed unexpectedly: got %q", updated.Description)
-			}
-			if !fieldSet["status"] && updated.Status != ptypes.StatusOpen {
-				t.Errorf("Status changed unexpectedly: got %v", updated.Status)
 			}
 			if !fieldSet["priority"] && updated.Priority != ptypes.PriorityMedium {
 				t.Errorf("Priority changed unexpectedly: got %v", updated.Priority)
@@ -1029,8 +1107,9 @@ func TestUpdateTask_YAMLPermutations(t *testing.T) {
 			if !fieldSet["notes"] && updated.Notes != "original notes" {
 				t.Errorf("Notes changed unexpectedly: got %q", updated.Notes)
 			}
-			if !fieldSet["owner"] && updated.Owner != nil {
-				t.Errorf("Owner changed unexpectedly: got %v", updated.Owner)
+			// status is reducer-exclusive: a metadata update never moves it off Open.
+			if updated.Status != ptypes.StatusOpen {
+				t.Errorf("Status changed unexpectedly: got %v, want reducer-exclusive StatusOpen", updated.Status)
 			}
 		})
 	}
@@ -1056,8 +1135,8 @@ func TestListTasks_YAMLPermutations(t *testing.T) {
 				task.Priority = ptypes.Priority(st.Priority)
 				task.Type = ptypes.TaskType(st.Type)
 				task.Phase = ptypes.Phase(st.Phase)
-				if err := db.InsertTask(task); err != nil {
-					t.Fatalf("InsertTask(%q) error: %v", st.Name, err)
+				if err := db.SeedLegacyTaskRow(task); err != nil {
+					t.Fatalf("SeedLegacyTaskRow(%q) error: %v", st.Name, err)
 				}
 				if st.Label != "" {
 					if err := db.AddLabel(task.ID, st.Label); err != nil {

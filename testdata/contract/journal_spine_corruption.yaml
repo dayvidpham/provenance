@@ -1,0 +1,118 @@
+# Adversarial histories for corruption of the JOURNAL SPINE ITSELF — the supertype
+# journal rows and their class-table-inheritance subtype rows — not merely a
+# projection column (docs/journal-relational-contract.md §10 rule 8 subtype
+# integrity, §15 from-empty convergence). Each case commits a valid journaled
+# history through the production path (Apply) and then damages the persisted spine
+# the way a partial write, a stale-backup restore, or a foreign tool would, then
+# asserts the production guard (VerifyIntegrity or ReplayProjections) fails CLOSED
+# with a typed, named-field error and performs NO silent repair.
+#
+# This is the corrupted-journal-spine negative-path family required by the Impl-UAT
+# C8a ruling (a named validation task before the final decision). It is history-shaped
+# — corruption of committed history — so per the C8b split it lives in YAML, driven by
+# raw-SQL corruption seams disclosed in internal/sqlite/spine_corruption_adversarial.go.
+cases:
+  - name: clean-spine-verifies-and-converges
+    classification: must-pass
+    provenance: {source: requirement, ref: "UAT C8a corrupted-journal-spine family — non-vacuous control"}
+    mutation:
+      description: >-
+        A well-formed journaled history (genesis authority, a task born through the
+        fold, an owner episode started and ended, a close event) passes both the
+        whole-journal subtype-integrity scan (§10 rule 8) and the from-empty
+        convergence re-derivation (§15) with no corruption injected. This control
+        proves the family's guards accept a genuinely converged spine, so the
+        must-fail cases below fail for the injected corruption and not vacuously.
+      operator: verify-clean-spine
+    input:
+      inject: none
+    expected:
+      verifyIntegrityPasses: true
+      convergencePasses: true
+
+  - name: orphaned-anchor-subtype-row-deleted
+    classification: must-fail
+    provenance: {source: requirement, ref: "UAT C8a corrupted-journal-spine family — subtype row deleted under a surviving anchor"}
+    mutation:
+      description: >-
+        A committed task_event's journal_task_events subtype row is deleted out from
+        under its surviving supertype journal row (foreign keys toggled off to force
+        it), leaving a supertype row of kind task_event with zero subtype rows. A
+        production writer never deletes a committed row, and never leaves a supertype
+        without exactly one subtype row; VerifyIntegrity's totality scan must fail
+        closed with a typed ErrSubtypeIntegrity naming the offending JournalID, and
+        repair nothing.
+      operator: corrupt-delete-subtype-row
+    input:
+      subtypeTable: journal_task_events
+    expected:
+      errorType: SubtypeIntegrity
+      failsClosed: true
+      silentRepair: false
+      errorActionable: true
+
+  - name: rewritten-discriminator-disagrees-with-subtype
+    classification: must-fail
+    provenance: {source: requirement, ref: "UAT C8a corrupted-journal-spine family — supertype discriminator rewritten"}
+    mutation:
+      description: >-
+        A committed task_event supertype row has its kind_id rewritten to a
+        different JournalKind (authority) while it keeps its journal_task_events
+        subtype row, so the supertype discriminator no longer agrees with the
+        subtype table the row carries. The discriminator is fixed at insert and no
+        production path rewrites it; VerifyIntegrity's discriminator-agreement scan
+        (§10 rule 8) must fail closed with a typed ErrSubtypeIntegrity and repair
+        nothing.
+      operator: corrupt-rewrite-discriminator
+    input:
+      rewriteTo: authority
+    expected:
+      errorType: SubtypeIntegrity
+      failsClosed: true
+      silentRepair: false
+      errorActionable: true
+
+  - name: truncated-tail-fails-convergence
+    classification: must-fail
+    provenance: {source: requirement, ref: "UAT C8a corrupted-journal-spine family — truncated journal tail"}
+    mutation:
+      description: >-
+        The highest-JournalID rows of a committed history (the close operation's
+        anchor and its closed event) are deleted — a truncated journal tail, the
+        shape a partial write or a restore from a stale backup leaves — so the
+        stored incremental projection reflects rows the spine no longer contains.
+        The surviving task keeps an earlier journal-spine row (it stays anchored),
+        so §15's from-empty convergence re-derives its owner/status/watermark over
+        the truncated spine and fails closed with a typed ProjectionDivergenceError
+        naming the diverging task and field, repairing nothing.
+      operator: corrupt-truncate-tail
+    input:
+      truncateTailRows: 2
+    expected:
+      errorType: ProjectionDivergence
+      failsClosed: true
+      silentRepair: false
+      errorActionable: true
+
+  - name: out-of-band-bare-supertype-insert-rejected
+    classification: must-fail
+    provenance: {source: requirement, ref: "UAT C8a corrupted-journal-spine family — bare supertype insert totality variant"}
+    mutation:
+      description: >-
+        A bare supertype journal row is inserted out of band (not through the
+        production Apply path) at a non-contiguous JournalID with no subtype row.
+        This corruption tests SUBTYPE TOTALITY: every supertype row must carry
+        exactly one subtype row (§10 rule 8). Journal ID contiguity is deliberately
+        NOT a spine invariant — AUTOINCREMENT permits gaps and ascending order holds
+        without contiguity. The corruption here is that the inserted supertype row
+        has zero subtype rows. VerifyIntegrity's totality scan must fail closed with
+        a typed ErrSubtypeIntegrity naming the offending JournalID, and repair
+        nothing.
+      operator: corrupt-noncontiguous-insert
+    input:
+      journalIdGap: 100
+    expected:
+      errorType: SubtypeIntegrity
+      failsClosed: true
+      silentRepair: false
+      errorActionable: true

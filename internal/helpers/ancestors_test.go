@@ -34,8 +34,8 @@ func setupChain(t *testing.T) (dgraph.Graph[string, ptypes.Task], ptypes.Task, p
 	c := makeTask("ns", "C")
 
 	for _, task := range []ptypes.Task{a, b, c} {
-		if err := g.AddVertex(task); err != nil {
-			t.Fatalf("AddVertex(%s) error: %v", task.Title, err)
+		if err := db.SeedLegacyTaskRow(task); err != nil {
+			t.Fatalf("SeedLegacyTaskRow(%s) error: %v", task.Title, err)
 		}
 	}
 
@@ -174,8 +174,8 @@ func TestAncestorsDiamond(t *testing.T) {
 	d := makeTask("ns", "D")
 
 	for _, task := range []ptypes.Task{a, b, c, d} {
-		if err := g.AddVertex(task); err != nil {
-			t.Fatalf("AddVertex(%s) error: %v", task.Title, err)
+		if err := db.SeedLegacyTaskRow(task); err != nil {
+			t.Fatalf("SeedLegacyTaskRow(%s) error: %v", task.Title, err)
 		}
 	}
 
@@ -236,8 +236,8 @@ func TestAncestorsEmptyGraph(t *testing.T) {
 	g := intgraph.NewGraph(db)
 
 	task := makeTask("ns", "lonely")
-	if err := g.AddVertex(task); err != nil {
-		t.Fatalf("AddVertex error: %v", err)
+	if err := db.SeedLegacyTaskRow(task); err != nil {
+		t.Fatalf("SeedLegacyTaskRow error: %v", err)
 	}
 
 	ancestors, err := helpers.Ancestors(g, db, task.ID)

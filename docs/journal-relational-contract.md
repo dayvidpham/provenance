@@ -480,6 +480,29 @@ kinds (`pasture.review.recorded`) that Provenance never enumerates in
 advance. This is the same open/closed distinction the historical `#4` body
 already drew, carried forward unchanged.
 
+**Fixed-mapping lifecycle kinds (`StatusForEventKind`).** A small **closed** set of
+`provenance.*` event kinds are the reducer's status-lifecycle vocabulary: their
+projection onto `tasks.status_id` is a fixed mapping, not an open payload read —
+`provenance.task.created`, `provenance.task.reopened`, and `provenance.task.stopped`
+→ `open`, `provenance.task.started` → `in_progress`, `provenance.task.closed` →
+`closed`. Any other `EventKind` (a caller-domain event) leaves status unchanged.
+`in_progress` is reachable natively **only** via `provenance.task.started` (added by
+`#5` as the completion of §15's status-divergence forward pointer, under §8.1's own
+"route that status change through a journal lifecycle event once the direct-write path
+retires" authority — not an open reversal of the ratified status model); the only
+other route to a non-`open` baseline is a migration marker's captured legacy status
+(§13). `provenance.task.stopped` is the `#5` lifecycle kind for the `in_progress` →
+`open` transition (`Session.Stop`) — halting active work without closing — added under
+the same authority. The generalized "status-from-payload" alternative was **rejected**
+to keep the lifecycle vocabulary a closed, statically-typed fixed mapping rather than
+an interpreted payload channel.
+
+Two kinds (`reopened`, `stopped`) share the `→ open` target; they are NOT
+disambiguated by the target status but by the **static status FSM** (§8.1), which fixes
+the legal *source* status of each transition kind — `stopped` only from `in_progress`,
+`reopened` only from `closed` — so the fixed target mapping and the source rule together
+keep every transition kind's meaning unambiguous.
+
 ### 5.2 `journal_task_event_contexts`
 
 | Attribute | Domain | Nullable | Notes |
@@ -551,8 +574,59 @@ The reducer consults this table's presence, not any status field, before
 accepting an `update`/`status`/`phase`/`owner`/`assignment`/`close`/`reopen`
 mutation against a `TaskID`: presence of a row rejects the mutation
 outright. A snapshot task remains an ordinary `TaskID` for relationship
-targets (edges, attribution, evidence) — only the seven listed mutation
-families are closed off.
+targets (attribution, evidence) — the listed lifecycle mutation families
+are closed off.
+
+### 6.4 Journaled relationship/annotation mutation families (`#5` amendment)
+
+**Amendment (reductive).** Earlier drafts classified typed dependency **edges**,
+**labels**, and **comments** as un-journaled *relationship/annotation targets* outside the
+journal's mutation-family scope — the journal recorded only the task-lifecycle families
+(create/update/status/close/reopen) plus authority/decision/evidence, and the Session
+exposed the five relationship/annotation verbs as honest un-journaled direct writes. That
+classification is **superseded**: per the recorded UAT Gate-1 ruling ("edges, labels, and
+comments should become journaled — this would enable who-provenance"), edge-add,
+edge-remove, label-add, label-remove, and comment-add are now **first-class journaled
+mutation families**. The "relationship-target-only, un-journaled" classification of
+edges/labels/comments — and the §16 un-journaled disclosure that documented it — are
+**void**. What is NOT changed: §14.5 (a `blocked_by` edge grants no ownership authority)
+stands unchanged — an edge's *creation* is now journaled, but the edge still delegates no
+authority (see §14.5).
+
+**Shape (fixed-kind pattern).** Each family is journaled ON a `journal_task_events` row
+(§5.1) carrying a **fixed per-family `EventKind`** — `provenance.edge.added`,
+`provenance.edge.removed`, `provenance.label.added`, `provenance.label.removed`,
+`provenance.comment.added` — never a payload-generalized dispatch (the same closed-kind
+discipline as the lifecycle kinds, §5.1, and the Gate-2 FSM precedent). The row's `TaskID`
+is the **source/subject** task; it is authorized against the operation's authority at the
+effect's own `JournalID` exactly like any task event (§9.3), and attributed to the
+committing actor (§8.2). The operands live in the row **payload**, encoded from closed
+shapes:
+
+| Family kind | Payload FD (operands) |
+|---|---|
+| `provenance.edge.added` / `provenance.edge.removed` | `{JournalID} → {Target, EdgeKind}` |
+| `provenance.label.added` / `provenance.label.removed` | `{JournalID} → {Label}` |
+| `provenance.comment.added` | `{JournalID} → {CommentID, Author, Body}` |
+
+The `journal_task_events` PK/BCNF of §5.1 applies unchanged (candidate key `{JournalID}`;
+`EventKind`/`Payload` opaque-to-the-supertype). **Who-provenance** is therefore
+journal-derivable: *who* added/removed a relationship (the anchor's committing actor),
+*under which authority* (the producing operation's `AuthorityJournalID`, §3.1), *at which
+position* (the row's `JournalID`), and *what* (the payload operands).
+
+**Domain projections (BCNF, re-derivable).** The `edges`, `labels`, and `comments` base
+tables are now **shared-reducer projections** — the current materialization of the
+journaled families — exactly as `tasks` (§8.1) is the projection of the lifecycle events.
+The shared reducer step folds each family row into its projection (an edge-add `INSERT`, an
+edge-remove `DELETE`, and so on), and the §15 from-empty convergence check covers them: a
+full replay re-derives the identical `edges`/`labels`/`comments` sets from ordered journal
+history. Their keys are unchanged — `edges{SourceID, TargetID, EdgeKind}`,
+`labels{TaskID, Name}`, `comments{CommentID}` (with FD `{CommentID} → {TaskID, Author,
+Body, CreatedAt}`). A `blocked_by` edge-add is **cycle-checked in the reducer fold** before
+it commits (the graph store reads the same `edges` projection, so a cycle-free journal
+keeps the graph acyclic); the comment's `CommentID` is minted once by the caller and
+carried in the payload so a replay reproduces the SAME id.
 
 ## 7. Actor domain
 
@@ -659,14 +733,65 @@ outside `Apply`/`Open` — it is the "current occupant of the
 for query convenience rather than recomputed from `journal_authority_assignment_episodes`
 on every read.
 
-**S1.1 → S1.3 staging note.** At the journal-base layer (`dayvidpham/provenance#4`,
-S1.1) `tasks.LastJournalID` ships **nullable**: the pre-journal direct-write
-task-creation path predates the shared reducer, so existing and newly created
-tasks have no watermark to populate until every task write is routed through
-`Apply`/`Open` (§9). This is a deliberate staging gap, not a schema bug — the
-column is tightened to `NOT NULL` (as stated above) by the shared-reducer
-slice (`dayvidpham/provenance#5`, S1.3) once all task writes are
-journal-anchored.
+**S1.1 → S1.3 staging note — RESOLVED (`dayvidpham/provenance#5`).** At the
+journal-base layer (`#4`, S1.1) `tasks.LastJournalID` shipped **nullable**: the
+pre-journal direct-write task-creation path predated the shared reducer, so tasks
+had no watermark to populate until every task write flowed through `Apply`/`Open`
+(§9). The tightening slice (`#5`) **retired that direct-write task path** — task
+creation, update, and closure are journaled through the Session SDK (§16), the
+graph `Store.AddVertex` no longer creates rows, and the bare direct-write insert is
+gone — so a fresh native database now ships `tasks.LastJournalID` **`NOT NULL`** and
+the only tasks-row `INSERT` is the reducer fold, which carries the watermark. A
+legacy database that predates the tightening is upgraded to the anchored,
+watermark-carrying shape by `MigrateLegacyBaseline` (§13), which re-tightens the column
+back to `NOT NULL` once every row is anchored — so a migrated database enforces the
+watermark invariant at the **schema level** exactly as a fresh one, not merely at the
+migration instant; `VerifyIntegrity` (§15) additionally rejects any un-anchored
+(NULL-watermark) task row over stored rows. The
+lifecycle status baseline is the reducer zero (`open`) unless a **fixed-mapping
+lifecycle event** moves it: `provenance.task.created` / `provenance.task.reopened` /
+`provenance.task.stopped` → `open`, `provenance.task.started` → `in_progress`,
+`provenance.task.closed` → `closed` (the fixed `StatusForEventKind` mapping, §5.1);
+`in_progress` is reachable natively only through `provenance.task.started`, or through
+a migration marker's captured legacy status (§13). Adding `provenance.task.started`
+(and its `stopped` counterpart) is exactly the completion of §15's forward pointer
+("route that status change through a journal lifecycle event once the direct-write path
+retires").
+
+**Static status FSM.** The four TRANSITION lifecycle kinds
+(`started`/`stopped`/`closed`/`reopened`) move an EXISTING task between statuses under a
+**static finite-state machine** — a fixed transition table over the closed status enum,
+enforced in the shared reducer fold before the status projection is materialized. The
+legal arrows are exactly:
+
+| from | verb (kind) | to |
+|---|---|---|
+| `open` | `Start` (`started`) | `in_progress` |
+| `in_progress` | `Stop` (`stopped`) | `open` |
+| `open` | `CloseTask` (`closed`) | `closed` |
+| `in_progress` | `CloseTask` (`closed`) | `closed` |
+| `closed` | `Reopen` (`reopened`) | `open` |
+
+Every other `(from, kind)` pair is illegal, including a same-state repeat (e.g.
+closing an already-closed task) and the direct `closed → in_progress` jump (a closed
+task reaches `in_progress` only by `Reopen` then `Start`). An illegal transition fails
+closed with the typed `InvalidStatusTransition{From, To, Kind}` (wrapping the
+`ErrStatusTransition` sentinel, recoverable with `errors.Is`) and commits nothing. The
+baseline-seeding kinds (`created`, `migrated`) are NOT transitions and are not checked:
+`created` seeds `open` at birth, `migrated` seeds the captured legacy status (§13). The
+FSM is enforced in the SINGLE shared reducer step Apply and Open both run (§9.2), so a
+live `Apply` rejects an illegal transition before commit and Open's from-empty replay
+applies the identical rule to the identical row — a committed transition is by
+construction reproducible.
+
+**Forced escape hatch.** A transition may be committed OUT of the FSM by a **forced**
+coercion (the `Session` verbs invoked `WithForce`, the CLI `--force`): the reducer
+records a forced marker in the produced journal row's payload and SKIPS the FSM for
+exactly that one row. Because the marker lives in the journal row, the coercion is
+**journal-reproducible** (Open's from-empty replay reads the marker and skips the FSM
+identically) and **audit-visible** (the row's payload shows `forced:true`). Force
+bypasses the FSM ONLY — never authorization (§9.3): a forced transition is still
+authorized against the operation's authority at the effect's own `JournalID`.
 
 ### 8.2 `task_attributions`
 
@@ -924,18 +1049,21 @@ boundary, before returning to the caller.
    `ProducedByOperationJournalID` is `NOT NULL` and refers to exactly one
    `journal_operations.JournalID`.
 
-   **S1.1 staging note.** At the journal-base layer (`dayvidpham/provenance#4`,
-   S1.1) no `journal_operations` subtype table exists yet, so there is no
-   operation anchor for a `task_event` row's `ProducedByOperationJournalID` to
-   reference. `AppendTaskEvent` — the pre-operations base primitive the
-   operations layer wraps — writes `task_event` rows with
-   `ProducedByOperationJournalID = NULL` uniformly, which does not yet satisfy
-   this rule. Rule 2's `NOT NULL` enforcement (and the `ProducedByOperationJournalID
-   → journal_operations.JournalID` foreign key from §2.1) takes hold starting
-   with the operations slice (`dayvidpham/provenance#5`, S1.2), when
-   `journal_operations` lands and every effect-producing operation anchors its
-   rows to it. `VerifyIntegrity`'s §10 rule 8 subtype-integrity guard does not
-   check rule 2 and is unaffected by this staging gap.
+   **S1.1 staging note — RESOLVED (`dayvidpham/provenance#5`).** At the
+   journal-base layer (`#4`, S1.1) no `journal_operations` subtype table exists
+   yet, so `AppendTaskEvent` — the pre-operations base primitive — writes
+   `task_event` rows with `ProducedByOperationJournalID = NULL` uniformly, and that
+   NULL-producer shape is valid **at that layer** (its standalone tests stay green).
+   The operations layer (`#5`) completes the `ProducedByOperationJournalID →
+   journal_operations.JournalID` foreign key AND adds the **task-event producer
+   `CHECK`** to the same journal rebuild: `CHECK (JournalKind <> 'task_event' OR
+   ProducedByOperationJournalID IS NOT NULL)`. Every task event is now produced by
+   an operation (a native create/update/lifecycle event, or a migration baseline
+   marker), so the only thing the `CHECK` rejects is the retired bare NULL-producer
+   append; the base primitive's method shape is unchanged (the layering holds
+   because only *which callers remain legal* changes under `#5`'s schema), and the
+   bare-append public path is retired from the operations-layer `JournalAPI`.
+   `VerifyIntegrity`'s §10 rule 8 subtype-integrity guard is orthogonal to rule 2.
 3. Common fields (`JournalKind`, `ActorID`, `RecordedAt`) are never
    duplicated on a subtype row; a subtype row's only own attributes are the
    ones that do not already exist on the supertype.
@@ -1084,6 +1212,38 @@ exists yet). Because `legacy id` is `tasks.id`, the existing table's own
 primary key, it is globally unique, so `(created_at, id)` is already a total,
 unique order regardless of how many legacy rows share an identical `created_at`
 — `id` alone breaks every tie.
+
+**Legacy-schema upgrade (`#5`).** A legacy database exists **on disk with the old
+schema** — it is never built through the new API. Its `tasks` table predates the
+`#5` `LastJournalID` tightening: the watermark column is nullable, or (for a database
+older than the journal-base layer) absent entirely, and its rows carry no watermark.
+Migration upgrades such a database **in place**: it first ensures the `LastJournalID`
+column exists (the column-add path — a no-op when the column is already present, an
+`ALTER TABLE ... ADD COLUMN LastJournalID INTEGER REFERENCES journal(JournalID)` when
+it is absent), then journal-anchors every legacy row (the baseline events below),
+whose reducer projection populates each row's watermark, and finally **re-tightens the
+column back to `NOT NULL`** once no un-anchored task row remains. When a run anchors the
+whole table — the ordinary full-database migration — every task row then carries a
+watermark, so the `NOT NULL` constraint is restored at the **schema level** exactly as on
+a fresh native database: a migrated database is not merely data-level-satisfied at the
+migration instant but structurally protected from a later un-journaled `NULL`-watermark
+write, closing what would otherwise be a fresh-vs-migrated asymmetry. If the caller
+migrated only a subset and un-anchored legacy rows remain, the table cannot yet satisfy
+`NOT NULL`, so the column stays at the legacy nullable shape and a later migration of the
+rest completes the tightening (the gate keeps the step fail-closed rather than erroring on
+a still-`NULL` row). `VerifyIntegrity` (§15) additionally rejects any un-anchored row over
+stored data throughout. The re-tightening runs as its own foreign-key-safe atomic rebuild
+immediately after the anchor batch commits (the canonical SQLite table rebuild toggles
+`PRAGMA foreign_keys`, a no-op inside a transaction, so it cannot nest inside the anchor
+savepoint), under the single migration lock; if it fails, the committed anchors are left
+in the valid legacy nullable shape and an idempotent re-run re-applies the re-tightening.
+The proof corpus models a legacy
+database via a **test-only old-schema seeding seam** — `SeedLegacyTask` downgrades a
+native schema to the legacy nullable (or column-less) watermark shape and raw-inserts
+a pre-journal row, mirroring an on-disk legacy database, never routing through the
+public API — so the migration path is exercised against exactly the input it upgrades
+in production, and §13.2's migrated/native equivalence compares fully-anchored
+post-migration state on both sides.
 
 The whole migration executes under the `pasture-system` bootstrap authority
 established by the genesis operation (§4.6): the genesis operation is the first
@@ -1281,6 +1441,40 @@ and `ended-before-started-in-one-batch-rejected`.
 
 ### 14.5 Parent-citation governance (deliberate ownership reach)
 
+§9.3/§14.1 fix *when* an authority is checked (against `Reduce(history, J_current
+− 1)`); this section fixes *what task* an authority governs — the scope the
+per-effect checkpoint evaluates:
+
+- A **bootstrap** authority (the genesis/system root, §4.6) governs **every**
+  task.
+- An **assignment** authority governs (a) the task of its own active episode
+  (a `started`-but-not-`ended` episode, §14.4), and (b) every task reachable
+  from that episode by **deliberate parent citations**, with whole-chain
+  liveness (specified below). It grants no other cross-task authority.
+
+There is deliberately **no edge-graph governance**. A scheduling edge — in
+particular `blocked_by`, which elsewhere in this system means only "the target
+must be work that finishes before the source" (a dependency-ordering constraint,
+enforced acyclic) — carries **no** ownership, hierarchy, or governance meaning. A
+task merely reachable from an authority's episode-task through such an edge is
+**not** governed by that authority: treating `blocked_by` reachability as
+governance would let any active assignment on a shared prerequisite task (an
+infra fix, a shared-library bump, a review gate) silently acquire write authority
+over every organizationally unrelated task that lists it as a scheduling blocker
+— an unbounded authorization over-grant. `authority_evidence.yaml` /
+`blocked-by-scheduling-edge-does-not-grant-authority` pins this rejection. The
+*only* cross-task reach an assignment authority has is the parent-citation chain
+defined here — a chain of deliberate ownership citations, categorically
+different from a scheduling edge.
+
+**Re-pin under the §6.4 amendment.** Journaling an edge's *creation* (§6.4) does not
+change this: a `blocked_by` edge now has a journaled birth (who added it, under which
+authority, at which position), but the edge itself still delegates **no** ownership
+authority. Governance flows only through parent citations, never through a journaled — or
+any — scheduling edge. `mutation_families.yaml` /
+`journaled-blocked-by-edge-grants-no-authority` pins that the ruling survives the
+amendment; `blocked-by-scheduling-edge-does-not-grant-authority` remains authoritative.
+
 An assignment authority reaches beyond its own task **only** through explicit
 parent citations. This is the delegated-ownership relation: a supervisor holding
 an episode on an epic can authorize work on a subtask precisely because the
@@ -1333,26 +1527,24 @@ the delegated authority is cut immediately — a grandparent no longer governs a
 grandchild once the parent between them ends, even though the grandchild episode
 is still active and the parent citation still physically points at the ended
 parent. Liveness is `active at effect time` for the whole chain, not merely at
-citation time. The must-fail
-`parent-chain-middle-episode-ended-cuts-authority` corpus case pins this.
+citation time. The must-fail `parent-chain-middle-episode-ended-cuts-authority`
+corpus case pins this.
 
 **Implementation.** The predicate is a **recursive walk** over
-`ParentAssignmentID` — a chain of *deliberate ownership citations*, categorically
-different from the rejected `blocked_by` scheduling-edge reach (§14.1): a
-scheduling edge orders work and delegates nothing, so the
-`blocked-by-scheduling-edge-does-not-grant-authority` must-fail case still holds
-unchanged. The walk is bounded and visited-tracked; a corrupted stored chain
-that forms a cycle (reachable only by bypassing citation validity, e.g. a direct
-schema corruption) fails closed with a typed error (`ErrCorruptParentChain`)
-rather than looping. The must-fail
+`ParentAssignmentID`. The walk is bounded and visited-tracked; a corrupted stored
+chain that forms a cycle (reachable only by bypassing citation validity, e.g. a
+direct schema corruption) fails closed with a typed error
+(`ErrCorruptParentChain`) rather than looping. The must-fail
 `corrupted-cyclic-parent-chain-fails-closed` corpus case drives this via an
 adversarial seam.
 
-This section **is** the §14 amendment the earlier build deferred: the
-cross-task governing-parent reach is now designed and delivered here, so an
-assignment authority is no longer restricted to its own episode's task. The one
-reach it still does not have is topological — a task merely reachable through a
-scheduling edge is governed by nothing but its own citation lineage (§14.1).
+**Amendment status.** This section **is** the §14 amendment the earlier build
+deferred behind a gate: the cross-task governing-parent reach — an
+assignment-to-assignment parent-citation model — is now designed and delivered
+here, so an assignment authority is no longer restricted to its own episode's
+task. The one reach it still does not have is topological: a task merely
+reachable through a scheduling edge is governed by nothing but its own citation
+lineage.
 
 ## 15. Projection invariants
 
@@ -1361,9 +1553,112 @@ columns, `task_attributions`, `task_event_activity`,
 `assignment_current`) is reproducible **solely** from ordered `journal`
 history — no projection may be seeded, patched, or reconciled from any
 non-journal input. `tasks.LastJournalID` exists specifically so this claim is
-checkable: `Open` may assert `stored_projection == Reduce(history,
-stored_projection.LastJournalID)` for every task before accepting a database
-as converged.
+checkable.
+
+**`Open` verifies convergence by a genuine from-empty re-derivation.**
+`ReplayProjections` (the `Open`/startup replay) does **not** re-fold on top of
+the stored projection and diff a before/after snapshot — such an on-top re-fold
+only detects drift in a field some journal row actually writes, so an
+out-of-band corruption on a field no row revisits (e.g. a hand-corrupted
+`tasks.status_id` on a task whose journal history carries **no** status-changing
+lifecycle event) reads back unchanged and is silently reported as converged.
+Instead, `Open` clears the projection to an empty slate in a scratch savepoint,
+re-folds the entire journal through the one shared reducer step (§9.2), and
+asserts `stored_projection == Reduce(history[..], from empty)` across the **full
+projection set** — owner, status, watermark, **and** `task_attributions` — for
+every task. The scratch rebuild is always rolled back, so the check is read-only
+and idempotent; a genuine divergence fails closed with a typed
+`ProjectionDivergenceError` (§13.1 six-field shape) naming the task, the
+diverging field, and the stored-vs-derived values, and no projection is silently
+repaired.
+
+Because the re-derivation runs from empty, every value it seeds is itself a
+journal fact: a task's status baseline is the reducer's zero (`open`) unless a
+lifecycle event (created/reopened/closed) or a **migration marker** moves it — a
+migration marker captures the migrated task's preserved legacy status in its own
+payload (§13 item 1), and the reducer seeds status from **that captured journal
+value**, never from the mutable `tasks` row, so a migrated-but-never-relifecycled
+task's status remains reproducible solely from journal history.
+
+**Staging scope — RESOLVED (`dayvidpham/provenance#5`).** Convergence is asserted
+for **journal-anchored** tasks — those with at least one journal-spine row (a
+`journal_task_events`, `journal_authority_*` episode, `journal_decisions`, or
+`journal_evidence` row) — so their owner, status, watermark, and attributions are
+all journal-reproducible. The direct-write task path is **retired**: task creation,
+update, and closure flow through the Session SDK (§16) and are journaled, so a
+"pure direct-write task with zero journal rows" is no longer produced — a native
+task is born through the fold with a `provenance.task.created` event, and
+`VerifyIntegrity` (§15/§8.1) rejects any un-anchored task row. The status-divergence
+forward pointer is discharged: a native `in_progress` transition now routes through
+the fixed-mapping `provenance.task.started` lifecycle event (§5.1, §8.1), so the
+status is journal-reproducible and convergence holds — `Session.Update(Status:
+in_progress)` emits `started`, never a direct column write. A migrated task **is**
+journal-anchored and fully checked; a migration marker's captured legacy status
+(§13) is the one non-native route to a baseline status.
+
+## 16. Mutation SDK (`Session`)
+
+`Session` is the mutation surface the Pasture task backend consumes. `Tracker.As(actor,
+authority)` binds a committing actor and a governing authority once, and exposes the
+task-tracker mutation verbs on one receiver. It sits on top of the low-level
+`MutationContext`/`Apply` primitive (still public); reads stay on the `Tracker`
+interface unchanged. Every verb is journaled: each builds one logical operation (§9) and
+commits it through `Apply`, so every birth, metadata change, status transition, closure,
+edge, label, and comment flows through the ordered journal and is reproducible from
+history (§8.1, §15).
+
+**Task lifecycle (`Create`, `Update`, and the dedicated status verbs).** `Create` mints
+a `TaskID` and commits one task-create effect (the task is born through the fold with a
+non-NULL watermark, §8.1). `Update` is **metadata-only**: the fields
+`Title`/`Description`/`Priority`/`Phase`/`Notes` emit one `provenance.task.updated` event
+materializing those columns; it never changes status, and an `Update` with no field set
+is a journal-honest no-op. `Owner` is not settable through `Update` — ownership moves
+only through assignment episodes (§4.4). The status lifecycle is governed by **four
+dedicated verbs** under the static FSM (§8.1): `Start` (`open → in_progress`), `Stop`
+(`in_progress → open`), `CloseTask` (`{open,in_progress} → closed`, also materializing
+the close reason), and `Reopen` (`closed → open`). Each journals its own fixed-mapping
+lifecycle kind; the shared reducer rejects an illegal transition (a same-state repeat, or
+the direct `closed → in_progress`) with the typed `InvalidStatusTransition{From, To, Kind}`
+(wrapping the `ErrStatusTransition` sentinel).
+Any status verb may be invoked `WithForce` — the escape hatch (CLI `--force`) — to coerce
+the FSM: the coercion is journaled with a forced marker, skips the FSM ONLY (never
+authorization, §9.3), and is reproducible from history. A journaled verb against a
+never-initialized (empty) journal returns an actionable `ErrGenesisRequired` (§4.6, §13)
+rather than a deep authority-not-found. `Atomic(build)` commits a caller-composed
+multi-effect operation in builder order with per-effect authorization (§9.3).
+
+`Update` is deliberately narrowed to metadata: a status decomposition inside `Update`
+would let a status change ride a metadata call and blur the FSM's boundary. The dedicated
+verbs are the sole status surface, `Update(Status: …)` under the hood is exactly one such
+verb's single-effect operation, and the forced escape hatch is available on every one of
+them (per the recorded UAT Gate-2 ruling: dedicated verbs are the design; a forced
+`--force` argument admits deliberate out-of-FSM coercion). Because there are no journal
+consumers before launch, dropping the pre-`#5` `UpdateFields.Status` field is an accepted
+compatibility break, not a preserved shim.
+
+**Journaled relationship/annotation verbs (`AddEdge`, `RemoveEdge`, `AddLabel`,
+`RemoveLabel`, `AddComment`) — §6.4.** Per the UAT Gate-1 ruling these five are now
+**journaled** (the earlier un-journaled disclosure is void): each commits one typed
+mutation-family effect (`provenance.edge.added`/`removed`, `provenance.label.added`/
+`removed`, `provenance.comment.added`) under this Session's actor and authority, so who
+added/removed the relationship, under which authority, at which journal position is
+derivable from the journal (who-provenance, §6.4). The `edges`/`labels`/`comments` domain
+tables are shared-reducer projections re-derivable from history (§6.4, §15), and
+authorization is the same per-effect discipline as a task event (§9.3). The verb
+**signatures are unchanged** — the forward-compatibility the earlier draft preserved made
+this a non-breaking internal upgrade. A `blocked_by` edge-add is cycle-checked in the
+reducer fold. The edge's *creation* being journaled does NOT make the edge grant
+authority — §14.5 (a scheduling edge delegates no ownership) is unchanged. All eight
+Session mutation verbs are thus journaled.
+
+**OperationID and retry safety.** Every journaled verb defaults to a fresh UUIDv7
+`OperationID`, so a naive retry after an ambiguous failure commits a **second**
+operation. To make a journaled mutation idempotent, pin a stable `OperationID`
+(`WithOperationID`) and reuse it verbatim on the retry: an exact same-identity replay
+short-circuits to the original committed result (§9.4); a reused id presenting different
+arguments is a typed conflict (§11). (`Create` mints a fresh `TaskID` on every call, so
+even a pinned-id `Create` retry is idempotent only through the §9.4 short-circuit, which
+returns the original task.)
 
 ## Adversarial proof corpus
 
@@ -1383,12 +1678,15 @@ that first exposed it — never a Beads ID or a proposal/slice/phase label.
 | [`retry_reopen_cancellation.yaml`](../testdata/contract/retry_reopen_cancellation.yaml) | 5 | Retry/reopen/cancellation; regression (e) |
 | [`authority_evidence.yaml`](../testdata/contract/authority_evidence.yaml) | 9 | Per-effect authority at each `JournalID`; orphaned/multiply-consumed evidence; anchor-only actor placement (subordinate row carrying actor rejected); assignment-transition lifecycle order; regressions (a), (d) |
 | [`owner_responsibility.yaml`](../testdata/contract/owner_responsibility.yaml) | 6 | Owner-responsibility end bound to legal close; transfer-CAS and transfer-crash atomicity; occupant attribution; regression (c) |
-| [`baseline_migration.yaml`](../testdata/contract/baseline_migration.yaml) | 7 | Fresh/legacy-assigned/legacy-terminal/unmappable-owner baseline transitions; honest timestamps; actionable migration-error fields; migrated/native observational equivalence; idempotent re-run; regression (g) |
-| [`topology_corruption.yaml`](../testdata/contract/topology_corruption.yaml) | 6 | Fail-closed on missing/corrupted external schema (table + column, both directions); actionable preflight-error fields; regression (f) |
+| [`baseline_migration.yaml`](../testdata/contract/baseline_migration.yaml) | 8 | Fresh/legacy-assigned/legacy-terminal/unmappable-owner baseline transitions; honest timestamps; actionable migration-error fields; migrated/native full-projection observational equivalence; deterministic `(created_at, id)` tie-break; idempotent re-run; regression (g) |
+| [`topology_corruption.yaml`](../testdata/contract/topology_corruption.yaml) | 7 | Fail-closed on missing/corrupted external schema (table + column, both directions incl. unexpected extra table); actionable preflight-error fields; regression (f) |
+| [`projection_convergence.yaml`](../testdata/contract/projection_convergence.yaml) | 6 | From-empty §15 convergence over the full projection set (owner/status/watermark/attributions); fail-closed `ProjectionDivergenceError` on out-of-band owner/status/watermark/attribution corruption; migrated-status reproducibility |
 | [`genesis_bootstrap.yaml`](../testdata/contract/genesis_bootstrap.yaml) | 5 | Genesis authority base case; NULL-authority discipline (first-operation-only, sole-bootstrap-effect); same-`OperationID` genesis retry short-circuit |
 | [`operation_results.yaml`](../testdata/contract/operation_results.yaml) | 3 | `ResultSlotID` → produced-row mapping reconstruction; EmittedEvents via the produced closure; rule-9 result-slot own-operation integrity (must-fail) |
 | [`subtype_integrity.yaml`](../testdata/contract/subtype_integrity.yaml) | 4 | Subtype totality/exclusivity/discriminator agreement (both inheritance levels) |
 | [`actor_namespace.yaml`](../testdata/contract/actor_namespace.yaml) | 3 | Namespace-claim range disjointness; entry-in-range validation |
+| [`status_fsm.yaml`](../testdata/contract/status_fsm.yaml) | 3 | Static status FSM (§8.1): illegal `closed→in_progress` fails closed; `in_progress→open` stopped transition + from-empty convergence; forced coercion commits, records the forced marker, and replays |
+| [`mutation_families.yaml`](../testdata/contract/mutation_families.yaml) | 4 | Journaled edges/labels/comments (§6.4): who-provenance (committer, position, payload operands); per-effect authorization must-fail per family (§9.3); edge/label/comment projections replay from empty (§15); journaled `blocked_by` edge still grants no authority (§14.5 re-pin) |
 
 **Seven regression obligations, each with at least one named history**
 (file → case name):

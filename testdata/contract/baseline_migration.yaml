@@ -14,6 +14,7 @@ cases:
     expected:
       migrationEventCreated: true
       episodesCreated: 0
+      projectedStatus: open
 
   - name: legacy-assigned-nonterminal-baseline-preserves-owner
     classification: must-pass
@@ -31,6 +32,7 @@ cases:
       episodesCreated: 1
       episodeActiveAfterMigration: true
       startedTransitionRecordedAt: "2025-06-02T00:00:00Z"
+      projectedStatus: in_progress
 
   - name: legacy-terminal-baseline-ends-assignment-at-legal-close-not-now
     classification: must-pass
@@ -51,6 +53,7 @@ cases:
       startedTransitionRecordedAt: "2025-06-03T00:00:00Z"
       endedTransitionRecordedAt: "2025-06-04T00:00:00Z"
       endedTransitionRecordedAtEqualsWallClock: false
+      projectedStatus: closed
 
   - name: fabricated-wallclock-timestamp-in-baseline-rejected
     classification: must-fail
@@ -108,10 +111,18 @@ cases:
         Reduce over [baseline rows, native transfer] must produce a projection
         identical (beyond RecordedAt provenance) to Reduce over a native-only
         history that creates the equivalent task, starts the equivalent first
-        episode, and applies the same transfer.
+        episode, and applies the same transfer. The equivalence covers the full
+        TaskProjection (owner AND status AND the watermark), so both the migrated
+        and native paths reach the same status (open — a status a native history
+        can reach; the legacy-preserved in_progress/closed statuses, which no
+        native lifecycle event produces, are covered by the migrate-legacy-task
+        cases). The absolute LastJournalID differs between two distinct tasks in
+        one database, so the watermark is compared structurally (each equals its
+        own task's latest journal row), per §13.2's observational-equivalence
+        definition.
       operator: migrate-then-extend-compare-to-native-only
     input:
-      legacyTask: {id: t8, owner: actor-frank, status: in_progress, updatedAt: "2025-06-10T00:00:00Z"}
+      legacyTask: {id: t8, owner: actor-frank, status: open, updatedAt: "2025-06-10T00:00:00Z"}
       nativeExtension:
         - {kind: transfer, fromOccupant: actor-frank, toOccupant: actor-grace, chainsOffMigratedEpisode: true}
       nativeOnlyEquivalent:
@@ -122,6 +133,27 @@ cases:
       projectionsIdenticalBeyondRecordedAt: true
       migratedOwner: actor-grace
       nativeOnlyOwner: actor-grace
+      migratedStatus: open
+      nativeOnlyStatus: open
+      watermarkComparedStructurally: true
+
+  - name: two-legacy-tasks-identical-createdat-break-tie-by-id
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#4 amendment §13 deterministic (created_at, id) pre-migration sort totality"}
+    mutation:
+      description: >-
+        Two legacy tasks share an identical created_at, so the (created_at,
+        id-ascending) pre-migration sort must break the tie by id alone,
+        producing a stable, deterministic baseline order (the task with the
+        smaller id gets the smaller baseline anchor JournalID) every run.
+      operator: migrate-two-identical-createdat-tie-break
+    input:
+      legacyTasks:
+        - {id: alpha, owner: null, status: open, createdAt: "2025-06-12T00:00:00Z", updatedAt: "2025-06-12T00:00:00Z"}
+        - {id: beta,  owner: null, status: open, createdAt: "2025-06-12T00:00:00Z", updatedAt: "2025-06-12T00:00:00Z"}
+    expected:
+      baselineAnchorsCreated: 2
+      smallerIdGetsSmallerAnchorJournalId: true
 
   - name: re-run-migration-hits-idempotent-short-circuit-no-duplicate-baseline
     classification: must-pass

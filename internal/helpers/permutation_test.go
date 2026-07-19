@@ -86,9 +86,9 @@ func setupTopology(t *testing.T, topo TopologyFixture) (
 	nodeMap := make(map[string]ptypes.Task, len(topo.Nodes))
 	for _, label := range topo.Nodes {
 		task := testutil.MakeTask("fixture", fmt.Sprintf("node-%s", label))
-		if err := g.AddVertex(task); err != nil {
+		if err := db.SeedLegacyTaskRow(task); err != nil {
 			t.Fatalf(
-				"permutation_test.setupTopology: topology %q: AddVertex for node %q failed: %v — "+
+				"permutation_test.setupTopology: topology %q: SeedLegacyTaskRow for node %q failed: %v — "+
 					"check that the task ID is unique and the DB schema is correct",
 				topo.Name, label, err,
 			)

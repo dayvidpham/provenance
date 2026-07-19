@@ -30,6 +30,35 @@ type (
 	FixedActorEntry        = journal.FixedActorEntry
 	UUIDRange              = journal.UUIDRange
 	NamespaceCodec         = journal.NamespaceCodec
+
+	// Operations, effects, results, and authority-lifecycle surface (§2-§4, §9).
+	OperationAuthorityID    = journal.OperationAuthorityID
+	AssignmentID            = journal.AssignmentID
+	ResultSlotID            = journal.ResultSlotID
+	AuthorityKind           = journal.AuthorityKind
+	AssignmentSlotID        = journal.AssignmentSlotID
+	AssignmentTransition    = journal.AssignmentTransition
+	EffectSort              = journal.EffectSort
+	Effect                  = journal.Effect
+	DecisionKind            = journal.DecisionKind
+	EvidenceKind            = journal.EvidenceKind
+	OperationInput          = journal.OperationInput
+	StoredOperationIdentity = journal.StoredOperationIdentity
+	CommittedResultKind     = journal.CommittedResultKind
+	ResultSlotBinding       = journal.ResultSlotBinding
+	CommittedResult         = journal.CommittedResult
+	OperationConflict       = journal.OperationConflict
+
+	// Shared-reducer replay, migration, and preflight surface (§9, §13, §15).
+	TaskStatus                    = journal.TaskStatus
+	TaskProjection                = journal.TaskProjection
+	ReplayResult                  = journal.ReplayResult
+	LegacyTaskRow                 = journal.LegacyTaskRow
+	MigrationInput                = journal.MigrationInput
+	MigrationResult               = journal.MigrationResult
+	MigrationOwnerUnmappableError = journal.MigrationOwnerUnmappableError
+	SchemaPreflightError          = journal.SchemaPreflightError
+	ProjectionDivergenceError     = journal.ProjectionDivergenceError
 )
 
 // Closed enum values.
@@ -51,6 +80,57 @@ const (
 	EventContextKindGit      = journal.EventContextKindGit
 
 	OrdinalV1CodecName = journal.OrdinalV1CodecName
+
+	// Authority-kind and assignment-lifecycle closed enums (§4).
+	AuthorityKindBootstrap  = journal.AuthorityKindBootstrap
+	AuthorityKindAssignment = journal.AuthorityKindAssignment
+	SlotOwnerResponsibility = journal.SlotOwnerResponsibility
+	TransitionStarted       = journal.TransitionStarted
+	TransitionEnded         = journal.TransitionEnded
+
+	// Effect sorts (§9.3).
+	EffectTaskEvent          = journal.EffectTaskEvent
+	EffectBootstrapAuthority = journal.EffectBootstrapAuthority
+	EffectAssignmentStart    = journal.EffectAssignmentStart
+	EffectAssignmentEnd      = journal.EffectAssignmentEnd
+	EffectDecision           = journal.EffectDecision
+	EffectEvidence           = journal.EffectEvidence
+	EffectTaskCreate         = journal.EffectTaskCreate
+
+	// Journaled relationship / annotation mutation-family effect sorts (§6 amendment).
+	EffectEdgeAdd     = journal.EffectEdgeAdd
+	EffectEdgeRemove  = journal.EffectEdgeRemove
+	EffectLabelAdd    = journal.EffectLabelAdd
+	EffectLabelRemove = journal.EffectLabelRemove
+	EffectCommentAdd  = journal.EffectCommentAdd
+
+	// Committed-result variants (§3.2, §9.4).
+	CommittedAbsent   = journal.CommittedAbsent
+	CommittedExact    = journal.CommittedExact
+	CommittedConflict = journal.CommittedConflict
+
+	// Task-status projection (§8.1).
+	TaskStatusOpen       = journal.TaskStatusOpen
+	TaskStatusInProgress = journal.TaskStatusInProgress
+	TaskStatusClosed     = journal.TaskStatusClosed
+
+	// Provenance lifecycle task-event kinds the reducer projects (§8.1, §13).
+	EventKindTaskCreated  = journal.EventKindTaskCreated
+	EventKindTaskStarted  = journal.EventKindTaskStarted
+	EventKindTaskStopped  = journal.EventKindTaskStopped
+	EventKindTaskClosed   = journal.EventKindTaskClosed
+	EventKindTaskReopened = journal.EventKindTaskReopened
+	EventKindTaskMigrated = journal.EventKindTaskMigrated
+	// EventKindTaskUpdated records a materialized-metadata mutation; it is NOT a
+	// status-changing lifecycle kind (§8.1).
+	EventKindTaskUpdated = journal.EventKindTaskUpdated
+
+	// Journaled relationship / annotation mutation-family kinds (§6 amendment).
+	EventKindEdgeAdded    = journal.EventKindEdgeAdded
+	EventKindEdgeRemoved  = journal.EventKindEdgeRemoved
+	EventKindLabelAdded   = journal.EventKindLabelAdded
+	EventKindLabelRemoved = journal.EventKindLabelRemoved
+	EventKindCommentAdded = journal.EventKindCommentAdded
 )
 
 // Typed context and validation constructors.
@@ -65,26 +145,79 @@ var (
 	OrdinalUUID            = journal.OrdinalUUID
 	BigEndianUUID          = journal.BigEndianUUID
 	LookupCodec            = journal.LookupCodec
+
+	// Deterministic migration identity + lifecycle-status projection (§8.1, §13).
+	MigrationBaselineOperationID  = journal.MigrationBaselineOperationID
+	MigrationBaselineAssignmentID = journal.MigrationBaselineAssignmentID
+	StatusForEventKind            = journal.StatusForEventKind
+
+	// Static status FSM surface (§8.1, §16): the transition table and its forced escape
+	// hatch, re-exported so callers can validate/inspect transitions and recover the
+	// typed rejection.
+	ValidateStatusTransition      = journal.ValidateStatusTransition
+	IsTransitionLifecycleKind     = journal.IsTransitionLifecycleKind
+	TransitionLifecycleKinds      = journal.TransitionLifecycleKinds
+	EncodeForcedTransitionPayload = journal.EncodeForcedTransitionPayload
+	DecodeForcedTransition        = journal.DecodeForcedTransition
+
+	// Journaled relationship / annotation mutation-family surface (§6 amendment):
+	// classification + payload codecs, re-exported so who-provenance queries can decode
+	// an edge/label/comment row's operands straight from the journal.
+	IsMutationFamilyKind         = journal.IsMutationFamilyKind
+	MutationFamilyKinds          = journal.MutationFamilyKinds
+	MutationFamilyKindForSort    = journal.MutationFamilyKindForSort
+	DecodeEdgeMutationPayload    = journal.DecodeEdgeMutationPayload
+	DecodeLabelMutationPayload   = journal.DecodeLabelMutationPayload
+	DecodeCommentMutationPayload = journal.DecodeCommentMutationPayload
 )
+
+// Status-FSM typed error + sentinel (§8.1).
+type InvalidStatusTransition = journal.InvalidStatusTransition
 
 // Journal sentinel errors, re-exported for errors.Is at call sites.
 var (
 	ErrUnsupportedOrderDimension = journal.ErrUnsupportedOrderDimension
 	ErrSubtypeIntegrity          = journal.ErrSubtypeIntegrity
+	ErrActorPlacement            = journal.ErrActorPlacement
 	ErrNamespaceRange            = journal.ErrNamespaceRange
 	ErrEntryOutOfRange           = journal.ErrEntryOutOfRange
 	ErrNamespaceClaim            = journal.ErrNamespaceClaim
+
+	// Operations/authority sentinel errors (§4, §9, §14).
+	ErrOperationConflict   = journal.ErrOperationConflict
+	ErrGenesis             = journal.ErrGenesis
+	ErrAuthorityScope      = journal.ErrAuthorityScope
+	ErrAssignmentLifecycle = journal.ErrAssignmentLifecycle
+	ErrOrphanedEvidence    = journal.ErrOrphanedEvidence
+	ErrStaleEpisode        = journal.ErrStaleEpisode
+	ErrResultSlotIntegrity = journal.ErrResultSlotIntegrity
+	ErrCloseWithoutEnding  = journal.ErrCloseWithoutEnding
+	ErrParentCitation      = journal.ErrParentCitation
+	ErrCorruptParentChain  = journal.ErrCorruptParentChain
+
+	// Shared-reducer replay, migration, and preflight sentinels (§9, §13, §15).
+	ErrMigrationOwnerUnmappable    = journal.ErrMigrationOwnerUnmappable
+	ErrSchemaPreflight             = journal.ErrSchemaPreflight
+	ErrProjectionDivergence        = journal.ErrProjectionDivergence
+	ErrStatusTransition            = journal.ErrStatusTransition
+	ErrMigrationFault              = journal.ErrMigrationFault
+	ErrInjectedFault               = journal.ErrInjectedFault
+	ErrDishonestMigrationTimestamp = journal.ErrDishonestMigrationTimestamp
 )
 
-// JournalAPI is the ordered global-journal surface: append task-event rows,
-// query them in strictly ascending JournalID order with a snapshot watermark
+// JournalAPI is the ordered global-journal surface: commit operations (§9), query
+// task-event rows in strictly ascending JournalID order with a snapshot watermark
 // and exclusive JournalID cursor, read the cumulative attribution projection,
 // verify subtype integrity (§10 rule 8 / §15), and register the actor-namespace
 // reservation registry (§7).
+//
+// The bare AppendTaskEvent primitive is retired from this surface: every task event is
+// now produced by an operation (Session.Create/Update/CloseTask, an Atomic op, or a
+// migration baseline), which the operations-layer producer CHECK enforces
+// (produced_by_operation_journal_id NOT NULL for a task_event). The journal-base #4
+// layer keeps its NULL-producer append primitive at its own layer; it is not part of
+// this operations-layer public API.
 type JournalAPI interface {
-	// AppendTaskEvent appends one task-event row to the global journal and
-	// advances its projections in a single fail-closed transaction.
-	AppendTaskEvent(in AppendTaskEventInput) (TaskEventRow, error)
 	// QueryTaskEvents returns one page in the query's order: the readable-timeline
 	// (RecordedAt, JournalID) display order (the default) or the canonical JournalID
 	// order. An unexposed order dimension is rejected with ErrUnsupportedOrderDimension.
@@ -103,6 +236,39 @@ type JournalAPI interface {
 	RegisterFixedActorEntry(entry FixedActorEntry, fixedUUID [16]byte) error
 	// NamespaceClaims returns every registered claim.
 	NamespaceClaims() ([]ActorNamespaceClaim, error)
+
+	// Apply commits one logical operation atomically (§9.5): an atomic append
+	// plus domain mutation folding the operation's effects in caller list order
+	// with per-effect authorization (§9.3), the §9.4 idempotent-replay
+	// short-circuit, genesis discipline (§4.6), and the subtype-integrity gate.
+	Apply(in OperationInput) (CommittedResult, error)
+	// LookupCommitted returns the committed result for an OperationID: the closed
+	// Absent variant (no side effects) for a never-applied operation, or the
+	// Exact variant with the reconstructed EmittedEvents closure and slot map
+	// (§3.2, §9.4).
+	LookupCommitted(op OperationID) (CommittedResult, error)
+	// AuthorityGovernsTaskAt reports whether the authority at authJID governs
+	// task for an effect at beforeJID, ordering strictly by JournalID (§9.3, §12).
+	AuthorityGovernsTaskAt(authJID JournalID, task TaskID, beforeJID JournalID) (bool, error)
+
+	// PreflightSchema verifies the external pre-journal schema's exact expected
+	// shape in both directions before any transaction opens (§13), failing closed
+	// with a typed *SchemaPreflightError on a missing table, missing expected
+	// column, or unexpected extra column.
+	PreflightSchema() error
+	// ReplayProjections folds the entire journal in JournalID order through the
+	// same reducer step Apply uses (§9.2) and verifies the recomputed projection
+	// converges with the stored incremental one (§15). It runs the schema preflight
+	// first, so a corrupted topology fails closed before any fold. It returns the
+	// converged per-task projection, or a typed *ProjectionDivergenceError.
+	ReplayProjections() (ReplayResult, error)
+	// MigrateLegacyBaseline migrates pre-journal tasks into deterministic baseline
+	// journal entries under the genesis bootstrap authority (§13): honest legacy
+	// RecordedAt, whole-batch fail-closed atomicity, and per-task idempotent anchors.
+	// An unmappable owner fails the whole batch with a typed
+	// *MigrationOwnerUnmappableError; a schema mismatch fails with a typed
+	// *SchemaPreflightError; nothing is committed in either case.
+	MigrateLegacyBaseline(in MigrationInput) (MigrationResult, error)
 }
 
 // Journal returns the ordered global-journal surface backed by the same SQLite

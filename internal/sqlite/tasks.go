@@ -2,37 +2,26 @@ package sqlite
 
 import (
 	"fmt"
-	"strings"
-	"time"
 
 	"github.com/dayvidpham/provenance/pkg/ptypes"
 	zs "zombiezen.com/go/sqlite"
 	"zombiezen.com/go/sqlite/sqlitex"
 )
 
-// InsertTask inserts a task row into the tasks table. Acquires the DB mutex.
-func (db *DB) InsertTask(task ptypes.Task) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	var ownerVal any
-	if task.Owner != nil {
-		ownerVal = task.Owner.String()
-	}
-
-	return sqlitex.Execute(db.conn,
-		`INSERT INTO tasks
-			(id, namespace, title, description, status_id, priority_id, type_id,
-			 phase_id, owner_id, notes, created_at, updated_at, closed_at, close_reason)
-		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)`,
-		&sqlitex.ExecOptions{Args: []any{
-			task.ID.String(), task.ID.Namespace, task.Title, task.Description,
-			int(task.Status), int(task.Priority), int(task.Type), int(task.Phase),
-			ownerVal, task.Notes,
-			task.CreatedAt.UnixNano(), task.UpdatedAt.UnixNano(),
-			TimeToNullInt(task.ClosedAt), task.CloseReason,
-		}})
-}
+// Every PRODUCTION tasks-row WRITE flows through the journaled reducer fold, never a
+// direct un-journaled *DB mutator. Creation is the fold's own watermark-carrying INSERT
+// (foldTaskCreateLocked in operations.go), reached only through a journaled
+// EffectTaskCreate (Session.Create / an Atomic op). Metadata updates and closure are the
+// fold's materialization step (materializeTaskEventColumnsLocked), reached through a
+// journaled EffectTaskEvent (Session.Update / Session.CloseTask); status and owner are
+// reducer-exclusive projections advanced only by lifecycle events and assignment
+// episodes. The former direct-write mutators were retired for this single path:
+// graph.Store.AddVertex no longer creates rows, and db.InsertTask / db.UpdateTask /
+// db.CloseTask are gone (they were un-journaled writes into status_id/owner_id/closed_at,
+// exactly the divergence §8.1 forbids). Base-layer tests that need an on-disk pre-journal
+// task row use the OLD-schema seeding seam (db.SeedLegacyTaskRow / db.SeedLegacyTask,
+// legacy_seed.go); tests of the update/close path drive the fold via db.Apply, never a
+// direct mutator. This file now holds only read queries over the tasks projection.
 
 // GetTask retrieves a task by ID. Returns (task, true, nil) if found,
 // (zero, false, nil) if not found, or (zero, false, err) on error. Acquires the DB mutex.
@@ -62,119 +51,6 @@ func (db *DB) GetTask(id ptypes.TaskID) (ptypes.Task, bool, error) {
 		return ptypes.Task{}, false, fmt.Errorf("sqlite.GetTask %q: %w", id.String(), err)
 	}
 	return task, found, nil
-}
-
-// UpdateTask applies partial updates to a task. Returns the updated task.
-// Returns ptypes.ErrNotFound if the task does not exist. Acquires the DB mutex.
-func (db *DB) UpdateTask(id ptypes.TaskID, fields ptypes.UpdateFields, now time.Time) (ptypes.Task, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	setClauses := []string{"updated_at = ?1"}
-	args := []any{now.UnixNano()}
-	idx := 2
-
-	if fields.Title != nil {
-		setClauses = append(setClauses, fmt.Sprintf("title = ?%d", idx))
-		args = append(args, *fields.Title)
-		idx++
-	}
-	if fields.Description != nil {
-		setClauses = append(setClauses, fmt.Sprintf("description = ?%d", idx))
-		args = append(args, *fields.Description)
-		idx++
-	}
-	if fields.Status != nil {
-		setClauses = append(setClauses, fmt.Sprintf("status_id = ?%d", idx))
-		args = append(args, int(*fields.Status))
-		idx++
-	}
-	if fields.Priority != nil {
-		setClauses = append(setClauses, fmt.Sprintf("priority_id = ?%d", idx))
-		args = append(args, int(*fields.Priority))
-		idx++
-	}
-	if fields.Phase != nil {
-		setClauses = append(setClauses, fmt.Sprintf("phase_id = ?%d", idx))
-		args = append(args, int(*fields.Phase))
-		idx++
-	}
-	if fields.Notes != nil {
-		setClauses = append(setClauses, fmt.Sprintf("notes = ?%d", idx))
-		args = append(args, *fields.Notes)
-		idx++
-	}
-	if fields.Owner != nil {
-		setClauses = append(setClauses, fmt.Sprintf("owner_id = ?%d", idx))
-		args = append(args, fields.Owner.String())
-		idx++
-	}
-
-	args = append(args, id.String())
-	whereIdx := idx
-	query := fmt.Sprintf(`UPDATE tasks SET %s WHERE id = ?%d`,
-		strings.Join(setClauses, ", "), whereIdx)
-
-	if err := sqlitex.Execute(db.conn, query, &sqlitex.ExecOptions{Args: args}); err != nil {
-		return ptypes.Task{}, fmt.Errorf("sqlite.UpdateTask %q: %w", id.String(), err)
-	}
-
-	var task ptypes.Task
-	var found bool
-	if err := sqlitex.Execute(db.conn,
-		`SELECT id, namespace, title, description, status_id, priority_id, type_id,
-		        phase_id, owner_id, notes, created_at, updated_at, closed_at, close_reason
-		 FROM tasks WHERE id = ?1`,
-		&sqlitex.ExecOptions{
-			Args: []any{id.String()},
-			ResultFunc: func(stmt *zs.Stmt) error {
-				var err error
-				task, err = ScanTask(stmt)
-				found = true
-				return err
-			},
-		}); err != nil {
-		return ptypes.Task{}, fmt.Errorf("sqlite.UpdateTask re-fetch %q: %w", id.String(), err)
-	}
-	if !found {
-		return ptypes.Task{}, fmt.Errorf("%w: task %q not found after update", ptypes.ErrNotFound, id.String())
-	}
-	return task, nil
-}
-
-// CloseTask marks a task as closed with the given reason. Returns the updated task.
-// Returns ptypes.ErrNotFound if the task does not exist after the update. Acquires the DB mutex.
-func (db *DB) CloseTask(id ptypes.TaskID, reason string, now time.Time) (ptypes.Task, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	if err := sqlitex.Execute(db.conn,
-		`UPDATE tasks SET status_id = 2, close_reason = ?2, closed_at = ?3, updated_at = ?4 WHERE id = ?1`,
-		&sqlitex.ExecOptions{Args: []any{id.String(), reason, now.UnixNano(), now.UnixNano()}}); err != nil {
-		return ptypes.Task{}, fmt.Errorf("sqlite.CloseTask %q: %w", id.String(), err)
-	}
-
-	var task ptypes.Task
-	var found bool
-	if err := sqlitex.Execute(db.conn,
-		`SELECT id, namespace, title, description, status_id, priority_id, type_id,
-		        phase_id, owner_id, notes, created_at, updated_at, closed_at, close_reason
-		 FROM tasks WHERE id = ?1`,
-		&sqlitex.ExecOptions{
-			Args: []any{id.String()},
-			ResultFunc: func(stmt *zs.Stmt) error {
-				var err error
-				task, err = ScanTask(stmt)
-				found = true
-				return err
-			},
-		}); err != nil {
-		return ptypes.Task{}, fmt.Errorf("sqlite.CloseTask re-fetch %q: %w", id.String(), err)
-	}
-	if !found {
-		return ptypes.Task{}, fmt.Errorf("%w: task %q not found after close", ptypes.ErrNotFound, id.String())
-	}
-	return task, nil
 }
 
 // ListTasks returns tasks matching the given filter. An empty filter returns all

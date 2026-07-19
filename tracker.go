@@ -11,13 +11,11 @@ package provenance
 
 import (
 	"fmt"
-	"time"
 
 	intgraph "github.com/dayvidpham/provenance/internal/graph"
 	"github.com/dayvidpham/provenance/internal/helpers"
 	dbsqlite "github.com/dayvidpham/provenance/internal/sqlite"
 	dgraph "github.com/dominikbraun/graph"
-	"github.com/google/uuid"
 )
 
 // ---------------------------------------------------------------------------
@@ -65,40 +63,13 @@ func (t *sqliteTracker) Close() error {
 }
 
 // ---------------------------------------------------------------------------
-// Task CRUD
+// Task reads
 // ---------------------------------------------------------------------------
-
-func (t *sqliteTracker) Create(namespace, title, description string, taskType TaskType, priority Priority, phase Phase) (Task, error) {
-	if namespace == "" {
-		return Task{}, fmt.Errorf(
-			"%w: Create — namespace is empty — "+
-				"provide a non-empty namespace string such as 'aura-plugins' or 'my-project'",
-			ErrInvalidID,
-		)
-	}
-
-	now := time.Now().UTC()
-	task := Task{
-		ID:          TaskID{Namespace: namespace, UUID: uuid.Must(uuid.NewV7())},
-		Title:       title,
-		Description: description,
-		Status:      StatusOpen,
-		Priority:    priority,
-		Type:        taskType,
-		Phase:       phase,
-		CreatedAt:   now,
-		UpdatedAt:   now,
-	}
-
-	if err := t.graph.AddVertex(task); err != nil {
-		return Task{}, fmt.Errorf(
-			"provenance.Tracker.Create: failed to insert task %q: %w — "+
-				"check that the database is writable and the namespace is valid",
-			task.ID.String(), err,
-		)
-	}
-	return task, nil
-}
+//
+// Task mutations (create/update/close) are journaled and live on the Session SDK
+// (Tracker.As → Session.Create/Update/CloseTask), which commits them through
+// Apply so every lifecycle change is authorized and reproducible from journal
+// history (§8.1, §9). There is no direct-write task-mutation path on the Tracker.
 
 func (t *sqliteTracker) Show(id TaskID) (Task, error) {
 	task, found, err := t.db.GetTask(id)
@@ -115,41 +86,6 @@ func (t *sqliteTracker) Show(id TaskID) (Task, error) {
 	return task, nil
 }
 
-func (t *sqliteTracker) Update(id TaskID, fields UpdateFields) (Task, error) {
-	task, err := t.db.UpdateTask(id, fields, time.Now().UTC())
-	if err != nil {
-		return Task{}, fmt.Errorf("provenance.Tracker.Update: %w", err)
-	}
-	return task, nil
-}
-
-func (t *sqliteTracker) CloseTask(id TaskID, reason string) (Task, error) {
-	current, found, err := t.db.GetTask(id)
-	if err != nil {
-		return Task{}, fmt.Errorf("provenance.Tracker.CloseTask: failed to fetch task %q: %w", id.String(), err)
-	}
-	if !found {
-		return Task{}, fmt.Errorf(
-			"%w: CloseTask — task %q does not exist — "+
-				"verify the TaskID was obtained from Create or a previous List/Show call",
-			ErrNotFound, id.String(),
-		)
-	}
-	if current.Status == StatusClosed {
-		return Task{}, fmt.Errorf(
-			"%w: CloseTask — task %q is already closed (reason: %q) — "+
-				"use Update to reopen the task before closing again",
-			ErrAlreadyClosed, id.String(), current.CloseReason,
-		)
-	}
-
-	task, err := t.db.CloseTask(id, reason, time.Now().UTC())
-	if err != nil {
-		return Task{}, fmt.Errorf("provenance.Tracker.CloseTask: %w", err)
-	}
-	return task, nil
-}
-
 func (t *sqliteTracker) List(filter ListFilter) ([]Task, error) {
 	tasks, err := t.db.ListTasks(filter)
 	if err != nil {
@@ -159,59 +95,15 @@ func (t *sqliteTracker) List(filter ListFilter) ([]Task, error) {
 }
 
 // ---------------------------------------------------------------------------
-// Typed Dependency Edges
+// Typed Dependency Edges (journaled §6 relationship writes)
 // ---------------------------------------------------------------------------
-
-func (t *sqliteTracker) AddEdge(sourceID TaskID, targetID string, kind EdgeKind) error {
-	if kind == EdgeBlockedBy {
-		if err := t.graph.AddEdge(sourceID.String(), targetID); err != nil {
-			if dgraph.ErrEdgeCreatesCycle == err {
-				return fmt.Errorf(
-					"%w: AddEdge — adding blocked-by edge from %q to %q would create a cycle — "+
-						"the target must be work that finishes BEFORE the source; "+
-						"use DepTree or Ancestors to inspect the current dependency graph",
-					ErrCycleDetected, sourceID.String(), targetID,
-				)
-			}
-			return fmt.Errorf(
-				"provenance.Tracker.AddEdge: failed to add blocked-by edge %q->%q: %w",
-				sourceID.String(), targetID, err,
-			)
-		}
-		return nil
-	}
-
-	if err := t.db.InsertEdge(sourceID, targetID, kind, time.Now().UTC()); err != nil {
-		return fmt.Errorf(
-			"provenance.Tracker.AddEdge: failed to insert edge %q->%q kind=%s: %w",
-			sourceID.String(), targetID, kind.String(), err,
-		)
-	}
-	return nil
-}
-
-func (t *sqliteTracker) RemoveEdge(sourceID TaskID, targetID string, kind EdgeKind) error {
-	if kind == EdgeBlockedBy {
-		if err := t.graph.RemoveEdge(sourceID.String(), targetID); err != nil {
-			if dgraph.ErrEdgeNotFound == err {
-				return nil
-			}
-			return fmt.Errorf(
-				"provenance.Tracker.RemoveEdge: failed to remove blocked-by edge %q->%q: %w",
-				sourceID.String(), targetID, err,
-			)
-		}
-		return nil
-	}
-
-	if err := t.db.DeleteEdge(sourceID, targetID, kind); err != nil {
-		return fmt.Errorf(
-			"provenance.Tracker.RemoveEdge: failed to delete edge %q->%q kind=%s: %w",
-			sourceID.String(), targetID, kind.String(), err,
-		)
-	}
-	return nil
-}
+//
+// Edge MUTATIONS (AddEdge/RemoveEdge) are journaled and live on the Session SDK
+// (Tracker.As → Session.AddEdge/RemoveEdge): each commits one typed edge mutation-family
+// effect through Apply, and the shared reducer folds it into the edges projection the
+// graph store reads (§6, as amended by #5). Cycle detection for blocked_by edges is
+// enforced in the reducer fold. There is no direct-write edge-mutation path on the
+// Tracker; the Edges read stays on the Tracker interface, backed by the same projection.
 
 func (t *sqliteTracker) Edges(id TaskID, kind *EdgeKind) ([]Edge, error) {
 	edges, err := t.db.GetEdges(id, kind)
@@ -258,16 +150,12 @@ func (t *sqliteTracker) Descendants(id TaskID) ([]Task, error) {
 }
 
 // ---------------------------------------------------------------------------
-// Labels
+// Labels (journaled §6 annotation writes)
 // ---------------------------------------------------------------------------
-
-func (t *sqliteTracker) AddLabel(id TaskID, label string) error {
-	return t.db.AddLabel(id, label)
-}
-
-func (t *sqliteTracker) RemoveLabel(id TaskID, label string) error {
-	return t.db.RemoveLabel(id, label)
-}
+//
+// Label MUTATIONS (AddLabel/RemoveLabel) are journaled on the Session SDK (Tracker.As);
+// each commits one label mutation-family effect and the shared reducer folds it into the
+// labels projection (§6, as amended by #5). Labels reads stay on the Tracker interface.
 
 func (t *sqliteTracker) Labels(id TaskID) ([]string, error) {
 	labels, err := t.db.GetLabels(id)
@@ -278,16 +166,12 @@ func (t *sqliteTracker) Labels(id TaskID) ([]string, error) {
 }
 
 // ---------------------------------------------------------------------------
-// Comments
+// Comments (journaled §6 annotation write)
 // ---------------------------------------------------------------------------
-
-func (t *sqliteTracker) AddComment(id TaskID, authorID AgentID, body string) (Comment, error) {
-	comment, err := t.db.AddComment(id, authorID, body)
-	if err != nil {
-		return Comment{}, fmt.Errorf("provenance.Tracker.AddComment: %w", err)
-	}
-	return comment, nil
-}
+//
+// Comment MUTATION (AddComment) is journaled on the Session SDK (Tracker.As); it commits
+// one comment mutation-family effect and the shared reducer folds it into the comments
+// projection (§6, as amended by #5). Comments reads stay on the Tracker interface.
 
 func (t *sqliteTracker) Comments(id TaskID) ([]Comment, error) {
 	comments, err := t.db.GetComments(id)

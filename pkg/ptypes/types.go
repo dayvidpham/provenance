@@ -259,12 +259,15 @@ type Comment struct {
 // Supporting Types for Tracker API
 // ---------------------------------------------------------------------------
 
-// UpdateFields specifies which task fields to modify.
-// Nil pointer fields are not modified.
+// UpdateFields specifies which task METADATA fields to modify via Session.Update.
+// Nil pointer fields are not modified. Status is deliberately NOT a field: the task
+// lifecycle is governed by the dedicated Session verbs Start/Stop/CloseTask/Reopen under
+// a static FSM (docs/journal-relational-contract.md §8.1, §16), so a status change is
+// never expressed as a metadata update. Owner is likewise reducer-exclusive (moved only
+// through assignment episodes) and is rejected by Session.Update.
 type UpdateFields struct {
 	Title       *string
 	Description *string
-	Status      *Status
 	Priority    *Priority
 	Phase       *Phase
 	Owner       *AgentID

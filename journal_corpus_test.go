@@ -32,10 +32,15 @@ var contractCorpusFiles = []string{
 	"owner_responsibility.yaml",
 	"baseline_migration.yaml",
 	"topology_corruption.yaml",
+	"projection_convergence.yaml",
 	"genesis_bootstrap.yaml",
 	"operation_results.yaml",
 	"subtype_integrity.yaml",
 	"actor_namespace.yaml",
+	"journal_spine_corruption.yaml",
+	"authority_revocation.yaml",
+	"status_fsm.yaml",
+	"mutation_families.yaml",
 }
 
 type anyMap = map[string]any
@@ -102,24 +107,47 @@ func TestContractCorpusPartitionIsComplete(t *testing.T) {
 		registered = append(registered, name)
 	}
 	if err := testcorpus.CheckClosedSet(scope.Operators(testcorpus.SliceS11), registered); err != nil {
-		t.Fatalf("executable registry does not match the s1.1 scope partition: %v", err)
+		t.Fatalf("executable s1.1 registry does not match the s1.1 scope partition: %v", err)
 	}
 
-	t.Logf("contract corpus: %d cases across %d files; s1.1 executable=%d s1.2=%d s1.3=%d",
+	// The S1.2 operations layer is now executable too: its registry must equal
+	// the s1.2 partition exactly (a new corpus operator or a stale handler fails).
+	registered12 := make([]testcorpus.OperatorName, 0, len(s12Operators))
+	for name := range s12Operators {
+		registered12 = append(registered12, name)
+	}
+	if err := testcorpus.CheckClosedSet(scope.Operators(testcorpus.SliceS12), registered12); err != nil {
+		t.Fatalf("executable s1.2 registry does not match the s1.2 scope partition: %v", err)
+	}
+
+	// The S1.3 shared-reducer/replay/migration layer is now executable too: its
+	// registry must equal the s1.3 partition exactly (a new corpus operator or a
+	// stale handler fails).
+	registered13 := make([]testcorpus.OperatorName, 0, len(s13Operators))
+	for name := range s13Operators {
+		registered13 = append(registered13, name)
+	}
+	if err := testcorpus.CheckClosedSet(scope.Operators(testcorpus.SliceS13), registered13); err != nil {
+		t.Fatalf("executable s1.3 registry does not match the s1.3 scope partition: %v", err)
+	}
+
+	t.Logf("contract corpus: %d cases across %d files; s1.1 executable=%d s1.2 executable=%d s1.3 executable=%d",
 		total, len(contractCorpusFiles),
 		len(scope.Operators(testcorpus.SliceS11)),
 		len(scope.Operators(testcorpus.SliceS12)),
 		len(scope.Operators(testcorpus.SliceS13)))
 }
 
-// TestContractCorpusExecutesS11Partition executes every S1.1-scoped case against
-// real production code and asserts each s1.2/s1.3 case is a recorded, not-yet-
-// executable obligation (no handler registered for it).
-func TestContractCorpusExecutesS11Partition(t *testing.T) {
+// TestContractCorpusExecutesImplementedPartitions executes every S1.1- and
+// S1.2-scoped case against real production code and asserts each remaining s1.3
+// case is a recorded, not-yet-executable obligation (no handler registered for
+// it). The S1.2 operations layer moves from recorded obligation to executed here.
+func TestContractCorpusExecutesImplementedPartitions(t *testing.T) {
 	scope := loadScope(t)
 
-	executed := 0
-	deferred := 0
+	executed11 := 0
+	executed12 := 0
+	executed13 := 0
 	for _, file := range contractCorpusFiles {
 		corpus := loadContractCorpus(t, file)
 		for _, c := range corpus.Cases {
@@ -127,32 +155,40 @@ func TestContractCorpusExecutesS11Partition(t *testing.T) {
 			if !ok {
 				t.Fatalf("%s/%s: operator %q missing from scope table", file, c.Name, c.Mutation.Operator)
 			}
-			if slice == testcorpus.SliceS11 {
-				op, ok := s11Operators[c.Mutation.Operator]
-				if !ok {
-					t.Fatalf("%s/%s: s1.1 operator %q has no registered handler", file, c.Name, c.Mutation.Operator)
+			var registry map[testcorpus.OperatorName]s11Handler
+			switch slice {
+			case testcorpus.SliceS11:
+				registry = s11Operators
+			case testcorpus.SliceS12:
+				registry = s12Operators
+			case testcorpus.SliceS13:
+				registry = s13Operators
+			default:
+				t.Fatalf("%s/%s: operator %q has unknown slice %q", file, c.Name, c.Mutation.Operator, slice)
+			}
+			op, ok := registry[c.Mutation.Operator]
+			if !ok {
+				t.Fatalf("%s/%s: %s operator %q has no registered handler", file, c.Name, slice, c.Mutation.Operator)
+			}
+			t.Run(file+"/"+c.Name, func(t *testing.T) {
+				if err := op(t, c.Input, c.Expected, c.Classification); err != nil {
+					t.Fatalf("execute %q: %v", c.Mutation.Operator, err)
 				}
-				t.Run(file+"/"+c.Name, func(t *testing.T) {
-					if err := op(t, c.Input, c.Expected, c.Classification); err != nil {
-						t.Fatalf("execute %q: %v", c.Mutation.Operator, err)
-					}
-				})
-				executed++
-			} else {
-				// Deferred obligation: assert there is genuinely no S1.1 handler,
-				// so an accidental future handler for an out-of-scope operator is
-				// caught rather than silently masking the partition.
-				if _, ok := s11Operators[c.Mutation.Operator]; ok {
-					t.Fatalf("%s/%s: operator %q is scoped %s but has an s1.1 handler", file, c.Name, c.Mutation.Operator, slice)
-				}
-				deferred++
+			})
+			switch slice {
+			case testcorpus.SliceS11:
+				executed11++
+			case testcorpus.SliceS12:
+				executed12++
+			case testcorpus.SliceS13:
+				executed13++
 			}
 		}
 	}
-	if executed == 0 {
-		t.Fatal("no S1.1 case executed — the harness would vacuously pass")
+	if executed11 == 0 || executed12 == 0 || executed13 == 0 {
+		t.Fatalf("expected all partitions to execute; s1.1=%d s1.2=%d s1.3=%d — the harness would vacuously pass", executed11, executed12, executed13)
 	}
-	t.Logf("executed %d S1.1 cases against production code; %d s1.2/s1.3 obligations recorded", executed, deferred)
+	t.Logf("executed %d S1.1 + %d S1.2 + %d S1.3 cases against production code", executed11, executed12, executed13)
 }
 
 // s11Handler drives one S1.1 case against production code. Returning nil means
@@ -193,11 +229,80 @@ func newJournalEnv(t *testing.T) *journalEnv {
 	if err != nil {
 		t.Fatalf("RegisterSoftwareAgent: %v", err)
 	}
-	task, err := tr.Create("provenance-test", "corpus task", "", TaskTypeTask, PriorityMedium, PhaseUnscoped)
-	if err != nil {
-		t.Fatalf("Create task: %v", err)
+	// The base journal-query / #4-primitive operators need a real task row to append
+	// task-events onto (AppendTaskEvent projects onto an existing tasks row). Seed it
+	// as a pre-journal (legacy-shape) row via the raw seeding seam rather than through
+	// a journaled creation, so the shared env.task carries no creation operation that
+	// would pollute the whole-journal ordering queries these operators assert over.
+	taskID := newCorpusTaskID()
+	now := time.Now().UTC()
+	st := tr.(*sqliteTracker)
+	if err := st.db.SeedLegacyTask(LegacyTaskRow{ID: taskID, Status: TaskStatusOpen, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("seed base env task: %v", err)
 	}
-	return &journalEnv{tr: tr, actor: agent.ID, task: task.ID}
+	return &journalEnv{tr: tr, actor: agent.ID, task: taskID}
+}
+
+// newCorpusTaskID mints a fresh namespaced UUIDv7 TaskID for the corpus harness,
+// replacing the id the retired Tracker.Create previously assigned.
+func newCorpusTaskID() TaskID {
+	return TaskID{Namespace: "provenance-test", UUID: uuid.Must(uuid.NewV7())}
+}
+
+// genesisBoot establishes the shared genesis bootstrap authority (which governs every
+// task, §14.1) and returns its produced JournalID, so the ordering operators can emit
+// operation-anchored task events on the base task. The #5 operations-layer producer
+// CHECK forbids the retired bare AppendTaskEvent (a NULL-producer task event), so every
+// task event flows through an operation.
+func (e *journalEnv) genesisBoot(t *testing.T) JournalID {
+	t.Helper()
+	res, err := e.tr.Journal().Apply(OperationInput{
+		OperationID:    "op-genesis",
+		ActorID:        e.actor,
+		CommandDigest:  []byte("genesis-c"),
+		MutationDigest: []byte("genesis-m"),
+		RecordedAt:     time.Now().UTC().UnixNano(),
+		Effects:        []Effect{{Sort: EffectBootstrapAuthority, BootstrapLabel: "pasture-system", ResultSlot: "auth"}},
+	})
+	if err != nil {
+		t.Fatalf("genesisBoot: %v", err)
+	}
+	if jid, ok := slotJournalID(res, "auth"); ok {
+		return jid
+	}
+	t.Fatal("genesisBoot: no bootstrap authority result slot")
+	return 0
+}
+
+// appendEventViaOp emits one task event on task as an operation under boot, returning
+// the produced event's JournalID — the operation-anchored replacement for the retired
+// bare AppendTaskEvent. The event's RecordedAt is carried honestly via a per-effect
+// override (§12); the operation anchor row is not a task event, so it never appears in
+// the QueryTaskEvents results these ordering operators assert over.
+func appendEventViaOp(t *testing.T, tr Tracker, boot JournalID, actor ActorID, task TaskID, opID string, kind EventKind, recordedAt time.Time) JournalID {
+	t.Helper()
+	auth := boot
+	ra := recordedAt.UTC().UnixNano()
+	res, err := tr.Journal().Apply(OperationInput{
+		OperationID:        OperationID(opID),
+		ActorID:            actor,
+		AuthorityJournalID: &auth,
+		CommandDigest:      []byte(opID + "-c"),
+		MutationDigest:     []byte(opID + "-m"),
+		RecordedAt:         time.Now().UTC().UnixNano(),
+		Effects: []Effect{{
+			Sort: EffectTaskEvent, TaskID: task, EventKind: kind,
+			RecordedAtOverride: &ra, ResultSlot: "ev",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("appendEventViaOp %q: %v", opID, err)
+	}
+	if jid, ok := slotJournalID(res, "ev"); ok {
+		return jid
+	}
+	t.Fatalf("appendEventViaOp %q: no result slot", opID)
+	return 0
 }
 
 // ---------------------------------------------------------------------------
@@ -210,6 +315,7 @@ func opOrderByJournalID(t *testing.T, input, expected anyMap, _ testcorpus.Class
 	if err != nil {
 		return err
 	}
+	boot := env.genesisBoot(t)
 	labelByJID := map[JournalID]string{}
 	for _, r := range rows {
 		row, err := asMap(r)
@@ -224,16 +330,8 @@ func opOrderByJournalID(t *testing.T, input, expected anyMap, _ testcorpus.Class
 		if err != nil {
 			return err
 		}
-		out, err := env.tr.Journal().AppendTaskEvent(AppendTaskEventInput{
-			ActorID:    env.actor,
-			TaskID:     env.task,
-			EventKind:  "provenance.task.updated",
-			RecordedAt: recordedAt,
-		})
-		if err != nil {
-			return fmt.Errorf("append %q: %w", label, err)
-		}
-		labelByJID[out.JournalID] = label
+		jid := appendEventViaOp(t, env.tr, boot, env.actor, env.task, "op-ev-"+label, "provenance.task.updated", recordedAt)
+		labelByJID[jid] = label
 	}
 
 	page, err := env.tr.Journal().QueryTaskEvents(JournalQueryV1{OrderBy: OrderByJournalID})
@@ -270,19 +368,32 @@ func opOrderByJournalIDConcurrent(t *testing.T, input, expected anyMap, _ testco
 		return err
 	}
 
+	boot := env.genesisBoot(t)
 	var mu sync.Mutex
 	var ids []JournalID
 	var firstErr error
 	var wg sync.WaitGroup
 	wg.Add(n)
 	for i := 0; i < n; i++ {
-		go func() {
+		go func(i int) {
 			defer wg.Done()
-			out, err := env.tr.Journal().AppendTaskEvent(AppendTaskEventInput{
-				ActorID:    env.actor,
-				TaskID:     env.task,
-				EventKind:  "provenance.task.updated",
-				RecordedAt: recordedAt,
+			// Operation-anchored append (a distinct OperationID per goroutine); the
+			// journal write path serialises operations (§9.5), so concurrent appends
+			// still receive strictly-ascending unique JournalIDs. t.Fatalf is unsafe off
+			// the test goroutine, so errors are captured into firstErr.
+			auth := boot
+			ra := recordedAt.UTC().UnixNano()
+			res, err := env.tr.Journal().Apply(OperationInput{
+				OperationID:        OperationID(fmt.Sprintf("op-concurrent-%d", i)),
+				ActorID:            env.actor,
+				AuthorityJournalID: &auth,
+				CommandDigest:      []byte(fmt.Sprintf("cc-%d", i)),
+				MutationDigest:     []byte(fmt.Sprintf("cm-%d", i)),
+				RecordedAt:         time.Now().UTC().UnixNano(),
+				Effects: []Effect{{
+					Sort: EffectTaskEvent, TaskID: env.task, EventKind: "provenance.task.updated",
+					RecordedAtOverride: &ra, ResultSlot: "ev",
+				}},
 			})
 			mu.Lock()
 			defer mu.Unlock()
@@ -292,8 +403,15 @@ func opOrderByJournalIDConcurrent(t *testing.T, input, expected anyMap, _ testco
 				}
 				return
 			}
-			ids = append(ids, out.JournalID)
-		}()
+			jid, ok := slotJournalID(res, "ev")
+			if !ok {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("concurrent append produced no event result slot")
+				}
+				return
+			}
+			ids = append(ids, jid)
+		}(i)
 	}
 	wg.Wait()
 	if firstErr != nil {
@@ -362,6 +480,7 @@ func opOrderByRecordedAtTimeline(t *testing.T, input, expected anyMap, _ testcor
 	if err != nil {
 		return err
 	}
+	boot := env.genesisBoot(t)
 	labelByJID := map[JournalID]string{}
 	for _, r := range rows {
 		row, err := asMap(r)
@@ -376,16 +495,8 @@ func opOrderByRecordedAtTimeline(t *testing.T, input, expected anyMap, _ testcor
 		if err != nil {
 			return err
 		}
-		out, err := env.tr.Journal().AppendTaskEvent(AppendTaskEventInput{
-			ActorID:    env.actor,
-			TaskID:     env.task,
-			EventKind:  "provenance.task.updated",
-			RecordedAt: recordedAt,
-		})
-		if err != nil {
-			return fmt.Errorf("append %q: %w", label, err)
-		}
-		labelByJID[out.JournalID] = label
+		jid := appendEventViaOp(t, env.tr, boot, env.actor, env.task, "op-ev-"+label, "provenance.task.updated", recordedAt)
+		labelByJID[jid] = label
 	}
 
 	// Paginated timeline walk with the composite exclusive cursor.
@@ -558,7 +669,10 @@ func opWriteJournalRowMissingSubtype(t *testing.T, input, expected anyMap, _ tes
 	if !ok {
 		return fmt.Errorf("expected *sqliteTracker, got %T", env.tr)
 	}
-	if _, err := st.db.AppendBareJournalRow(JournalKindTaskEvent, env.actor, time.Now()); err != nil {
+	// A bare decision row (a kind with a subtype table but no subtype row) drives the
+	// totality violation; a task-event kind is no longer usable here because the #5
+	// operations-layer producer CHECK forbids a NULL-producer task event at insert time.
+	if _, err := st.db.AppendBareJournalRow(JournalKindDecision, env.actor, time.Now()); err != nil {
 		return fmt.Errorf("append bare journal row: %w", err)
 	}
 	err := env.tr.Journal().VerifyIntegrity()

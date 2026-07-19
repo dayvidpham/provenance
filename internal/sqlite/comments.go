@@ -39,6 +39,34 @@ func (db *DB) AddComment(id ptypes.TaskID, authorID ptypes.AgentID, body string)
 	return comment, nil
 }
 
+// GetComment returns one comment by id. found is false when no such comment exists.
+// Acquires the DB mutex. Used by the journaled Session.AddComment read-back path.
+func (db *DB) GetComment(id ptypes.CommentID) (ptypes.Comment, bool, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	var (
+		comment ptypes.Comment
+		found   bool
+	)
+	if err := sqlitex.Execute(db.conn,
+		`SELECT id, task_id, author_id, body, created_at FROM comments WHERE id = ?1`,
+		&sqlitex.ExecOptions{
+			Args: []any{id.String()},
+			ResultFunc: func(stmt *zs.Stmt) error {
+				c, err := ScanComment(stmt)
+				if err != nil {
+					return err
+				}
+				comment = c
+				found = true
+				return nil
+			},
+		}); err != nil {
+		return ptypes.Comment{}, false, fmt.Errorf("sqlite.GetComment %q: %w", id.String(), err)
+	}
+	return comment, found, nil
+}
+
 // GetComments returns all comments on a task in chronological order.
 // Acquires the DB mutex.
 func (db *DB) GetComments(id ptypes.TaskID) ([]ptypes.Comment, error) {

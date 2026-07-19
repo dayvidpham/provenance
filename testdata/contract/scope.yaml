@@ -48,8 +48,13 @@ operators:
   - {operator: lookup-committed-emitted-events-from-closure, slice: s1.2, reason: produced-row closure}
   - {operator: lookup-committed-reconstruct-result-slots,   slice: s1.2, reason: result-slot reconstruction}
   - {operator: reject-result-slot-referencing-foreign-operation, slice: s1.2, reason: result-slot own-operation integrity (rule 9)}
-  - {operator: authority-governing-parent,                  slice: s1.2, reason: authority}
+  - {operator: blocked-by-scheduling-edge-does-not-grant-authority, slice: s1.2, reason: authority}
   - {operator: authority-unrelated,                         slice: s1.2, reason: authority}
+  - {operator: transitive-parent-citation-grants-authority, slice: s1.2, reason: parent-citation governance (§14.5)}
+  - {operator: parent-chain-middle-episode-ended-cuts-authority, slice: s1.2, reason: parent-citation whole-chain liveness (§14.5)}
+  - {operator: parent-chain-middle-ended-same-operation-cuts-authority, slice: s1.2, reason: "parent-citation whole-chain liveness within one operation's per-effect fold (§9.3.1 / §14.5)"}
+  - {operator: citation-of-inactive-parent-at-start-rejected, slice: s1.2, reason: parent-citation validity at start (§14.5)}
+  - {operator: corrupted-cyclic-parent-chain-fails-closed,  slice: s1.2, reason: parent-citation bounded fail-closed walk (§14.5)}
   - {operator: batch-ended-before-started,                  slice: s1.2, reason: assignment lifecycle order}
   - {operator: end-episode-never-started,                   slice: s1.2, reason: assignment lifecycle order}
   - {operator: fold-sequentially-check-effect2-sees-effect1, slice: s1.2, reason: per-effect authorization}
@@ -79,9 +84,29 @@ operators:
   - {operator: migrate-batch-with-one-unmappable-owner,     slice: s1.3, reason: migration fail-closed}
   - {operator: migrate-then-extend-compare-to-native-only,  slice: s1.3, reason: migrated/native equivalence}
   - {operator: migrate-then-remigrate-same-legacy-set,      slice: s1.3, reason: idempotent re-migration}
+  - {operator: migrate-two-identical-createdat-tie-break,   slice: s1.3, reason: "deterministic created_at/id sort totality"}
   - {operator: schema-preflight,                            slice: s1.3, reason: external-schema preflight}
   - {operator: schema-preflight-extra-column,               slice: s1.3, reason: external-schema preflight}
+  - {operator: schema-preflight-extra-table,                slice: s1.3, reason: external-schema preflight extra-table direction}
   - {operator: schema-preflight-missing-column,             slice: s1.3, reason: external-schema preflight}
   - {operator: schema-preflight-missing-table,              slice: s1.3, reason: external-schema preflight}
   - {operator: fault-mid-migration,                         slice: s1.3, reason: migration fail-closed}
   - {operator: concurrent-open-during-corruption,           slice: s1.3, reason: fail-closed topology detection}
+  - {operator: replay-converges-clean,                      slice: s1.3, reason: §15 from-empty convergence}
+  - {operator: replay-converges-migrated-status,            slice: s1.3, reason: §15 migrated-status reproducibility}
+  - {operator: replay-detects-out-of-band-corruption,       slice: s1.3, reason: §15 fail-closed divergence detection}
+  - {operator: verify-clean-spine,                          slice: s1.3, reason: "UAT C8a corrupted-spine family — non-vacuous control"}
+  - {operator: corrupt-delete-subtype-row,                  slice: s1.3, reason: "UAT C8a corrupted-spine family — subtype-totality fail-closed"}
+  - {operator: corrupt-rewrite-discriminator,               slice: s1.3, reason: "UAT C8a corrupted-spine family — discriminator-agreement fail-closed"}
+  - {operator: corrupt-truncate-tail,                       slice: s1.3, reason: "UAT C8a corrupted-spine family — truncated-tail convergence fail-closed"}
+  - {operator: corrupt-noncontiguous-insert,                slice: s1.3, reason: "UAT C8a corrupted-spine family — bare-supertype-insert totality fail-closed"}
+  - {operator: revoke-then-pinned-retry-uncommitted,        slice: s1.3, reason: "UAT C8a authority-revocation family — pinned retry under revoked authority"}
+  - {operator: revoke-then-exact-replay-committed,          slice: s1.3, reason: "UAT C8a authority-revocation family — committed exact replay short-circuits"}
+  - {operator: fsm-rejects-closed-to-in-progress,          slice: s1.3, reason: "§8.1 status FSM — illegal closed→in_progress transition fails closed"}
+  - {operator: fsm-stopped-transition-converges,           slice: s1.3, reason: "§8.1 status FSM — in_progress→open stopped transition + from-empty convergence"}
+  - {operator: fsm-forced-coercion-converges,              slice: s1.3, reason: "§8.1/§16 forced FSM escape hatch — journal-reproducible, audit-visible coercion"}
+  - {operator: mutation-family-who-provenance,             slice: s1.3, reason: "§6 amendment — edge/label/comment journaled who-provenance (committer, authority, position, operands)"}
+  - {operator: mutation-family-unauthorized-rejected,      slice: s1.3, reason: "§6/§9.3 — edge/label/comment mutations obey per-effect authorization (must-fail per family)"}
+  - {operator: mutation-family-projections-replay,         slice: s1.3, reason: "§6/§15 — edge/label/comment domain projections re-derive from empty and converge"}
+  - {operator: journaled-edge-grants-no-authority,         slice: s1.3, reason: "§14.5 re-pin — journaled blocked_by edge still delegates no ownership authority"}
+  - {operator: mutation-family-comment-body-corruption-detected, slice: s1.3, reason: "§6.4/§15 — full-tuple domain-projection convergence detects out-of-band comment-body corruption a key-only check missed"}

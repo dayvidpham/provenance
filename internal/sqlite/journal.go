@@ -3,6 +3,7 @@ package sqlite
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/dayvidpham/provenance/internal/journal"
@@ -42,6 +43,24 @@ func journalParseTask(s string) (journal.TaskID, error) {
 // ---------------------------------------------------------------------------
 // Schema
 // ---------------------------------------------------------------------------
+
+// journalAttributedViewDDL creates the read-only denormalized attribution surface
+// (§8.5). effective_actor_id is a row's own stored actor on an anchor, or its
+// anchor's actor on a subordinate row, resolved once via the anchor self-join so no
+// consumer hand-writes the COALESCE. LEFT JOIN keeps anchor rows (whose
+// produced_by_operation_journal_id is NULL) in the result. It is defined as a shared
+// const because the operations slice's journal-table rebuild
+// (completeJournalOperationFK) must drop and recreate the view around the rebuild —
+// a view that references the table being renamed cannot dangle across the rename.
+const journalAttributedViewDDL = `CREATE VIEW IF NOT EXISTS journal_attributed AS
+	SELECT j.journal_id                           AS journal_id,
+	       j.kind_id                              AS kind_id,
+	       COALESCE(j.actor_id, anchor.actor_id)  AS effective_actor_id,
+	       j.recorded_at                          AS recorded_at,
+	       j.produced_by_operation_journal_id     AS produced_by_operation_journal_id
+	FROM journal j
+	LEFT JOIN journal anchor
+	  ON anchor.journal_id = j.produced_by_operation_journal_id`
 
 // ensureJournalSchema creates the journal-base relations and seeds the closed
 // journal_kinds lookup. Idempotent (CREATE TABLE IF NOT EXISTS / INSERT OR
@@ -125,21 +144,7 @@ func (db *DB) ensureJournalSchema() error {
 			PRIMARY KEY (task_id, actor_id)
 		) STRICT, WITHOUT ROWID`,
 		// journal_attributed (§8.5): the read-only denormalized attribution surface.
-		// effective_actor_id is a row's own stored actor on an anchor, or its anchor's
-		// actor on a subordinate row, resolved once via the anchor self-join so no
-		// consumer hand-writes the COALESCE. LEFT JOIN keeps anchor rows (whose
-		// produced_by_operation_journal_id is NULL) in the result. The view is stored
-		// SQL resolved at query time, so it survives the operations slice's journal
-		// table rebuild (completeJournalOperationFK) unchanged.
-		`CREATE VIEW IF NOT EXISTS journal_attributed AS
-			SELECT j.journal_id                           AS journal_id,
-			       j.kind_id                              AS kind_id,
-			       COALESCE(j.actor_id, anchor.actor_id)  AS effective_actor_id,
-			       j.recorded_at                          AS recorded_at,
-			       j.produced_by_operation_journal_id     AS produced_by_operation_journal_id
-			FROM journal j
-			LEFT JOIN journal anchor
-			  ON anchor.journal_id = j.produced_by_operation_journal_id`,
+		journalAttributedViewDDL,
 	}
 	for _, stmt := range ddl {
 		if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
@@ -307,7 +312,46 @@ func (db *DB) VerifyIntegrity() error {
 	if err := db.verifySubtypeIntegrityLocked(); err != nil {
 		return err
 	}
-	return db.verifyActorPlacementLocked()
+	if err := db.verifyActorPlacementLocked(); err != nil {
+		return err
+	}
+	// Watermark presence is checked LAST: it is the §8.1 tightening (no un-journaled
+	// task row), a whole-database invariant a converged/native database satisfies,
+	// whereas the subtype and placement checks above localise a specific injected
+	// journal violation. Ordering it last lets the adversarial corpus assert those
+	// journal-row violations by their own sentinel without a coexisting legacy task
+	// row masking them.
+	return db.verifyWatermarkPresenceLocked()
+}
+
+// verifyWatermarkPresenceLocked enforces the §8.1 watermark tightening over stored
+// rows: every tasks row must carry a last_journal_id (no un-journaled task). It is a
+// no-op on an even-older legacy database whose tasks table predates the column entirely
+// (that database is not yet migrated; migration adds the column and anchors its rows,
+// §13). Returns journal.ErrWatermarkMissing on the first un-anchored row.
+func (db *DB) verifyWatermarkPresenceLocked() error {
+	present, _, err := db.tasksWatermarkColumnInfoLocked()
+	if err != nil {
+		return err
+	}
+	if !present {
+		return nil
+	}
+	var badID string
+	if err := sqlitex.Execute(db.conn,
+		`SELECT id FROM tasks WHERE last_journal_id IS NULL LIMIT 1`,
+		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { badID = stmt.ColumnText(0); return nil }}); err != nil {
+		return fmt.Errorf("verifyWatermarkPresence: %w", err)
+	}
+	if badID != "" {
+		return fmt.Errorf(
+			"%w: task %q has a NULL last_journal_id — where: watermark-presence gate; when: at "+
+				"VerifyIntegrity / §15 convergence; impact: the database is not accepted as converged; "+
+				"fix: a task is born through the journal fold (Session.Create) carrying its watermark, "+
+				"and a legacy row is anchored by MigrateLegacyBaseline — no task row may exist un-journaled",
+			journal.ErrWatermarkMissing, badID)
+	}
+	return nil
 }
 
 // verifyActorPlacementLocked enforces the anchor-only actor-placement invariant
@@ -358,20 +402,98 @@ func (db *DB) verifyActorPlacementLocked() error {
 		journal.ErrActorPlacement, badJID)
 }
 
-// knownSubtypeTables maps each JournalKind to its subtype table. Only tables
-// that actually exist in the live schema are checked, so this guard extends
-// automatically as later slices add operation/authority/decision/evidence
-// tables without weakening the check for the kinds present today.
-func (db *DB) subtypeTablesPresent() (map[journal.JournalKind]string, error) {
-	all := map[journal.JournalKind]string{
-		journal.JournalKindOperation: "journal_operations",
-		journal.JournalKindTaskEvent: "journal_task_events",
-		journal.JournalKindAuthority: "journal_authorities",
-		journal.JournalKindDecision:  "journal_decisions",
-		journal.JournalKindEvidence:  "journal_evidence",
+// subtypeAllTables is the closed class-table-inheritance map (§10 rule 8): every
+// JournalKind to its subtype table. It is the SINGLE source of truth — the live-present
+// probe (subtypeTablesPresent) and every pre-built integrity query below derive from it, so
+// a new subtype kind is added in exactly one place. Statically defined (over the former
+// per-call literal) per the statically-defined-over-runtime preference; identifiers are
+// compile-time literals, never caller input.
+var subtypeAllTables = map[journal.JournalKind]string{
+	journal.JournalKindOperation: "journal_operations",
+	journal.JournalKindTaskEvent: "journal_task_events",
+	journal.JournalKindAuthority: "journal_authorities",
+	journal.JournalKindDecision:  "journal_decisions",
+	journal.JournalKindEvidence:  "journal_evidence",
+}
+
+// subtypeIntegrityQuery holds the two per-table subtype-integrity probes (§10 rule 8)
+// pre-built ONCE at package init from subtypeAllTables, so verifySubtypeIntegrityLocked
+// constructs no SQL text per check. Table identifiers come from the closed map, never
+// caller input, so their interpolation is safe.
+type subtypeIntegrityQuery struct {
+	// totality: a journal row of this kind with no subtype row.
+	totality string
+	// discriminator: a subtype row whose journal row carries a different kind_id.
+	discriminator string
+}
+
+// subtypeIntegrityQueries maps each closed JournalKind to its pre-built totality and
+// discriminator probes (built once at package init).
+var subtypeIntegrityQueries = buildSubtypeIntegrityQueries()
+
+func buildSubtypeIntegrityQueries() map[journal.JournalKind]subtypeIntegrityQuery {
+	out := make(map[journal.JournalKind]subtypeIntegrityQuery, len(subtypeAllTables))
+	for kind, table := range subtypeAllTables {
+		out[kind] = subtypeIntegrityQuery{
+			totality: fmt.Sprintf(`SELECT j.journal_id FROM journal j
+					LEFT JOIN %s s ON s.journal_id = j.journal_id
+					WHERE j.kind_id = ?1 AND s.journal_id IS NULL LIMIT 1`, table),
+			discriminator: fmt.Sprintf(`SELECT s.journal_id FROM %s s
+					JOIN journal j ON j.journal_id = s.journal_id
+					WHERE j.kind_id <> ?1 LIMIT 1`, table),
+		}
 	}
-	present := make(map[journal.JournalKind]string, len(all))
-	for kind, table := range all {
+	return out
+}
+
+// subtypeExclusivityPair is one pre-built cross-subtype exclusivity probe (§10 rule 8):
+// a JournalID may appear in at most one subtype table. All C(5,2) pairs over the closed
+// subtypeAllTables set are built once at package init, in deterministic kind order.
+type subtypeExclusivityPair struct {
+	a, b  journal.JournalKind
+	query string
+}
+
+var subtypeExclusivityPairs = buildSubtypeExclusivityPairs()
+
+func buildSubtypeExclusivityPairs() []subtypeExclusivityPair {
+	kinds := make([]journal.JournalKind, 0, len(subtypeAllTables))
+	for k := range subtypeAllTables {
+		kinds = append(kinds, k)
+	}
+	sort.Slice(kinds, func(i, j int) bool { return kinds[i] < kinds[j] })
+	pairs := make([]subtypeExclusivityPair, 0, len(kinds)*(len(kinds)-1)/2)
+	for i := 0; i < len(kinds); i++ {
+		for j := i + 1; j < len(kinds); j++ {
+			pairs = append(pairs, subtypeExclusivityPair{
+				a: kinds[i], b: kinds[j],
+				query: fmt.Sprintf(`SELECT a.journal_id FROM %s a JOIN %s b ON a.journal_id = b.journal_id LIMIT 1`,
+					subtypeAllTables[kinds[i]], subtypeAllTables[kinds[j]]),
+			})
+		}
+	}
+	return pairs
+}
+
+// Authority-level discriminator-agreement probes (§10 rule 8, second inheritance level),
+// static per-table constants: a bootstrap detail row must sit on a bootstrap authority
+// (authority_kind_id 0), an assignment transition on an assignment authority (kind 1).
+const (
+	authorityBootstrapMismatchQuery = `SELECT d.journal_id FROM journal_authority_bootstraps d
+			JOIN journal_authorities a ON a.journal_id = d.journal_id
+			WHERE a.authority_kind_id <> ?1 LIMIT 1`
+	authorityAssignmentMismatchQuery = `SELECT d.journal_id FROM journal_authority_assignment_transitions d
+			JOIN journal_authorities a ON a.journal_id = d.journal_id
+			WHERE a.authority_kind_id <> ?1 LIMIT 1`
+)
+
+// subtypeTablesPresent narrows the closed subtypeAllTables map to the tables that actually
+// exist in the live schema, so this guard extends automatically as later slices add
+// operation/authority/decision/evidence tables without weakening the check for the kinds
+// present today.
+func (db *DB) subtypeTablesPresent() (map[journal.JournalKind]string, error) {
+	present := make(map[journal.JournalKind]string, len(subtypeAllTables))
+	for kind, table := range subtypeAllTables {
 		var exists bool
 		if err := sqlitex.Execute(db.conn,
 			`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1`,
@@ -395,12 +517,10 @@ func (db *DB) verifySubtypeIntegrityLocked() error {
 		return err
 	}
 	for kind, table := range tables {
+		probes := subtypeIntegrityQueries[kind]
 		// Totality: a journal row of this kind with no subtype row.
 		var missing int64
-		if err := sqlitex.Execute(db.conn,
-			fmt.Sprintf(`SELECT j.journal_id FROM journal j
-				LEFT JOIN %s s ON s.journal_id = j.journal_id
-				WHERE j.kind_id = ?1 AND s.journal_id IS NULL LIMIT 1`, table),
+		if err := sqlitex.Execute(db.conn, probes.totality,
 			&sqlitex.ExecOptions{
 				Args:       []any{int(kind)},
 				ResultFunc: func(stmt *zs.Stmt) error { missing = stmt.ColumnInt64(0); return nil },
@@ -421,10 +541,7 @@ func (db *DB) verifySubtypeIntegrityLocked() error {
 		// carries a different kind_id (or a JournalID present in a foreign
 		// subtype table).
 		var mismatch int64
-		if err := sqlitex.Execute(db.conn,
-			fmt.Sprintf(`SELECT s.journal_id FROM %s s
-				JOIN journal j ON j.journal_id = s.journal_id
-				WHERE j.kind_id <> ?1 LIMIT 1`, table),
+		if err := sqlitex.Execute(db.conn, probes.discriminator,
 			&sqlitex.ExecOptions{
 				Args:       []any{int(kind)},
 				ResultFunc: func(stmt *zs.Stmt) error { mismatch = stmt.ColumnInt64(0); return nil },
@@ -439,6 +556,85 @@ func (db *DB) verifySubtypeIntegrityLocked() error {
 					"impact: the write is rolled back; fix: the subtype table must "+
 					"agree with journal.kind_id",
 				journal.ErrSubtypeIntegrity, table, mismatch, kind)
+		}
+	}
+	// Exclusivity across subtype tables (§10 rule 8): a JournalID may appear in at
+	// most one subtype table. Checked explicitly so a second subtype row whose own
+	// discriminator happens to agree is still rejected (the per-table discriminator
+	// pass above only rejects a row disagreeing with its supertype).
+	if err := db.verifySubtypeExclusivityLocked(tables); err != nil {
+		return err
+	}
+	// Authority-level class-table inheritance (§10 rule 8, second level):
+	// journal_authorities → its bootstrap/assignment detail rows.
+	return db.verifyAuthorityDetailIntegrityLocked()
+}
+
+// verifySubtypeExclusivityLocked rejects a JournalID present in two subtype
+// tables at once (§10 rule 8 exclusivity). The subtype PKs are all JournalID, so
+// a pairwise existence probe over the present tables is exact.
+func (db *DB) verifySubtypeExclusivityLocked(tables map[journal.JournalKind]string) error {
+	// Walk the pre-built closed pair set, probing only pairs whose BOTH tables are present
+	// in the live schema — so the check is the exact subset of pairs the former dynamic
+	// double loop covered, with no per-call SQL construction.
+	for _, p := range subtypeExclusivityPairs {
+		ta, okA := tables[p.a]
+		tb, okB := tables[p.b]
+		if !okA || !okB {
+			continue
+		}
+		var dup int64
+		if err := sqlitex.Execute(db.conn, p.query,
+			&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { dup = stmt.ColumnInt64(0); return nil }},
+		); err != nil {
+			return fmt.Errorf("verifySubtypeExclusivity %s/%s: %w", ta, tb, err)
+		}
+		if dup != 0 {
+			return fmt.Errorf(
+				"%w: journal %d appears in both %s and %s subtype tables — where: subtype-integrity "+
+					"gate; when: before commit; impact: the write is rolled back; fix: a journal row "+
+					"must have exactly one subtype row selected by its JournalKind",
+				journal.ErrSubtypeIntegrity, dup, ta, tb)
+		}
+	}
+	return nil
+}
+
+// verifyAuthorityDetailIntegrityLocked enforces authority-level discriminator
+// agreement (§10 rule 8): a bootstrap authority carries a bootstrap detail row
+// and no assignment transition; an assignment authority carries a transition and
+// no bootstrap detail.
+func (db *DB) verifyAuthorityDetailIntegrityLocked() error {
+	var present bool
+	if err := sqlitex.Execute(db.conn,
+		`SELECT 1 FROM sqlite_master WHERE type='table' AND name='journal_authorities'`,
+		&sqlitex.ExecOptions{ResultFunc: func(*zs.Stmt) error { present = true; return nil }}); err != nil {
+		return fmt.Errorf("verifyAuthorityDetailIntegrity: probe journal_authorities: %w", err)
+	}
+	if !present {
+		return nil
+	}
+	checks := []struct {
+		query string
+		want  int
+		label string
+	}{
+		{authorityBootstrapMismatchQuery, 0, "bootstrap detail on a non-bootstrap authority"},
+		{authorityAssignmentMismatchQuery, 1, "assignment transition on a non-assignment authority"},
+	}
+	for _, c := range checks {
+		var bad int64
+		if err := sqlitex.Execute(db.conn, c.query,
+			&sqlitex.ExecOptions{Args: []any{c.want}, ResultFunc: func(stmt *zs.Stmt) error { bad = stmt.ColumnInt64(0); return nil }},
+		); err != nil {
+			return fmt.Errorf("verifyAuthorityDetailIntegrity %s: %w", c.label, err)
+		}
+		if bad != 0 {
+			return fmt.Errorf(
+				"%w: authority %d has a %s — where: subtype-integrity gate (authority level); when: "+
+					"before commit; impact: the write is rolled back; fix: an authority's detail row must "+
+					"agree with its AuthorityKind",
+				journal.ErrSubtypeIntegrity, bad, c.label)
 		}
 	}
 	return nil
@@ -559,7 +755,11 @@ func (db *DB) QueryTaskEvents(q journal.JournalQueryV1) (journal.JournalTaskEven
 	}
 	fetch := q.Limit
 	if fetch > 0 {
-		sql += fmt.Sprintf(" LIMIT %d", fetch+1) // +1 to detect a further page
+		// Bind the page size like every other value (the +1 detects a further page); the
+		// placeholder index is interpolated, the value is bound. LIMIT is the final clause,
+		// so `next` needs no further advance.
+		sql += fmt.Sprintf(" LIMIT ?%d", next)
+		args = append(args, fetch+1)
 	}
 
 	var rows []journal.TaskEventRow
