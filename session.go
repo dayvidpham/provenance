@@ -367,9 +367,6 @@ func (s *Session) Reopen(id TaskID, opts ...ApplyOption) (Task, error) {
 // with ErrStatusTransition unless WithForce is passed. Returns ErrNotFound if the task
 // does not exist, ErrGenesisRequired if no genesis authority exists yet.
 func (s *Session) CloseTask(id TaskID, reason string, opts ...ApplyOption) (Task, error) {
-	if err := s.checkGate("CloseTask"); err != nil {
-		return Task{}, err
-	}
 	return s.setStatus("CloseTask", id, EventKindTaskClosed, reason, opts)
 }
 
@@ -384,6 +381,13 @@ func (s *Session) CloseTask(id TaskID, reason string, opts ...ApplyOption) (Task
 // authority exists yet, and the typed ErrStatusTransition on an FSM-illegal unforced
 // transition.
 func (s *Session) setStatus(verb string, id TaskID, kind EventKind, closeReason string, opts []ApplyOption) (Task, error) {
+	// Borrowed-mode liveness gate for the whole lifecycle-verb family (Start, Stop,
+	// Reopen, CloseTask): once the owning DBOS root has shut down, every transition
+	// returns a StoreUnavailableError instead of writing through the still-open bridge
+	// connection. A no-op for a standalone Session.
+	if err := s.checkGate(verb); err != nil {
+		return Task{}, err
+	}
 	if err := s.requireInitialized(verb); err != nil {
 		return Task{}, err
 	}

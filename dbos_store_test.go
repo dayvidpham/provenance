@@ -139,6 +139,15 @@ func TestBorrowed_PostShutdown_SessionGated(t *testing.T) {
 	_, updateErr := sess.Update(tid, provenance.UpdateFields{})
 	mustStoreUnavailable(t, updateErr, "Session.Update")
 
+	_, startErr := sess.Start(tid)
+	mustStoreUnavailable(t, startErr, "Session.Start")
+
+	_, stopErr := sess.Stop(tid)
+	mustStoreUnavailable(t, stopErr, "Session.Stop")
+
+	_, reopenErr := sess.Reopen(tid)
+	mustStoreUnavailable(t, reopenErr, "Session.Reopen")
+
 	_, closeErr := sess.CloseTask(tid, "done")
 	mustStoreUnavailable(t, closeErr, "Session.CloseTask")
 
