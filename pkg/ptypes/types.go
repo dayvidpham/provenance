@@ -15,7 +15,7 @@ import (
 // namespacedID is a type constraint for all ID types that have
 // Namespace and UUID fields. Used by parseID to deduplicate parse logic.
 type namespacedID interface {
-	TaskID | AgentID | ActivityID | CommentID
+	TaskID | ActorID | ActivityID | CommentID
 }
 
 // parseID is a generic helper that parses "namespace--uuid" into any ID type
@@ -48,8 +48,8 @@ func parseID[T namespacedID](raw, caller string) (T, error) {
 	switch any(zero).(type) {
 	case TaskID:
 		result = TaskID{Namespace: ns, UUID: u}
-	case AgentID:
-		result = AgentID{Namespace: ns, UUID: u}
+	case ActorID:
+		result = ActorID{Namespace: ns, UUID: u}
 	case ActivityID:
 		result = ActivityID{Namespace: ns, UUID: u}
 	case CommentID:
@@ -80,23 +80,37 @@ func ParseTaskID(s string) (TaskID, error) {
 	return parseID[TaskID](s, "ParseTaskID")
 }
 
-// AgentID uniquely identifies an agent (PROV-O Agent).
-// Wire format: "namespace--uuid".
-type AgentID struct {
+// ActorID uniquely identifies a human, model, or software actor (PROV-O Agent).
+// Actor kind is metadata and never creates a second identity domain or wire
+// format. Wire format: "namespace--uuid".
+type ActorID struct {
 	Namespace string
 	UUID      uuid.UUID
 }
 
 // String returns the wire format: "namespace--uuid".
-func (id AgentID) String() string {
+func (id ActorID) String() string {
 	return id.Namespace + "--" + id.UUID.String()
 }
 
-// ParseAgentID parses "namespace--uuid" into an AgentID.
+// ParseActorID parses "namespace--uuid" into an ActorID.
 // Uses strings.LastIndex to split on the rightmost "--" separator.
 // Returns ErrInvalidID if the format is invalid or the UUID is malformed.
+func ParseActorID(s string) (ActorID, error) {
+	return parseID[ActorID](s, "ParseActorID")
+}
+
+// AgentID is the one-release source-compatibility spelling for ActorID.
+//
+// Deprecated: use ActorID. This is a type alias, not a second identity domain;
+// the wire format is identical.
+type AgentID = ActorID
+
+// ParseAgentID parses "namespace--uuid" into the canonical ActorID domain.
+//
+// Deprecated: use ParseActorID.
 func ParseAgentID(s string) (AgentID, error) {
-	return parseID[AgentID](s, "ParseAgentID")
+	return parseID[ActorID](s, "ParseAgentID")
 }
 
 // ActivityID uniquely identifies an activity (PROV-O Activity).
@@ -245,12 +259,15 @@ type Comment struct {
 // Supporting Types for Tracker API
 // ---------------------------------------------------------------------------
 
-// UpdateFields specifies which task fields to modify.
-// Nil pointer fields are not modified.
+// UpdateFields specifies which task METADATA fields to modify via Session.Update.
+// Nil pointer fields are not modified. Status is deliberately NOT a field: the task
+// lifecycle is governed by the dedicated Session verbs Start/Stop/CloseTask/Reopen under
+// a static FSM (docs/journal-relational-contract.md §8.1, §16), so a status change is
+// never expressed as a metadata update. Owner is likewise reducer-exclusive (moved only
+// through assignment episodes) and is rejected by Session.Update.
 type UpdateFields struct {
 	Title       *string
 	Description *string
-	Status      *Status
 	Priority    *Priority
 	Phase       *Phase
 	Owner       *AgentID

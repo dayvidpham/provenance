@@ -1,0 +1,178 @@
+# Adversarial histories for legacy baseline migration
+# (docs/journal-relational-contract.md §13).
+cases:
+  - name: fresh-task-baseline-no-assignment
+    classification: must-pass
+    provenance: {source: boundary, ref: "provenance#4 amendment §13 baseline transitions: fresh"}
+    mutation:
+      description: >-
+        A legacy task with no owner migrates to one journal_task_events
+        migration-marker row and zero authority episodes.
+      operator: migrate-legacy-task
+    input:
+      legacyTask: {id: t1, owner: null, status: open, updatedAt: "2025-06-01T00:00:00Z"}
+    expected:
+      migrationEventCreated: true
+      episodesCreated: 0
+      projectedStatus: open
+
+  - name: legacy-assigned-nonterminal-baseline-preserves-owner
+    classification: must-pass
+    provenance: {source: boundary, ref: "provenance#4 amendment §13 baseline transitions: legacy-assigned"}
+    mutation:
+      description: >-
+        A legacy task with a registered owner and non-terminal status
+        migrates to one migration-marker event plus one started transition
+        on a new owner-responsibility episode, RecordedAt = legacy updatedAt.
+      operator: migrate-legacy-task
+    input:
+      legacyTask: {id: t2, owner: actor-alice, status: in_progress, updatedAt: "2025-06-02T00:00:00Z"}
+    expected:
+      migrationEventCreated: true
+      episodesCreated: 1
+      episodeActiveAfterMigration: true
+      startedTransitionRecordedAt: "2025-06-02T00:00:00Z"
+      projectedStatus: in_progress
+
+  - name: legacy-terminal-baseline-ends-assignment-at-legal-close-not-now
+    classification: must-pass
+    provenance: {source: boundary, ref: "provenance#4 amendment §13 baseline transitions: legacy-terminal"}
+    mutation:
+      description: >-
+        A legacy task with a registered owner and Closed status migrates to
+        a started transition AND an ended transition on the same episode,
+        both stamped with the legacy row's own closedAt (falling back to
+        updatedAt if closedAt is absent) — never the wall-clock time the
+        migration itself runs at.
+      operator: migrate-legacy-task
+    input:
+      legacyTask: {id: t3, owner: actor-bob, status: closed, updatedAt: "2025-06-03T00:00:00Z", closedAt: "2025-06-04T00:00:00Z"}
+      migrationRunWallClock: "2026-07-16T21:47:00Z"
+    expected:
+      episodesCreated: 1
+      startedTransitionRecordedAt: "2025-06-03T00:00:00Z"
+      endedTransitionRecordedAt: "2025-06-04T00:00:00Z"
+      endedTransitionRecordedAtEqualsWallClock: false
+      projectedStatus: closed
+
+  - name: fabricated-wallclock-timestamp-in-baseline-rejected
+    classification: must-fail
+    provenance: {source: bug, ref: "regression (g): honest, non-fabricated timestamps in bootstrap/migration repair"}
+    mutation:
+      description: >-
+        An attempted migration writer stamps a baseline's ended transition
+        with the migration's own wall-clock time instead of the legacy
+        row's closedAt/updatedAt. This must be rejected by validation
+        (RecordedAt for a migration-sourced row must trace to a legacy
+        column value, never to a wall-clock read taken during migration).
+      operator: migrate-legacy-task-with-fabricated-timestamp
+    input:
+      legacyTask: {id: t4, owner: actor-carol, status: closed, updatedAt: "2025-06-05T00:00:00Z", closedAt: "2025-06-06T00:00:00Z"}
+      migrationRunWallClock: "2026-07-16T21:47:00Z"
+      writerUsesWallClockForEndedTransition: true
+    expected:
+      accepted: false
+      reason: recorded-at-not-traced-to-legacy-source
+
+  - name: unmappable-owner-fails-closed-no-partial-migration
+    classification: must-fail
+    provenance: {source: boundary, ref: "provenance#4 amendment §13 baseline transitions: unmappable-owner"}
+    mutation:
+      description: >-
+        One legacy task among several has an owner string that does not
+        resolve to a registered ActorID. The entire migration transaction
+        (covering every legacy task in the run, not just the offending one)
+        must roll back with zero baseline rows committed for any task.
+      operator: migrate-batch-with-one-unmappable-owner
+    input:
+      legacyTasks:
+        - {id: t5, owner: actor-dave, status: open, updatedAt: "2025-06-07T00:00:00Z"}
+        - {id: t6, owner: "unregistered-legacy-owner", status: open, updatedAt: "2025-06-08T00:00:00Z"}
+        - {id: t7, owner: null, status: open, updatedAt: "2025-06-09T00:00:00Z"}
+    expected:
+      accepted: false
+      reason: unmappable-owner
+      committedAnchorsForAnyTask: 0
+      errorType: MigrationOwnerUnmappableError
+      errorHasWhat: true
+      errorHasWhy: true
+      errorHasWhere: true
+      errorHasWhen: true
+      errorHasImpact: true
+      errorHasFix: true
+
+  - name: migrated-then-native-extended-equals-native-only
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#4 amendment §13.2 migrated/native observational equivalence"}
+    mutation:
+      description: >-
+        A legacy assigned task is migrated to a baseline episode, then a native
+        responsibility transfer chains off the migrated episode's AssignmentID.
+        Reduce over [baseline rows, native transfer] must produce a projection
+        identical (beyond RecordedAt provenance) to Reduce over a native-only
+        history that creates the equivalent task, starts the equivalent first
+        episode, and applies the same transfer. The equivalence covers the full
+        TaskProjection (owner AND status AND the watermark), so both the migrated
+        and native paths reach the same status (open — a status a native history
+        can reach; the legacy-preserved in_progress/closed statuses, which no
+        native lifecycle event produces, are covered by the migrate-legacy-task
+        cases). The absolute LastJournalID differs between two distinct tasks in
+        one database, so the watermark is compared structurally (each equals its
+        own task's latest journal row), per §13.2's observational-equivalence
+        definition.
+      operator: migrate-then-extend-compare-to-native-only
+    input:
+      legacyTask: {id: t8, owner: actor-frank, status: open, updatedAt: "2025-06-10T00:00:00Z"}
+      nativeExtension:
+        - {kind: transfer, fromOccupant: actor-frank, toOccupant: actor-grace, chainsOffMigratedEpisode: true}
+      nativeOnlyEquivalent:
+        - {kind: create, task: t8n}
+        - {kind: start, slot: owner-responsibility, occupant: actor-frank}
+        - {kind: transfer, fromOccupant: actor-frank, toOccupant: actor-grace}
+    expected:
+      projectionsIdenticalBeyondRecordedAt: true
+      migratedOwner: actor-grace
+      nativeOnlyOwner: actor-grace
+      migratedStatus: open
+      nativeOnlyStatus: open
+      watermarkComparedStructurally: true
+
+  - name: two-legacy-tasks-identical-createdat-break-tie-by-id
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#4 amendment §13 deterministic (created_at, id) pre-migration sort totality"}
+    mutation:
+      description: >-
+        Two legacy tasks share an identical created_at, so the (created_at,
+        id-ascending) pre-migration sort must break the tie by id alone,
+        producing a stable, deterministic baseline order (the task with the
+        smaller id gets the smaller baseline anchor JournalID) every run.
+      operator: migrate-two-identical-createdat-tie-break
+    input:
+      legacyTasks:
+        - {id: alpha, owner: null, status: open, createdAt: "2025-06-12T00:00:00Z", updatedAt: "2025-06-12T00:00:00Z"}
+        - {id: beta,  owner: null, status: open, createdAt: "2025-06-12T00:00:00Z", updatedAt: "2025-06-12T00:00:00Z"}
+    expected:
+      baselineAnchorsCreated: 2
+      smallerIdGetsSmallerAnchorJournalId: true
+
+  - name: re-run-migration-hits-idempotent-short-circuit-no-duplicate-baseline
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#4 amendment §13 deterministic baseline OperationID; §9.4 idempotent replay"}
+    mutation:
+      description: >-
+        A migration is run, then re-run (e.g. after a partially-recovered first
+        run or an accidental second invocation). Because each baseline anchor's
+        OperationID is the deterministic function
+        provenance.migration.baseline--<legacy id>, the re-run presents the
+        identical OperationID per task and hits §9.4's idempotent short-circuit,
+        producing zero duplicate baseline anchors.
+      operator: migrate-then-remigrate-same-legacy-set
+    input:
+      legacyTasks:
+        - {id: t9, owner: actor-heidi, status: open, updatedAt: "2025-06-11T00:00:00Z"}
+      firstRun: {baselineAnchorsCreated: 1}
+      secondRun: {sameLegacySet: true}
+    expected:
+      baselineAnchorsAfterSecondRun: 1
+      secondRunShortCircuited: true
+      duplicateBaselineAnchors: 0

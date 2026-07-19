@@ -25,6 +25,71 @@ import (
 type DB struct {
 	mu   sync.Mutex
 	conn *zs.Conn
+
+	// projTasksTable / projAttribTable name the tables the shared reducer's
+	// projection-WRITE steps target (docs/journal-relational-contract.md §8, §15).
+	// They are the real projection tables ("tasks", "task_attributions") during a
+	// live Apply, and are temporarily repointed at connection-scoped shadow tables
+	// during ReplayProjections' from-empty convergence check so the real rows are
+	// never mutated while the check runs (SHADOW DERIVATION — the real tables stay
+	// read-only during the check, so the check is constraint-independent and the
+	// NOT NULL tasks.last_journal_id tightening cannot be tripped by a clear-in-place
+	// scratch UPDATE). Both are always held under db.mu; the swap+restore is bracketed
+	// inside one locked ReplayProjections call so a live Apply never observes the
+	// shadow target. Empty is treated as the real default by projTasks/projAttribs.
+	projTasksTable  string
+	projAttribTable string
+	// projEdgesTable / projLabelsTable / projCommentsTable name the domain-projection
+	// WRITE targets for the journaled relationship/annotation mutation families (§6
+	// amendment, §15). Real ("edges"/"labels"/"comments") during a live Apply; repointed
+	// at connection-scoped shadow tables during ReplayProjections' from-empty convergence
+	// check so the real rows stay read-only. Empty is treated as the real default.
+	projEdgesTable    string
+	projLabelsTable   string
+	projCommentsTable string
+}
+
+// projTasks returns the projection-write target table for tasks: the shadow table
+// during a from-empty replay derivation, else the real "tasks" table (§8, §15).
+func (db *DB) projTasks() string {
+	if db.projTasksTable == "" {
+		return "tasks"
+	}
+	return db.projTasksTable
+}
+
+// projAttribs returns the projection-write target table for task attributions:
+// the shadow table during a from-empty replay derivation, else the real
+// "task_attributions" table (§8.2, §15).
+func (db *DB) projAttribs() string {
+	if db.projAttribTable == "" {
+		return "task_attributions"
+	}
+	return db.projAttribTable
+}
+
+// projEdges / projLabels / projComments return the domain-projection write target for
+// the journaled edge/label/comment mutation families: the shadow table during a
+// from-empty replay derivation, else the real base table (§6 amendment, §15).
+func (db *DB) projEdges() string {
+	if db.projEdgesTable == "" {
+		return "edges"
+	}
+	return db.projEdgesTable
+}
+
+func (db *DB) projLabels() string {
+	if db.projLabelsTable == "" {
+		return "labels"
+	}
+	return db.projLabelsTable
+}
+
+func (db *DB) projComments() string {
+	if db.projCommentsTable == "" {
+		return "comments"
+	}
+	return db.projCommentsTable
 }
 
 // Open opens (or creates) a SQLite database at dbPath and returns an
@@ -154,22 +219,16 @@ func (db *DB) ensureSchema(models []ptypes.ModelEntry) error {
 			version  TEXT NOT NULL DEFAULT '',
 			source   TEXT NOT NULL DEFAULT ''
 		) STRICT, WITHOUT ROWID`,
-		`CREATE TABLE IF NOT EXISTS tasks (
-			id           TEXT PRIMARY KEY,
-			namespace    TEXT NOT NULL,
-			title        TEXT NOT NULL,
-			description  TEXT NOT NULL DEFAULT '',
-			status_id    INTEGER NOT NULL DEFAULT 0 REFERENCES statuses(id),
-			priority_id  INTEGER NOT NULL DEFAULT 2 REFERENCES priorities(id),
-			type_id      INTEGER NOT NULL DEFAULT 2 REFERENCES task_types(id),
-			phase_id     INTEGER NOT NULL REFERENCES phases(id),
-			owner_id     TEXT REFERENCES agents(id),
-			notes        TEXT NOT NULL DEFAULT '',
-			created_at   INTEGER NOT NULL,
-			updated_at   INTEGER NOT NULL,
-			closed_at    INTEGER,
-			close_reason TEXT NOT NULL DEFAULT ''
-		) STRICT`,
+		// tasks carries the last_journal_id projection watermark (§8.1): the JournalID
+		// whose ordered history this row's derived state reflects. A fresh native
+		// database ships it NOT NULL — every production tasks-row INSERT is the reducer
+		// fold, which carries the watermark, so no un-journaled task row can exist. A
+		// legacy database predates the tightening and is upgraded by MigrateLegacyBaseline
+		// (§13). The column body and shape live in schema_watermark.go so ensureSchema and
+		// every watermark rebuild share one source of truth. FK target journal(journal_id)
+		// is created by ensureJournalSchema (SQLite resolves cross-table FKs at row time).
+		fmt.Sprintf("CREATE TABLE IF NOT EXISTS tasks (\n\t\t\t%s,\n\t\t\t%s\n\t\t) STRICT",
+			tasksTableColumns, tasksWatermarkClause(true)),
 		`CREATE INDEX IF NOT EXISTS idx_tasks_namespace ON tasks (namespace)`,
 		`CREATE INDEX IF NOT EXISTS idx_tasks_status    ON tasks (status_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_tasks_priority  ON tasks (priority_id)`,
@@ -219,7 +278,13 @@ func (db *DB) ensureSchema(models []ptypes.ModelEntry) error {
 			return fmt.Errorf("ensureSchema: %w — statement: %s", err, stmt[:min(len(stmt), 80)])
 		}
 	}
-	return db.seedReferenceData(models)
+	if err := db.seedReferenceData(models); err != nil {
+		return err
+	}
+	if err := db.ensureJournalSchema(); err != nil {
+		return err
+	}
+	return db.ensureOperationsSchema()
 }
 
 // ---------------------------------------------------------------------------

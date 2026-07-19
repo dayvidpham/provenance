@@ -1,0 +1,62 @@
+# Adversarial histories for the static task-status finite-state machine
+# (docs/journal-relational-contract.md §8.1, §16). The shared reducer enforces a
+# fixed transition table over the closed status enum for the four transition
+# lifecycle kinds (started/stopped/closed/reopened); an illegal transition fails
+# closed, and the forced escape hatch coerces the FSM while staying
+# journal-reproducible. Apply and Open fold the identical rule (§9.2), so every
+# committed transition (including a forced coercion) replays from empty.
+cases:
+  - name: direct-closed-to-in-progress-rejected
+    classification: must-fail
+    provenance: {source: requirement, ref: "provenance#5 §8.1 status FSM: closed→in_progress is not a legal arrow"}
+    mutation:
+      description: >-
+        A task is created (open) and closed (open→closed). A Start event is then
+        folded against the closed task (an attempted closed→in_progress
+        transition). The static FSM has no such arrow — a closed task reaches
+        in_progress only by Reopen (→open) then Start (→in_progress) — so the
+        reducer MUST fail closed with the typed ErrStatusTransition and commit
+        nothing.
+      operator: fsm-rejects-closed-to-in-progress
+    input:
+      operationId: op-illegal-start
+    expected:
+      accepted: false
+      errorType: ErrStatusTransition
+
+  - name: stopped-transition-halts-in-progress-and-converges
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#5 §8.1 status FSM: in_progress→open via provenance.task.stopped"}
+    mutation:
+      description: >-
+        A task is created (open), started (open→in_progress), then stopped
+        (in_progress→open) via the new provenance.task.stopped lifecycle kind —
+        halting active work without closing the task. The task's status returns
+        to open, and Open's from-empty full replay re-derives the identical
+        status through the same FSM fold, converging with no divergence.
+      operator: fsm-stopped-transition-converges
+    input:
+      shape: create-start-stop
+    expected:
+      status: open
+      converged: true
+
+  - name: forced-coercion-commits-replays-and-records-marker
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#5 §8.1/§16 forced FSM escape hatch: journal-reproducible, audit-visible coercion"}
+    mutation:
+      description: >-
+        A task is created (open) and closed (open→closed). A forced Start
+        (WithForce) then coerces the FSM-illegal closed→in_progress transition:
+        the reducer skips the FSM for that one row, records a forced marker in
+        the journal payload, and commits status=in_progress. The coercion is
+        audit-visible (the started event's payload carries forced:true) and
+        journal-reproducible — Open's from-empty replay reads the same marker,
+        skips the FSM identically, and converges on in_progress.
+      operator: fsm-forced-coercion-converges
+    input:
+      operationId: op-forced-start
+    expected:
+      status: in_progress
+      forcedMarkerPresent: true
+      converged: true

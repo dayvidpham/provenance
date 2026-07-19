@@ -1,0 +1,168 @@
+# Adversarial histories for fail-closed topology corruption and missing
+# external schema (docs/journal-relational-contract.md §13 external-schema
+# preflight).
+cases:
+  - name: schema-preflight-succeeds-on-exact-match
+    classification: must-pass
+    provenance: {source: boundary, ref: "provenance#4 amendment §13 external-schema preflight"}
+    mutation:
+      description: >-
+        Opening a database whose pre-journal schema exactly matches the
+        expected shape (table/column presence) passes preflight and
+        proceeds to migration.
+      operator: schema-preflight
+    input:
+      schemaMatchesExpected: true
+    expected:
+      preflightPassed: true
+      migrationProceeds: true
+
+  - name: missing-journal-table-fails-closed-before-any-write
+    classification: must-fail
+    provenance: {source: bug, ref: "regression (f): fail-closed on missing external schema dependencies"}
+    mutation:
+      description: >-
+        Open is called against a database that lacks the journal table
+        entirely (a corrupted or partially-provisioned deployment). No row
+        of any kind — schema marker, baseline, projection — may be written;
+        the caller receives an actionable error identifying the missing
+        table before any transaction opens.
+      operator: schema-preflight-missing-table
+    input:
+      missingTables: [journal]
+    expected:
+      preflightPassed: false
+      writesAttempted: 0
+      errorIdentifiesMissingTable: true
+      errorType: SchemaPreflightError
+      errorHasWhat: true
+      errorHasWhy: true
+      errorHasWhere: true
+      errorHasWhen: true
+      errorHasImpact: true
+      errorHasFix: true
+
+  - name: extra-unexpected-column-fails-closed
+    classification: must-fail
+    provenance: {source: bug, ref: "salvage TestIntegratedGateRejectsExactSchemaAndFullEventClosureDrift (extra schema column)"}
+    mutation:
+      description: >-
+        A marker-present database has an unreviewed extra column added to
+        journal_task_events outside any migration this implementation
+        recognizes. Reopening it must fail activation rather than silently
+        proceeding against a schema shape it does not fully understand.
+      operator: schema-preflight-extra-column
+    input:
+      markerPresent: true
+      extraColumn: {table: journal_task_events, column: unreviewed}
+    expected:
+      preflightPassed: false
+      migrationTransactionRolledBack: true
+      errorType: SchemaPreflightError
+      errorHasWhat: true
+      errorHasWhy: true
+      errorHasWhere: true
+      errorHasWhen: true
+      errorHasImpact: true
+      errorHasFix: true
+
+  - name: partial-baseline-fault-rolls-back-everything
+    classification: must-fail
+    provenance: {source: bug, ref: "salvage TestCoordinatedActivationFaultRollsBackSchemaMarkerBaselinesAndAssignments"}
+    mutation:
+      description: >-
+        A fault is injected after several (but not all) legacy tasks have
+        had baseline rows written within the single migration transaction.
+        The whole transaction — schema marker, every baseline anchor and
+        episode already written in this run, not just the faulted task —
+        must roll back atomically.
+      operator: fault-mid-migration
+    input:
+      legacyTaskCount: 6
+      faultAfterBaselineIndex: 3
+    expected:
+      committedBaselineAnchors: 0
+      committedSchemaMarker: false
+      errorHasWhat: true
+      errorHasWhy: true
+      errorHasWhere: true
+      errorHasWhen: true
+      errorHasImpact: true
+      errorHasFix: true
+
+  - name: concurrent-open-during-corruption-detects-and-halts
+    classification: must-fail
+    provenance: {source: boundary, ref: "provenance#4 amendment §13 topology corruption fails closed with an actionable error"}
+    mutation:
+      description: >-
+        Two concurrent Open calls race against a database whose topology is
+        corrupted (extra column, per the extra-unexpected-column case)
+        mid-way through the first caller's preflight. Both callers must
+        observe the same fail-closed outcome; neither may proceed on a
+        partial or racily-inconsistent view of the schema.
+      operator: concurrent-open-during-corruption
+    input:
+      concurrentOpens: 2
+      corruption: {table: journal_task_events, column: unreviewed}
+    expected:
+      bothCallersFailClosed: true
+      anyCallerProceeds: false
+      errorType: SchemaPreflightError
+      errorHasWhat: true
+      errorHasWhy: true
+      errorHasWhere: true
+      errorHasWhen: true
+      errorHasImpact: true
+      errorHasFix: true
+
+  - name: extra-unexpected-table-fails-closed
+    classification: must-fail
+    provenance: {source: requirement, ref: "provenance#4 amendment §13 external-schema preflight (table presence, both directions)"}
+    mutation:
+      description: >-
+        A recognized database has gained an unaccounted-for extra
+        journal-spine-named table (a stray migration artifact, a manually
+        created table, or a future schema version's table left behind after a
+        downgrade) — the symmetric direction to the extra-unexpected-column
+        case. Preflight verifies exact expected shape in BOTH directions for
+        tables as well as columns, so an unrecognized journal-spine table must
+        also fail closed before any write, with a typed SchemaPreflightError.
+      operator: schema-preflight-extra-table
+    input:
+      markerPresent: true
+      extraTable: {table: journal_unreviewed}
+    expected:
+      preflightPassed: false
+      writesAttempted: 0
+      errorType: SchemaPreflightError
+      errorHasWhat: true
+      errorHasWhy: true
+      errorHasWhere: true
+      errorHasWhen: true
+      errorHasImpact: true
+      errorHasFix: true
+
+  - name: missing-expected-column-fails-closed
+    classification: must-fail
+    provenance: {source: requirement, ref: "provenance#4 amendment §13 external-schema preflight (column presence, both directions)"}
+    mutation:
+      description: >-
+        A recognized database is missing an EXPECTED column (journal_task_events
+        lacks its Payload column) — the symmetric direction to the
+        extra-unexpected-column case. Preflight verifies exact expected shape in
+        both directions, so a missing expected column must also fail closed
+        before any write, with a typed SchemaPreflightError.
+      operator: schema-preflight-missing-column
+    input:
+      markerPresent: true
+      missingColumn: {table: journal_task_events, column: Payload}
+    expected:
+      preflightPassed: false
+      writesAttempted: 0
+      errorType: SchemaPreflightError
+      errorHasWhat: true
+      errorHasWhy: true
+      errorHasWhere: true
+      errorHasWhen: true
+      errorHasImpact: true
+      errorHasFix: true

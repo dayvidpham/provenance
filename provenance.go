@@ -8,26 +8,32 @@ type Tracker interface {
 	// It is safe to call Close multiple times.
 	Close() error
 
-	// ---------------------------------------------------------------------------
-	// Task CRUD
-	// ---------------------------------------------------------------------------
+	// Journal returns the ordered global-journal surface
+	// (docs/journal-relational-contract.md): task-event append, JournalID-ordered
+	// queries, the cumulative attribution projection, subtype-integrity
+	// verification, and the actor-namespace reservation registry.
+	Journal() JournalAPI
 
-	// Create creates a new task. A UUIDv7 TaskID with the given namespace is
-	// assigned automatically. Returns ErrInvalidID if namespace is empty.
-	Create(namespace, title, description string, taskType TaskType, priority Priority, phase Phase) (Task, error)
+	// As binds a committing actor and a governing authority (a bootstrap or
+	// assignment authority's JournalID, obtained from a genesis operation or a
+	// started assignment episode) and returns a Session: the mutation SDK over the
+	// journal. The Session's task-lifecycle verbs (Create/Update/CloseTask) are
+	// journaled single-operation wrappers over Apply; its relationship/annotation
+	// verbs (AddEdge/RemoveEdge/AddLabel/RemoveLabel/AddComment) are un-journaled
+	// direct domain writes (docs/journal-relational-contract.md §6). See Session.
+	As(actor ActorID, authority JournalID) *Session
+
+	// ---------------------------------------------------------------------------
+	// Task reads
+	// ---------------------------------------------------------------------------
+	//
+	// Task MUTATIONS (create, update, close) live on the journaled Session SDK
+	// (Tracker.As), not on Tracker: every task-lifecycle change flows through the
+	// ordered journal so it is authorized and reproducible from history (§8.1, §9).
 
 	// Show retrieves a task by ID.
 	// Returns ErrNotFound if no task with that ID exists.
 	Show(id TaskID) (Task, error)
-
-	// Update applies partial updates to a task. Only non-nil fields in fields
-	// are written. Returns ErrNotFound if the task does not exist.
-	Update(id TaskID, fields UpdateFields) (Task, error)
-
-	// CloseTask marks a task as closed with the given reason.
-	// Returns ErrNotFound if the task does not exist.
-	// Returns ErrAlreadyClosed if the task is already closed.
-	CloseTask(id TaskID, reason string) (Task, error)
 
 	// List returns tasks matching the filter. An empty ListFilter returns all
 	// tasks ordered by creation time (ascending).
@@ -36,16 +42,9 @@ type Tracker interface {
 	// ---------------------------------------------------------------------------
 	// Typed Dependency Edges
 	// ---------------------------------------------------------------------------
-
-	// AddEdge creates a typed edge from sourceID to targetID.
-	// For EdgeBlockedBy: cycle detection is enforced; returns ErrCycleDetected
-	// if the edge would introduce a cycle.
-	// For other kinds: the edge is inserted directly without cycle checking.
-	AddEdge(sourceID TaskID, targetID string, kind EdgeKind) error
-
-	// RemoveEdge deletes the edge from sourceID to targetID with the given kind.
-	// Returns nil if the edge did not exist.
-	RemoveEdge(sourceID TaskID, targetID string, kind EdgeKind) error
+	//
+	// Edge MUTATIONS (AddEdge/RemoveEdge) live on the Session SDK (Tracker.As) as
+	// un-journaled §6 relationship writes; Edges reads are on Tracker.
 
 	// Edges returns all edges originating from id.
 	// If kind is non-nil, only edges of that kind are returned.
@@ -81,12 +80,9 @@ type Tracker interface {
 	// ---------------------------------------------------------------------------
 	// Labels
 	// ---------------------------------------------------------------------------
-
-	// AddLabel attaches a label to a task. Idempotent.
-	AddLabel(id TaskID, label string) error
-
-	// RemoveLabel detaches a label from a task. Idempotent.
-	RemoveLabel(id TaskID, label string) error
+	//
+	// Label MUTATIONS (AddLabel/RemoveLabel) live on the Session SDK (Tracker.As)
+	// as un-journaled §6 annotation writes; Labels reads are on Tracker.
 
 	// Labels returns all labels attached to a task.
 	Labels(id TaskID) ([]string, error)
@@ -94,10 +90,9 @@ type Tracker interface {
 	// ---------------------------------------------------------------------------
 	// Comments
 	// ---------------------------------------------------------------------------
-
-	// AddComment adds a comment to a task authored by authorID.
-	// Returns ErrNotFound if the task or author agent does not exist.
-	AddComment(id TaskID, authorID AgentID, body string) (Comment, error)
+	//
+	// Comment MUTATION (AddComment) lives on the Session SDK (Tracker.As) as an
+	// un-journaled §6 annotation write; Comments reads are on Tracker.
 
 	// Comments returns all comments on a task in chronological order.
 	Comments(id TaskID) ([]Comment, error)

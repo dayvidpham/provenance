@@ -13,9 +13,11 @@ import (
 // Shared test fixtures (M5)
 // ---------------------------------------------------------------------------
 
-// openTestTracker returns a fresh in-memory Tracker for testing.
-// The tracker is closed automatically when the test ends.
-func openTestTracker(t *testing.T) provenance.Tracker {
+// openTestTracker returns a fresh in-memory tracker for testing, wrapped with a
+// genesis-bound Session so the task/edge/label/comment mutation verbs run through the
+// journaled production path (Tracker.As). The tracker is closed automatically when
+// the test ends.
+func openTestTracker(t *testing.T) *testTracker {
 	t.Helper()
 	tr, err := provenance.OpenMemory()
 	if err != nil {
@@ -26,12 +28,12 @@ func openTestTracker(t *testing.T) provenance.Tracker {
 			t.Errorf("tracker.Close() failed: %v", err)
 		}
 	})
-	return tr
+	return wrapTracker(t, tr)
 }
 
 // mustCreateTask creates a task with sensible defaults and fatals on error.
 // Uses TaskTypeTask, PriorityMedium, and PhaseUnscoped as defaults.
-func mustCreateTask(t *testing.T, tr provenance.Tracker, namespace string) provenance.Task {
+func mustCreateTask(t *testing.T, tr *testTracker, namespace string) provenance.Task {
 	t.Helper()
 	task, err := tr.Create(namespace, "Test Task", "", provenance.TaskTypeTask, provenance.PriorityMedium, provenance.PhaseUnscoped)
 	if err != nil {
@@ -184,9 +186,11 @@ func TestCloseTaskAlreadyClosed(t *testing.T) {
 		t.Fatalf("First CloseTask() error: %v", err)
 	}
 
+	// Re-closing an already-closed task is an FSM-illegal same-state transition
+	// (closed→closed), rejected by the shared reducer with the typed ErrStatusTransition.
 	_, err = tr.CloseTask(task.ID, "second close")
-	if !errors.Is(err, provenance.ErrAlreadyClosed) {
-		t.Errorf("Second CloseTask: got %v, want ErrAlreadyClosed", err)
+	if !errors.Is(err, provenance.ErrStatusTransition) {
+		t.Errorf("Second CloseTask: got %v, want ErrStatusTransition", err)
 	}
 }
 

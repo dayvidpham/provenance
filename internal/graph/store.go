@@ -5,6 +5,7 @@
 package graph
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -12,6 +13,15 @@ import (
 	"github.com/dayvidpham/provenance/pkg/ptypes"
 	dgraph "github.com/dominikbraun/graph"
 )
+
+// ErrDirectVertexCreate is returned by Store.AddVertex when it is asked to create a
+// graph vertex for a task that has no row in the tasks table. Task creation is
+// journaled: a task is born only through the reducer fold (Session.Create / an Atomic
+// EffectTaskCreate), which INSERTs the tasks row with a non-NULL journal watermark. The
+// graph is a live, read-only view over that table (Store.Vertex reads tasks(id)), so
+// there is no direct-write vertex-creation path — this rejection is the structural
+// analogue of the journal's direct-write-rejection invariant. errors.Is recovers it.
+var ErrDirectVertexCreate = errors.New("provenance: direct graph-vertex creation is not permitted")
 
 // Store implements dgraph.Store[string, ptypes.Task] for the blocked-by
 // subgraph. All persistence is delegated to the internal/sqlite.DB.
@@ -39,6 +49,12 @@ func NewGraph(db *dbsqlite.DB) dgraph.Graph[string, ptypes.Task] {
 	)
 }
 
+// AddVertex satisfies the dgraph.Store interface but no longer creates rows: task
+// creation is journaled (Session.Create / an Atomic EffectTaskCreate), and the graph is
+// a live view over the tasks table. A call for a task that already has a row is the
+// dominikbraun already-exists condition (ErrVertexAlreadyExists); a call for a task with
+// no row is a retired direct-write creation attempt and fails with ErrDirectVertexCreate
+// naming Session.Create as the path. It writes nothing.
 func (s *Store) AddVertex(hash string, value ptypes.Task, _ dgraph.VertexProperties) error {
 	if hash != value.ID.String() {
 		return fmt.Errorf(
@@ -47,7 +63,20 @@ func (s *Store) AddVertex(hash string, value ptypes.Task, _ dgraph.VertexPropert
 			hash, value.ID.String(),
 		)
 	}
-	return s.db.InsertTask(value)
+	_, found, err := s.db.GetTask(value.ID)
+	if err != nil {
+		return fmt.Errorf("graph.Store.AddVertex: check task %q existence: %w", hash, err)
+	}
+	if found {
+		return dgraph.ErrVertexAlreadyExists
+	}
+	return fmt.Errorf(
+		"%w: graph.Store.AddVertex for task %q — where: blocked-by graph store adapter; "+
+			"why: task creation is journaled, so a task row is born only through the reducer "+
+			"fold (a non-NULL journal watermark), never a direct graph-vertex write; "+
+			"impact: nothing was written; fix: create the task via Session.Create (or an "+
+			"Atomic EffectTaskCreate) first — the graph then sees it as a vertex automatically",
+		ErrDirectVertexCreate, hash)
 }
 
 func (s *Store) Vertex(hash string) (ptypes.Task, dgraph.VertexProperties, error) {

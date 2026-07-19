@@ -1,0 +1,299 @@
+# Adversarial histories for per-effect authority and single-consumption
+# assignment evidence (docs/journal-relational-contract.md §9.3, §14).
+cases:
+  - name: effect-authorized-against-state-at-own-journalid
+    classification: must-pass
+    provenance: {source: bug, ref: "regression (a): per-effect authorization at the effect's own journal position"}
+    mutation:
+      description: >-
+        A single ConditionalMutationBatch operation's second child effect
+        (StartTaskAssignment on a NEW slot occupant) depends on its first
+        child effect (EndTaskAssignment on the OLD occupant) having already
+        been folded — i.e. the second effect's authority check must see the
+        first effect's just-committed state, not the pre-transaction
+        snapshot. A superseded implementation validated authority once for
+        the whole batch and let every child reuse that stale value; this
+        case proves the reducer must not do that.
+      operator: fold-sequentially-check-effect2-sees-effect1
+    input:
+      operationId: op-transfer-1
+      effects:
+        - {index: 1, kind: authority, transition: ended, task: t1, slot: owner-responsibility, assignment: A}
+        - {index: 2, kind: authority, transition: started, task: t1, slot: owner-responsibility, assignment: B, predecessor: A}
+    expected:
+      effect1Accepted: true
+      effect2AuthorizedAgainst: "state-after-effect-1"
+      effect2Accepted: true
+
+  - name: orphaned-predecessor-assignment-rejected
+    classification: must-fail
+    provenance: {source: bug, ref: "regression (d): responsibility-assignment semantics bound to explicit lifecycle records"}
+    mutation:
+      description: >-
+        A started transition names PredecessorAssignmentID = C, but episode
+        C has no ended transition row (it is still active, or was never
+        properly started). The referenced episode exists (so the foreign
+        key alone is satisfied) but the business-rule check that it has
+        actually ended must reject the operation.
+      operator: start-with-orphaned-predecessor
+    input:
+      operationId: op-orphan-1
+      predecessorEpisode: {assignmentId: C, hasEndedTransition: false}
+      newEpisode: {assignmentId: D, predecessor: C}
+    expected:
+      accepted: false
+      reason: predecessor-not-ended
+
+  - name: predecessor-assignment-consumed-twice-rejected
+    classification: must-fail
+    provenance: {source: bug, ref: "regression (d): single-consumption ownership-assignment evidence"}
+    mutation:
+      description: >-
+        Two different successor episodes (E and F) both name the same
+        already-ended predecessor episode (A) as their PredecessorAssignmentID.
+        The UNIQUE(PredecessorAssignmentID) constraint must reject the
+        second one.
+      operator: two-successors-same-predecessor
+    input:
+      operationId: op-double-consume-1
+      predecessorEpisode: {assignmentId: A, hasEndedTransition: true}
+      firstSuccessor: {assignmentId: E, predecessor: A}
+      secondSuccessor: {assignmentId: F, predecessor: A}
+    expected:
+      firstSuccessorAccepted: true
+      secondSuccessorAccepted: false
+      reason: predecessor-already-consumed
+
+  - name: unrelated-assignment-authority-rejected
+    classification: must-fail
+    provenance: {source: bug, ref: "salvage authorityUnrelated / issue-5-1-unrelated-escalation"}
+    mutation:
+      description: >-
+        An operation presents authority from an assignment on task T2 to
+        mutate task T1, where no active assignment or governing-parent
+        lineage connects the authority to T1.
+      operator: authority-unrelated
+    input:
+      authorityTask: t2
+      targetTask: t1
+      topology: unrelated
+    expected:
+      allowed: false
+
+  - name: blocked-by-scheduling-edge-does-not-grant-authority
+    classification: must-fail
+    provenance: {source: bug, ref: "authorization over-grant: scheduling edges (blocked_by) carry no ownership semantics"}
+    mutation:
+      description: >-
+        Two organizationally unrelated tasks are linked only by a blocked_by
+        scheduling edge (dependent blocked_by prereq: the prereq must finish
+        before the dependent, a pure ordering constraint with no ownership
+        meaning). An authority whose active assignment is on the prereq task
+        attempts to mutate the unrelated dependent task. An assignment
+        authority governs ONLY its own active episode's task; a task merely
+        reachable through a scheduling edge is NOT governed, so the reducer must
+        reject the over-grant. Any broader governance chain (e.g. a genuine
+        governing-parent relation) requires a contract amendment before
+        implementation (§14.1 authority note).
+      operator: blocked-by-scheduling-edge-does-not-grant-authority
+    input:
+      authorityTask: prereq
+      targetTask: dependent
+      topology: blocked-by-only
+    expected:
+      allowed: false
+
+  - name: ended-authority-exact-replay-still-succeeds
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#5 exact ended authority may replay"}
+    mutation:
+      description: >-
+        An operation is replayed (identical OperationID, actor, authority,
+        command digest, mutation digest) after the authority it originally
+        used has since ended. Exact replay must still return the original
+        result; only a NEW operation using an ended authority is rejected.
+      operator: replay-with-ended-authority
+    input:
+      operationId: op-review-1
+      authorityEndedSinceOriginalCommit: true
+      replayIsExactIdentity: true
+    expected:
+      accepted: true
+      reason: exact-replay-skips-current-authority-check
+
+  - name: subordinate-row-carrying-actor-rejected
+    classification: must-fail
+    provenance: {source: requirement, ref: "provenance#4 amendment §2.1 anchor-only actor placement; §10 totality rule 5"}
+    mutation:
+      description: >-
+        A subordinate (operation-produced) journal row is written carrying a
+        stored actor_id at all — the new-model violation. Under anchor-only
+        placement (§2.1) a subordinate row's actor_id must be NULL and its
+        committing actor derived from its anchor (§8.5); a stored actor on a
+        subordinate row is structurally forbidden. Driven via the adversarial
+        seam that bypasses the CHECK constraint so the reducer/VerifyIntegrity
+        placement guard (§10 rule 5) is exercised directly, it must be rejected
+        before commit. (Disagreement between a produced row's actor and its
+        anchor is no longer expressible — the column is simply absent — so the
+        retired committing-actor-agreement case is replaced by this one.)
+      operator: produce-subordinate-row-carrying-actor
+    input:
+      operationId: op-subordinate-actor-1
+      anchorActor: actor-alice
+      subordinateRow: {kind: task_event, task: t1, eventKind: "provenance.task.updated", carriesActor: true}
+    expected:
+      accepted: false
+      reason: subordinate-row-carries-actor
+
+  - name: transitive-parent-citation-grants-authority
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#5 §14.5 parent-citation governance: transitive deliberate-ownership reach"}
+    mutation:
+      description: >-
+        Three episodes form a deliberate delegation chain by parent citation:
+        a supervisor episode on an epic (no parent), a worker episode on a
+        story citing the supervisor episode as its parent, and a helper
+        episode on a subtask citing the worker episode. Each start is
+        authorized by the bootstrap authority (which governs every task); the
+        parent citation is separate metadata declared at start. Because the
+        whole chain (helper -> worker -> supervisor) is active, the
+        supervisor's own assignment authority governs the subtask: an effect
+        on the subtask under the supervisor authority must be accepted, since
+        the subtask's episode reaches the supervisor episode via active parent
+        citations (§14.5 predicate branch b).
+      operator: transitive-parent-citation-grants-authority
+    input:
+      operationId: op-grandparent-authorizes-subtask
+      chain: [{episode: E-SUP, task: epic, parent: null}, {episode: E-WRK, task: story, parent: E-SUP}, {episode: E-HLP, task: subtask, parent: E-WRK}]
+      effectUnderAuthority: {authorityEpisode: E-SUP, targetTask: subtask}
+    expected:
+      accepted: true
+      reason: transitive-active-citation-chain-grants-authority
+
+  - name: parent-chain-middle-episode-ended-cuts-authority
+    classification: must-fail
+    provenance: {source: requirement, ref: "provenance#5 §14.5 whole-chain liveness: an ended middle episode cuts delegated authority"}
+    mutation:
+      description: >-
+        The same supervisor -> worker -> helper citation chain, but the middle
+        (worker) episode on the story is ended before the effect. Whole-chain
+        liveness (§14.5) requires EVERY episode on the delegation chain to be
+        active at the effect's journal position; with the worker episode ended,
+        the subtask's episode no longer reaches the supervisor through an
+        entirely-active chain. A grandparent no longer governs a grandchild
+        once the parent between them ends, so an effect on the subtask under the
+        supervisor authority must be rejected.
+      operator: parent-chain-middle-episode-ended-cuts-authority
+    input:
+      operationId: op-grandchild-effect-after-middle-ended
+      chain: [{episode: E-SUP, task: epic, parent: null}, {episode: E-WRK, task: story, parent: E-SUP}, {episode: E-HLP, task: subtask, parent: E-WRK}]
+      endedMiddleEpisode: E-WRK
+      effectUnderAuthority: {authorityEpisode: E-SUP, targetTask: subtask}
+    expected:
+      accepted: false
+      reason: whole-chain-liveness-broken-by-ended-middle-episode
+
+  - name: parent-chain-middle-ended-same-operation-cuts-authority
+    classification: must-fail
+    provenance: {source: bug, ref: "same-operation regression: §14.5 whole-chain liveness must hold WITHIN one operation's per-effect fold, not only across operations"}
+    mutation:
+      description: >-
+        The same supervisor -> worker -> helper citation chain, but the cut
+        happens WITHIN a single operation. One operation batches two effects:
+        effect 1 ends the middle (worker) episode on the story, and effect 2
+        mutates the helper's subtask under the supervisor authority. Per the
+        per-effect fold (§9.3.1) each effect is authorized against the state
+        produced by all earlier effects of the same operation, so effect 2 must
+        see effect 1's just-ended middle episode and the supervisor's transitive
+        reach to the subtask is already cut — the whole operation is rejected and
+        nothing is committed. This mirrors the predecessor/successor
+        same-operation fold case (effect-authorized-against-state-at-own-journalid)
+        for the §14.5 parent-citation governance walk rather than for the
+        pre-existing succession path.
+      operator: parent-chain-middle-ended-same-operation-cuts-authority
+    input:
+      operationId: op-end-middle-then-grandchild-effect
+      chain: [{episode: E-SUP, task: epic, parent: null}, {episode: E-WRK, task: story, parent: E-SUP}, {episode: E-HLP, task: subtask, parent: E-WRK}]
+      effects:
+        - {index: 1, kind: authority, transition: ended, task: story, slot: owner-responsibility, assignment: E-WRK}
+        - {index: 2, kind: task_event, task: subtask, eventKind: provenance.task.updated, authorityEpisode: E-SUP}
+    expected:
+      accepted: false
+      reason: effect-2-sees-effect-1-ended-middle-episode-cutting-whole-chain-liveness
+
+  - name: citation-of-inactive-parent-at-start-rejected
+    classification: must-fail
+    provenance: {source: requirement, ref: "provenance#5 §14.5 citation validity: the cited parent must be active at citation"}
+    mutation:
+      description: >-
+        An episode's start cites a parent that has already ended (is not active
+        at the citation's own journal position). A parent citation is a
+        deliberate claim to be governed by a LIVE authority; citing an ended
+        (or never-started, or nonexistent) parent is rejected before commit.
+      operator: citation-of-inactive-parent-at-start-rejected
+    input:
+      operationId: op-cite-ended-parent
+      parentEpisode: {episode: E-SUP, task: epic, endedBeforeCitation: true}
+      childEpisode: {episode: E-WRK, task: story, parent: E-SUP}
+    expected:
+      accepted: false
+      reason: cited-parent-not-active-at-citation
+
+  - name: corrupted-cyclic-parent-chain-fails-closed
+    classification: must-fail
+    provenance: {source: requirement, ref: "provenance#5 §14.5 bounded fail-closed walk over a corrupt cyclic parent chain"}
+    mutation:
+      description: >-
+        A corrupt cyclic parent-citation chain (episode X parent Y, episode Y
+        parent X) is written directly, bypassing the start-effect cycle guard
+        the production writer enforces. When the governance walk evaluates an
+        authority against a task whose episode enters the cycle, the bounded,
+        visited-tracked traversal must fail closed with a typed
+        corrupt-chain error rather than looping forever.
+      operator: corrupted-cyclic-parent-chain-fails-closed
+    input:
+      cyclicEpisodes: [{episode: X, task: tX, parent: Y}, {episode: Y, task: tY, parent: X}]
+      queryAuthorityEpisode: {episode: Z, task: tZ}
+      queryTargetTask: tX
+    expected:
+      accepted: false
+      reason: bounded-walk-fails-closed-on-corrupt-cycle
+
+  - name: ended-transition-without-started-rejected
+    classification: must-fail
+    provenance: {source: requirement, ref: "provenance#4 amendment §14.4 assignment-transition lifecycle order"}
+    mutation:
+      description: >-
+        An operation writes an 'ended' transition for an episode that has no
+        prior 'started' transition row. Every FK, key, and totality rule is
+        satisfied, but the lifecycle-order rule requires a 'started' first, so
+        the reducer must reject the ended-without-started transition.
+      operator: end-episode-never-started
+    input:
+      operationId: op-end-orphan-1
+      episode: {assignmentId: G, hasStartedTransition: false}
+      transition: ended
+    expected:
+      accepted: false
+      reason: ended-without-started
+
+  - name: ended-before-started-in-one-batch-rejected
+    classification: must-fail
+    provenance: {source: requirement, ref: "provenance#4 amendment §14.4; §9.3 sequential per-effect fold"}
+    mutation:
+      description: >-
+        A single operation batches an 'ended' effect (index 1) before the
+        'started' effect (index 2) for the same episode. Sequential per-effect
+        folding (§9.3) evaluates the 'ended' effect first, against state in
+        which the episode has not started, so the lifecycle-order rule rejects
+        the batch — a started transition must carry a strictly smaller JournalID
+        than the ended transition of the same episode.
+      operator: batch-ended-before-started
+    input:
+      operationId: op-inverted-lifecycle-1
+      effects:
+        - {index: 1, kind: authority, transition: ended, task: t1, slot: owner-responsibility, assignment: H}
+        - {index: 2, kind: authority, transition: started, task: t1, slot: owner-responsibility, assignment: H}
+    expected:
+      accepted: false
+      reason: ended-before-started
