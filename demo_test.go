@@ -40,11 +40,10 @@ func TestDemo_CoreWorkflow(t *testing.T) {
 		t.Errorf("Title = %q, want %q", found.Title, "REQUEST: Port codegen to Go")
 	}
 
-	// Update
-	inProgress := provenance.StatusInProgress
-	updated, err := tr.Update(task.ID, provenance.UpdateFields{Status: &inProgress})
+	// Start — the dedicated open→in_progress lifecycle verb (§8.1 FSM)
+	updated, err := tr.Start(task.ID)
 	if err != nil {
-		t.Fatalf("Update failed: %v", err)
+		t.Fatalf("Start failed: %v", err)
 	}
 	if updated.Status != provenance.StatusInProgress {
 		t.Errorf("Status = %v, want StatusInProgress", updated.Status)

@@ -97,6 +97,13 @@ const (
 	EffectEvidence           = journal.EffectEvidence
 	EffectTaskCreate         = journal.EffectTaskCreate
 
+	// Journaled relationship / annotation mutation-family effect sorts (§6 amendment).
+	EffectEdgeAdd     = journal.EffectEdgeAdd
+	EffectEdgeRemove  = journal.EffectEdgeRemove
+	EffectLabelAdd    = journal.EffectLabelAdd
+	EffectLabelRemove = journal.EffectLabelRemove
+	EffectCommentAdd  = journal.EffectCommentAdd
+
 	// Committed-result variants (§3.2, §9.4).
 	CommittedAbsent   = journal.CommittedAbsent
 	CommittedExact    = journal.CommittedExact
@@ -110,12 +117,20 @@ const (
 	// Provenance lifecycle task-event kinds the reducer projects (§8.1, §13).
 	EventKindTaskCreated  = journal.EventKindTaskCreated
 	EventKindTaskStarted  = journal.EventKindTaskStarted
+	EventKindTaskStopped  = journal.EventKindTaskStopped
 	EventKindTaskClosed   = journal.EventKindTaskClosed
 	EventKindTaskReopened = journal.EventKindTaskReopened
 	EventKindTaskMigrated = journal.EventKindTaskMigrated
 	// EventKindTaskUpdated records a materialized-metadata mutation; it is NOT a
 	// status-changing lifecycle kind (§8.1).
 	EventKindTaskUpdated = journal.EventKindTaskUpdated
+
+	// Journaled relationship / annotation mutation-family kinds (§6 amendment).
+	EventKindEdgeAdded    = journal.EventKindEdgeAdded
+	EventKindEdgeRemoved  = journal.EventKindEdgeRemoved
+	EventKindLabelAdded   = journal.EventKindLabelAdded
+	EventKindLabelRemoved = journal.EventKindLabelRemoved
+	EventKindCommentAdded = journal.EventKindCommentAdded
 )
 
 // Typed context and validation constructors.
@@ -135,7 +150,29 @@ var (
 	MigrationBaselineOperationID  = journal.MigrationBaselineOperationID
 	MigrationBaselineAssignmentID = journal.MigrationBaselineAssignmentID
 	StatusForEventKind            = journal.StatusForEventKind
+
+	// Static status FSM surface (§8.1, §16): the transition table and its forced escape
+	// hatch, re-exported so callers can validate/inspect transitions and recover the
+	// typed rejection.
+	ValidateStatusTransition      = journal.ValidateStatusTransition
+	IsTransitionLifecycleKind     = journal.IsTransitionLifecycleKind
+	TransitionLifecycleKinds      = journal.TransitionLifecycleKinds
+	EncodeForcedTransitionPayload = journal.EncodeForcedTransitionPayload
+	DecodeForcedTransition        = journal.DecodeForcedTransition
+
+	// Journaled relationship / annotation mutation-family surface (§6 amendment):
+	// classification + payload codecs, re-exported so who-provenance queries can decode
+	// an edge/label/comment row's operands straight from the journal.
+	IsMutationFamilyKind         = journal.IsMutationFamilyKind
+	MutationFamilyKinds          = journal.MutationFamilyKinds
+	MutationFamilyKindForSort    = journal.MutationFamilyKindForSort
+	DecodeEdgeMutationPayload    = journal.DecodeEdgeMutationPayload
+	DecodeLabelMutationPayload   = journal.DecodeLabelMutationPayload
+	DecodeCommentMutationPayload = journal.DecodeCommentMutationPayload
 )
+
+// Status-FSM typed error + sentinel (§8.1).
+type InvalidStatusTransition = journal.InvalidStatusTransition
 
 // Journal sentinel errors, re-exported for errors.Is at call sites.
 var (
@@ -162,6 +199,7 @@ var (
 	ErrMigrationOwnerUnmappable    = journal.ErrMigrationOwnerUnmappable
 	ErrSchemaPreflight             = journal.ErrSchemaPreflight
 	ErrProjectionDivergence        = journal.ErrProjectionDivergence
+	ErrStatusTransition            = journal.ErrStatusTransition
 	ErrMigrationFault              = journal.ErrMigrationFault
 	ErrInjectedFault               = journal.ErrInjectedFault
 	ErrDishonestMigrationTimestamp = journal.ErrDishonestMigrationTimestamp

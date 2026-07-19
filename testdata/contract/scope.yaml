@@ -95,3 +95,18 @@ operators:
   - {operator: replay-converges-clean,                      slice: s1.3, reason: §15 from-empty convergence}
   - {operator: replay-converges-migrated-status,            slice: s1.3, reason: §15 migrated-status reproducibility}
   - {operator: replay-detects-out-of-band-corruption,       slice: s1.3, reason: §15 fail-closed divergence detection}
+  - {operator: verify-clean-spine,                          slice: s1.3, reason: "UAT C8a corrupted-spine family — non-vacuous control"}
+  - {operator: corrupt-delete-subtype-row,                  slice: s1.3, reason: "UAT C8a corrupted-spine family — subtype-totality fail-closed"}
+  - {operator: corrupt-rewrite-discriminator,               slice: s1.3, reason: "UAT C8a corrupted-spine family — discriminator-agreement fail-closed"}
+  - {operator: corrupt-truncate-tail,                       slice: s1.3, reason: "UAT C8a corrupted-spine family — truncated-tail convergence fail-closed"}
+  - {operator: corrupt-noncontiguous-insert,                slice: s1.3, reason: "UAT C8a corrupted-spine family — bare-supertype-insert totality fail-closed"}
+  - {operator: revoke-then-pinned-retry-uncommitted,        slice: s1.3, reason: "UAT C8a authority-revocation family — pinned retry under revoked authority"}
+  - {operator: revoke-then-exact-replay-committed,          slice: s1.3, reason: "UAT C8a authority-revocation family — committed exact replay short-circuits"}
+  - {operator: fsm-rejects-closed-to-in-progress,          slice: s1.3, reason: "§8.1 status FSM — illegal closed→in_progress transition fails closed"}
+  - {operator: fsm-stopped-transition-converges,           slice: s1.3, reason: "§8.1 status FSM — in_progress→open stopped transition + from-empty convergence"}
+  - {operator: fsm-forced-coercion-converges,              slice: s1.3, reason: "§8.1/§16 forced FSM escape hatch — journal-reproducible, audit-visible coercion"}
+  - {operator: mutation-family-who-provenance,             slice: s1.3, reason: "§6 amendment — edge/label/comment journaled who-provenance (committer, authority, position, operands)"}
+  - {operator: mutation-family-unauthorized-rejected,      slice: s1.3, reason: "§6/§9.3 — edge/label/comment mutations obey per-effect authorization (must-fail per family)"}
+  - {operator: mutation-family-projections-replay,         slice: s1.3, reason: "§6/§15 — edge/label/comment domain projections re-derive from empty and converge"}
+  - {operator: journaled-edge-grants-no-authority,         slice: s1.3, reason: "§14.5 re-pin — journaled blocked_by edge still delegates no ownership authority"}
+  - {operator: mutation-family-comment-body-corruption-detected, slice: s1.3, reason: "§6.4/§15 — full-tuple domain-projection convergence detects out-of-band comment-body corruption a key-only check missed"}

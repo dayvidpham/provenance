@@ -131,6 +131,21 @@ const (
 	// JournalKindTaskEvent (the created event), and the projection seeds status=Open.
 	// It must be ordered before any effect (or FK) that references the new task.
 	EffectTaskCreate // JournalKindTaskEvent (provenance.task.created), also inserts the tasks row
+
+	// Journaled relationship / annotation mutation-family effect sorts (§6, as amended
+	// by #5). Each produces one journal_task_events row carrying its fixed per-family
+	// EventKind (provenance.edge.added/removed, provenance.label.added/removed,
+	// provenance.comment.added) plus the operands in the payload; the shared reducer
+	// folds the row into the edges/labels/comments domain projection. They authorize
+	// against the operation's authority exactly like a task_event (§9.3), so who
+	// added/removed the relationship, under which authority, at which journal position is
+	// journal-derivable (who-provenance). An edge-add of a blocked_by edge is additionally
+	// cycle-checked in the fold before it commits.
+	EffectEdgeAdd     // JournalKindTaskEvent (provenance.edge.added), + edges INSERT projection
+	EffectEdgeRemove  // JournalKindTaskEvent (provenance.edge.removed), + edges DELETE projection
+	EffectLabelAdd    // JournalKindTaskEvent (provenance.label.added), + labels INSERT projection
+	EffectLabelRemove // JournalKindTaskEvent (provenance.label.removed), + labels DELETE projection
+	EffectCommentAdd  // JournalKindTaskEvent (provenance.comment.added), + comments INSERT projection
 )
 
 var effectSortStrings = [...]string{
@@ -141,6 +156,11 @@ var effectSortStrings = [...]string{
 	EffectDecision:           "decision",
 	EffectEvidence:           "evidence",
 	EffectTaskCreate:         "task_create",
+	EffectEdgeAdd:            "edge_add",
+	EffectEdgeRemove:         "edge_remove",
+	EffectLabelAdd:           "label_add",
+	EffectLabelRemove:        "label_remove",
+	EffectCommentAdd:         "comment_add",
 }
 
 func (s EffectSort) String() string {
@@ -155,7 +175,10 @@ func (s EffectSort) String() string {
 // finer effect taxonomy to the closed JournalKind enum.
 func (s EffectSort) JournalKind() (JournalKind, error) {
 	switch s {
-	case EffectTaskEvent, EffectTaskCreate:
+	case EffectTaskEvent, EffectTaskCreate,
+		EffectEdgeAdd, EffectEdgeRemove, EffectLabelAdd, EffectLabelRemove, EffectCommentAdd:
+		// The relationship/annotation mutation families are journaled ON a
+		// journal_task_events row carrying their fixed per-family EventKind (§6 amendment).
 		return JournalKindTaskEvent, nil
 	case EffectBootstrapAuthority, EffectAssignmentStart, EffectAssignmentEnd:
 		return JournalKindAuthority, nil
@@ -240,6 +263,14 @@ type Effect struct {
 	UpdatePhase       *Phase
 	UpdateNotes       *string
 
+	// Forced, on a TRANSITION lifecycle task_event (started/stopped/closed/reopened,
+	// §8.1), requests the FSM escape hatch: the reducer records a forced marker in the
+	// produced row's payload (EncodeForcedTransitionPayload) and SKIPS the static status
+	// FSM for that one row, so an out-of-FSM coercion is committed, journal-reproducible,
+	// and audit-visible. It never bypasses authorization (§9.3), only the FSM, and it has
+	// no effect on a non-transition kind.
+	Forced bool
+
 	// bootstrap authority (EffectBootstrapAuthority)
 	BootstrapLabel       string
 	OperationAuthorityID OperationAuthorityID
@@ -262,6 +293,21 @@ type Effect struct {
 	DecisionKind  DecisionKind
 	EvidenceKind  EvidenceKind
 	ContentDigest []byte
+
+	// Relationship / annotation mutation families (§6 amendment). TaskID (above) is the
+	// SOURCE task the mutation is authorized against (§9.3) and attributed to. The
+	// operands are journaled in the produced row's payload so the domain projection is
+	// reproducible solely from history (§15):
+	//   - EffectEdgeAdd / EffectEdgeRemove: EdgeTargetID (opaque target handle) + EdgeRelKind.
+	//   - EffectLabelAdd / EffectLabelRemove: Label.
+	//   - EffectCommentAdd: CommentIdentity + CommentAuthor + CommentBody (the comment id is
+	//     minted once by the caller and carried here so a replay reproduces the SAME id).
+	EdgeTargetID    string
+	EdgeRelKind     EdgeKind
+	Label           string
+	CommentIdentity CommentID
+	CommentAuthor   ActorID
+	CommentBody     string
 }
 
 // DecisionKind / EvidenceKind are open, validated namespaced strings (§6),

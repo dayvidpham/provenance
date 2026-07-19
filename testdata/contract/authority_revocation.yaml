@@ -1,0 +1,50 @@
+# History-shaped authority-revocation cases for the Impl-UAT C8a negative-path
+# families (docs/journal-relational-contract.md §9.4 idempotent replay, §14.1
+# per-effect authority). These are the revoke-then-retry-with-a-pinned-OperationID
+# histories: whether a pinned retry gets a free pass under a since-revoked authority
+# depends on whether the ORIGINAL attempt committed. Because these are sequences of
+# committed/uncommitted operations (history-shaped), per the C8b split they live in
+# YAML; the concurrent revocation RACES (no-TOCTOU, transfer-CAS single-winner) are
+# process-shaped and live in the sibling Go tests
+# (journal_authority_revocation_race_test.go).
+cases:
+  - name: revoke-then-pinned-retry-of-uncommitted-op-rejected
+    classification: must-fail
+    provenance: {source: requirement, ref: "UAT C8a authority-revocation family — pinned retry of an uncommitted op under a revoked authority"}
+    mutation:
+      description: >-
+        An operation citing an assignment authority is attempted with a pinned
+        OperationID but faults mid-apply, so nothing commits. The authority's episode
+        is then revoked (ended). Retrying the SAME pinned OperationID must NOT get a
+        free pass from the §9.4 short-circuit — there is no committed result to
+        short-circuit to — so the retry re-executes against current state and is
+        authorized at its effect's JournalID against the now-revoked authority,
+        failing closed with a typed ErrAuthorityScope. A pinned id is not a
+        capability that survives revocation.
+      operator: revoke-then-pinned-retry-uncommitted
+    input:
+      operationId: op-pinned-retry-1
+    expected:
+      errorType: AuthorityScope
+      failsClosed: true
+      committedBefore: false
+
+  - name: revoke-then-exact-replay-of-committed-op-short-circuits
+    classification: must-pass
+    provenance: {source: requirement, ref: "UAT C8a authority-revocation family — exact replay of a committed op after revocation"}
+    mutation:
+      description: >-
+        An operation citing an assignment authority commits. The authority's episode
+        is then revoked (ended). An EXACT replay of the same committed OperationID
+        (identical four-field identity) still succeeds via the §9.4 short-circuit,
+        which returns the original committed result without re-checking the
+        now-revoked authority — replay reproduces a committed fact, it does not
+        re-authorize. This is the must-pass contrast to the uncommitted-retry case:
+        the short-circuit is scoped to an already-committed operation, never a fresh
+        one.
+      operator: revoke-then-exact-replay-committed
+    input:
+      operationId: op-committed-replay-1
+    expected:
+      shortCircuits: true
+      failsClosed: false

@@ -106,6 +106,14 @@ func (db *DB) projectTaskEventRowLocked(jid int64, committing journal.ActorID, r
 	if err := db.insertAttributionLocked(task, committing, jid); err != nil {
 		return err
 	}
+	// Journaled relationship/annotation mutation families (§6 amendment) fold into the
+	// edges/labels/comments domain projection through the same shared reducer step Apply
+	// and Open both run (§9.2), so those tables are re-derivable from ordered history and
+	// covered by the §15 convergence check. They are non-lifecycle, so they never reach
+	// the status branches below.
+	if journal.IsMutationFamilyKind(journal.EventKind(kindStr)) {
+		return db.projectMutationFamilyRowLocked(task, journal.EventKind(kindStr), payload, jid, recordedAt)
+	}
 	// A migration marker seeds the status projection from the legacy status it
 	// captured in its own payload (§13, §15) — read from the journal row, never from
 	// the mutable tasks row — so both live migration and Open's from-empty replay
@@ -121,9 +129,58 @@ func (db *DB) projectTaskEventRowLocked(jid int64, committing journal.ActorID, r
 		return db.advanceWatermarkLocked(task, jid)
 	}
 	if status, isLifecycle := journal.StatusForEventKind(journal.EventKind(kindStr)); isLifecycle {
+		// The static status FSM (§8.1) governs the four TRANSITION lifecycle kinds
+		// (started/stopped/closed/reopened). It is enforced HERE — in the single shared
+		// reducer step Apply and Open both run (§9.2) — so a live Apply rejects an illegal
+		// transition before commit and Open's from-empty replay applies the identical rule
+		// to the identical row. The current status is read from the projection target
+		// (real tasks during Apply, the shadow table during replay), which reflects the
+		// history strictly before this row. A forced coercion carries a marker in this
+		// row's payload and skips the FSM, so the coercion is reproducible either way.
+		if journal.IsTransitionLifecycleKind(journal.EventKind(kindStr)) {
+			forced, ferr := journal.DecodeForcedTransition(payload)
+			if ferr != nil {
+				return fmt.Errorf("project task_event %d: %w", jid, ferr)
+			}
+			if !forced {
+				current, cerr := db.readProjTaskStatusLocked(task)
+				if cerr != nil {
+					return cerr
+				}
+				if verr := journal.ValidateStatusTransition(current, journal.EventKind(kindStr)); verr != nil {
+					return fmt.Errorf("project task_event %d: %w", jid, verr)
+				}
+			}
+		}
 		return db.projectTaskStatusLocked(task, status, jid, recordedAt)
 	}
 	return db.advanceWatermarkLocked(task, jid)
+}
+
+// readProjTaskStatusLocked reads a task's current lifecycle status from the projection
+// target (the real tasks table during a live Apply, the shadow table during a from-empty
+// replay derivation), so the status FSM checks the transition against the status derived
+// from history strictly before the row being folded (§8.1, §15).
+func (db *DB) readProjTaskStatusLocked(task journal.TaskID) (journal.TaskStatus, error) {
+	var status journal.TaskStatus
+	found := false
+	if err := sqlitex.Execute(db.conn,
+		fmt.Sprintf(`SELECT status_id FROM %s WHERE id = ?1`, db.projTasks()),
+		&sqlitex.ExecOptions{Args: []any{task.String()}, ResultFunc: func(stmt *zs.Stmt) error {
+			found = true
+			status = journal.TaskStatus(stmt.ColumnInt(0))
+			return nil
+		}}); err != nil {
+		return 0, fmt.Errorf("read current status for %q: %w", task, err)
+	}
+	if !found {
+		return 0, fmt.Errorf(
+			"provenance: status FSM cannot read current status of task %q — where: shared-reducer "+
+				"status projection (§8.1); when: folding a transition lifecycle event; impact: nothing "+
+				"committed; fix: the task row must exist (born via Session.Create) before a lifecycle "+
+				"transition is folded against it", task)
+	}
+	return status, nil
 }
 
 // projectAuthorityRowLocked projects an authority row. A bootstrap authority
@@ -245,8 +302,11 @@ func (db *DB) projectTaskStatusLocked(task journal.TaskID, status journal.TaskSt
 // constraint-independent (the NOT NULL tasks.last_journal_id tightening cannot break
 // a from-empty refold) and needs no scratch savepoint/rollback.
 const (
-	shadowTasksTable  = "shadow_tasks"
-	shadowAttribTable = "shadow_task_attributions"
+	shadowTasksTable    = "shadow_tasks"
+	shadowAttribTable   = "shadow_task_attributions"
+	shadowEdgesTable    = "shadow_edges"
+	shadowLabelsTable   = "shadow_labels"
+	shadowCommentsTable = "shadow_comments"
 )
 
 // ReplayProjections re-derives EVERY projection from an EMPTY slate by folding the
@@ -299,10 +359,17 @@ func (db *DB) ReplayProjections() (journal.ReplayResult, error) {
 	if err != nil {
 		return journal.ReplayResult{}, err
 	}
+	// The relationship/annotation domain projections are journaled in full (§6 amendment),
+	// so every edge/label/comment is journal-reproducible; the stored sets are snapshotted
+	// whole (not scoped to anchored tasks) and diffed against the from-empty re-derivation.
+	storedDomain, err := db.snapshotDomainProjectionsLocked("edges", "labels", "comments")
+	if err != nil {
+		return journal.ReplayResult{}, err
+	}
 
 	// Re-derive every projection from empty into connection-scoped shadow tables;
 	// the real tables stay read-only (SHADOW DERIVATION, §15).
-	derivedTasks, derivedAttribs, folded, err := db.rederiveProjectionsShadowLocked()
+	derivedTasks, derivedAttribs, derivedDomain, folded, err := db.rederiveProjectionsShadowLocked()
 	if err != nil {
 		return journal.ReplayResult{}, err
 	}
@@ -312,6 +379,10 @@ func (db *DB) ReplayProjections() (journal.ReplayResult, error) {
 		return journal.ReplayResult{}, err
 	}
 	if err := diffAttributions(storedAttribs, derivedAttribs, anchored); err != nil {
+		return journal.ReplayResult{}, err
+	}
+	// Convergence over the journaled edge/label/comment domain projections (§6, §15).
+	if err := diffDomainProjections(storedDomain, derivedDomain); err != nil {
 		return journal.ReplayResult{}, err
 	}
 
@@ -339,19 +410,29 @@ func (db *DB) ReplayProjections() (journal.ReplayResult, error) {
 func (db *DB) rederiveProjectionsShadowLocked() (
 	tasks map[string]journal.TaskProjection,
 	attribs map[string]map[string]int64,
+	domain domainProjection,
 	folded int,
 	err error,
 ) {
 	if err = db.createProjectionShadowLocked(); err != nil {
-		return nil, nil, 0, fmt.Errorf("ReplayProjections: stage shadow projection tables: %w", err)
+		return nil, nil, domainProjection{}, 0, fmt.Errorf("ReplayProjections: stage shadow projection tables: %w", err)
 	}
 	// Repoint the shared reducer's projection-write steps at the shadow tables, and
-	// unconditionally restore the real target + drop the shadow tables on return.
+	// unconditionally restore the real targets + drop the shadow tables on return. The
+	// relationship/annotation domain projections (§6 amendment) are repointed alongside
+	// the task/attribution projections so their from-empty refold lands in the shadow
+	// tables too.
 	db.projTasksTable = shadowTasksTable
 	db.projAttribTable = shadowAttribTable
+	db.projEdgesTable = shadowEdgesTable
+	db.projLabelsTable = shadowLabelsTable
+	db.projCommentsTable = shadowCommentsTable
 	defer func() {
 		db.projTasksTable = ""
 		db.projAttribTable = ""
+		db.projEdgesTable = ""
+		db.projLabelsTable = ""
+		db.projCommentsTable = ""
 		if derr := db.dropProjectionShadowLocked(); derr != nil && err == nil {
 			err = fmt.Errorf("ReplayProjections: drop shadow projection tables: %w", derr)
 		}
@@ -364,24 +445,28 @@ func (db *DB) rederiveProjectionsShadowLocked() (
 			order = append(order, stmt.ColumnInt64(0))
 			return nil
 		}}); err != nil {
-		return nil, nil, 0, fmt.Errorf("ReplayProjections: enumerate journal: %w", err)
+		return nil, nil, domainProjection{}, 0, fmt.Errorf("ReplayProjections: enumerate journal: %w", err)
 	}
 	for _, jid := range order {
 		if err = db.projectJournalRowLocked(jid); err != nil {
-			return nil, nil, 0, fmt.Errorf("ReplayProjections: fold row %d: %w", jid, err)
+			return nil, nil, domainProjection{}, 0, fmt.Errorf("ReplayProjections: fold row %d: %w", jid, err)
 		}
 		folded++
 	}
 
 	tasks, err = db.snapshotTaskProjectionsLocked(shadowTasksTable)
 	if err != nil {
-		return nil, nil, 0, err
+		return nil, nil, domainProjection{}, 0, err
 	}
 	attribs, err = db.snapshotAttributionsLocked(shadowAttribTable)
 	if err != nil {
-		return nil, nil, 0, err
+		return nil, nil, domainProjection{}, 0, err
 	}
-	return tasks, attribs, folded, nil
+	domain, err = db.snapshotDomainProjectionsLocked(shadowEdgesTable, shadowLabelsTable, shadowCommentsTable)
+	if err != nil {
+		return nil, nil, domainProjection{}, 0, err
+	}
+	return tasks, attribs, domain, folded, nil
 }
 
 // createProjectionShadowLocked builds the connection-scoped empty-slate shadow
@@ -411,6 +496,29 @@ func (db *DB) createProjectionShadowLocked() error {
 			first_journal_id INTEGER NOT NULL,
 			PRIMARY KEY (task_id, actor_id)
 		)`,
+		// Journaled relationship/annotation domain projections (§6 amendment): shadow
+		// mirrors of the real edges/labels/comments tables, carrying the same projection
+		// columns but NONE of the real constraints (no FKs), started EMPTY so the
+		// from-empty refold re-derives them purely from journal history (§15).
+		`CREATE TEMP TABLE shadow_edges (
+			source_id  TEXT NOT NULL,
+			target_id  TEXT NOT NULL,
+			kind_id    INTEGER NOT NULL,
+			created_at INTEGER NOT NULL,
+			PRIMARY KEY (source_id, target_id, kind_id)
+		)`,
+		`CREATE TEMP TABLE shadow_labels (
+			task_id TEXT NOT NULL,
+			name    TEXT NOT NULL,
+			PRIMARY KEY (task_id, name)
+		)`,
+		`CREATE TEMP TABLE shadow_comments (
+			id         TEXT PRIMARY KEY,
+			task_id    TEXT NOT NULL,
+			author_id  TEXT NOT NULL,
+			body       TEXT NOT NULL,
+			created_at INTEGER NOT NULL
+		)`,
 	}
 	for _, stmt := range ddl {
 		if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
@@ -428,7 +536,11 @@ func (db *DB) createProjectionShadowLocked() error {
 
 // dropProjectionShadowLocked removes the connection-scoped shadow projection tables.
 func (db *DB) dropProjectionShadowLocked() error {
-	for _, stmt := range []string{`DROP TABLE IF EXISTS shadow_tasks`, `DROP TABLE IF EXISTS shadow_task_attributions`} {
+	for _, stmt := range []string{
+		`DROP TABLE IF EXISTS shadow_tasks`, `DROP TABLE IF EXISTS shadow_task_attributions`,
+		`DROP TABLE IF EXISTS shadow_edges`, `DROP TABLE IF EXISTS shadow_labels`,
+		`DROP TABLE IF EXISTS shadow_comments`,
+	} {
 		if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
 			return fmt.Errorf("drop shadow projection table: %w", err)
 		}
@@ -590,4 +702,212 @@ func ownerString(o *journal.ActorID) string {
 		return ""
 	}
 	return o.String()
+}
+
+// domainProjection is a from-a-slate snapshot of the journaled relationship/annotation
+// domain projections (§6 amendment): edges keyed by (source, target, kind), labels by
+// (task, name), comments by id. Each family maps its natural key to the FULL projected
+// tuple — the key AND every non-key content column — so the §15 convergence check compares
+// the COMPLETE row against the from-empty re-derivation, matching the full-tuple discipline
+// of diffTaskProjections/diffAttributions. A key-only comparison would let a comment's
+// task_id/author_id/body/created_at (or an edge's created_at) drift out-of-band undetected
+// — the exact corruption class §15's from-empty SHADOW derivation exists to catch; carrying
+// the whole tuple here closes that hole. Because every edge/label/comment now flows through
+// the journal, these sets are compared WHOLE (not scoped to anchored tasks): a from-empty
+// refold reproduces exactly the journaled rows.
+type domainProjection struct {
+	edges    map[string]domainEdge
+	labels   map[string]domainLabel
+	comments map[string]domainComment
+}
+
+// domainEdge is one projected edge keyed by (source, target, kind); created_at is its only
+// non-key content column. task names the reporting (source) task for a divergence message.
+type domainEdge struct {
+	task      journal.TaskID
+	createdAt int64
+}
+
+// domainLabel is one projected label keyed by (task, name). Labels are KEY-ONLY BY NATURE:
+// (task_id, name) are the projection's only columns, so key presence already IS the full
+// tuple and there is no non-key content column to diverge — hence domainLabel carries only
+// the task it names.
+type domainLabel struct {
+	task journal.TaskID
+}
+
+// domainComment is one projected comment keyed by its id; task_id, author_id, body, and
+// created_at are ALL non-key content a full-tuple compare must verify (the comment PK is id
+// alone, so its task_id is not part of the key).
+type domainComment struct {
+	task      journal.TaskID
+	author    string
+	body      string
+	createdAt int64
+}
+
+// snapshotDomainProjectionsLocked reads the FULL edge/label/comment tuples from the named
+// tables (the real tables, or the shadow tables during a from-empty derivation) so a replay
+// can diff the stored domain projection against the from-empty re-derivation across every
+// column, not merely the keys (§15). It selects the non-key content columns
+// (edges.created_at; comments.author_id/body/created_at) alongside the keys; labels have no
+// non-key column.
+func (db *DB) snapshotDomainProjectionsLocked(edgesT, labelsT, commentsT string) (domainProjection, error) {
+	dp := domainProjection{
+		edges:    map[string]domainEdge{},
+		labels:   map[string]domainLabel{},
+		comments: map[string]domainComment{},
+	}
+	if err := sqlitex.Execute(db.conn,
+		fmt.Sprintf(`SELECT source_id, target_id, kind_id, created_at FROM %s`, edgesT),
+		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
+			src, tgt, kind := stmt.ColumnText(0), stmt.ColumnText(1), stmt.ColumnInt(2)
+			task, err := journalParseTask(src)
+			if err != nil {
+				return err
+			}
+			dp.edges[fmt.Sprintf("%s\x00%s\x00%d", src, tgt, kind)] = domainEdge{task: task, createdAt: stmt.ColumnInt64(3)}
+			return nil
+		}}); err != nil {
+		return domainProjection{}, fmt.Errorf("snapshot edges %s: %w", edgesT, err)
+	}
+	if err := sqlitex.Execute(db.conn,
+		fmt.Sprintf(`SELECT task_id, name FROM %s`, labelsT),
+		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
+			taskRaw, name := stmt.ColumnText(0), stmt.ColumnText(1)
+			task, err := journalParseTask(taskRaw)
+			if err != nil {
+				return err
+			}
+			dp.labels[fmt.Sprintf("%s\x00%s", taskRaw, name)] = domainLabel{task: task}
+			return nil
+		}}); err != nil {
+		return domainProjection{}, fmt.Errorf("snapshot labels %s: %w", labelsT, err)
+	}
+	if err := sqlitex.Execute(db.conn,
+		fmt.Sprintf(`SELECT id, task_id, author_id, body, created_at FROM %s`, commentsT),
+		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
+			id, taskRaw := stmt.ColumnText(0), stmt.ColumnText(1)
+			task, err := journalParseTask(taskRaw)
+			if err != nil {
+				return err
+			}
+			dp.comments[id] = domainComment{
+				task:      task,
+				author:    stmt.ColumnText(2),
+				body:      stmt.ColumnText(3),
+				createdAt: stmt.ColumnInt64(4),
+			}
+			return nil
+		}}); err != nil {
+		return domainProjection{}, fmt.Errorf("snapshot comments %s: %w", commentsT, err)
+	}
+	return dp, nil
+}
+
+// diffDomainProjections asserts the stored edge/label/comment projections equal the
+// from-empty re-derivation ACROSS THE FULL TUPLE (§6, §15): a stored row the fold does not
+// reproduce, a folded row the stored projection lacks, OR a row present in both whose
+// non-key content differs (an edge's created_at; a comment's task/author/body/created_at),
+// all fail closed with a typed ProjectionDivergenceError naming the divergent field. This
+// mirrors diffTaskProjections/diffAttributions, closing the key-only hole that let a
+// comment's body/author/task drift out-of-band undetected.
+func diffDomainProjections(stored, derived domainProjection) error {
+	if err := diffDomainEdges(stored.edges, derived.edges); err != nil {
+		return err
+	}
+	if err := diffDomainLabels(stored.labels, derived.labels); err != nil {
+		return err
+	}
+	return diffDomainComments(stored.comments, derived.comments)
+}
+
+// diffDomainEdges compares the full edge tuple: key presence in both directions, then the
+// created_at content column for a key present in both.
+func diffDomainEdges(stored, derived map[string]domainEdge) error {
+	for key, s := range stored {
+		d, ok := derived[key]
+		if !ok {
+			return divergence(s.task, "edge",
+				fmt.Sprintf("edge %q present in the stored projection", key),
+				"absent from the from-empty fold")
+		}
+		if s.createdAt != d.createdAt {
+			return divergence(d.task, "edge created_at",
+				fmt.Sprintf("edge %q created_at %d", key, s.createdAt),
+				fmt.Sprintf("created_at %d", d.createdAt))
+		}
+	}
+	for key, d := range derived {
+		if _, ok := stored[key]; !ok {
+			return divergence(d.task, "edge",
+				fmt.Sprintf("edge %q absent from the stored projection", key),
+				"derived by the from-empty fold")
+		}
+	}
+	return nil
+}
+
+// diffDomainLabels compares labels by key presence only: (task_id, name) are the
+// projection's ONLY columns, so key presence IS the full tuple — there is no content column
+// to diverge (documented on domainLabel).
+func diffDomainLabels(stored, derived map[string]domainLabel) error {
+	for key, s := range stored {
+		if _, ok := derived[key]; !ok {
+			return divergence(s.task, "label",
+				fmt.Sprintf("label %q present in the stored projection", key),
+				"absent from the from-empty fold")
+		}
+	}
+	for key, d := range derived {
+		if _, ok := stored[key]; !ok {
+			return divergence(d.task, "label",
+				fmt.Sprintf("label %q absent from the stored projection", key),
+				"derived by the from-empty fold")
+		}
+	}
+	return nil
+}
+
+// diffDomainComments compares the full comment tuple: key (id) presence in both directions,
+// then each non-key content column (task_id, author_id, body, created_at). A comment whose
+// stored body/author/task drifts from the from-empty re-derivation diverges here, naming the
+// specific field — the completeness gap this fix closes.
+func diffDomainComments(stored, derived map[string]domainComment) error {
+	for id, s := range stored {
+		d, ok := derived[id]
+		if !ok {
+			return divergence(s.task, "comment",
+				fmt.Sprintf("comment %q present in the stored projection", id),
+				"absent from the from-empty fold")
+		}
+		if s.task.String() != d.task.String() {
+			return divergence(d.task, "comment task",
+				fmt.Sprintf("comment %q task %s", id, s.task.String()),
+				fmt.Sprintf("task %s", d.task.String()))
+		}
+		if s.author != d.author {
+			return divergence(d.task, "comment author",
+				fmt.Sprintf("comment %q author %s", id, s.author),
+				fmt.Sprintf("author %s", d.author))
+		}
+		if s.body != d.body {
+			return divergence(d.task, "comment body",
+				fmt.Sprintf("comment %q body %q", id, s.body),
+				fmt.Sprintf("body %q", d.body))
+		}
+		if s.createdAt != d.createdAt {
+			return divergence(d.task, "comment created_at",
+				fmt.Sprintf("comment %q created_at %d", id, s.createdAt),
+				fmt.Sprintf("created_at %d", d.createdAt))
+		}
+	}
+	for id, d := range derived {
+		if _, ok := stored[id]; !ok {
+			return divergence(d.task, "comment",
+				fmt.Sprintf("comment %q absent from the stored projection", id),
+				"derived by the from-empty fold")
+		}
+	}
+	return nil
 }

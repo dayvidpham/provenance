@@ -21,6 +21,7 @@ import (
 
 	dbsqlite "github.com/dayvidpham/provenance/internal/sqlite"
 	"github.com/dayvidpham/provenance/internal/testcorpus"
+	"github.com/google/uuid"
 )
 
 // s13Operators is the closed registry of executable S1.3 operators. Its key set
@@ -58,6 +59,25 @@ var s13Operators = map[testcorpus.OperatorName]s11Handler{
 	"replay-with-ended-authority": opReplayWithEndedAuthority,
 	// zero_event_operations.yaml (§9.4)
 	"replay-zero-task-event-operation": opReplayZeroTaskEventOperation,
+	// journal_spine_corruption.yaml (§10 rule 8, §15) — UAT C8a corrupted-journal-spine family
+	"verify-clean-spine":            opVerifyCleanSpine,
+	"corrupt-delete-subtype-row":    opCorruptDeleteSubtypeRow,
+	"corrupt-rewrite-discriminator": opCorruptRewriteDiscriminator,
+	"corrupt-truncate-tail":         opCorruptTruncateTail,
+	"corrupt-noncontiguous-insert":  opCorruptNoncontiguousInsert,
+	// authority_revocation.yaml (§9.4, §14.1) — UAT C8a authority-revocation family
+	"revoke-then-pinned-retry-uncommitted": opRevokeThenPinnedRetryUncommitted,
+	"revoke-then-exact-replay-committed":   opRevokeThenExactReplayCommitted,
+	// status_fsm.yaml (§8.1, §16) — static task-status FSM + forced escape hatch
+	"fsm-rejects-closed-to-in-progress": opFSMRejectsClosedToInProgress,
+	"fsm-stopped-transition-converges":  opFSMStoppedTransitionConverges,
+	"fsm-forced-coercion-converges":     opFSMForcedCoercionConverges,
+	// mutation_families.yaml (§6 amendment) — journaled edges/labels/comments
+	"mutation-family-who-provenance":                   opMutationFamilyWhoProvenance,
+	"mutation-family-unauthorized-rejected":            opMutationFamilyUnauthorizedRejected,
+	"mutation-family-projections-replay":               opMutationFamilyProjectionsReplay,
+	"journaled-edge-grants-no-authority":               opJournaledEdgeGrantsNoAuthority,
+	"mutation-family-comment-body-corruption-detected": opMutationFamilyCommentBodyCorruptionDetected,
 }
 
 // ---------------------------------------------------------------------------
@@ -1358,4 +1378,412 @@ func asBoolOK(m anyMap, key string) (bool, bool) {
 	}
 	b, ok := v.(bool)
 	return b, ok
+}
+
+// ---------------------------------------------------------------------------
+// status_fsm.yaml — static task-status FSM (§8.1, §16)
+// ---------------------------------------------------------------------------
+
+// fsmCloseTask closes an env task through one journaled provenance.task.closed
+// operation under the bootstrap authority. The task carries no owner episode, so no
+// ended transition is required (§8.1 close-ends-assignment applies only to an active
+// owner episode).
+func fsmCloseTask(t *testing.T, env *opsEnv, boot JournalID, task TaskID, opID string) error {
+	_, err := env.tr.Journal().Apply(OperationInput{
+		OperationID: OperationID(opID), ActorID: env.actor, AuthorityJournalID: &boot,
+		CommandDigest: env.digest(opID + "-c"), MutationDigest: env.digest(opID + "-m"),
+		Effects: []Effect{{Sort: EffectTaskEvent, TaskID: task, EventKind: EventKindTaskClosed}},
+	})
+	return err
+}
+
+func opFSMRejectsClosedToInProgress(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
+	env := newOpsEnv(t)
+	boot := env.genesis(t, "op-genesis")
+	task := env.taskFor(t, "t1")
+	if err := fsmCloseTask(t, env, boot, task, "op-close-for-illegal-start"); err != nil {
+		return fmt.Errorf("close before illegal start: %w", err)
+	}
+	// A direct closed→in_progress transition (Start) has no FSM arrow: a closed task
+	// reaches in_progress only by Reopen (→open) then Start. The reducer must fail closed.
+	_, err := env.tr.Journal().Apply(OperationInput{
+		OperationID: opID(input, "op-illegal-start"), ActorID: env.actor, AuthorityJournalID: &boot,
+		CommandDigest: env.digest("sc"), MutationDigest: env.digest("sm"),
+		Effects: []Effect{{Sort: EffectTaskEvent, TaskID: task, EventKind: EventKindTaskStarted}},
+	})
+	if e := expectRejected(err, ErrStatusTransition, "direct closed->in_progress transition"); e != nil {
+		return e
+	}
+	// Fail-closed: nothing committed, the task stays closed.
+	got, err := env.tr.Show(task)
+	if err != nil {
+		return err
+	}
+	if got.Status != StatusClosed {
+		return fmt.Errorf("task status = %v after rejected start, want closed (nothing committed)", got.Status)
+	}
+	return nil
+}
+
+func opFSMStoppedTransitionConverges(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
+	env := newOpsEnv(t)
+	boot := env.genesis(t, "op-genesis")
+	task := env.taskFor(t, "t1")
+	// Start (open → in_progress).
+	if _, err := env.tr.Journal().Apply(OperationInput{
+		OperationID: "op-start", ActorID: env.actor, AuthorityJournalID: &boot,
+		CommandDigest: env.digest("startc"), MutationDigest: env.digest("startm"),
+		Effects: []Effect{{Sort: EffectTaskEvent, TaskID: task, EventKind: EventKindTaskStarted}},
+	}); err != nil {
+		return fmt.Errorf("start: %w", err)
+	}
+	// Stop (in_progress → open) via the new provenance.task.stopped kind.
+	if _, err := env.tr.Journal().Apply(OperationInput{
+		OperationID: "op-stop", ActorID: env.actor, AuthorityJournalID: &boot,
+		CommandDigest: env.digest("stopc"), MutationDigest: env.digest("stopm"),
+		Effects: []Effect{{Sort: EffectTaskEvent, TaskID: task, EventKind: EventKindTaskStopped}},
+	}); err != nil {
+		return fmt.Errorf("stop: %w", err)
+	}
+	got, err := env.tr.Show(task)
+	if err != nil {
+		return err
+	}
+	if got.Status != StatusOpen {
+		return fmt.Errorf("status after stop = %v, want open", got.Status)
+	}
+	// Open's from-empty full replay folds the identical FSM rule and converges.
+	if _, err := env.tr.Journal().ReplayProjections(); err != nil {
+		return fmt.Errorf("from-empty replay after stop diverged: %w", err)
+	}
+	return nil
+}
+
+func opFSMForcedCoercionConverges(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
+	env := newOpsEnv(t)
+	boot := env.genesis(t, "op-genesis")
+	task := env.taskFor(t, "t1")
+	if err := fsmCloseTask(t, env, boot, task, "op-close-before-forced"); err != nil {
+		return fmt.Errorf("close before forced coercion: %w", err)
+	}
+	// A forced Start coerces the FSM-illegal closed→in_progress transition: the reducer
+	// skips the FSM for this one row and records a forced marker in the journal payload.
+	if _, err := env.tr.Journal().Apply(OperationInput{
+		OperationID: opID(input, "op-forced-start"), ActorID: env.actor, AuthorityJournalID: &boot,
+		CommandDigest: env.digest("fc"), MutationDigest: env.digest("fm"),
+		Effects: []Effect{{Sort: EffectTaskEvent, TaskID: task, EventKind: EventKindTaskStarted, Forced: true}},
+	}); err != nil {
+		return fmt.Errorf("forced coercion rejected: %w", err)
+	}
+	got, err := env.tr.Show(task)
+	if err != nil {
+		return err
+	}
+	if got.Status != StatusInProgress {
+		return fmt.Errorf("status after forced start = %v, want in_progress", got.Status)
+	}
+	// Audit-visible: the started event's payload carries the forced marker.
+	page, err := env.tr.Journal().QueryTaskEvents(JournalQueryV1{
+		TaskIDs: []TaskID{task}, EventKinds: []EventKind{EventKindTaskStarted},
+	})
+	if err != nil {
+		return err
+	}
+	if len(page.Events) != 1 {
+		return fmt.Errorf("found %d started events, want exactly 1", len(page.Events))
+	}
+	forced, derr := DecodeForcedTransition(page.Events[0].Payload)
+	if derr != nil {
+		return derr
+	}
+	if !forced {
+		return fmt.Errorf("forced started event payload %s does not carry the forced marker", string(page.Events[0].Payload))
+	}
+	// Journal-reproducible: from-empty replay reads the same marker, skips the FSM
+	// identically, and converges on the coerced in_progress status.
+	if _, err := env.tr.Journal().ReplayProjections(); err != nil {
+		return fmt.Errorf("from-empty replay after forced coercion diverged: %w", err)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// mutation_families.yaml — journaled edges/labels/comments (§6 amendment)
+// ---------------------------------------------------------------------------
+
+// opMutationFamilyWhoProvenance adds an edge, a label, and a comment under the bootstrap
+// authority and asserts each is journaled as its fixed per-family kind, attributed to the
+// committing actor at a definite journal position, with operands decodable from the
+// payload (who-provenance), and that the domain projections take effect.
+func opMutationFamilyWhoProvenance(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
+	env := newOpsEnv(t)
+	boot := env.genesis(t, "op-genesis")
+	src := env.taskFor(t, "src")
+	tgt := env.taskFor(t, "tgt")
+	commentID := CommentID{Namespace: src.Namespace, UUID: uuid.Must(uuid.NewV7())}
+	if _, err := env.tr.Journal().Apply(OperationInput{
+		OperationID: "op-mf-writes", ActorID: env.actor, AuthorityJournalID: &boot,
+		CommandDigest: env.digest("mfc"), MutationDigest: env.digest("mfm"),
+		Effects: []Effect{
+			{Sort: EffectEdgeAdd, TaskID: src, EdgeTargetID: tgt.String(), EdgeRelKind: EdgeBlockedBy},
+			{Sort: EffectLabelAdd, TaskID: src, Label: "priority"},
+			{Sort: EffectCommentAdd, TaskID: src, CommentIdentity: commentID, CommentAuthor: env.actor, CommentBody: "looks good"},
+		},
+	}); err != nil {
+		return fmt.Errorf("journal edge/label/comment: %w", err)
+	}
+	// Who-provenance for the edge: the journal row names the committer, a definite
+	// position, and its operands.
+	page, err := env.tr.Journal().QueryTaskEvents(JournalQueryV1{
+		TaskIDs: []TaskID{src}, EventKinds: []EventKind{EventKindEdgeAdded},
+	})
+	if err != nil {
+		return err
+	}
+	if len(page.Events) != 1 {
+		return fmt.Errorf("edge-added events = %d, want 1", len(page.Events))
+	}
+	ev := page.Events[0]
+	if ev.ActorID.String() != env.actor.String() {
+		return fmt.Errorf("edge-added committer = %s, want %s", ev.ActorID.String(), env.actor.String())
+	}
+	if ev.JournalID == 0 {
+		return fmt.Errorf("edge-added carries no journal position")
+	}
+	ep, err := DecodeEdgeMutationPayload(ev.Payload)
+	if err != nil {
+		return err
+	}
+	if ep.Target != tgt.String() || ep.EdgeKind != EdgeBlockedBy {
+		return fmt.Errorf("edge payload = %+v, want target=%s blocked_by", ep, tgt.String())
+	}
+	// The domain projections took effect.
+	edges, err := env.tr.Edges(src, nil)
+	if err != nil || len(edges) != 1 {
+		return fmt.Errorf("Edges(src) = %v (err %v), want 1", edges, err)
+	}
+	labels, err := env.tr.Labels(src)
+	if err != nil || len(labels) != 1 {
+		return fmt.Errorf("Labels(src) = %v (err %v), want 1", labels, err)
+	}
+	comments, err := env.tr.Comments(src)
+	if err != nil || len(comments) != 1 {
+		return fmt.Errorf("Comments(src) = %v (err %v), want 1", comments, err)
+	}
+	return nil
+}
+
+// opMutationFamilyUnauthorizedRejected proves each mutation family is subject to the same
+// per-effect authorization as a task event (§9.3): an assignment authority scoped to
+// task X governs nothing on task Y, so every edge/label/comment mutation on Y under that
+// authority fails closed with ErrAuthorityScope and commits nothing.
+func opMutationFamilyUnauthorizedRejected(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
+	env := newOpsEnv(t)
+	boot := env.genesis(t, "op-genesis")
+	taskX := env.taskFor(t, "x")
+	taskY := env.taskFor(t, "y")
+	occupant := env.actorFor(t, "occ")
+	// An assignment authority whose episode is on taskX — it governs taskX only.
+	auth := env.startEpisode(t, "op-auth-x", boot, taskX, "AUTH-X", occupant)
+	commentID := CommentID{Namespace: taskY.Namespace, UUID: uuid.Must(uuid.NewV7())}
+	families := []struct {
+		name string
+		eff  Effect
+	}{
+		{"edge-add", Effect{Sort: EffectEdgeAdd, TaskID: taskY, EdgeTargetID: taskX.String(), EdgeRelKind: EdgeBlockedBy}},
+		{"edge-remove", Effect{Sort: EffectEdgeRemove, TaskID: taskY, EdgeTargetID: taskX.String(), EdgeRelKind: EdgeBlockedBy}},
+		{"label-add", Effect{Sort: EffectLabelAdd, TaskID: taskY, Label: "unauthorized"}},
+		{"label-remove", Effect{Sort: EffectLabelRemove, TaskID: taskY, Label: "unauthorized"}},
+		{"comment-add", Effect{Sort: EffectCommentAdd, TaskID: taskY, CommentIdentity: commentID, CommentAuthor: occupant, CommentBody: "no"}},
+	}
+	for i, f := range families {
+		_, err := env.tr.Journal().Apply(OperationInput{
+			OperationID: OperationID(fmt.Sprintf("op-mf-unauth-%d", i)), ActorID: env.actor, AuthorityJournalID: &auth,
+			CommandDigest: env.digest(fmt.Sprintf("uc%d", i)), MutationDigest: env.digest(fmt.Sprintf("um%d", i)),
+			Effects: []Effect{f.eff},
+		})
+		if e := expectRejected(err, ErrAuthorityScope, f.name+" on an ungoverned task"); e != nil {
+			return e
+		}
+	}
+	// Fail-closed: no edge/label/comment landed on taskY.
+	edges, err := env.tr.Edges(taskY, nil)
+	if err != nil {
+		return err
+	}
+	if len(edges) != 0 {
+		return fmt.Errorf("ungoverned edge attempts left %d edges, want 0", len(edges))
+	}
+	labels, err := env.tr.Labels(taskY)
+	if err != nil {
+		return err
+	}
+	if len(labels) != 0 {
+		return fmt.Errorf("ungoverned label attempts left %d labels, want 0", len(labels))
+	}
+	return nil
+}
+
+// opMutationFamilyProjectionsReplay proves the edge/label/comment domain projections are
+// re-derivable solely from ordered journal history (§6, §15): after a sequence of adds and
+// removes, Open's from-empty full replay reconstructs the identical projections and
+// converges with no divergence.
+func opMutationFamilyProjectionsReplay(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
+	env := newOpsEnv(t)
+	boot := env.genesis(t, "op-genesis")
+	a := env.taskFor(t, "a")
+	b := env.taskFor(t, "b")
+	c := env.taskFor(t, "c")
+	commentID := CommentID{Namespace: a.Namespace, UUID: uuid.Must(uuid.NewV7())}
+	// Add a->b and a->c blocked_by edges, two labels, one comment.
+	if _, err := env.tr.Journal().Apply(OperationInput{
+		OperationID: "op-mf-adds", ActorID: env.actor, AuthorityJournalID: &boot,
+		CommandDigest: env.digest("addc"), MutationDigest: env.digest("addm"),
+		Effects: []Effect{
+			{Sort: EffectEdgeAdd, TaskID: a, EdgeTargetID: b.String(), EdgeRelKind: EdgeBlockedBy},
+			{Sort: EffectEdgeAdd, TaskID: a, EdgeTargetID: c.String(), EdgeRelKind: EdgeBlockedBy},
+			{Sort: EffectLabelAdd, TaskID: a, Label: "keep"},
+			{Sort: EffectLabelAdd, TaskID: a, Label: "drop"},
+			{Sort: EffectCommentAdd, TaskID: a, CommentIdentity: commentID, CommentAuthor: env.actor, CommentBody: "hi"},
+		},
+	}); err != nil {
+		return fmt.Errorf("adds: %w", err)
+	}
+	// Remove one edge and one label.
+	if _, err := env.tr.Journal().Apply(OperationInput{
+		OperationID: "op-mf-removes", ActorID: env.actor, AuthorityJournalID: &boot,
+		CommandDigest: env.digest("remc"), MutationDigest: env.digest("remm"),
+		Effects: []Effect{
+			{Sort: EffectEdgeRemove, TaskID: a, EdgeTargetID: c.String(), EdgeRelKind: EdgeBlockedBy},
+			{Sort: EffectLabelRemove, TaskID: a, Label: "drop"},
+		},
+	}); err != nil {
+		return fmt.Errorf("removes: %w", err)
+	}
+	// Live projection: one edge (a->b), one label (keep), one comment.
+	edges, err := env.tr.Edges(a, nil)
+	if err != nil || len(edges) != 1 || edges[0].TargetID != b.String() {
+		return fmt.Errorf("Edges(a) = %v (err %v), want [a->b]", edges, err)
+	}
+	labels, err := env.tr.Labels(a)
+	if err != nil || len(labels) != 1 || labels[0] != "keep" {
+		return fmt.Errorf("Labels(a) = %v (err %v), want [keep]", labels, err)
+	}
+	// From-empty replay re-derives the identical edge/label/comment projections.
+	if _, err := env.tr.Journal().ReplayProjections(); err != nil {
+		return fmt.Errorf("from-empty replay of edge/label/comment projections diverged: %w", err)
+	}
+	return nil
+}
+
+// opJournaledEdgeGrantsNoAuthority re-pins §14.5 under the §6 amendment: a blocked_by
+// edge's CREATION is now journaled, but the edge still delegates NO ownership authority —
+// an assignment authority on the source task does not reach the target merely because a
+// blocked_by edge connects them.
+func opJournaledEdgeGrantsNoAuthority(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
+	env := newOpsEnv(t)
+	boot := env.genesis(t, "op-genesis")
+	src := env.taskFor(t, "src")
+	tgt := env.taskFor(t, "tgt")
+	occupant := env.actorFor(t, "occ")
+	// Journal a blocked_by edge src->tgt under the bootstrap authority.
+	if _, err := env.tr.Journal().Apply(OperationInput{
+		OperationID: "op-edge-journaled", ActorID: env.actor, AuthorityJournalID: &boot,
+		CommandDigest: env.digest("ec"), MutationDigest: env.digest("em"),
+		Effects: []Effect{{Sort: EffectEdgeAdd, TaskID: src, EdgeTargetID: tgt.String(), EdgeRelKind: EdgeBlockedBy}},
+	}); err != nil {
+		return fmt.Errorf("journal blocked_by edge: %w", err)
+	}
+	// The edge IS journaled (its creation is recorded).
+	page, err := env.tr.Journal().QueryTaskEvents(JournalQueryV1{
+		TaskIDs: []TaskID{src}, EventKinds: []EventKind{EventKindEdgeAdded},
+	})
+	if err != nil {
+		return err
+	}
+	if len(page.Events) != 1 {
+		return fmt.Errorf("expected the blocked_by edge creation to be journaled, found %d rows", len(page.Events))
+	}
+	// An assignment authority on src governs src, but the edge grants it NO reach to tgt.
+	auth := env.startEpisode(t, "op-auth-src", boot, src, "AUTH-SRC", occupant)
+	governsTgt, err := env.tr.Journal().AuthorityGovernsTaskAt(auth, tgt, JournalID(1<<30))
+	if err != nil {
+		return err
+	}
+	if governsTgt {
+		return fmt.Errorf("assignment authority on src reached tgt through a blocked_by edge — §14.5 violated")
+	}
+	// Sanity: the same authority DOES govern its own episode's task (src).
+	governsSrc, err := env.tr.Journal().AuthorityGovernsTaskAt(auth, src, JournalID(1<<30))
+	if err != nil {
+		return err
+	}
+	if !governsSrc {
+		return fmt.Errorf("assignment authority does not govern its own episode task src")
+	}
+	return nil
+}
+
+// opMutationFamilyCommentBodyCorruptionDetected proves the §15 convergence check compares
+// the FULL comment tuple, not merely its id key: a committed comment's body is corrupted
+// out-of-band (past the shared reducer), and Open's from-empty replay — which re-derives the
+// body SOLELY from the journaled payload — MUST fail closed with a typed
+// ProjectionDivergenceError naming the comment body field. A key-only domain-projection
+// diff would read the tampered body back unchanged and falsely report convergence.
+func opMutationFamilyCommentBodyCorruptionDetected(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
+	env := newOpsEnv(t)
+	boot := env.genesis(t, "op-genesis")
+	task := env.taskFor(t, "commented")
+	commentID := CommentID{Namespace: task.Namespace, UUID: uuid.Must(uuid.NewV7())}
+	if _, err := env.tr.Journal().Apply(OperationInput{
+		OperationID: "op-mf-comment", ActorID: env.actor, AuthorityJournalID: &boot,
+		CommandDigest: env.digest("cbc"), MutationDigest: env.digest("cbm"),
+		Effects: []Effect{
+			{Sort: EffectCommentAdd, TaskID: task, CommentIdentity: commentID, CommentAuthor: env.actor, CommentBody: "the honest journaled body"},
+		},
+	}); err != nil {
+		return fmt.Errorf("journal comment: %w", err)
+	}
+	// Sanity: the clean projection converges before any corruption.
+	if _, err := env.tr.Journal().ReplayProjections(); err != nil {
+		return fmt.Errorf("pre-corruption replay unexpectedly diverged: %w", err)
+	}
+	// Corrupt the committed comment body directly, bypassing the shared reducer — the
+	// out-of-band content drift a key-only convergence check would miss.
+	st := env.tr.(*sqliteTracker)
+	if err := st.db.AdversarialCorruptCommentBody(commentID.String(), "TAMPERED body no journal row derives"); err != nil {
+		return fmt.Errorf("corrupt comment body: %w", err)
+	}
+	// From-empty replay re-derives the body from the journaled payload and MUST diverge.
+	_, err := env.tr.Journal().ReplayProjections()
+	if err == nil {
+		return fmt.Errorf("out-of-band comment-body corruption was accepted as converged; expected a fail-closed ProjectionDivergenceError")
+	}
+	if !errors.Is(err, ErrProjectionDivergence) {
+		return fmt.Errorf("comment-body corruption rejected with %v, want ErrProjectionDivergence", err)
+	}
+	var typed *ProjectionDivergenceError
+	if !errors.As(err, &typed) {
+		return fmt.Errorf("comment-body corruption: error is not a typed *ProjectionDivergenceError: %v", err)
+	}
+	wantField, err := asString(expected, "divergentField")
+	if err != nil {
+		return err
+	}
+	if typed.Field != wantField {
+		return fmt.Errorf("divergence named field %q, want %q", typed.Field, wantField)
+	}
+	if typed.Task.Namespace == "" {
+		return fmt.Errorf("ProjectionDivergenceError Task (what) is empty")
+	}
+	if fld := firstEmptyField(map[string]string{
+		"Operation": typed.Operation, "Field": typed.Field, "Stored": typed.Stored,
+		"Replayed": typed.Replayed, "Why": typed.Why, "Impact": typed.Impact, "Fix": typed.Fix,
+	}); fld != "" {
+		return fmt.Errorf("ProjectionDivergenceError field %q is empty (six-field actionable contract)", fld)
+	}
+	if !errorIsActionable(typed.Error()) {
+		return fmt.Errorf("ProjectionDivergenceError is not actionable (missing why/where/when/impact/fix): %v", typed)
+	}
+	return nil
 }

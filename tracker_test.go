@@ -186,9 +186,11 @@ func TestCloseTaskAlreadyClosed(t *testing.T) {
 		t.Fatalf("First CloseTask() error: %v", err)
 	}
 
+	// Re-closing an already-closed task is an FSM-illegal same-state transition
+	// (closed→closed), rejected by the shared reducer with the typed ErrStatusTransition.
 	_, err = tr.CloseTask(task.ID, "second close")
-	if !errors.Is(err, provenance.ErrAlreadyClosed) {
-		t.Errorf("Second CloseTask: got %v, want ErrAlreadyClosed", err)
+	if !errors.Is(err, provenance.ErrStatusTransition) {
+		t.Errorf("Second CloseTask: got %v, want ErrStatusTransition", err)
 	}
 }
 

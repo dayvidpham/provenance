@@ -39,6 +39,14 @@ type DB struct {
 	// shadow target. Empty is treated as the real default by projTasks/projAttribs.
 	projTasksTable  string
 	projAttribTable string
+	// projEdgesTable / projLabelsTable / projCommentsTable name the domain-projection
+	// WRITE targets for the journaled relationship/annotation mutation families (§6
+	// amendment, §15). Real ("edges"/"labels"/"comments") during a live Apply; repointed
+	// at connection-scoped shadow tables during ReplayProjections' from-empty convergence
+	// check so the real rows stay read-only. Empty is treated as the real default.
+	projEdgesTable    string
+	projLabelsTable   string
+	projCommentsTable string
 }
 
 // projTasks returns the projection-write target table for tasks: the shadow table
@@ -58,6 +66,30 @@ func (db *DB) projAttribs() string {
 		return "task_attributions"
 	}
 	return db.projAttribTable
+}
+
+// projEdges / projLabels / projComments return the domain-projection write target for
+// the journaled edge/label/comment mutation families: the shadow table during a
+// from-empty replay derivation, else the real base table (§6 amendment, §15).
+func (db *DB) projEdges() string {
+	if db.projEdgesTable == "" {
+		return "edges"
+	}
+	return db.projEdgesTable
+}
+
+func (db *DB) projLabels() string {
+	if db.projLabelsTable == "" {
+		return "labels"
+	}
+	return db.projLabelsTable
+}
+
+func (db *DB) projComments() string {
+	if db.projCommentsTable == "" {
+		return "comments"
+	}
+	return db.projCommentsTable
 }
 
 // Open opens (or creates) a SQLite database at dbPath and returns an

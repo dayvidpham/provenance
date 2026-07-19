@@ -122,6 +122,7 @@ func DecodeLegacyStatus(payload []byte) (TaskStatus, bool, error) {
 const (
 	EventKindTaskCreated  EventKind = "provenance.task.created"
 	EventKindTaskStarted  EventKind = "provenance.task.started"
+	EventKindTaskStopped  EventKind = "provenance.task.stopped"
 	EventKindTaskClosed   EventKind = "provenance.task.closed"
 	EventKindTaskReopened EventKind = "provenance.task.reopened"
 	EventKindTaskMigrated EventKind = "provenance.task.migrated"
@@ -134,6 +135,20 @@ const (
 	// the fold like the birth metadata EventKindTaskCreated writes, and are NOT part of
 	// the §15 owner/status/watermark convergence set.
 	EventKindTaskUpdated EventKind = "provenance.task.updated"
+
+	// Journaled relationship / annotation mutation-family kinds (§6, as amended by #5).
+	// Each is a fixed per-family kind — never a payload-generalized dispatch — carried on
+	// a journal_task_events row, so who added/removed an edge/label/comment, under which
+	// authority, at which journal position is queryable from the journal (who-provenance).
+	// The operands (edge target/kind, label text, comment id/author/body) live in the
+	// row payload; the shared reducer folds them into the edges/labels/comments domain
+	// projections (§6, §15 convergence), never into status. They are NON-lifecycle, so
+	// StatusForEventKind returns ok=false for them.
+	EventKindEdgeAdded    EventKind = "provenance.edge.added"
+	EventKindEdgeRemoved  EventKind = "provenance.edge.removed"
+	EventKindLabelAdded   EventKind = "provenance.label.added"
+	EventKindLabelRemoved EventKind = "provenance.label.removed"
+	EventKindCommentAdded EventKind = "provenance.comment.added"
 )
 
 // StatusForEventKind reports the status a lifecycle task-event kind projects to,
@@ -160,9 +175,16 @@ const (
 // generalized status-from-payload — so the closed lifecycle vocabulary stays
 // strongly typed (the migration marker's payload-captured status stays the sole
 // special case, §13).
+//
+// EventKindTaskStopped → open is the fixed-mapping lifecycle kind for the
+// in_progress → open transition (Session.Stop): a task that was started can be
+// halted back to open without closing it. Like reopened it projects to open; the
+// static FSM (ValidateStatusTransition) distinguishes the two by their legal source
+// status — stopped only from in_progress, reopened only from closed — so the target
+// status alone never has to disambiguate the two kinds.
 func StatusForEventKind(kind EventKind) (TaskStatus, bool) {
 	switch kind {
-	case EventKindTaskCreated, EventKindTaskReopened:
+	case EventKindTaskCreated, EventKindTaskReopened, EventKindTaskStopped:
 		return TaskStatusOpen, true
 	case EventKindTaskStarted:
 		return TaskStatusInProgress, true
