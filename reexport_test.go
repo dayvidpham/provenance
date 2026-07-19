@@ -139,6 +139,7 @@ func TestReexportSentinelErrorIdentity(t *testing.T) {
 		{"ErrAlreadyClosed", provenance.ErrAlreadyClosed, ptypes.ErrAlreadyClosed},
 		{"ErrInvalidID", provenance.ErrInvalidID, ptypes.ErrInvalidID},
 		{"ErrAgentKindMismatch", provenance.ErrAgentKindMismatch, ptypes.ErrAgentKindMismatch},
+		{"ErrAgentAlreadyExists", provenance.ErrAgentAlreadyExists, ptypes.ErrAgentAlreadyExists},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
