@@ -42,7 +42,7 @@ func buildRetryMatrixFixture(t *testing.T) (Tracker, retryMatrixFixture) {
 		t.Fatal(err)
 	}
 	boot, _ := slotJournalID(gen, "authority")
-	target, err := tr.As(actor.ID, boot).Create("retry", "target", "target", TaskTypeTask, PriorityMedium, PhaseUnscoped, WithOperationID("retry-matrix-target"))
+	target, err := tr.As(actor.ID, boot).Create("retry", "target", "target", TaskTypeTask, PriorityMedium, PhaseUnscoped, WithOperationID(pinnedCreateOperationID(1)))
 	if err != nil {
 		t.Fatal(err)
 	}

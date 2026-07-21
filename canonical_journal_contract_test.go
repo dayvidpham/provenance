@@ -3,6 +3,7 @@ package provenance
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -10,9 +11,14 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/google/uuid"
 	"zombiezen.com/go/sqlite"
 	"zombiezen.com/go/sqlite/sqlitex"
 )
+
+func pinnedCreateOperationID(sequence int) OperationID {
+	return OperationID(fmt.Sprintf("provenance.op.018f0000-0000-7000-8000-%012x", sequence))
+}
 
 func TestCanonicalRetryIgnoresCallerMutationDigestButRejectsEffectChange(t *testing.T) {
 	env := newOpsEnv(t)
@@ -230,10 +236,11 @@ func TestPinnedSessionCreateAcrossIndependentHandles(t *testing.T) {
 	var tasks [2]Task
 	var errs [2]error
 	var wg sync.WaitGroup
+	opID := pinnedCreateOperationID(4)
 	wg.Add(2)
 	call := func(i int, tr Tracker) {
 		defer wg.Done()
-		tasks[i], errs[i] = tr.As(actor.ID, boot).Create("canonical", "same", "same", TaskTypeTask, PriorityMedium, PhaseUnscoped, WithOperationID("pinned-create-request"))
+		tasks[i], errs[i] = tr.As(actor.ID, boot).Create("canonical", "same", "same", TaskTypeTask, PriorityMedium, PhaseUnscoped, WithOperationID(opID))
 	}
 	go call(0, first)
 	go call(1, second)
@@ -246,12 +253,140 @@ func TestPinnedSessionCreateAcrossIndependentHandles(t *testing.T) {
 	if !reflect.DeepEqual(tasks[0], tasks[1]) {
 		t.Fatalf("concurrent pinned creates differ: %#v %#v", tasks[0], tasks[1])
 	}
+	assertPinnedTaskV7(t, tasks[0], opID)
+	firstResult, err := first.Journal().LookupCommitted(opID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondResult, err := second.Journal().LookupCommitted(opID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(firstResult, secondResult) {
+		t.Fatalf("independent complete retry results differ: %+v %+v", firstResult, secondResult)
+	}
 	listed, err := first.List(ListFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(listed) != 1 {
 		t.Fatalf("created %d tasks, want one", len(listed))
+	}
+}
+
+func TestPinnedSessionCreateSameProcessAndReopenUUIDv7(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pinned-create-reopen.sqlite")
+	tr, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actor, err := tr.RegisterSoftwareAgent("canonical", "pinned-reopen", "1", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	genesis, err := tr.Journal().Apply(OperationInput{OperationID: "pinned-reopen-genesis", ActorID: actor.ID, CommandDigest: []byte("c"), Effects: []Effect{{Sort: EffectBootstrapAuthority, ResultSlot: "authority"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	boot, _ := slotJournalID(genesis, "authority")
+	opID := pinnedCreateOperationID(8)
+	session := tr.As(actor.ID, boot)
+	first, err := session.Create("canonical", "same", "same", TaskTypeTask, PriorityMedium, PhaseUnscoped, WithOperationID(opID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstResult, err := tr.Journal().LookupCommitted(opID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sameProcess, err := session.Create("canonical", "same", "same", TaskTypeTask, PriorityMedium, PhaseUnscoped, WithOperationID(opID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sameResult, err := tr.Journal().LookupCommitted(opID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(first, sameProcess) || !reflect.DeepEqual(firstResult, sameResult) {
+		t.Fatalf("same-process pinned retry changed task/result: %#v %#v %+v %+v", first, sameProcess, firstResult, sameResult)
+	}
+	assertPinnedTaskV7(t, first, opID)
+	if err := tr.Close(); err != nil {
+		t.Fatal(err)
+	}
+	tr, err = OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+	reopened, err := tr.As(actor.ID, boot).Create("canonical", "same", "same", TaskTypeTask, PriorityMedium, PhaseUnscoped, WithOperationID(opID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopenedResult, err := tr.Journal().LookupCommitted(opID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(first, reopened) || !reflect.DeepEqual(firstResult, reopenedResult) {
+		t.Fatalf("reopened pinned retry changed task/result: %#v %#v %+v %+v", first, reopened, firstResult, reopenedResult)
+	}
+	assertPinnedTaskV7(t, reopened, opID)
+}
+
+func TestPinnedSessionCreateRejectsInvalidOperationUUIDsBeforeWrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pinned-create-invalid.sqlite")
+	tr, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+	actor, err := tr.RegisterSoftwareAgent("canonical", "pinned-invalid", "1", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	genesis, err := tr.Journal().Apply(OperationInput{OperationID: "pinned-invalid-genesis", ActorID: actor.ID, CommandDigest: []byte("c"), Effects: []Effect{{Sort: EffectBootstrapAuthority, ResultSlot: "authority"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	boot, _ := slotJournalID(genesis, "authority")
+	before := readOperationCounts(t, tr)
+	invalidIDs := map[string]OperationID{
+		"empty":        "",
+		"arbitrary":    "pinned-create",
+		"malformed":    "provenance.op.not-a-uuid",
+		"noncanonical": "provenance.op.018F0000-0000-7000-8000-000000000001",
+		"uuid-v5":      "provenance.op.018f0000-0000-5000-8000-000000000001",
+		"uuid-v4":      "provenance.op.018f0000-0000-4000-8000-000000000001",
+	}
+	for name, opID := range invalidIDs {
+		t.Run(name, func(t *testing.T) {
+			_, err := tr.As(actor.ID, boot).Create("canonical", "invalid", "invalid", TaskTypeTask, PriorityMedium, PhaseUnscoped, WithOperationID(opID))
+			if !errors.Is(err, ErrInvalidID) {
+				t.Fatalf("error=%v, want ErrInvalidID", err)
+			}
+			for _, part := range []string{"where:", "impact:", "fix:"} {
+				if !strings.Contains(err.Error(), part) {
+					t.Fatalf("error lacks %s: %v", part, err)
+				}
+			}
+			if after := readOperationCounts(t, tr); after != before {
+				t.Fatalf("invalid pinned ID wrote rows: before=%+v after=%+v", before, after)
+			}
+		})
+	}
+}
+
+func assertPinnedTaskV7(t *testing.T, task Task, operationID OperationID) {
+	t.Helper()
+	if task.ID.UUID.Version() != 7 || task.ID.UUID.Variant() != uuid.RFC4122 {
+		t.Fatalf("pinned task UUID=%s version=%d variant=%v, want RFC4122 UUIDv7", task.ID.UUID, task.ID.UUID.Version(), task.ID.UUID.Variant())
+	}
+	operationUUID, err := uuid.Parse(strings.TrimPrefix(string(operationID), "provenance.op."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.ID.UUID != operationUUID {
+		t.Fatalf("pinned task UUID=%s, want operation UUIDv7 %s", task.ID.UUID, operationUUID)
 	}
 }
 
@@ -320,7 +455,7 @@ func TestCanonicalTaskStateSurvivesRestartAndReplay(t *testing.T) {
 	}
 	boot, _ := slotJournalID(genesis, "authority")
 	session := tracker.As(actor.ID, boot)
-	task, err := session.Create("canonical", "title", "description", TaskTypeFeature, PriorityMedium, PhaseWorkerSlices, WithOperationID("restart-create"))
+	task, err := session.Create("canonical", "title", "description", TaskTypeFeature, PriorityMedium, PhaseWorkerSlices, WithOperationID(pinnedCreateOperationID(5)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -581,7 +716,7 @@ func TestDeleteModeCorruptionPreflightIsByteAndModeReadOnly(t *testing.T) {
 				t.Fatal(err)
 			}
 			boot, _ := slotJournalID(genesis, "authority")
-			task, err := tr.As(actor.ID, boot).Create("canonical", "title", "description", TaskTypeTask, PriorityMedium, PhaseUnscoped, WithOperationID("delete-mode-task"))
+			task, err := tr.As(actor.ID, boot).Create("canonical", "title", "description", TaskTypeTask, PriorityMedium, PhaseUnscoped, WithOperationID(pinnedCreateOperationID(6)))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -728,7 +863,7 @@ func TestMissingJournalOperationFKMigrationIsComposableAndIdempotent(t *testing.
 				t.Fatal(err)
 			}
 			boot, _ := slotJournalID(genesis, "authority")
-			if _, err := tr.As(actor.ID, boot).Create("canonical", "task", "task", TaskTypeTask, PriorityMedium, PhaseUnscoped, WithOperationID("missing-fk-task")); err != nil {
+			if _, err := tr.As(actor.ID, boot).Create("canonical", "task", "task", TaskTypeTask, PriorityMedium, PhaseUnscoped, WithOperationID(pinnedCreateOperationID(7))); err != nil {
 				t.Fatal(err)
 			}
 			store := tr.(*sqliteTracker)

@@ -102,29 +102,54 @@ func PrepareMutationV1(effects []Effect) (CanonicalMutation, error) {
 	if len(effects) > MaxCanonicalEffects {
 		return CanonicalMutation{}, canonicalMutationError("effect-count", fmt.Sprintf("%d exceeds maximum %d", len(effects), MaxCanonicalEffects), "split the operation into bounded mutations")
 	}
-	var out bytes.Buffer
-	w := canonicalWriter{w: &out}
-	w.field("version", []byte(MutationEncodingV1))
-	w.field("effect-count", []byte(strconv.Itoa(len(effects))))
+	normalized := make([]Effect, len(effects))
+	counter := &canonicalSizeCounter{limit: MaxCanonicalMutationBytes}
+	w := canonicalWriter{w: counter}
+	writeCanonicalEnvelopeHeader(&w, len(effects))
 	for i := range effects {
 		if err := validateRawCanonicalEffectBounds(effects[i], i); err != nil {
 			return CanonicalMutation{}, err
 		}
-		normalized, err := normalizeCanonicalEffect(effects[i], i)
+		var err error
+		normalized[i], err = normalizeCanonicalEffect(effects[i], i)
 		if err != nil {
 			return CanonicalMutation{}, err
 		}
-		if err := encodeCanonicalEffect(&w, normalized, i); err != nil {
+		if err := encodeCanonicalEffect(&w, normalized[i], i); err != nil {
 			return CanonicalMutation{}, err
 		}
 	}
 	if w.err != nil {
-		return CanonicalMutation{}, fmt.Errorf("provenance: encode canonical mutation: %w", w.err)
+		return CanonicalMutation{}, w.err
 	}
-	if out.Len() > MaxCanonicalMutationBytes {
-		return CanonicalMutation{}, canonicalMutationError("mutation", fmt.Sprintf("%d bytes exceeds maximum %d", out.Len(), MaxCanonicalMutationBytes), "reduce payloads or split the operation")
+	var out bytes.Buffer
+	out.Grow(counter.size)
+	w = canonicalWriter{w: &out}
+	writeCanonicalEnvelopeHeader(&w, len(normalized))
+	for i := range normalized {
+		if err := encodeCanonicalEffect(&w, normalized[i], i); err != nil {
+			return CanonicalMutation{}, err
+		}
+	}
+	if w.err != nil {
+		return CanonicalMutation{}, fmt.Errorf("provenance: encode bounded canonical mutation: %w", w.err)
 	}
 	return DecodeCanonicalMutation(out.Bytes())
+}
+
+func writeCanonicalEnvelopeHeader(w *canonicalWriter, effectCount int) {
+	w.field("version", []byte(MutationEncodingV1))
+	w.field("effect-count", []byte(strconv.Itoa(effectCount)))
+}
+
+type canonicalSizeCounter struct{ size, limit int }
+
+func (w *canonicalSizeCounter) Write(p []byte) (int, error) {
+	if len(p) > w.limit-w.size {
+		return 0, canonicalMutationError("mutation", fmt.Sprintf("exact framed size exceeds maximum %d at byte %d before canonical byte allocation", w.limit, w.size+len(p)), "reduce operands or split the operation")
+	}
+	w.size += len(p)
+	return len(p), nil
 }
 
 // DecodeCanonicalMutation strictly decodes one complete canonical mutation. Field

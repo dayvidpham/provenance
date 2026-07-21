@@ -447,6 +447,46 @@ func TestCanonicalMutationStaticLimitsAtBoundary(t *testing.T) {
 	}
 }
 
+func TestCanonicalMutationRejectsAggregateFramedSizeBeforeCanonicalAllocation(t *testing.T) {
+	task, _, _ := fixtureIDs(t)
+	payload := []byte(`"` + strings.Repeat("x", MaxCanonicalFieldBytes-2) + `"`)
+	effects := make([]Effect, 9)
+	for i := range effects {
+		effects[i] = Effect{
+			Sort:      EffectTaskEvent,
+			TaskID:    task,
+			EventKind: "fixture.event",
+			Payload:   payload,
+		}
+	}
+
+	_, err := PrepareMutationV1(effects)
+	if err == nil {
+		t.Fatal("individually bounded effects with oversized aggregate framing were accepted")
+	}
+	assertActionableCanonicalError(t, err)
+	var bounded *CanonicalMutationError
+	if !errors.As(err, &bounded) || bounded.Field != "mutation" {
+		t.Fatalf("aggregate error = %#v, want mutation size error", err)
+	}
+	if !strings.Contains(bounded.Reason, "exact framed size") || !strings.Contains(bounded.Reason, "before canonical byte allocation") {
+		t.Fatalf("aggregate error does not identify exact pre-allocation framing bound: %+v", bounded)
+	}
+}
+
+func TestCanonicalSizeCounterHasExactHardCapAndNoBackingBuffer(t *testing.T) {
+	counter := &canonicalSizeCounter{limit: MaxCanonicalMutationBytes}
+	if n, err := counter.Write(make([]byte, MaxCanonicalMutationBytes)); err != nil || n != MaxCanonicalMutationBytes {
+		t.Fatalf("exact size boundary rejected: n=%d err=%v", n, err)
+	}
+	if n, err := counter.Write([]byte{'x'}); n != 0 || !errors.Is(err, ErrCanonicalMutation) {
+		t.Fatalf("byte beyond exact boundary: n=%d err=%v, want typed rejection", n, err)
+	}
+	if counter.size != MaxCanonicalMutationBytes {
+		t.Fatalf("counter advanced after overflow: %d", counter.size)
+	}
+}
+
 func TestCanonicalJSONRejectsDuplicateAndTrailingFields(t *testing.T) {
 	task, _, _ := fixtureIDs(t)
 	for _, payload := range []string{`{"x":1,"x":2}`, `{"x":1} {"y":2}`} {

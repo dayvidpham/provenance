@@ -39,11 +39,11 @@ func buildStartupFixture(t *testing.T, path string) (Tracker, startupFixture) {
 	}
 	boot, _ := slotJournalID(gen, "authority")
 	s := tr.As(actor.ID, boot)
-	task, err := s.Create("matrix", "title", "description", TaskTypeTask, PriorityMedium, PhaseUnscoped, WithOperationID("matrix-task"))
+	task, err := s.Create("matrix", "title", "description", TaskTypeTask, PriorityMedium, PhaseUnscoped, WithOperationID(pinnedCreateOperationID(2)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	target, err := s.Create("matrix", "target", "target", TaskTypeTask, PriorityMedium, PhaseUnscoped, WithOperationID("matrix-target"))
+	target, err := s.Create("matrix", "target", "target", TaskTypeTask, PriorityMedium, PhaseUnscoped, WithOperationID(pinnedCreateOperationID(3)))
 	if err != nil {
 		t.Fatal(err)
 	}
