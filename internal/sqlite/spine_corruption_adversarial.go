@@ -35,20 +35,43 @@ import (
 // spine can be removed; the database is left in the deliberately corrupt state the
 // corpus then drives VerifyIntegrity against (expecting ErrSubtypeIntegrity). The
 // table name comes from the closed corpus, never caller input.
-func (db *DB) AdversarialDeleteSubtypeRow(jid journal.JournalID, table string) error {
+type AdversarialSubtypeTable uint8
+
+const (
+	AdversarialSubtypeOperations AdversarialSubtypeTable = iota + 1
+	AdversarialSubtypeTaskEvents
+	AdversarialSubtypeAuthorities
+	AdversarialSubtypeDecisions
+	AdversarialSubtypeEvidence
+)
+
+func (table AdversarialSubtypeTable) deleteStatement() sqlStatement {
+	switch table {
+	case AdversarialSubtypeOperations:
+		return sqlStatement{text: `DELETE FROM journal_operations WHERE journal_id=?1`}
+	case AdversarialSubtypeTaskEvents:
+		return sqlStatement{text: `DELETE FROM journal_task_events WHERE journal_id=?1`}
+	case AdversarialSubtypeAuthorities:
+		return sqlStatement{text: `DELETE FROM journal_authorities WHERE journal_id=?1`}
+	case AdversarialSubtypeDecisions:
+		return sqlStatement{text: `DELETE FROM journal_decisions WHERE journal_id=?1`}
+	case AdversarialSubtypeEvidence:
+		return sqlStatement{text: `DELETE FROM journal_evidence WHERE journal_id=?1`}
+	default:
+		panic("unknown adversarial subtype table")
+	}
+}
+
+func (db *DB) AdversarialDeleteSubtypeRow(jid journal.JournalID, table AdversarialSubtypeTable) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if !knownSubtypeTable(table) {
-		return fmt.Errorf("AdversarialDeleteSubtypeRow: unknown subtype table %q (closed set: journal_operations/journal_task_events/journal_authorities/journal_decisions/journal_evidence)", table)
-	}
 	if err := sqlitex.ExecuteTransient(db.conn, `PRAGMA foreign_keys=OFF`, nil); err != nil {
 		return fmt.Errorf("AdversarialDeleteSubtypeRow %q: disable FK: %w", table, err)
 	}
 	defer func() { _ = sqlitex.ExecuteTransient(db.conn, `PRAGMA foreign_keys=ON`, nil) }()
 	// The table is one of the closed subtype-table constants above, never caller
 	// input, so identifier interpolation is safe here.
-	stmt := fmt.Sprintf(`DELETE FROM %s WHERE journal_id = ?1`, table)
-	if err := sqlitex.Execute(db.conn, stmt, &sqlitex.ExecOptions{Args: []any{int64(jid)}}); err != nil {
+	if err := executeStatement(db.conn, table.deleteStatement(), &sqlitex.ExecOptions{Args: []any{int64(jid)}}); err != nil {
 		return fmt.Errorf("AdversarialDeleteSubtypeRow %q journal_id=%d: %w", table, jid, err)
 	}
 	if changes := db.conn.Changes(); changes != 1 {
@@ -153,8 +176,8 @@ func (db *DB) AdversarialInsertNonContiguousSupertype(actor journal.ActorID, gap
 		return 0, fmt.Errorf("AdversarialInsertNonContiguousSupertype: gap must be positive, got %d", gap)
 	}
 	var maxJID int64
-	if err := sqlitex.Execute(db.conn, `SELECT COALESCE(MAX(journal_id), 0) FROM journal`,
-		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { maxJID = stmt.ColumnInt64(0); return nil }}); err != nil {
+	if err := sqlitex.Execute(db.conn, `SELECT COALESCE(MAX(journal_id), ?1) FROM journal`,
+		&sqlitex.ExecOptions{Args: []any{0}, ResultFunc: func(stmt *zs.Stmt) error { maxJID = stmt.ColumnInt64(0); return nil }}); err != nil {
 		return 0, fmt.Errorf("AdversarialInsertNonContiguousSupertype: read max journal_id: %w", err)
 	}
 	target := maxJID + int64(gap)
@@ -174,20 +197,20 @@ func (db *DB) AdversarialInsertNonContiguousSupertype(actor journal.ActorID, gap
 // class-table-inheritance and authority-detail tables the spine uses.
 func (db *DB) deleteSpineRowCascadeLocked(jid int64) error {
 	// Detail tables that reference the subtype rows (deepest first).
-	details := []string{
-		`DELETE FROM journal_operation_result_slots WHERE journal_id = ?1`,
-		`DELETE FROM journal_authority_bootstraps WHERE journal_id = ?1`,
-		`DELETE FROM journal_authority_assignment_transitions WHERE journal_id = ?1`,
-		`DELETE FROM journal_authorities WHERE journal_id = ?1`,
-		`DELETE FROM journal_task_event_contexts WHERE event_journal_id = ?1`,
-		`DELETE FROM journal_task_events WHERE journal_id = ?1`,
-		`DELETE FROM journal_operations WHERE journal_id = ?1`,
-		`DELETE FROM journal_decisions WHERE journal_id = ?1`,
-		`DELETE FROM journal_evidence WHERE journal_id = ?1`,
+	details := []sqlStatement{
+		{text: `DELETE FROM journal_operation_result_slots WHERE journal_id = ?1`},
+		{text: `DELETE FROM journal_authority_bootstraps WHERE journal_id = ?1`},
+		{text: `DELETE FROM journal_authority_assignment_transitions WHERE journal_id = ?1`},
+		{text: `DELETE FROM journal_authorities WHERE journal_id = ?1`},
+		{text: `DELETE FROM journal_task_event_contexts WHERE event_journal_id = ?1`},
+		{text: `DELETE FROM journal_task_events WHERE journal_id = ?1`},
+		{text: `DELETE FROM journal_operations WHERE journal_id = ?1`},
+		{text: `DELETE FROM journal_decisions WHERE journal_id = ?1`},
+		{text: `DELETE FROM journal_evidence WHERE journal_id = ?1`},
 	}
 	for _, stmt := range details {
-		if err := sqlitex.Execute(db.conn, stmt, &sqlitex.ExecOptions{Args: []any{jid}}); err != nil {
-			return fmt.Errorf("cascade %q: %w", stmt, err)
+		if err := executeStatement(db.conn, stmt, &sqlitex.ExecOptions{Args: []any{jid}}); err != nil {
+			return fmt.Errorf("cascade static subtype statement: %w", err)
 		}
 	}
 	if err := sqlitex.Execute(db.conn, `DELETE FROM journal WHERE journal_id = ?1`,

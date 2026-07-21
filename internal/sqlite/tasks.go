@@ -59,50 +59,44 @@ func (db *DB) ListTasks(filter ptypes.ListFilter) ([]ptypes.Task, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	query := `SELECT id, namespace, title, description, status_id, priority_id, type_id,
-	                 phase_id, owner_id, notes, created_at, updated_at, closed_at, close_reason
-	          FROM tasks WHERE 1=1`
-	var args []any
-	idx := 1
-
+	flag := func(enabled bool) int {
+		if enabled {
+			return 1
+		}
+		return 0
+	}
+	var status, priority, taskType, phase any
 	if filter.Status != nil {
-		query += fmt.Sprintf(" AND status_id = ?%d", idx)
-		args = append(args, int(*filter.Status))
-		idx++
+		status = int(*filter.Status)
 	}
 	if filter.Priority != nil {
-		query += fmt.Sprintf(" AND priority_id = ?%d", idx)
-		args = append(args, int(*filter.Priority))
-		idx++
+		priority = int(*filter.Priority)
 	}
 	if filter.Type != nil {
-		query += fmt.Sprintf(" AND type_id = ?%d", idx)
-		args = append(args, int(*filter.Type))
-		idx++
+		taskType = int(*filter.Type)
 	}
 	if filter.Phase != nil {
-		query += fmt.Sprintf(" AND phase_id = ?%d", idx)
-		args = append(args, int(*filter.Phase))
-		idx++
+		phase = int(*filter.Phase)
 	}
-	if filter.Namespace != "" {
-		query += fmt.Sprintf(" AND namespace = ?%d", idx)
-		args = append(args, filter.Namespace)
-		idx++
-	}
-	if filter.Label != "" {
-		query += fmt.Sprintf(
-			" AND EXISTS (SELECT 1 FROM labels l WHERE l.task_id = tasks.id AND l.name = ?%d)", idx,
-		)
-		args = append(args, filter.Label)
-		idx++
-	}
-	_ = idx
-	query += " ORDER BY created_at ASC"
 
 	var tasks []ptypes.Task
-	err := sqlitex.Execute(db.conn, query, &sqlitex.ExecOptions{
-		Args: args,
+	err := sqlitex.Execute(db.conn, `SELECT id,namespace,title,description,status_id,priority_id,type_id,
+		phase_id,owner_id,notes,created_at,updated_at,closed_at,close_reason FROM tasks
+		WHERE (NOT ?1 OR status_id=?2)
+		  AND (NOT ?3 OR priority_id=?4)
+		  AND (NOT ?5 OR type_id=?6)
+		  AND (NOT ?7 OR phase_id=?8)
+		  AND (NOT ?9 OR namespace=?10)
+		  AND (NOT ?11 OR EXISTS (SELECT 1 FROM labels l WHERE l.task_id=tasks.id AND l.name=?12))
+		ORDER BY created_at ASC`, &sqlitex.ExecOptions{
+		Args: []any{
+			flag(filter.Status != nil), status,
+			flag(filter.Priority != nil), priority,
+			flag(filter.Type != nil), taskType,
+			flag(filter.Phase != nil), phase,
+			flag(filter.Namespace != ""), filter.Namespace,
+			flag(filter.Label != ""), filter.Label,
+		},
 		ResultFunc: func(stmt *zs.Stmt) error {
 			task, err := ScanTask(stmt)
 			if err != nil {
@@ -145,21 +139,20 @@ func (db *DB) ReadyTasks() ([]ptypes.Task, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	const query = `
+	var tasks []ptypes.Task
+	err := sqlitex.Execute(db.conn, `
 		SELECT t.id, t.namespace, t.title, t.description, t.status_id, t.priority_id,
 		       t.type_id, t.phase_id, t.owner_id, t.notes, t.created_at, t.updated_at,
 		       t.closed_at, t.close_reason
 		FROM tasks t
-		WHERE t.status_id != 2
+		WHERE t.status_id != ?1
 		AND NOT EXISTS (
 			SELECT 1 FROM edges e
 			JOIN tasks blocker ON e.target_id = blocker.id
-			WHERE e.source_id = t.id AND e.kind_id = 0 AND blocker.status_id != 2
+			WHERE e.source_id = t.id AND e.kind_id = ?2 AND blocker.status_id != ?1
 		)
-		ORDER BY t.priority_id ASC, t.created_at ASC`
-
-	var tasks []ptypes.Task
-	err := sqlitex.Execute(db.conn, query, &sqlitex.ExecOptions{
+		ORDER BY t.priority_id ASC, t.created_at ASC`, &sqlitex.ExecOptions{
+		Args: []any{int(ptypes.StatusClosed), int(ptypes.EdgeBlockedBy)},
 		ResultFunc: func(stmt *zs.Stmt) error {
 			task, err := ScanTask(stmt)
 			if err != nil {
@@ -181,21 +174,20 @@ func (db *DB) BlockedTasks() ([]ptypes.Task, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	const query = `
+	var tasks []ptypes.Task
+	err := sqlitex.Execute(db.conn, `
 		SELECT t.id, t.namespace, t.title, t.description, t.status_id, t.priority_id,
 		       t.type_id, t.phase_id, t.owner_id, t.notes, t.created_at, t.updated_at,
 		       t.closed_at, t.close_reason
 		FROM tasks t
-		WHERE t.status_id != 2
+		WHERE t.status_id != ?1
 		AND EXISTS (
 			SELECT 1 FROM edges e
 			JOIN tasks blocker ON e.target_id = blocker.id
-			WHERE e.source_id = t.id AND e.kind_id = 0 AND blocker.status_id != 2
+			WHERE e.source_id = t.id AND e.kind_id = ?2 AND blocker.status_id != ?1
 		)
-		ORDER BY t.priority_id ASC, t.created_at ASC`
-
-	var tasks []ptypes.Task
-	err := sqlitex.Execute(db.conn, query, &sqlitex.ExecOptions{
+		ORDER BY t.priority_id ASC, t.created_at ASC`, &sqlitex.ExecOptions{
+		Args: []any{int(ptypes.StatusClosed), int(ptypes.EdgeBlockedBy)},
 		ResultFunc: func(stmt *zs.Stmt) error {
 			task, err := ScanTask(stmt)
 			if err != nil {

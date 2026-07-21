@@ -20,6 +20,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/dayvidpham/provenance/internal/sqlite"
 	"github.com/dayvidpham/provenance/internal/testcorpus"
 )
 
@@ -189,7 +190,18 @@ func opCorruptDeleteSubtypeRow(t *testing.T, input, expected anyMap, _ testcorpu
 	if err != nil {
 		return err
 	}
-	if err := env.tr.db.AdversarialDeleteSubtypeRow(target, table); err != nil {
+	tables := map[string]sqlite.AdversarialSubtypeTable{
+		"journal_operations":  sqlite.AdversarialSubtypeOperations,
+		"journal_task_events": sqlite.AdversarialSubtypeTaskEvents,
+		"journal_authorities": sqlite.AdversarialSubtypeAuthorities,
+		"journal_decisions":   sqlite.AdversarialSubtypeDecisions,
+		"journal_evidence":    sqlite.AdversarialSubtypeEvidence,
+	}
+	typedTable, ok := tables[table]
+	if !ok {
+		return fmt.Errorf("unknown subtype table fixture %q", table)
+	}
+	if err := env.tr.db.AdversarialDeleteSubtypeRow(target, typedTable); err != nil {
 		return fmt.Errorf("inject subtype-row deletion: %w", err)
 	}
 	verr := env.tr.Journal().VerifyIntegrity()

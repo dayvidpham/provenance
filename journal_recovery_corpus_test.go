@@ -739,7 +739,7 @@ func opSchemaPreflight(t *testing.T, input, expected anyMap, _ testcorpus.Classi
 func opSchemaPreflightMissingTable(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
 	env := newOpsEnv(t)
 	st := env.tr.(*sqliteTracker)
-	if err := st.db.AdversarialDropTable("journal"); err != nil {
+	if err := st.db.AdversarialDropTable(dbsqlite.AdversarialDropJournalTable); err != nil {
 		return fmt.Errorf("corrupt schema (drop journal): %w", err)
 	}
 	return expectPreflightFailure(env.tr.Journal().PreflightSchema(), "a missing journal table")
@@ -748,7 +748,7 @@ func opSchemaPreflightMissingTable(t *testing.T, input, expected anyMap, _ testc
 func opSchemaPreflightExtraColumn(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
 	env := newOpsEnv(t)
 	st := env.tr.(*sqliteTracker)
-	if err := st.db.AdversarialAddColumn("journal_task_events", "unreviewed"); err != nil {
+	if err := st.db.AdversarialAddColumn(dbsqlite.AdversarialAddUnreviewedTaskEventColumn); err != nil {
 		return fmt.Errorf("corrupt schema (extra column): %w", err)
 	}
 	return expectPreflightFailure(env.tr.Journal().PreflightSchema(), "an unexpected extra column")
@@ -757,7 +757,7 @@ func opSchemaPreflightExtraColumn(t *testing.T, input, expected anyMap, _ testco
 func opSchemaPreflightExtraTable(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
 	env := newOpsEnv(t)
 	st := env.tr.(*sqliteTracker)
-	if err := st.db.AdversarialAddTable("journal_unreviewed"); err != nil {
+	if err := st.db.AdversarialAddTable(dbsqlite.AdversarialAddUnreviewedJournalTable); err != nil {
 		return fmt.Errorf("corrupt schema (extra table): %w", err)
 	}
 	return expectPreflightFailure(env.tr.Journal().PreflightSchema(), "an unexpected extra journal-spine table")
@@ -766,7 +766,7 @@ func opSchemaPreflightExtraTable(t *testing.T, input, expected anyMap, _ testcor
 func opSchemaPreflightMissingColumn(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
 	env := newOpsEnv(t)
 	st := env.tr.(*sqliteTracker)
-	if err := st.db.AdversarialDropColumn("journal_task_events", "payload"); err != nil {
+	if err := st.db.AdversarialDropColumn(dbsqlite.AdversarialDropTaskEventPayload); err != nil {
 		return fmt.Errorf("corrupt schema (drop expected column): %w", err)
 	}
 	return expectPreflightFailure(env.tr.Journal().PreflightSchema(), "a missing expected column")
@@ -817,7 +817,7 @@ func opFaultMidMigration(t *testing.T, input, expected anyMap, _ testcorpus.Clas
 func opConcurrentOpenDuringCorruption(t *testing.T, input, expected anyMap, _ testcorpus.Classification) error {
 	env := newOpsEnv(t)
 	st := env.tr.(*sqliteTracker)
-	if err := st.db.AdversarialAddColumn("journal_task_events", "unreviewed"); err != nil {
+	if err := st.db.AdversarialAddColumn(dbsqlite.AdversarialAddUnreviewedTaskEventColumn); err != nil {
 		return fmt.Errorf("corrupt schema: %w", err)
 	}
 	// Two concurrent opens race against the corrupted topology; both must observe

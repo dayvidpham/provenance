@@ -143,7 +143,10 @@ func (db *DB) ensureJournalSchema() error {
 			PRIMARY KEY (task_id, actor_id)
 		) STRICT, WITHOUT ROWID`,
 		// journal_attributed (§8.5): the read-only denormalized attribution surface.
-		journalAttributedViewDDL,
+		`CREATE VIEW IF NOT EXISTS journal_attributed AS
+		 SELECT j.journal_id AS journal_id,j.kind_id AS kind_id,COALESCE(j.actor_id,anchor.actor_id) AS effective_actor_id,
+		 j.recorded_at AS recorded_at,j.produced_by_operation_journal_id AS produced_by_operation_journal_id
+		 FROM journal j LEFT JOIN journal anchor ON anchor.journal_id=j.produced_by_operation_journal_id`,
 	}
 	for _, stmt := range ddl {
 		if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
@@ -451,6 +454,30 @@ const (
 	subtypeEvidence
 )
 
+type authorityIntegrityQuery uint8
+
+const (
+	authorityBootstrapMissing authorityIntegrityQuery = iota + 1
+	authorityAssignmentMissing
+	authorityBootstrapMismatch
+	authorityAssignmentMismatch
+)
+
+func (query authorityIntegrityQuery) statement() sqlStatement {
+	switch query {
+	case authorityBootstrapMissing:
+		return sqlStatement{text: authorityBootstrapMissingQuery}
+	case authorityAssignmentMissing:
+		return sqlStatement{text: authorityAssignmentMissingQuery}
+	case authorityBootstrapMismatch:
+		return sqlStatement{text: authorityBootstrapMismatchQuery}
+	case authorityAssignmentMismatch:
+		return sqlStatement{text: authorityAssignmentMismatchQuery}
+	default:
+		panic("unknown authority integrity query")
+	}
+}
+
 var subtypeAllTables = map[journal.JournalKind]subtypeTable{
 	journal.JournalKindOperation: subtypeOperations,
 	journal.JournalKindTaskEvent: subtypeTaskEvents,
@@ -476,18 +503,20 @@ func (table subtypeTable) label() string {
 	}
 }
 
-func subtypeIntegrityQueries(table subtypeTable) (totality, discriminator string) {
+type subtypeIntegrityStatements struct{ totality, discriminator sqlStatement }
+
+func (table subtypeTable) integrityStatements() subtypeIntegrityStatements {
 	switch table {
 	case subtypeOperations:
-		return `SELECT j.journal_id FROM journal j LEFT JOIN journal_operations s ON s.journal_id=j.journal_id WHERE j.kind_id=?1 AND s.journal_id IS NULL LIMIT 1`, `SELECT s.journal_id FROM journal_operations s JOIN journal j ON j.journal_id=s.journal_id WHERE j.kind_id<>?1 LIMIT 1`
+		return subtypeIntegrityStatements{sqlStatement{text: `SELECT j.journal_id FROM journal j LEFT JOIN journal_operations s ON s.journal_id=j.journal_id WHERE j.kind_id=?1 AND s.journal_id IS NULL LIMIT 1`}, sqlStatement{text: `SELECT s.journal_id FROM journal_operations s JOIN journal j ON j.journal_id=s.journal_id WHERE j.kind_id<>?1 LIMIT 1`}}
 	case subtypeTaskEvents:
-		return `SELECT j.journal_id FROM journal j LEFT JOIN journal_task_events s ON s.journal_id=j.journal_id WHERE j.kind_id=?1 AND s.journal_id IS NULL LIMIT 1`, `SELECT s.journal_id FROM journal_task_events s JOIN journal j ON j.journal_id=s.journal_id WHERE j.kind_id<>?1 LIMIT 1`
+		return subtypeIntegrityStatements{sqlStatement{text: `SELECT j.journal_id FROM journal j LEFT JOIN journal_task_events s ON s.journal_id=j.journal_id WHERE j.kind_id=?1 AND s.journal_id IS NULL LIMIT 1`}, sqlStatement{text: `SELECT s.journal_id FROM journal_task_events s JOIN journal j ON j.journal_id=s.journal_id WHERE j.kind_id<>?1 LIMIT 1`}}
 	case subtypeAuthorities:
-		return `SELECT j.journal_id FROM journal j LEFT JOIN journal_authorities s ON s.journal_id=j.journal_id WHERE j.kind_id=?1 AND s.journal_id IS NULL LIMIT 1`, `SELECT s.journal_id FROM journal_authorities s JOIN journal j ON j.journal_id=s.journal_id WHERE j.kind_id<>?1 LIMIT 1`
+		return subtypeIntegrityStatements{sqlStatement{text: `SELECT j.journal_id FROM journal j LEFT JOIN journal_authorities s ON s.journal_id=j.journal_id WHERE j.kind_id=?1 AND s.journal_id IS NULL LIMIT 1`}, sqlStatement{text: `SELECT s.journal_id FROM journal_authorities s JOIN journal j ON j.journal_id=s.journal_id WHERE j.kind_id<>?1 LIMIT 1`}}
 	case subtypeDecisions:
-		return `SELECT j.journal_id FROM journal j LEFT JOIN journal_decisions s ON s.journal_id=j.journal_id WHERE j.kind_id=?1 AND s.journal_id IS NULL LIMIT 1`, `SELECT s.journal_id FROM journal_decisions s JOIN journal j ON j.journal_id=s.journal_id WHERE j.kind_id<>?1 LIMIT 1`
+		return subtypeIntegrityStatements{sqlStatement{text: `SELECT j.journal_id FROM journal j LEFT JOIN journal_decisions s ON s.journal_id=j.journal_id WHERE j.kind_id=?1 AND s.journal_id IS NULL LIMIT 1`}, sqlStatement{text: `SELECT s.journal_id FROM journal_decisions s JOIN journal j ON j.journal_id=s.journal_id WHERE j.kind_id<>?1 LIMIT 1`}}
 	case subtypeEvidence:
-		return `SELECT j.journal_id FROM journal j LEFT JOIN journal_evidence s ON s.journal_id=j.journal_id WHERE j.kind_id=?1 AND s.journal_id IS NULL LIMIT 1`, `SELECT s.journal_id FROM journal_evidence s JOIN journal j ON j.journal_id=s.journal_id WHERE j.kind_id<>?1 LIMIT 1`
+		return subtypeIntegrityStatements{sqlStatement{text: `SELECT j.journal_id FROM journal j LEFT JOIN journal_evidence s ON s.journal_id=j.journal_id WHERE j.kind_id=?1 AND s.journal_id IS NULL LIMIT 1`}, sqlStatement{text: `SELECT s.journal_id FROM journal_evidence s JOIN journal j ON j.journal_id=s.journal_id WHERE j.kind_id<>?1 LIMIT 1`}}
 	default:
 		panic("unknown subtype table")
 	}
@@ -516,28 +545,28 @@ const (
 	exclusivityDecisionEvidence
 )
 
-func (query subtypeExclusivityQuery) sql() string {
+func (query subtypeExclusivityQuery) statement() sqlStatement {
 	switch query {
 	case exclusivityOperationTaskEvent:
-		return `SELECT a.journal_id FROM journal_operations a JOIN journal_task_events b ON a.journal_id=b.journal_id LIMIT 1`
+		return sqlStatement{text: `SELECT a.journal_id FROM journal_operations a JOIN journal_task_events b ON a.journal_id=b.journal_id LIMIT 1`}
 	case exclusivityOperationAuthority:
-		return `SELECT a.journal_id FROM journal_operations a JOIN journal_authorities b ON a.journal_id=b.journal_id LIMIT 1`
+		return sqlStatement{text: `SELECT a.journal_id FROM journal_operations a JOIN journal_authorities b ON a.journal_id=b.journal_id LIMIT 1`}
 	case exclusivityOperationDecision:
-		return `SELECT a.journal_id FROM journal_operations a JOIN journal_decisions b ON a.journal_id=b.journal_id LIMIT 1`
+		return sqlStatement{text: `SELECT a.journal_id FROM journal_operations a JOIN journal_decisions b ON a.journal_id=b.journal_id LIMIT 1`}
 	case exclusivityOperationEvidence:
-		return `SELECT a.journal_id FROM journal_operations a JOIN journal_evidence b ON a.journal_id=b.journal_id LIMIT 1`
+		return sqlStatement{text: `SELECT a.journal_id FROM journal_operations a JOIN journal_evidence b ON a.journal_id=b.journal_id LIMIT 1`}
 	case exclusivityTaskEventAuthority:
-		return `SELECT a.journal_id FROM journal_task_events a JOIN journal_authorities b ON a.journal_id=b.journal_id LIMIT 1`
+		return sqlStatement{text: `SELECT a.journal_id FROM journal_task_events a JOIN journal_authorities b ON a.journal_id=b.journal_id LIMIT 1`}
 	case exclusivityTaskEventDecision:
-		return `SELECT a.journal_id FROM journal_task_events a JOIN journal_decisions b ON a.journal_id=b.journal_id LIMIT 1`
+		return sqlStatement{text: `SELECT a.journal_id FROM journal_task_events a JOIN journal_decisions b ON a.journal_id=b.journal_id LIMIT 1`}
 	case exclusivityTaskEventEvidence:
-		return `SELECT a.journal_id FROM journal_task_events a JOIN journal_evidence b ON a.journal_id=b.journal_id LIMIT 1`
+		return sqlStatement{text: `SELECT a.journal_id FROM journal_task_events a JOIN journal_evidence b ON a.journal_id=b.journal_id LIMIT 1`}
 	case exclusivityAuthorityDecision:
-		return `SELECT a.journal_id FROM journal_authorities a JOIN journal_decisions b ON a.journal_id=b.journal_id LIMIT 1`
+		return sqlStatement{text: `SELECT a.journal_id FROM journal_authorities a JOIN journal_decisions b ON a.journal_id=b.journal_id LIMIT 1`}
 	case exclusivityAuthorityEvidence:
-		return `SELECT a.journal_id FROM journal_authorities a JOIN journal_evidence b ON a.journal_id=b.journal_id LIMIT 1`
+		return sqlStatement{text: `SELECT a.journal_id FROM journal_authorities a JOIN journal_evidence b ON a.journal_id=b.journal_id LIMIT 1`}
 	case exclusivityDecisionEvidence:
-		return `SELECT a.journal_id FROM journal_decisions a JOIN journal_evidence b ON a.journal_id=b.journal_id LIMIT 1`
+		return sqlStatement{text: `SELECT a.journal_id FROM journal_decisions a JOIN journal_evidence b ON a.journal_id=b.journal_id LIMIT 1`}
 	default:
 		panic("unknown subtype exclusivity query")
 	}
@@ -604,10 +633,10 @@ func (db *DB) verifySubtypeIntegrityLocked() error {
 		return err
 	}
 	for kind, table := range tables {
-		totalityQuery, discriminatorQuery := subtypeIntegrityQueries(table)
+		statements := table.integrityStatements()
 		// Totality: a journal row of this kind with no subtype row.
 		var missing int64
-		if err := sqlitex.Execute(db.conn, totalityQuery,
+		if err := executeStatement(db.conn, statements.totality,
 			&sqlitex.ExecOptions{
 				Args:       []any{int(kind)},
 				ResultFunc: func(stmt *zs.Stmt) error { missing = stmt.ColumnInt64(0); return nil },
@@ -628,7 +657,7 @@ func (db *DB) verifySubtypeIntegrityLocked() error {
 		// carries a different kind_id (or a JournalID present in a foreign
 		// subtype table).
 		var mismatch int64
-		if err := sqlitex.Execute(db.conn, discriminatorQuery,
+		if err := executeStatement(db.conn, statements.discriminator,
 			&sqlitex.ExecOptions{
 				Args:       []any{int(kind)},
 				ResultFunc: func(stmt *zs.Stmt) error { mismatch = stmt.ColumnInt64(0); return nil },
@@ -671,7 +700,7 @@ func (db *DB) verifySubtypeExclusivityLocked(tables map[journal.JournalKind]subt
 			continue
 		}
 		var dup int64
-		if err := sqlitex.Execute(db.conn, p.query.sql(),
+		if err := executeStatement(db.conn, p.query.statement(),
 			&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { dup = stmt.ColumnInt64(0); return nil }},
 		); err != nil {
 			return fmt.Errorf("verifySubtypeExclusivity %s/%s: %w", ta.label(), tb.label(), err)
@@ -702,18 +731,18 @@ func (db *DB) verifyAuthorityDetailIntegrityLocked() error {
 		return nil
 	}
 	checks := []struct {
-		query string
+		query authorityIntegrityQuery
 		want  int
 		label string
 	}{
-		{authorityBootstrapMissingQuery, 0, "bootstrap authority missing its bootstrap detail"},
-		{authorityAssignmentMissingQuery, 1, "assignment authority missing its assignment transition"},
-		{authorityBootstrapMismatchQuery, 0, "bootstrap detail on a non-bootstrap authority"},
-		{authorityAssignmentMismatchQuery, 1, "assignment transition on a non-assignment authority"},
+		{authorityBootstrapMissing, 0, "bootstrap authority missing its bootstrap detail"},
+		{authorityAssignmentMissing, 1, "assignment authority missing its assignment transition"},
+		{authorityBootstrapMismatch, 0, "bootstrap detail on a non-bootstrap authority"},
+		{authorityAssignmentMismatch, 1, "assignment transition on a non-assignment authority"},
 	}
 	for _, c := range checks {
 		var bad int64
-		if err := sqlitex.Execute(db.conn, c.query,
+		if err := executeStatement(db.conn, c.query.statement(),
 			&sqlitex.ExecOptions{Args: []any{c.want}, ResultFunc: func(stmt *zs.Stmt) error { bad = stmt.ColumnInt64(0); return nil }},
 		); err != nil {
 			return fmt.Errorf("verifyAuthorityDetailIntegrity %s: %w", c.label, err)
@@ -754,8 +783,8 @@ func (db *DB) QueryTaskEvents(q journal.JournalQueryV1) (journal.JournalTaskEven
 	snapshot := int64(q.SnapshotMaxJournalID)
 	if snapshot == 0 {
 		if err := sqlitex.Execute(db.conn,
-			`SELECT COALESCE(MAX(journal_id), 0) FROM journal`,
-			&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
+			`SELECT COALESCE(MAX(journal_id), ?1) FROM journal`,
+			&sqlitex.ExecOptions{Args: []any{0}, ResultFunc: func(stmt *zs.Stmt) error {
 				snapshot = stmt.ColumnInt64(0)
 				return nil
 			}},
@@ -765,95 +794,55 @@ func (db *DB) QueryTaskEvents(q journal.JournalQueryV1) (journal.JournalTaskEven
 	}
 
 	timeline := q.OrderBy == journal.OrderByRecordedAt
-	// Read the row's actor through journal_attributed (§8.5): effective_actor_id is
-	// the row's own stored actor on an anchor, or its derived anchor actor on a
-	// subordinate row — never a bare read of the (NULL-on-subordinate) actor_id
-	// column. At this layer every task_event is an anchor, so this equals the
-	// stored actor; the derived surface keeps the read correct once operations land.
-	//
-	// The snapshot is journal_id-bounded under both orders (`j.journal_id <= ?1`).
-	// The exclusive cursor differs: the canonical order advances on journal_id
-	// alone; the timeline order advances on the composite (recorded_at, journal_id)
-	// so ties and backdated rows neither drop nor repeat across the page boundary.
-	var sql string
-	var args []any
-	var next int
+	queryOrder, afterRecordedAt := taskEventQueryJournalOrder, int64(0)
 	if timeline {
-		afterRecordedAt := q.AfterRecordedAt.UTC().UnixNano()
-		sql = `SELECT j.journal_id, j.effective_actor_id, j.recorded_at, te.task_id, te.event_kind, te.payload
-			FROM journal_attributed j JOIN journal_task_events te ON te.journal_id = j.journal_id
-			WHERE j.journal_id <= ?1
-			  AND (j.recorded_at > ?2 OR (j.recorded_at = ?2 AND j.journal_id > ?3))`
-		args = []any{snapshot, afterRecordedAt, int64(q.AfterJournalID)}
-		next = 4
-	} else {
-		sql = `SELECT j.journal_id, j.effective_actor_id, j.recorded_at, te.task_id, te.event_kind, te.payload
-			FROM journal_attributed j JOIN journal_task_events te ON te.journal_id = j.journal_id
-			WHERE j.journal_id <= ?1 AND j.journal_id > ?2`
-		args = []any{snapshot, int64(q.AfterJournalID)}
-		next = 3
+		queryOrder = taskEventQueryTimelineOrder
+		afterRecordedAt = q.AfterRecordedAt.UTC().UnixNano()
 	}
-	if len(q.TaskIDs) > 0 {
-		sql += " AND te.task_id IN ("
-		for i, id := range q.TaskIDs {
-			if i > 0 {
-				sql += ","
-			}
-			sql += fmt.Sprintf("?%d", next)
-			args = append(args, id.String())
-			next++
+	taskIDs := make([]string, len(q.TaskIDs))
+	for i, id := range q.TaskIDs {
+		taskIDs[i] = id.String()
+	}
+	eventKinds := make([]string, len(q.EventKinds))
+	for i, kind := range q.EventKinds {
+		eventKinds[i] = string(kind)
+	}
+	contextFilters := make([][2]string, len(q.Contexts))
+	for i, context := range q.Contexts {
+		kind, identity, err := journal.EncodeStoredEventContext(context)
+		if err != nil {
+			return journal.JournalTaskEventPageV1{}, fmt.Errorf("QueryTaskEvents: encode context filter: %w", err)
 		}
-		sql += ")"
+		contextFilters[i] = [2]string{string(kind), identity}
 	}
-	if len(q.EventKinds) > 0 {
-		sql += " AND te.event_kind IN ("
-		for i, k := range q.EventKinds {
-			if i > 0 {
-				sql += ","
-			}
-			sql += fmt.Sprintf("?%d", next)
-			args = append(args, string(k))
-			next++
+	taskJSON, err := json.Marshal(taskIDs)
+	if err != nil {
+		return journal.JournalTaskEventPageV1{}, fmt.Errorf("QueryTaskEvents: encode task filters: %w", err)
+	}
+	eventJSON, err := json.Marshal(eventKinds)
+	if err != nil {
+		return journal.JournalTaskEventPageV1{}, fmt.Errorf("QueryTaskEvents: encode event filters: %w", err)
+	}
+	contextJSON, err := json.Marshal(contextFilters)
+	if err != nil {
+		return journal.JournalTaskEventPageV1{}, fmt.Errorf("QueryTaskEvents: encode context filters: %w", err)
+	}
+	flag := func(enabled bool) int {
+		if enabled {
+			return 1
 		}
-		sql += ")"
+		return 0
 	}
-	if len(q.Contexts) > 0 {
-		// Contexts is ORed within the dimension (§8.3, §12): a task-event row
-		// matches if it carries ANY of the requested (kind, identity) context
-		// pairs. EXISTS against journal_task_event_contexts keeps the outer
-		// query from fanning out into duplicate rows per matching context edge.
-		sql += " AND EXISTS (SELECT 1 FROM journal_task_event_contexts ctx WHERE ctx.event_journal_id = te.journal_id AND ("
-		for i, ctx := range q.Contexts {
-			kind, identity, encErr := journal.EncodeStoredEventContext(ctx)
-			if encErr != nil {
-				return journal.JournalTaskEventPageV1{}, fmt.Errorf("QueryTaskEvents: encode context filter: %w", encErr)
-			}
-			if i > 0 {
-				sql += " OR "
-			}
-			sql += fmt.Sprintf("(ctx.context_kind = ?%d AND ctx.context_identity = ?%d)", next, next+1)
-			args = append(args, string(kind), identity)
-			next += 2
-		}
-		sql += "))"
-	}
-	if timeline {
-		sql += " ORDER BY j.recorded_at ASC, j.journal_id ASC"
-	} else {
-		sql += " ORDER BY j.journal_id ASC"
-	}
-	fetch := q.Limit
+	fetch, boundLimit := q.Limit, -1
 	if fetch > 0 {
-		// Bind the page size like every other value (the +1 detects a further page); the
-		// placeholder index is interpolated, the value is bound. LIMIT is the final clause,
-		// so `next` needs no further advance.
-		sql += fmt.Sprintf(" LIMIT ?%d", next)
-		args = append(args, fetch+1)
+		boundLimit = fetch + 1
 	}
 
 	var rows []journal.TaskEventRow
-	if err := sqlitex.Execute(db.conn, sql, &sqlitex.ExecOptions{
-		Args: args,
+	if err := executeStatement(db.conn, queryOrder.statement(), &sqlitex.ExecOptions{
+		Args: []any{snapshot, afterRecordedAt, int64(q.AfterJournalID),
+			flag(len(taskIDs) > 0), string(taskJSON), flag(len(eventKinds) > 0), string(eventJSON),
+			flag(len(contextFilters) > 0), string(contextJSON), "$[0]", "$[1]", boundLimit},
 		ResultFunc: func(stmt *zs.Stmt) error {
 			row, scanErr := scanTaskEventRow(stmt)
 			if scanErr != nil {

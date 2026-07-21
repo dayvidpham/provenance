@@ -27,21 +27,30 @@ const (
 type inspectedMutationEncodingTag struct{ text string }
 
 func (v MutationEncodingVersion) String() string {
-	text, ok := mutationEncodingText(v)
+	descriptor, ok := canonicalCodecForVersion(v)
 	if !ok {
 		return fmt.Sprintf("MutationEncodingVersion(%d)", v)
 	}
-	return text
+	return descriptor.wireTag
 }
 
-// mutationEncodingText is the only enum-to-wire mapping for codec versions.
-func mutationEncodingText(version MutationEncodingVersion) (string, bool) {
-	switch version {
-	case MutationEncodingV1:
-		return "provenance.mutation.v1", true
-	default:
-		return "", false
+type canonicalCodecDescriptor struct {
+	version MutationEncodingVersion
+	wireTag string
+	decoder canonicalMutationDecoder
+}
+
+var canonicalCodecRegistry = [...]canonicalCodecDescriptor{
+	{version: MutationEncodingV1, wireTag: "provenance.mutation.v1", decoder: decodeCanonicalMutationV1},
+}
+
+func canonicalCodecForVersion(version MutationEncodingVersion) (canonicalCodecDescriptor, bool) {
+	for _, descriptor := range canonicalCodecRegistry {
+		if descriptor.version == version {
+			return descriptor, true
+		}
 	}
+	return canonicalCodecDescriptor{}, false
 }
 
 func inspectMutationEncodingTag(text string) inspectedMutationEncodingTag {
@@ -49,9 +58,9 @@ func inspectMutationEncodingTag(text string) inspectedMutationEncodingTag {
 }
 
 func (tag inspectedMutationEncodingTag) version() (MutationEncodingVersion, bool) {
-	for _, version := range [...]MutationEncodingVersion{MutationEncodingV1} {
-		if text, _ := mutationEncodingText(version); text == tag.text {
-			return version, true
+	for _, descriptor := range canonicalCodecRegistry {
+		if descriptor.wireTag == tag.text {
+			return descriptor.version, true
 		}
 	}
 	return 0, false
@@ -139,24 +148,30 @@ func cloneCanonicalEffect(e Effect) Effect {
 	return e
 }
 
-var canonicalEffectSorts = []EffectSort{
-	EffectTaskEvent, EffectBootstrapAuthority, EffectAssignmentStart,
-	EffectAssignmentEnd, EffectDecision, EffectEvidence, EffectTaskCreate,
-	EffectEdgeAdd, EffectEdgeRemove, EffectLabelAdd, EffectLabelRemove,
-	EffectCommentAdd, EffectTaskCreateAllocated,
+type canonicalV1FamilyDescriptor struct {
+	sort EffectSort
+	tag  string
+}
+
+var canonicalV1Families = [...]canonicalV1FamilyDescriptor{
+	{EffectTaskEvent, "task_event"},
+	{EffectBootstrapAuthority, "bootstrap_authority"},
+	{EffectAssignmentStart, "assignment_start"},
+	{EffectAssignmentEnd, "assignment_end"},
+	{EffectDecision, "decision"},
+	{EffectEvidence, "evidence"},
+	{EffectTaskCreate, "task_create"},
+	{EffectEdgeAdd, "edge_add"},
+	{EffectEdgeRemove, "edge_remove"},
+	{EffectLabelAdd, "label_add"},
+	{EffectLabelRemove, "label_remove"},
+	{EffectCommentAdd, "comment_add"},
+	{EffectTaskCreateAllocated, "task_create_allocated"},
 }
 
 type canonicalV1Codec struct{}
 
 var mutationV1Codec canonicalV1Codec
-
-type canonicalFieldScope uint8
-
-const (
-	canonicalEnvelopeScope canonicalFieldScope = iota + 1
-	canonicalEffectScope
-	canonicalContextScope
-)
 
 type canonicalEnvelopeField uint8
 
@@ -212,120 +227,147 @@ const (
 	contextIdentity
 )
 
-type canonicalFieldRef struct {
-	scope        canonicalFieldScope
-	effectIndex  int
-	contextIndex int
-	envelope     canonicalEnvelopeField
-	effect       canonicalEffectField
-	context      canonicalContextField
+type canonicalV1FieldRef interface{ canonicalV1FieldRef() }
+type canonicalV1EnvelopeRef struct{ field canonicalEnvelopeField }
+type canonicalV1EffectRef struct {
+	index int
+	field canonicalEffectField
+}
+type canonicalV1ContextRef struct {
+	effectIndex, contextIndex int
+	field                     canonicalContextField
 }
 
-func envelopeField(field canonicalEnvelopeField) canonicalFieldRef {
-	return canonicalFieldRef{scope: canonicalEnvelopeScope, envelope: field}
+func (canonicalV1EnvelopeRef) canonicalV1FieldRef() {}
+func (canonicalV1EffectRef) canonicalV1FieldRef()   {}
+func (canonicalV1ContextRef) canonicalV1FieldRef()  {}
+
+func envelopeField(field canonicalEnvelopeField) canonicalV1FieldRef {
+	return canonicalV1EnvelopeRef{field: field}
+}
+func effectField(index int, field canonicalEffectField) canonicalV1FieldRef {
+	return canonicalV1EffectRef{index: index, field: field}
+}
+func contextField(effectIndex, contextIndex int, field canonicalContextField) canonicalV1FieldRef {
+	return canonicalV1ContextRef{effectIndex: effectIndex, contextIndex: contextIndex, field: field}
 }
 
-func effectField(index int, field canonicalEffectField) canonicalFieldRef {
-	return canonicalFieldRef{scope: canonicalEffectScope, effectIndex: index, effect: field}
-}
-
-func contextField(effectIndex, contextIndex int, field canonicalContextField) canonicalFieldRef {
-	return canonicalFieldRef{scope: canonicalContextScope, effectIndex: effectIndex, contextIndex: contextIndex, context: field}
-}
-
-// renderV1FieldName is the sole V1 field-name and path renderer.
-func renderV1FieldName(ref canonicalFieldRef) string {
-	if ref.scope == canonicalEnvelopeScope {
-		switch ref.envelope {
+func (canonicalV1Codec) renderFieldName(ref canonicalV1FieldRef) (string, error) {
+	switch typed := ref.(type) {
+	case canonicalV1EnvelopeRef:
+		switch typed.field {
 		case envelopeVersion:
-			return "version"
+			return "version", nil
 		case envelopeEffectCount:
-			return "effect-count"
+			return "effect-count", nil
+		default:
+			return "", canonicalMutationError("field-reference", fmt.Sprintf("unknown V1 envelope field %d", typed.field), "use a declared V1 envelope field")
 		}
-	}
-	var name string
-	if ref.scope == canonicalContextScope {
-		switch ref.context {
+	case canonicalV1ContextRef:
+		if typed.effectIndex < 0 || typed.effectIndex >= MaxCanonicalEffects || typed.contextIndex < 0 || typed.contextIndex >= MaxCanonicalContextsPerEffect {
+			return "", canonicalMutationError("field-reference", "V1 context index is negative or outside the canonical bounds", "use bounded non-negative effect and context indices")
+		}
+		var name string
+		switch typed.field {
 		case contextKind:
 			name = "kind"
 		case contextIdentity:
 			name = "identity"
+		default:
+			return "", canonicalMutationError("field-reference", fmt.Sprintf("unknown V1 context field %d", typed.field), "use a declared V1 context field")
 		}
-		return fmt.Sprintf("effect.%d.context.%d.%s", ref.effectIndex, ref.contextIndex, name)
+		return fmt.Sprintf("effect.%d.context.%d.%s", typed.effectIndex, typed.contextIndex, name), nil
+	case canonicalV1EffectRef:
+		if typed.index < 0 || typed.index >= MaxCanonicalEffects {
+			return "", canonicalMutationError("field-reference", "V1 effect index is negative or outside the canonical bound", "use a bounded non-negative effect index")
+		}
+		var name string
+		switch typed.field {
+		case effectFamily:
+			name = "family"
+		case effectResultSlot:
+			name = "result-slot"
+		case effectRecordedAtOverride:
+			name = "recorded-at-override"
+		case effectContextCount:
+			name = "context-count"
+		case effectPayload:
+			name = "payload"
+		case effectTask:
+			name = "task"
+		case effectTitle:
+			name = "title"
+		case effectDescription:
+			name = "description"
+		case effectType:
+			name = "type"
+		case effectPriority:
+			name = "priority"
+		case effectPhase:
+			name = "phase"
+		case effectEventKind:
+			name = "event-kind"
+		case effectUpdateTitle:
+			name = "update-title"
+		case effectUpdateDescription:
+			name = "update-description"
+		case effectUpdatePriority:
+			name = "update-priority"
+		case effectUpdatePhase:
+			name = "update-phase"
+		case effectUpdateNotes:
+			name = "update-notes"
+		case effectForced:
+			name = "forced"
+		case effectCloseReason:
+			name = "close-reason"
+		case effectBootstrapLabel:
+			name = "bootstrap-label"
+		case effectOperationAuthority:
+			name = "operation-authority"
+		case effectAssignment:
+			name = "assignment"
+		case effectSlot:
+			name = "slot"
+		case effectOccupant:
+			name = "occupant"
+		case effectPredecessor:
+			name = "predecessor"
+		case effectParent:
+			name = "parent"
+		case effectDecisionKind:
+			name = "decision-kind"
+		case effectEvidenceKind:
+			name = "evidence-kind"
+		case effectContentDigest:
+			name = "content-digest"
+		case effectEdgeTarget:
+			name = "edge-target"
+		case effectEdgeKind:
+			name = "edge-kind"
+		case effectLabel:
+			name = "label"
+		case effectComment:
+			name = "comment"
+		case effectCommentAuthor:
+			name = "comment-author"
+		case effectCommentBody:
+			name = "comment-body"
+		default:
+			return "", canonicalMutationError("field-reference", fmt.Sprintf("unknown V1 effect field %d", typed.field), "use a declared V1 effect field")
+		}
+		return fmt.Sprintf("effect.%d.%s", typed.index, name), nil
+	default:
+		return "", canonicalMutationError("field-reference", "unknown V1 field reference variant", "use a V1 scope-specific field constructor")
 	}
-	switch ref.effect {
-	case effectFamily:
-		name = "family"
-	case effectResultSlot:
-		name = "result-slot"
-	case effectRecordedAtOverride:
-		name = "recorded-at-override"
-	case effectContextCount:
-		name = "context-count"
-	case effectPayload:
-		name = "payload"
-	case effectTask:
-		name = "task"
-	case effectTitle:
-		name = "title"
-	case effectDescription:
-		name = "description"
-	case effectType:
-		name = "type"
-	case effectPriority:
-		name = "priority"
-	case effectPhase:
-		name = "phase"
-	case effectEventKind:
-		name = "event-kind"
-	case effectUpdateTitle:
-		name = "update-title"
-	case effectUpdateDescription:
-		name = "update-description"
-	case effectUpdatePriority:
-		name = "update-priority"
-	case effectUpdatePhase:
-		name = "update-phase"
-	case effectUpdateNotes:
-		name = "update-notes"
-	case effectForced:
-		name = "forced"
-	case effectCloseReason:
-		name = "close-reason"
-	case effectBootstrapLabel:
-		name = "bootstrap-label"
-	case effectOperationAuthority:
-		name = "operation-authority"
-	case effectAssignment:
-		name = "assignment"
-	case effectSlot:
-		name = "slot"
-	case effectOccupant:
-		name = "occupant"
-	case effectPredecessor:
-		name = "predecessor"
-	case effectParent:
-		name = "parent"
-	case effectDecisionKind:
-		name = "decision-kind"
-	case effectEvidenceKind:
-		name = "evidence-kind"
-	case effectContentDigest:
-		name = "content-digest"
-	case effectEdgeTarget:
-		name = "edge-target"
-	case effectEdgeKind:
-		name = "edge-kind"
-	case effectLabel:
-		name = "label"
-	case effectComment:
-		name = "comment"
-	case effectCommentAuthor:
-		name = "comment-author"
-	case effectCommentBody:
-		name = "comment-body"
+}
+
+func (codec canonicalV1Codec) diagnosticField(ref canonicalV1FieldRef) string {
+	name, err := codec.renderFieldName(ref)
+	if err != nil {
+		return "field-reference"
 	}
-	return fmt.Sprintf("effect.%d.%s", ref.effectIndex, name)
+	return name
 }
 
 // PrepareMutationV1 validates and normalizes effects, writes their canonical bytes,
@@ -337,7 +379,7 @@ func PrepareMutationV1(effects []Effect) (CanonicalMutation, error) {
 	}
 	normalized := make([]Effect, len(effects))
 	counter := &canonicalSizeCounter{limit: MaxCanonicalMutationBytes}
-	w := canonicalWriter{w: counter}
+	w := canonicalWriter{codec: mutationV1Codec, w: counter}
 	writeCanonicalEnvelopeHeader(&w, len(effects))
 	for i := range effects {
 		if err := validateRawCanonicalEffectBounds(effects[i], i); err != nil {
@@ -357,7 +399,7 @@ func PrepareMutationV1(effects []Effect) (CanonicalMutation, error) {
 	}
 	var out bytes.Buffer
 	out.Grow(counter.size)
-	w = canonicalWriter{w: &out}
+	w = canonicalWriter{codec: mutationV1Codec, w: &out}
 	writeCanonicalEnvelopeHeader(&w, len(normalized))
 	for i := range normalized {
 		if err := mutationV1Codec.encodeEffect(&w, normalized[i], i); err != nil {
@@ -371,8 +413,7 @@ func PrepareMutationV1(effects []Effect) (CanonicalMutation, error) {
 }
 
 func writeCanonicalEnvelopeHeader(w *canonicalWriter, effectCount int) {
-	version, _ := mutationEncodingText(MutationEncodingV1)
-	w.field(envelopeField(envelopeVersion), []byte(version))
+	w.field(envelopeField(envelopeVersion), []byte(MutationEncodingV1.String()))
 	w.field(envelopeField(envelopeEffectCount), []byte(strconv.Itoa(effectCount)))
 }
 
@@ -407,7 +448,7 @@ func InspectCanonicalMutationEncodingVersion(data []byte) (inspectedMutationEnco
 	if len(data) > MaxCanonicalMutationBytes {
 		return inspectedMutationEncodingTag{}, canonicalMutationError("mutation", fmt.Sprintf("%d bytes exceeds maximum %d", len(data), MaxCanonicalMutationBytes), "restore bounded canonical bytes")
 	}
-	r := canonicalReader{r: bufio.NewReader(bytes.NewReader(data))}
+	r := canonicalReader{codec: mutationV1Codec, r: bufio.NewReader(bytes.NewReader(data))}
 	version, err := r.field(envelopeField(envelopeVersion))
 	if err == nil {
 		return inspectMutationEncodingTag(string(version)), nil
@@ -423,7 +464,7 @@ func decodeCanonicalMutation(data []byte) (CanonicalMutation, error) {
 	if len(data) > MaxCanonicalMutationBytes {
 		return CanonicalMutation{}, canonicalMutationError("mutation", fmt.Sprintf("%d bytes exceeds maximum %d", len(data), MaxCanonicalMutationBytes), "restore bounded canonical bytes")
 	}
-	r := canonicalReader{r: bufio.NewReader(bytes.NewReader(data))}
+	r := canonicalReader{codec: mutationV1Codec, r: bufio.NewReader(bytes.NewReader(data))}
 	version, err := r.field(envelopeField(envelopeVersion))
 	if err != nil {
 		return CanonicalMutation{}, err
@@ -433,25 +474,21 @@ func decodeCanonicalMutation(data []byte) (CanonicalMutation, error) {
 	if !ok {
 		return CanonicalMutation{}, fmt.Errorf("unsupported encoding version %q", version)
 	}
-	decoder, ok := canonicalMutationDecoderFor(registered)
+	descriptor, ok := canonicalCodecForVersion(registered)
 	if !ok {
 		return CanonicalMutation{}, fmt.Errorf("unsupported encoding version %q", version)
 	}
-	return decoder(&r, data)
+	return descriptor.decoder(data, descriptor.version, descriptor.wireTag)
 }
 
-type canonicalMutationDecoder func(*canonicalReader, []byte) (CanonicalMutation, error)
+type canonicalMutationDecoder func([]byte, MutationEncodingVersion, string) (CanonicalMutation, error)
 
-func canonicalMutationDecoderFor(version MutationEncodingVersion) (canonicalMutationDecoder, bool) {
-	switch version {
-	case MutationEncodingV1:
-		return decodeCanonicalMutationV1, true
-	default:
-		return nil, false
+func decodeCanonicalMutationV1(data []byte, versionID MutationEncodingVersion, wireTag string) (CanonicalMutation, error) {
+	r := canonicalReader{codec: mutationV1Codec, r: bufio.NewReader(bytes.NewReader(data))}
+	version, err := r.field(envelopeField(envelopeVersion))
+	if err != nil || versionID != MutationEncodingV1 || string(version) != wireTag {
+		return CanonicalMutation{}, fmt.Errorf("provenance: decode V1 canonical mutation: invalid version frame %q: %w", version, err)
 	}
-}
-
-func decodeCanonicalMutationV1(r *canonicalReader, data []byte) (CanonicalMutation, error) {
 	rawCount, err := r.field(envelopeField(envelopeEffectCount))
 	if err != nil {
 		return CanonicalMutation{}, err
@@ -462,7 +499,7 @@ func decodeCanonicalMutationV1(r *canonicalReader, data []byte) (CanonicalMutati
 	}
 	effects := make([]Effect, count)
 	for i := range effects {
-		effects[i], err = mutationV1Codec.decodeEffect(r, i)
+		effects[i], err = mutationV1Codec.decodeEffect(&r, i)
 		if err != nil {
 			return CanonicalMutation{}, err
 		}
@@ -475,7 +512,7 @@ func decodeCanonicalMutationV1(r *canonicalReader, data []byte) (CanonicalMutati
 	}
 	digest := sha256.Sum256(data)
 	return CanonicalMutation{
-		version: MutationEncodingV1,
+		version: versionID,
 		bytes:   append([]byte(nil), data...),
 		digest:  append([]byte(nil), digest[:]...),
 		effects: effects,
@@ -485,18 +522,23 @@ func decodeCanonicalMutationV1(r *canonicalReader, data []byte) (CanonicalMutati
 // IsSupportedMutationEncoding is the single codec-version registry used by
 // persistence and wire decoding. SQL enforces only structural NULL/nonempty facts.
 func IsSupportedMutationEncoding(version MutationEncodingVersion) bool {
-	_, ok := canonicalMutationDecoderFor(version)
-	return ok
+	descriptor, ok := canonicalCodecForVersion(version)
+	return ok && descriptor.decoder != nil
 }
 
 type canonicalWriter struct {
-	w   io.Writer
-	err error
+	codec canonicalV1Codec
+	w     io.Writer
+	err   error
 }
 
-func (w *canonicalWriter) field(ref canonicalFieldRef, value []byte) {
-	name := renderV1FieldName(ref)
+func (w *canonicalWriter) field(ref canonicalV1FieldRef, value []byte) {
 	if w.err != nil {
+		return
+	}
+	name, err := w.codec.renderFieldName(ref)
+	if err != nil {
+		w.err = err
 		return
 	}
 	if len(value) > MaxCanonicalFieldBytes {
@@ -512,10 +554,16 @@ func (w *canonicalWriter) field(ref canonicalFieldRef, value []byte) {
 	}
 }
 
-type canonicalReader struct{ r *bufio.Reader }
+type canonicalReader struct {
+	codec canonicalV1Codec
+	r     *bufio.Reader
+}
 
-func (r *canonicalReader) field(ref canonicalFieldRef) ([]byte, error) {
-	want := renderV1FieldName(ref)
+func (r *canonicalReader) field(ref canonicalV1FieldRef) ([]byte, error) {
+	want, renderErr := r.codec.renderFieldName(ref)
+	if renderErr != nil {
+		return nil, renderErr
+	}
 	name, err := r.r.ReadString(':')
 	if err != nil {
 		return nil, fmt.Errorf("provenance: decode canonical mutation: missing field %q: %w", want, err)
@@ -630,7 +678,10 @@ func (codec canonicalV1Codec) encodeEffect(w *canonicalWriter, e Effect, index i
 
 func (codec canonicalV1Codec) decodeEffect(r *canonicalReader, index int) (Effect, error) {
 	{
-		fieldName := func(field canonicalEffectField) string { return renderV1FieldName(effectField(index, field)) }
+		fieldName := func(field canonicalEffectField) string {
+			name, _ := codec.renderFieldName(effectField(index, field))
+			return name
+		}
 		read := func(field canonicalEffectField) ([]byte, error) { return r.field(effectField(index, field)) }
 		family, err := read(effectFamily)
 		if err != nil {
@@ -931,19 +982,19 @@ func (codec canonicalV1Codec) normalizeEffect(e Effect, index int) (Effect, erro
 		e.ContentDigest = nil
 	}
 	if !validEffectSort(e.Sort) {
-		return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.family", index), fmt.Sprintf("unknown family %d", e.Sort), "use a declared EffectSort")
+		return Effect{}, canonicalMutationError(codec.diagnosticField(effectField(index, effectFamily)), fmt.Sprintf("unknown family %d", e.Sort), "use a declared EffectSort")
 	}
 	if e.ActorID.Namespace != "" {
-		return Effect{}, fmt.Errorf("%w: %w", ErrActorPlacement, canonicalMutationError(fmt.Sprintf("effect.%d.actor", index), "per-effect ActorID is not behaviorally valid; actor comes from the operation anchor", "leave Effect.ActorID zero"))
+		return Effect{}, fmt.Errorf("%w: %w", ErrActorPlacement, canonicalMutationError(fmt.Sprintf("effect[%d] actor input", index), "per-effect ActorID is not behaviorally valid; actor comes from the operation anchor", "leave Effect.ActorID zero"))
 	}
 	n := Effect{Sort: e.Sort, ResultSlot: e.ResultSlot, RecordedAtOverride: e.RecordedAtOverride}
 	switch e.Sort {
 	case EffectTaskCreate, EffectTaskCreateAllocated:
 		if e.TaskID.Namespace == "" || !e.Type.IsValid() || !e.Priority.IsValid() || !e.Phase.IsValid() {
-			return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.task-create", index), "invalid task identity or classification enum", "supply a namespaced task and valid type/priority/phase")
+			return Effect{}, canonicalMutationError(fmt.Sprintf("effect[%d] task-create input", index), "invalid task identity or classification enum", "supply a namespaced task and valid type/priority/phase")
 		}
 		if e.Sort == EffectTaskCreateAllocated && e.ResultSlot == "" {
-			return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.result-slot", index), "allocated task create requires a result slot for committed identity reconciliation", "supply a stable non-empty result slot")
+			return Effect{}, canonicalMutationError(codec.diagnosticField(effectField(index, effectResultSlot)), "allocated task create requires a result slot for committed identity reconciliation", "supply a stable non-empty result slot")
 		}
 		n.TaskID = e.TaskID
 		n.Payload = e.Payload
@@ -955,10 +1006,10 @@ func (codec canonicalV1Codec) normalizeEffect(e Effect, index int) (Effect, erro
 		n.Phase = e.Phase
 	case EffectTaskEvent:
 		if e.TaskID.Namespace == "" {
-			return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.task", index), "task event requires a task", "supply a namespaced TaskID")
+			return Effect{}, canonicalMutationError(codec.diagnosticField(effectField(index, effectTask)), "task event requires a task", "supply a namespaced TaskID")
 		}
 		if err := ValidateEventKind(e.EventKind); err != nil {
-			return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.event-kind", index), err.Error(), "use a valid namespaced event kind")
+			return Effect{}, canonicalMutationError(codec.diagnosticField(effectField(index, effectEventKind)), err.Error(), "use a valid namespaced event kind")
 		}
 		n.TaskID = e.TaskID
 		n.EventKind = e.EventKind
@@ -977,7 +1028,7 @@ func (codec canonicalV1Codec) normalizeEffect(e Effect, index int) (Effect, erro
 				n.CloseReason = e.CloseReason
 			}
 			if e.Forced && len(e.Payload) > 0 {
-				return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.payload", index), "forced lifecycle payload is reducer-generated", "leave payload empty when Forced is true")
+				return Effect{}, canonicalMutationError(codec.diagnosticField(effectField(index, effectPayload)), "forced lifecycle payload is reducer-generated", "leave payload empty when Forced is true")
 			}
 		}
 	case EffectBootstrapAuthority:
@@ -985,7 +1036,7 @@ func (codec canonicalV1Codec) normalizeEffect(e Effect, index int) (Effect, erro
 		n.OperationAuthorityID = e.OperationAuthorityID
 	case EffectAssignmentStart:
 		if e.TaskID.Namespace == "" || e.AssignmentID == "" {
-			return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.assignment-start", index), "task and assignment are required", "supply both identities")
+			return Effect{}, canonicalMutationError(fmt.Sprintf("effect[%d] assignment-start input", index), "task and assignment are required", "supply both identities")
 		}
 		n.TaskID = e.TaskID
 		n.AssignmentID = e.AssignmentID
@@ -995,21 +1046,21 @@ func (codec canonicalV1Codec) normalizeEffect(e Effect, index int) (Effect, erro
 		n.Parent = e.Parent
 	case EffectAssignmentEnd:
 		if e.AssignmentID == "" {
-			return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.assignment", index), "assignment is required", "supply the episode identity")
+			return Effect{}, canonicalMutationError(codec.diagnosticField(effectField(index, effectAssignment)), "assignment is required", "supply the episode identity")
 		}
 		n.AssignmentID = e.AssignmentID
 		n.TaskID = e.TaskID
 		n.SlotID = e.SlotID
 	case EffectDecision:
 		if err := ValidateEventKind(EventKind(e.DecisionKind)); err != nil {
-			return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.decision-kind", index), err.Error(), "use a lower-case namespaced decision kind such as caller.decision")
+			return Effect{}, canonicalMutationError(codec.diagnosticField(effectField(index, effectDecisionKind)), err.Error(), "use a lower-case namespaced decision kind such as caller.decision")
 		}
 		n.TaskID = e.TaskID
 		n.DecisionKind = e.DecisionKind
 		n.Payload = e.Payload
 	case EffectEvidence:
 		if err := ValidateEventKind(EventKind(e.EvidenceKind)); err != nil {
-			return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.evidence-kind", index), err.Error(), "use a lower-case namespaced evidence kind such as caller.evidence")
+			return Effect{}, canonicalMutationError(codec.diagnosticField(effectField(index, effectEvidenceKind)), err.Error(), "use a lower-case namespaced evidence kind such as caller.evidence")
 		}
 		n.TaskID = e.TaskID
 		n.EvidenceKind = e.EvidenceKind
@@ -1017,7 +1068,7 @@ func (codec canonicalV1Codec) normalizeEffect(e Effect, index int) (Effect, erro
 		n.Payload = e.Payload
 	case EffectEdgeAdd, EffectEdgeRemove:
 		if e.TaskID.Namespace == "" || e.EdgeTargetID == "" || !e.EdgeRelKind.IsValid() {
-			return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.edge", index), "invalid edge operands", "supply source, target, and valid edge kind")
+			return Effect{}, canonicalMutationError(fmt.Sprintf("effect[%d] edge input", index), "invalid edge operands", "supply source, target, and valid edge kind")
 		}
 		n.TaskID = e.TaskID
 		n.EdgeTargetID = e.EdgeTargetID
@@ -1025,14 +1076,14 @@ func (codec canonicalV1Codec) normalizeEffect(e Effect, index int) (Effect, erro
 		n.Contexts = e.Contexts
 	case EffectLabelAdd, EffectLabelRemove:
 		if e.TaskID.Namespace == "" || e.Label == "" {
-			return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.label", index), "task and label are required", "supply both operands")
+			return Effect{}, canonicalMutationError(codec.diagnosticField(effectField(index, effectLabel)), "task and label are required", "supply both operands")
 		}
 		n.TaskID = e.TaskID
 		n.Label = e.Label
 		n.Contexts = e.Contexts
 	case EffectCommentAdd:
 		if e.TaskID.Namespace == "" || e.CommentIdentity.Namespace == "" || e.CommentAuthor.Namespace == "" {
-			return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.comment", index), "task, comment identity, and author are required", "supply all comment operands")
+			return Effect{}, canonicalMutationError(codec.diagnosticField(effectField(index, effectComment)), "task, comment identity, and author are required", "supply all comment operands")
 		}
 		n.TaskID = e.TaskID
 		n.CommentIdentity = e.CommentIdentity
@@ -1044,16 +1095,16 @@ func (codec canonicalV1Codec) normalizeEffect(e Effect, index int) (Effect, erro
 		v1, v2 := reflect.ValueOf(e), reflect.ValueOf(n)
 		for i := 0; i < v1.NumField(); i++ {
 			if !reflect.DeepEqual(v1.Field(i).Interface(), v2.Field(i).Interface()) {
-				return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.%s", index, reflect.TypeOf(e).Field(i).Name), "field is populated but not consumed by this effect family", "clear the irrelevant field")
+				return Effect{}, canonicalMutationError(fmt.Sprintf("effect[%d] input %s", index, reflect.TypeOf(e).Field(i).Name), "field is populated but not consumed by this effect family", "clear the irrelevant field")
 			}
 		}
 	}
 	contexts, err := CanonicalEventContexts(n.Contexts)
 	if err != nil {
-		return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.contexts", index), err.Error(), "supply valid bounded event contexts")
+		return Effect{}, canonicalMutationError(fmt.Sprintf("effect[%d] contexts input", index), err.Error(), "supply valid bounded event contexts")
 	}
 	if len(contexts) > MaxCanonicalContextsPerEffect {
-		return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.context-count", index), fmt.Sprintf("%d exceeds maximum %d", len(contexts), MaxCanonicalContextsPerEffect), "reduce contexts")
+		return Effect{}, canonicalMutationError(codec.diagnosticField(effectField(index, effectContextCount)), fmt.Sprintf("%d exceeds maximum %d", len(contexts), MaxCanonicalContextsPerEffect), "reduce contexts")
 	}
 	if len(contexts) > 0 {
 		n.Contexts = contexts
@@ -1062,7 +1113,7 @@ func (codec canonicalV1Codec) normalizeEffect(e Effect, index int) (Effect, erro
 	}
 	if len(n.Payload) > 0 {
 		if _, err := codec.canonicalJSON(n.Payload); err != nil {
-			return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.payload", index), err.Error(), "supply one strict JSON value without duplicate fields")
+			return Effect{}, canonicalMutationError(codec.diagnosticField(effectField(index, effectPayload)), err.Error(), "supply one strict JSON value without duplicate fields")
 		}
 	}
 	return n, nil
@@ -1070,7 +1121,7 @@ func (codec canonicalV1Codec) normalizeEffect(e Effect, index int) (Effect, erro
 
 func validateRawCanonicalEffectBounds(effect Effect, index int) error {
 	if len(effect.Contexts) > MaxCanonicalContextsPerEffect {
-		return canonicalMutationError(fmt.Sprintf("effect.%d.context-count", index), fmt.Sprintf("raw count %d exceeds maximum %d before canonicalization", len(effect.Contexts), MaxCanonicalContextsPerEffect), "reduce contexts before retrying")
+		return canonicalMutationError(mutationV1Codec.diagnosticField(effectField(index, effectContextCount)), fmt.Sprintf("raw count %d exceeds maximum %d before canonicalization", len(effect.Contexts), MaxCanonicalContextsPerEffect), "reduce contexts before retrying")
 	}
 	value, typ := reflect.ValueOf(effect), reflect.TypeOf(effect)
 	for i := 0; i < value.NumField(); i++ {
@@ -1089,16 +1140,16 @@ func validateRawCanonicalEffectBounds(effect Effect, index int) error {
 			}
 		}
 		if size > MaxCanonicalFieldBytes {
-			return canonicalMutationError(fmt.Sprintf("effect.%d.%s", index, name), fmt.Sprintf("raw length %d exceeds maximum %d before normalization", size, MaxCanonicalFieldBytes), "reduce the operand before retrying")
+			return canonicalMutationError(fmt.Sprintf("effect[%d] input %s", index, name), fmt.Sprintf("raw length %d exceeds maximum %d before normalization", size, MaxCanonicalFieldBytes), "reduce the operand before retrying")
 		}
 	}
 	for contextIndex, context := range effect.Contexts {
 		kind, identity, err := EncodeStoredEventContext(context)
 		if err != nil {
-			return canonicalMutationError(fmt.Sprintf("effect.%d.context.%d", index, contextIndex), err.Error(), "supply a valid context identity")
+			return canonicalMutationError(fmt.Sprintf("effect[%d] context[%d] input", index, contextIndex), err.Error(), "supply a valid context identity")
 		}
 		if len(kind) > MaxCanonicalFieldBytes || len(identity) > MaxCanonicalFieldBytes {
-			return canonicalMutationError(fmt.Sprintf("effect.%d.context.%d", index, contextIndex), "raw context field exceeds maximum length", "reduce the context identity")
+			return canonicalMutationError(fmt.Sprintf("effect[%d] context[%d] input", index, contextIndex), "raw context field exceeds maximum length", "reduce the context identity")
 		}
 	}
 	return nil
@@ -1110,42 +1161,18 @@ func validEffectSort(sort EffectSort) bool {
 }
 
 func (canonicalV1Codec) familyTag(sort EffectSort) (string, bool) {
-	switch sort {
-	case EffectTaskEvent:
-		return "task_event", true
-	case EffectBootstrapAuthority:
-		return "bootstrap_authority", true
-	case EffectAssignmentStart:
-		return "assignment_start", true
-	case EffectAssignmentEnd:
-		return "assignment_end", true
-	case EffectDecision:
-		return "decision", true
-	case EffectEvidence:
-		return "evidence", true
-	case EffectTaskCreate:
-		return "task_create", true
-	case EffectEdgeAdd:
-		return "edge_add", true
-	case EffectEdgeRemove:
-		return "edge_remove", true
-	case EffectLabelAdd:
-		return "label_add", true
-	case EffectLabelRemove:
-		return "label_remove", true
-	case EffectCommentAdd:
-		return "comment_add", true
-	case EffectTaskCreateAllocated:
-		return "task_create_allocated", true
-	default:
-		return "", false
+	for _, descriptor := range canonicalV1Families {
+		if descriptor.sort == sort {
+			return descriptor.tag, true
+		}
 	}
+	return "", false
 }
 
-func (codec canonicalV1Codec) parseFamilyTag(tag string) (EffectSort, error) {
-	for _, sort := range canonicalEffectSorts {
-		if wireTag, _ := codec.familyTag(sort); wireTag == tag {
-			return sort, nil
+func (canonicalV1Codec) parseFamilyTag(tag string) (EffectSort, error) {
+	for _, descriptor := range canonicalV1Families {
+		if descriptor.tag == tag {
+			return descriptor.sort, nil
 		}
 	}
 	return 0, fmt.Errorf("provenance: decode canonical mutation: unknown effect family %q", tag)

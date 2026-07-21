@@ -112,8 +112,8 @@ func (db *DB) requireResultSlotOwnOperationLocked(anchor, producedJID int64) err
 func (db *DB) insertAttributionLocked(task journal.TaskID, actor journal.ActorID, jid int64) error {
 	// Targets the real task_attributions during a live Apply and the shadow
 	// attribution table during a from-empty replay derivation (§8.2, §15).
-	if err := sqlitex.Execute(db.conn,
-		insertAttributionQuery(db.projectionTarget),
+	if err := executeStatement(db.conn,
+		db.projectionTarget.insertAttributionStatement(),
 		&sqlitex.ExecOptions{Args: []any{task.String(), actor.String(), jid}}); err != nil {
 		return fmt.Errorf("update %s attribution: %w", db.projectionTarget.label(), err)
 	}
@@ -123,8 +123,8 @@ func (db *DB) insertAttributionLocked(task journal.TaskID, actor journal.ActorID
 func (db *DB) advanceWatermarkLocked(task journal.TaskID, jid int64) error {
 	// Targets the real tasks table during a live Apply and the shadow tasks table
 	// during a from-empty replay derivation (§8.1, §15).
-	if err := sqlitex.Execute(db.conn,
-		advanceWatermarkQuery(db.projectionTarget),
+	if err := executeStatement(db.conn,
+		db.projectionTarget.advanceWatermarkStatement(),
 		&sqlitex.ExecOptions{Args: []any{jid, task.String()}}); err != nil {
 		return fmt.Errorf("advance %s task watermark: %w", db.projectionTarget.label(), err)
 	}
@@ -152,33 +152,33 @@ func (db *DB) recomputeTaskOwnerLocked(task journal.TaskID, jid int64) error {
 		}); err != nil {
 		return fmt.Errorf("recompute task owner: %w", err)
 	}
-	if err := sqlitex.Execute(db.conn,
-		updateOwnerQuery(db.projectionTarget),
+	if err := executeStatement(db.conn,
+		db.projectionTarget.updateOwnerStatement(),
 		&sqlitex.ExecOptions{Args: []any{owner, jid, task.String()}}); err != nil {
 		return fmt.Errorf("update %s owner: %w", db.projectionTarget.label(), err)
 	}
 	return nil
 }
 
-func insertAttributionQuery(target projectionTarget) string {
+func (target projectionTarget) insertAttributionStatement() sqlStatement {
 	if target == projectionTargetShadow {
-		return `INSERT OR IGNORE INTO shadow_task_attributions (task_id, actor_id, first_journal_id) VALUES (?1, ?2, ?3)`
+		return sqlStatement{text: `INSERT OR IGNORE INTO shadow_task_attributions (task_id, actor_id, first_journal_id) VALUES (?1, ?2, ?3)`}
 	}
-	return `INSERT OR IGNORE INTO task_attributions (task_id, actor_id, first_journal_id) VALUES (?1, ?2, ?3)`
+	return sqlStatement{text: `INSERT OR IGNORE INTO task_attributions (task_id, actor_id, first_journal_id) VALUES (?1, ?2, ?3)`}
 }
 
-func advanceWatermarkQuery(target projectionTarget) string {
+func (target projectionTarget) advanceWatermarkStatement() sqlStatement {
 	if target == projectionTargetShadow {
-		return `UPDATE shadow_tasks SET last_journal_id = ?1 WHERE id = ?2`
+		return sqlStatement{text: `UPDATE shadow_tasks SET last_journal_id = ?1 WHERE id = ?2`}
 	}
-	return `UPDATE tasks SET last_journal_id = ?1 WHERE id = ?2`
+	return sqlStatement{text: `UPDATE tasks SET last_journal_id = ?1 WHERE id = ?2`}
 }
 
-func updateOwnerQuery(target projectionTarget) string {
+func (target projectionTarget) updateOwnerStatement() sqlStatement {
 	if target == projectionTargetShadow {
-		return `UPDATE shadow_tasks SET owner_id = ?1, last_journal_id = ?2 WHERE id = ?3`
+		return sqlStatement{text: `UPDATE shadow_tasks SET owner_id = ?1, last_journal_id = ?2 WHERE id = ?3`}
 	}
-	return `UPDATE tasks SET owner_id = ?1, last_journal_id = ?2 WHERE id = ?3`
+	return sqlStatement{text: `UPDATE tasks SET owner_id = ?1, last_journal_id = ?2 WHERE id = ?3`}
 }
 
 // ---------------------------------------------------------------------------

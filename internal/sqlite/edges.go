@@ -33,17 +33,14 @@ func (db *DB) GetEdges(sourceID ptypes.TaskID, kind *ptypes.EdgeKind) ([]ptypes.
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	query := `SELECT source_id, target_id, kind_id FROM edges WHERE source_id = ?1`
-	args := []any{sourceID.String()}
+	var kindValue any
 	if kind != nil {
-		query += " AND kind_id = ?2"
-		args = append(args, int(*kind))
+		kindValue = int(*kind)
 	}
-	query += " ORDER BY created_at ASC"
 
 	var edges []ptypes.Edge
-	err := sqlitex.Execute(db.conn, query, &sqlitex.ExecOptions{
-		Args: args,
+	err := sqlitex.Execute(db.conn, `SELECT source_id,target_id,kind_id FROM edges WHERE source_id=?1 AND (NOT ?2 OR kind_id=?3) ORDER BY created_at ASC`, &sqlitex.ExecOptions{
+		Args: []any{sourceID.String(), kind != nil, kindValue},
 		ResultFunc: func(stmt *zs.Stmt) error {
 			edges = append(edges, ptypes.Edge{
 				SourceID: stmt.ColumnText(0),
@@ -67,8 +64,8 @@ func (db *DB) GetBlockedByEdges() ([]ptypes.Edge, error) {
 
 	var edges []ptypes.Edge
 	err := sqlitex.Execute(db.conn,
-		`SELECT source_id, target_id, kind_id FROM edges WHERE kind_id = 0 ORDER BY created_at ASC`,
-		&sqlitex.ExecOptions{
+		`SELECT source_id, target_id, kind_id FROM edges WHERE kind_id = ?1 ORDER BY created_at ASC`,
+		&sqlitex.ExecOptions{Args: []any{int(ptypes.EdgeBlockedBy)},
 			ResultFunc: func(stmt *zs.Stmt) error {
 				edges = append(edges, ptypes.Edge{
 					SourceID: stmt.ColumnText(0),
@@ -92,8 +89,8 @@ func (db *DB) GetDepTree(rootID ptypes.TaskID) ([]ptypes.Edge, error) {
 
 	adj := make(map[string][]string)
 	if err := sqlitex.Execute(db.conn,
-		`SELECT source_id, target_id FROM edges WHERE kind_id = 0`,
-		&sqlitex.ExecOptions{
+		`SELECT source_id, target_id FROM edges WHERE kind_id = ?1`,
+		&sqlitex.ExecOptions{Args: []any{int(ptypes.EdgeBlockedBy)},
 			ResultFunc: func(stmt *zs.Stmt) error {
 				src := stmt.ColumnText(0)
 				tgt := stmt.ColumnText(1)

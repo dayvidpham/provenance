@@ -118,7 +118,7 @@ func (db *DB) encodeMutationFamilyPayload(eff journal.Effect) ([]byte, error) {
 // same table the graph store reads, so journal and graph stay consistent (§6).
 func (db *DB) edgeCreatesCycleLocked(source, target string) (bool, error) {
 	found := false
-	if err := sqlitex.Execute(db.conn, edgeCycleQuery(db.projectionTarget),
+	if err := executeStatement(db.conn, db.projectionTarget.edgeCycleStatement(),
 		&sqlitex.ExecOptions{
 			Args:       []any{target, source, int(ptypes.EdgeBlockedBy)},
 			ResultFunc: func(*zs.Stmt) error { found = true; return nil },
@@ -145,8 +145,8 @@ func (db *DB) projectMutationFamilyRowLocked(task journal.TaskID, kind journal.E
 		if err != nil {
 			return err
 		}
-		if err := sqlitex.Execute(db.conn,
-			projectEdgeAddQuery(db.projectionTarget),
+		if err := executeStatement(db.conn,
+			db.projectionTarget.projectEdgeAddStatement(),
 			&sqlitex.ExecOptions{Args: []any{task.String(), p.Target, int(p.EdgeKind), recordedAt}}); err != nil {
 			return fmt.Errorf("project edge-add %s->%s: %w", task, p.Target, err)
 		}
@@ -155,8 +155,8 @@ func (db *DB) projectMutationFamilyRowLocked(task journal.TaskID, kind journal.E
 		if err != nil {
 			return err
 		}
-		if err := sqlitex.Execute(db.conn,
-			projectEdgeRemoveQuery(db.projectionTarget),
+		if err := executeStatement(db.conn,
+			db.projectionTarget.projectEdgeRemoveStatement(),
 			&sqlitex.ExecOptions{Args: []any{task.String(), p.Target, int(p.EdgeKind)}}); err != nil {
 			return fmt.Errorf("project edge-remove %s->%s: %w", task, p.Target, err)
 		}
@@ -165,8 +165,8 @@ func (db *DB) projectMutationFamilyRowLocked(task journal.TaskID, kind journal.E
 		if err != nil {
 			return err
 		}
-		if err := sqlitex.Execute(db.conn,
-			projectLabelAddQuery(db.projectionTarget),
+		if err := executeStatement(db.conn,
+			db.projectionTarget.projectLabelAddStatement(),
 			&sqlitex.ExecOptions{Args: []any{task.String(), p.Label}}); err != nil {
 			return fmt.Errorf("project label-add %s %q: %w", task, p.Label, err)
 		}
@@ -175,8 +175,8 @@ func (db *DB) projectMutationFamilyRowLocked(task journal.TaskID, kind journal.E
 		if err != nil {
 			return err
 		}
-		if err := sqlitex.Execute(db.conn,
-			projectLabelRemoveQuery(db.projectionTarget),
+		if err := executeStatement(db.conn,
+			db.projectionTarget.projectLabelRemoveStatement(),
 			&sqlitex.ExecOptions{Args: []any{task.String(), p.Label}}); err != nil {
 			return fmt.Errorf("project label-remove %s %q: %w", task, p.Label, err)
 		}
@@ -188,8 +188,8 @@ func (db *DB) projectMutationFamilyRowLocked(task journal.TaskID, kind journal.E
 		// INSERT OR IGNORE keeps a from-empty replay of the SAME journaled comment
 		// idempotent (the caller-minted id is carried in the payload, §6), so the
 		// projection reproduces exactly one row.
-		if err := sqlitex.Execute(db.conn,
-			projectCommentAddQuery(db.projectionTarget),
+		if err := executeStatement(db.conn,
+			db.projectionTarget.projectCommentAddStatement(),
 			&sqlitex.ExecOptions{Args: []any{p.CommentID, task.String(), p.Author, p.Body, recordedAt}}); err != nil {
 			return fmt.Errorf("project comment-add %s %q: %w", task, p.CommentID, err)
 		}
@@ -199,44 +199,44 @@ func (db *DB) projectMutationFamilyRowLocked(task journal.TaskID, kind journal.E
 	return db.advanceWatermarkLocked(task, jid)
 }
 
-func edgeCycleQuery(target projectionTarget) string {
+func (target projectionTarget) edgeCycleStatement() sqlStatement {
 	if target == projectionTargetShadow {
-		return `WITH RECURSIVE reach(node) AS (SELECT ?1 UNION SELECT e.target_id FROM shadow_edges e JOIN reach r ON e.source_id=r.node WHERE e.kind_id=?3) SELECT 1 FROM reach WHERE node=?2 LIMIT 1`
+		return sqlStatement{text: `WITH RECURSIVE reach(node) AS (SELECT ?1 UNION SELECT e.target_id FROM shadow_edges e JOIN reach r ON e.source_id=r.node WHERE e.kind_id=?3) SELECT 1 FROM reach WHERE node=?2 LIMIT 1`}
 	}
-	return `WITH RECURSIVE reach(node) AS (SELECT ?1 UNION SELECT e.target_id FROM edges e JOIN reach r ON e.source_id=r.node WHERE e.kind_id=?3) SELECT 1 FROM reach WHERE node=?2 LIMIT 1`
+	return sqlStatement{text: `WITH RECURSIVE reach(node) AS (SELECT ?1 UNION SELECT e.target_id FROM edges e JOIN reach r ON e.source_id=r.node WHERE e.kind_id=?3) SELECT 1 FROM reach WHERE node=?2 LIMIT 1`}
 }
 
-func projectEdgeAddQuery(target projectionTarget) string {
+func (target projectionTarget) projectEdgeAddStatement() sqlStatement {
 	if target == projectionTargetShadow {
-		return `INSERT OR IGNORE INTO shadow_edges (source_id,target_id,kind_id,created_at) VALUES (?1,?2,?3,?4)`
+		return sqlStatement{text: `INSERT OR IGNORE INTO shadow_edges (source_id,target_id,kind_id,created_at) VALUES (?1,?2,?3,?4)`}
 	}
-	return `INSERT OR IGNORE INTO edges (source_id,target_id,kind_id,created_at) VALUES (?1,?2,?3,?4)`
+	return sqlStatement{text: `INSERT OR IGNORE INTO edges (source_id,target_id,kind_id,created_at) VALUES (?1,?2,?3,?4)`}
 }
 
-func projectEdgeRemoveQuery(target projectionTarget) string {
+func (target projectionTarget) projectEdgeRemoveStatement() sqlStatement {
 	if target == projectionTargetShadow {
-		return `DELETE FROM shadow_edges WHERE source_id=?1 AND target_id=?2 AND kind_id=?3`
+		return sqlStatement{text: `DELETE FROM shadow_edges WHERE source_id=?1 AND target_id=?2 AND kind_id=?3`}
 	}
-	return `DELETE FROM edges WHERE source_id=?1 AND target_id=?2 AND kind_id=?3`
+	return sqlStatement{text: `DELETE FROM edges WHERE source_id=?1 AND target_id=?2 AND kind_id=?3`}
 }
 
-func projectLabelAddQuery(target projectionTarget) string {
+func (target projectionTarget) projectLabelAddStatement() sqlStatement {
 	if target == projectionTargetShadow {
-		return `INSERT OR IGNORE INTO shadow_labels (task_id,name) VALUES (?1,?2)`
+		return sqlStatement{text: `INSERT OR IGNORE INTO shadow_labels (task_id,name) VALUES (?1,?2)`}
 	}
-	return `INSERT OR IGNORE INTO labels (task_id,name) VALUES (?1,?2)`
+	return sqlStatement{text: `INSERT OR IGNORE INTO labels (task_id,name) VALUES (?1,?2)`}
 }
 
-func projectLabelRemoveQuery(target projectionTarget) string {
+func (target projectionTarget) projectLabelRemoveStatement() sqlStatement {
 	if target == projectionTargetShadow {
-		return `DELETE FROM shadow_labels WHERE task_id=?1 AND name=?2`
+		return sqlStatement{text: `DELETE FROM shadow_labels WHERE task_id=?1 AND name=?2`}
 	}
-	return `DELETE FROM labels WHERE task_id=?1 AND name=?2`
+	return sqlStatement{text: `DELETE FROM labels WHERE task_id=?1 AND name=?2`}
 }
 
-func projectCommentAddQuery(target projectionTarget) string {
+func (target projectionTarget) projectCommentAddStatement() sqlStatement {
 	if target == projectionTargetShadow {
-		return `INSERT OR IGNORE INTO shadow_comments (id,task_id,author_id,body,created_at) VALUES (?1,?2,?3,?4,?5)`
+		return sqlStatement{text: `INSERT OR IGNORE INTO shadow_comments (id,task_id,author_id,body,created_at) VALUES (?1,?2,?3,?4,?5)`}
 	}
-	return `INSERT OR IGNORE INTO comments (id,task_id,author_id,body,created_at) VALUES (?1,?2,?3,?4,?5)`
+	return sqlStatement{text: `INSERT OR IGNORE INTO comments (id,task_id,author_id,body,created_at) VALUES (?1,?2,?3,?4,?5)`}
 }

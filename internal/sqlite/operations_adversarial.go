@@ -22,9 +22,9 @@ func (db *DB) AdversarialRemoveJournalOperationFK() (err error) {
 	defer end(&err)
 	steps := []string{
 		`DROP VIEW IF EXISTS journal_attributed`,
-		fmt.Sprintf(`CREATE TABLE journal_legacy (journal_id INTEGER PRIMARY KEY AUTOINCREMENT,kind_id INTEGER NOT NULL REFERENCES journal_kinds(id),actor_id TEXT REFERENCES agents(id),recorded_at INTEGER NOT NULL,produced_by_operation_journal_id INTEGER,CHECK ((actor_id IS NULL) = (produced_by_operation_journal_id IS NOT NULL)),CHECK (kind_id <> %d OR produced_by_operation_journal_id IS NOT NULL)) STRICT`, int(journal.JournalKindTaskEvent)),
+		`CREATE TABLE journal_legacy (journal_id INTEGER PRIMARY KEY AUTOINCREMENT,kind_id INTEGER NOT NULL REFERENCES journal_kinds(id),actor_id TEXT REFERENCES agents(id),recorded_at INTEGER NOT NULL,produced_by_operation_journal_id INTEGER,CHECK ((actor_id IS NULL) = (produced_by_operation_journal_id IS NOT NULL)),CHECK (kind_id <> 1 OR produced_by_operation_journal_id IS NOT NULL)) STRICT`,
 		`INSERT INTO journal_legacy SELECT * FROM journal`, `DROP TABLE journal`, `ALTER TABLE journal_legacy RENAME TO journal`,
-		`CREATE INDEX idx_journal_kind ON journal(kind_id)`, `CREATE INDEX idx_journal_actor ON journal(actor_id)`, `CREATE INDEX idx_journal_pboj ON journal(produced_by_operation_journal_id)`, `CREATE INDEX idx_journal_recorded_at ON journal(recorded_at,journal_id)`, journalAttributedViewDDL,
+		`CREATE INDEX idx_journal_kind ON journal(kind_id)`, `CREATE INDEX idx_journal_actor ON journal(actor_id)`, `CREATE INDEX idx_journal_pboj ON journal(produced_by_operation_journal_id)`, `CREATE INDEX idx_journal_recorded_at ON journal(recorded_at,journal_id)`, `CREATE VIEW IF NOT EXISTS journal_attributed AS SELECT j.journal_id AS journal_id,j.kind_id AS kind_id,COALESCE(j.actor_id,anchor.actor_id) AS effective_actor_id,j.recorded_at AS recorded_at,j.produced_by_operation_journal_id AS produced_by_operation_journal_id FROM journal j LEFT JOIN journal anchor ON anchor.journal_id=j.produced_by_operation_journal_id`,
 	}
 	for _, step := range steps {
 		if err = sqlitex.ExecuteTransient(db.conn, step, nil); err != nil {
@@ -76,13 +76,13 @@ func (db *DB) AdversarialJournalRowTwoSubtypes(actor journal.ActorID) (journal.J
 		return 0, txErr
 	}
 	if txErr = sqlitex.Execute(db.conn,
-		`INSERT INTO journal_decisions (journal_id, decision_kind, task_id, payload) VALUES (?1, 'pasture.review.vote', NULL, '{}')`,
-		&sqlitex.ExecOptions{Args: []any{jid}}); txErr != nil {
+		`INSERT INTO journal_decisions (journal_id, decision_kind, task_id, payload) VALUES (?1, ?2, NULL, ?3)`,
+		&sqlitex.ExecOptions{Args: []any{jid, "pasture.review.vote", "{}"}}); txErr != nil {
 		return 0, txErr
 	}
 	if txErr = sqlitex.Execute(db.conn,
-		`INSERT INTO journal_evidence (journal_id, evidence_kind, task_id, content_digest, payload) VALUES (?1, 'pasture.git.commit', NULL, ?2, '{}')`,
-		&sqlitex.ExecOptions{Args: []any{jid, []byte("x")}}); txErr != nil {
+		`INSERT INTO journal_evidence (journal_id, evidence_kind, task_id, content_digest, payload) VALUES (?1, ?2, NULL, ?3, ?4)`,
+		&sqlitex.ExecOptions{Args: []any{jid, "pasture.git.commit", []byte("x"), "{}"}}); txErr != nil {
 		return 0, txErr
 	}
 	return journal.JournalID(jid), nil
@@ -129,14 +129,14 @@ func (db *DB) AdversarialSubordinateRowCarryingActor(actor journal.ActorID, task
 	// Subordinate task_event row carrying an actor it must not: PBOJID set AND
 	// actor_id set. insertJournalRowLocked would write NULL, so insert directly.
 	if txErr = sqlitex.Execute(db.conn,
-		`INSERT INTO journal (kind_id, actor_id, recorded_at, produced_by_operation_journal_id) VALUES (?1, ?2, 0, ?3)`,
-		&sqlitex.ExecOptions{Args: []any{int(journal.JournalKindTaskEvent), actor.String(), anchorJID}}); txErr != nil {
+		`INSERT INTO journal (kind_id, actor_id, recorded_at, produced_by_operation_journal_id) VALUES (?1, ?2, ?3, ?4)`,
+		&sqlitex.ExecOptions{Args: []any{int(journal.JournalKindTaskEvent), actor.String(), int64(0), anchorJID}}); txErr != nil {
 		return 0, txErr
 	}
 	subordinateJID := db.conn.LastInsertRowID()
 	if txErr = sqlitex.Execute(db.conn,
-		`INSERT INTO journal_task_events (journal_id, task_id, event_kind, payload) VALUES (?1, ?2, 'provenance.task.updated', '{}')`,
-		&sqlitex.ExecOptions{Args: []any{subordinateJID, task.String()}}); txErr != nil {
+		`INSERT INTO journal_task_events (journal_id, task_id, event_kind, payload) VALUES (?1, ?2, ?3, ?4)`,
+		&sqlitex.ExecOptions{Args: []any{subordinateJID, task.String(), string(journal.EventKindTaskUpdated), "{}"}}); txErr != nil {
 		return 0, txErr
 	}
 	return journal.JournalID(subordinateJID), nil
@@ -157,8 +157,8 @@ func (db *DB) AdversarialSubtypeMismatchingKind(actor journal.ActorID) (journal.
 		return 0, txErr
 	}
 	if txErr = sqlitex.Execute(db.conn,
-		`INSERT INTO journal_decisions (journal_id, decision_kind, task_id, payload) VALUES (?1, 'pasture.review.vote', NULL, '{}')`,
-		&sqlitex.ExecOptions{Args: []any{jid}}); txErr != nil {
+		`INSERT INTO journal_decisions (journal_id, decision_kind, task_id, payload) VALUES (?1, ?2, NULL, ?3)`,
+		&sqlitex.ExecOptions{Args: []any{jid, "pasture.review.vote", "{}"}}); txErr != nil {
 		return 0, txErr
 	}
 	if txErr = sqlitex.Execute(db.conn,
@@ -191,8 +191,8 @@ func (db *DB) AdversarialAuthorityDetailMismatch(actor journal.ActorID, task jou
 		return 0, txErr
 	}
 	if txErr = sqlitex.Execute(db.conn,
-		`INSERT INTO journal_authority_bootstraps (journal_id, label) VALUES (?1, 'adversarial')`,
-		&sqlitex.ExecOptions{Args: []any{jid}}); txErr != nil {
+		`INSERT INTO journal_authority_bootstraps (journal_id, label) VALUES (?1, ?2)`,
+		&sqlitex.ExecOptions{Args: []any{jid, "adversarial"}}); txErr != nil {
 		return 0, txErr
 	}
 	assignment := fmt.Sprintf("adversarial-episode-%d", jid)
@@ -262,14 +262,24 @@ func (db *DB) AdversarialMigrateWithFault(in journal.MigrationInput, faultAfterT
 // AdversarialAddColumn adds an unreviewed extra column to a journal table,
 // corrupting the external schema shape so the corpus can drive the fail-closed
 // preflight (§13). Column names come from the closed corpus, never caller input.
-func (db *DB) AdversarialAddColumn(table, column string) error {
+type AdversarialColumnAddition uint8
+
+const AdversarialAddUnreviewedTaskEventColumn AdversarialColumnAddition = 1
+
+func (addition AdversarialColumnAddition) statement() sqlStatement {
+	if addition != AdversarialAddUnreviewedTaskEventColumn {
+		panic("unknown adversarial column addition")
+	}
+	return sqlStatement{text: `ALTER TABLE journal_task_events ADD COLUMN unreviewed TEXT`}
+}
+
+func (db *DB) AdversarialAddColumn(addition AdversarialColumnAddition) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	// DDL identifiers cannot be bound as parameters; table/column come from the
 	// closed corpus, never caller input, so identifier interpolation is safe here.
-	stmt := fmt.Sprintf(`ALTER TABLE %q ADD COLUMN %q TEXT`, table, column)
-	if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
-		return fmt.Errorf("AdversarialAddColumn %q.%q: %w", table, column, err)
+	if err := executeTransientStatement(db.conn, addition.statement(), nil); err != nil {
+		return fmt.Errorf("AdversarialAddColumn: %w", err)
 	}
 	return nil
 }
@@ -277,13 +287,23 @@ func (db *DB) AdversarialAddColumn(table, column string) error {
 // AdversarialDropColumn removes an expected column from a journal table, the
 // symmetric corruption to AdversarialAddColumn, so the corpus can drive the
 // missing-expected-column preflight failure (§13).
-func (db *DB) AdversarialDropColumn(table, column string) error {
+type AdversarialColumnDrop uint8
+
+const AdversarialDropTaskEventPayload AdversarialColumnDrop = 1
+
+func (drop AdversarialColumnDrop) statement() sqlStatement {
+	if drop != AdversarialDropTaskEventPayload {
+		panic("unknown adversarial column drop")
+	}
+	return sqlStatement{text: `ALTER TABLE journal_task_events DROP COLUMN payload`}
+}
+
+func (db *DB) AdversarialDropColumn(drop AdversarialColumnDrop) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	// DDL identifiers cannot be bound; table/column come from the closed corpus.
-	stmt := fmt.Sprintf(`ALTER TABLE %q DROP COLUMN %q`, table, column)
-	if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
-		return fmt.Errorf("AdversarialDropColumn %q.%q: %w", table, column, err)
+	if err := executeTransientStatement(db.conn, drop.statement(), nil); err != nil {
+		return fmt.Errorf("AdversarialDropColumn: %w", err)
 	}
 	return nil
 }
@@ -293,17 +313,27 @@ func (db *DB) AdversarialDropColumn(table, column string) error {
 // failure (§13). Foreign-key enforcement is toggled off around the drop so a table
 // referenced by empty child tables can be removed; the database is left in the
 // deliberately corrupt state the corpus then opens against.
-func (db *DB) AdversarialDropTable(table string) error {
+type AdversarialTableDrop uint8
+
+const AdversarialDropJournalTable AdversarialTableDrop = 1
+
+func (drop AdversarialTableDrop) statement() sqlStatement {
+	if drop != AdversarialDropJournalTable {
+		panic("unknown adversarial table drop")
+	}
+	return sqlStatement{text: `DROP TABLE journal`}
+}
+
+func (db *DB) AdversarialDropTable(drop AdversarialTableDrop) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if err := sqlitex.ExecuteTransient(db.conn, `PRAGMA foreign_keys=OFF`, nil); err != nil {
-		return fmt.Errorf("AdversarialDropTable %q: disable FK: %w", table, err)
+		return fmt.Errorf("AdversarialDropTable: disable FK: %w", err)
 	}
 	defer func() { _ = sqlitex.ExecuteTransient(db.conn, `PRAGMA foreign_keys=ON`, nil) }()
 	// DDL identifier cannot be bound; table comes from the closed corpus.
-	stmt := fmt.Sprintf(`DROP TABLE %q`, table)
-	if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
-		return fmt.Errorf("AdversarialDropTable %q: %w", table, err)
+	if err := executeTransientStatement(db.conn, drop.statement(), nil); err != nil {
+		return fmt.Errorf("AdversarialDropTable: %w", err)
 	}
 	return nil
 }
@@ -354,14 +384,24 @@ func (db *DB) AdversarialMigrateFabricatedEndedTimestamp(in journal.MigrationInp
 // version's table left after a downgrade), corrupting the external schema shape so
 // the corpus can drive the fail-closed extra-table preflight (§13). The table name
 // comes from the closed corpus, never caller input.
-func (db *DB) AdversarialAddTable(table string) error {
+type AdversarialTableAddition uint8
+
+const AdversarialAddUnreviewedJournalTable AdversarialTableAddition = 1
+
+func (addition AdversarialTableAddition) statement() sqlStatement {
+	if addition != AdversarialAddUnreviewedJournalTable {
+		panic("unknown adversarial table addition")
+	}
+	return sqlStatement{text: `CREATE TABLE journal_unreviewed (journal_id INTEGER PRIMARY KEY) STRICT`}
+}
+
+func (db *DB) AdversarialAddTable(addition AdversarialTableAddition) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	// DDL identifier cannot be bound as a parameter; table comes from the closed
 	// corpus, never caller input, so identifier interpolation is safe here.
-	stmt := fmt.Sprintf(`CREATE TABLE %q (journal_id INTEGER PRIMARY KEY) STRICT`, table)
-	if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
-		return fmt.Errorf("AdversarialAddTable %q: %w", table, err)
+	if err := executeTransientStatement(db.conn, addition.statement(), nil); err != nil {
+		return fmt.Errorf("AdversarialAddTable: %w", err)
 	}
 	return nil
 }
@@ -369,12 +409,12 @@ func (db *DB) AdversarialAddTable(table string) error {
 // AdversarialProjectionField names the projection column an out-of-band corruption
 // seam writes past the reducer, so the corpus stays a closed set rather than
 // accepting arbitrary column names.
-type AdversarialProjectionField string
+type AdversarialProjectionField uint8
 
 const (
-	AdversarialFieldOwner     AdversarialProjectionField = "owner_id"
-	AdversarialFieldStatus    AdversarialProjectionField = "status_id"
-	AdversarialFieldWatermark AdversarialProjectionField = "last_journal_id"
+	AdversarialFieldOwner AdversarialProjectionField = iota + 1
+	AdversarialFieldStatus
+	AdversarialFieldWatermark
 )
 
 // AdversarialCorruptTaskProjection writes directly to a task's stored projection
@@ -393,13 +433,24 @@ func (db *DB) AdversarialCorruptTaskProjection(task journal.TaskID, field Advers
 	default:
 		return fmt.Errorf("AdversarialCorruptTaskProjection: unknown projection field %q (closed set: owner_id/status_id/last_journal_id)", field)
 	}
-	// The column name is one of the closed constants above, never caller input.
-	stmt := fmt.Sprintf(`UPDATE tasks SET %s = ?1 WHERE id = ?2`, string(field))
-	if err := sqlitex.Execute(db.conn, stmt,
+	if err := executeStatement(db.conn, field.statement(),
 		&sqlitex.ExecOptions{Args: []any{value, task.String()}}); err != nil {
-		return fmt.Errorf("AdversarialCorruptTaskProjection %q.%s: %w", task, field, err)
+		return fmt.Errorf("AdversarialCorruptTaskProjection %q field %d: %w", task, field, err)
 	}
 	return nil
+}
+
+func (field AdversarialProjectionField) statement() sqlStatement {
+	switch field {
+	case AdversarialFieldOwner:
+		return sqlStatement{text: `UPDATE tasks SET owner_id=?1 WHERE id=?2`}
+	case AdversarialFieldStatus:
+		return sqlStatement{text: `UPDATE tasks SET status_id=?1 WHERE id=?2`}
+	case AdversarialFieldWatermark:
+		return sqlStatement{text: `UPDATE tasks SET last_journal_id=?1 WHERE id=?2`}
+	default:
+		panic("unknown adversarial projection field")
+	}
 }
 
 // AdversarialCorruptCommentBody rewrites a committed comment's body directly in the
@@ -491,8 +542,8 @@ func (db *DB) AdversarialCyclicParentChain(actor journal.ActorID, taskX, taskY, 
 		return 0, journal.TaskID{}, 0, txErr
 	}
 	var maxJID int64
-	if txErr = sqlitex.Execute(db.conn, `SELECT COALESCE(MAX(journal_id), 0) FROM journal`,
-		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { maxJID = stmt.ColumnInt64(0); return nil }}); txErr != nil {
+	if txErr = sqlitex.Execute(db.conn, `SELECT COALESCE(MAX(journal_id), ?1) FROM journal`,
+		&sqlitex.ExecOptions{Args: []any{0}, ResultFunc: func(stmt *zs.Stmt) error { maxJID = stmt.ColumnInt64(0); return nil }}); txErr != nil {
 		return 0, journal.TaskID{}, 0, txErr
 	}
 	return journal.JournalID(jz), taskX, journal.JournalID(maxJID + 1), nil

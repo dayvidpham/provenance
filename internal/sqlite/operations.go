@@ -180,24 +180,49 @@ func (db *DB) ensureOperationsSchema() error {
 // Existing operations remain explicit legacy opaque records (both columns NULL);
 // every operation committed after this migration stores both columns.
 func (db *DB) ensureCanonicalMutationColumns() error {
-	for _, column := range []struct{ name, ddl string }{
-		{"mutation_encoding_version", `ALTER TABLE journal_operations ADD COLUMN mutation_encoding_version TEXT`},
-		{"canonical_mutation", `ALTER TABLE journal_operations ADD COLUMN canonical_mutation BLOB`},
+	for _, column := range []canonicalOperationColumn{
+		canonicalOperationVersionColumn, canonicalOperationBytesColumn,
 	} {
 		present := false
 		if err := sqlitex.ExecuteTransient(db.conn, `PRAGMA table_info(journal_operations)`, &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
-			present = present || stmt.ColumnText(1) == column.name
+			present = present || stmt.ColumnText(1) == column.name()
 			return nil
 		}}); err != nil {
-			return fmt.Errorf("ensure canonical mutation schema: inspect %s: %w", column.name, err)
+			return fmt.Errorf("ensure canonical mutation schema: inspect %s: %w", column.name(), err)
 		}
 		if !present {
-			if err := sqlitex.ExecuteTransient(db.conn, column.ddl, nil); err != nil {
-				return fmt.Errorf("ensure canonical mutation schema: add %s: %w", column.name, err)
+			if err := executeTransientStatement(db.conn, column.addStatement(), nil); err != nil {
+				return fmt.Errorf("ensure canonical mutation schema: add %s: %w", column.name(), err)
 			}
 		}
 	}
 	return nil
+}
+
+type canonicalOperationColumn uint8
+
+const (
+	canonicalOperationVersionColumn canonicalOperationColumn = iota + 1
+	canonicalOperationBytesColumn
+)
+
+func (column canonicalOperationColumn) name() string {
+	if column == canonicalOperationVersionColumn {
+		return "mutation_encoding_version"
+	}
+	if column == canonicalOperationBytesColumn {
+		return "canonical_mutation"
+	}
+	panic("unknown canonical operation column")
+}
+func (column canonicalOperationColumn) addStatement() sqlStatement {
+	if column == canonicalOperationVersionColumn {
+		return sqlStatement{text: `ALTER TABLE journal_operations ADD COLUMN mutation_encoding_version TEXT`}
+	}
+	if column == canonicalOperationBytesColumn {
+		return sqlStatement{text: `ALTER TABLE journal_operations ADD COLUMN canonical_mutation BLOB`}
+	}
+	panic("unknown canonical operation column")
 }
 
 func (db *DB) ensureGenericCanonicalConstraints() error {
@@ -208,13 +233,13 @@ func (db *DB) ensureGenericCanonicalConstraints() error {
 	needsTriggers := false
 	if strings.Contains(tableSQL, journal.MutationEncodingV1.String()) {
 		needsTriggers = true
-		steps := []string{
-			`DROP TRIGGER IF EXISTS journal_operations_canonical_insert`, `DROP TRIGGER IF EXISTS journal_operations_canonical_update`,
-			`CREATE TABLE journal_operations_generic (journal_id INTEGER PRIMARY KEY REFERENCES journal(journal_id),operation_id TEXT NOT NULL UNIQUE,authority_journal_id INTEGER REFERENCES journal_authorities(journal_id),command_digest BLOB NOT NULL,mutation_digest BLOB NOT NULL,mutation_encoding_version TEXT,canonical_mutation BLOB,CHECK ((mutation_encoding_version IS NULL AND canonical_mutation IS NULL) OR (length(mutation_encoding_version)>0 AND length(canonical_mutation)>0))) STRICT`,
-			`INSERT INTO journal_operations_generic SELECT * FROM journal_operations`, `DROP TABLE journal_operations`, `ALTER TABLE journal_operations_generic RENAME TO journal_operations`,
+		steps := []sqlStatement{
+			{text: `DROP TRIGGER IF EXISTS journal_operations_canonical_insert`}, {text: `DROP TRIGGER IF EXISTS journal_operations_canonical_update`},
+			{text: `CREATE TABLE journal_operations_generic (journal_id INTEGER PRIMARY KEY REFERENCES journal(journal_id),operation_id TEXT NOT NULL UNIQUE,authority_journal_id INTEGER REFERENCES journal_authorities(journal_id),command_digest BLOB NOT NULL,mutation_digest BLOB NOT NULL,mutation_encoding_version TEXT,canonical_mutation BLOB,CHECK ((mutation_encoding_version IS NULL AND canonical_mutation IS NULL) OR (length(mutation_encoding_version)>0 AND length(canonical_mutation)>0))) STRICT`},
+			{text: `INSERT INTO journal_operations_generic SELECT * FROM journal_operations`}, {text: `DROP TABLE journal_operations`}, {text: `ALTER TABLE journal_operations_generic RENAME TO journal_operations`},
 		}
 		for _, step := range steps {
-			if err := sqlitex.ExecuteTransient(db.conn, step, nil); err != nil {
+			if err := executeTransientStatement(db.conn, step, nil); err != nil {
 				return fmt.Errorf("replace V1-specific journal_operations constraint: %w", err)
 			}
 		}
@@ -264,7 +289,7 @@ func (db *DB) preflightCanonicalColumnsReadOnly() error {
 		return nil
 	}
 	malformed, versionState, bytesState := "", "", ""
-	if err := sqlitex.Execute(db.conn, `SELECT operation_id,mutation_encoding_version,canonical_mutation FROM journal_operations WHERE (mutation_encoding_version IS NULL) != (canonical_mutation IS NULL) OR (mutation_encoding_version IS NOT NULL AND (length(mutation_encoding_version)=0 OR length(canonical_mutation)=0)) LIMIT 1`, &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
+	if err := sqlitex.Execute(db.conn, `SELECT operation_id,mutation_encoding_version,canonical_mutation FROM journal_operations WHERE (mutation_encoding_version IS NULL) != (canonical_mutation IS NULL) OR (mutation_encoding_version IS NOT NULL AND (NOT length(mutation_encoding_version) OR NOT length(canonical_mutation))) LIMIT 1`, &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 		malformed = stmt.ColumnText(0)
 		versionState = canonicalColumnState(stmt, 1)
 		bytesState = canonicalColumnState(stmt, 2)
@@ -361,15 +386,15 @@ func (db *DB) completeJournalOperationFK() error {
 		// thing this rejects is a bare NULL-producer append (the retired AppendTaskEvent
 		// path). The journal-base layer keeps NULL-producer task_events (no FK, no this
 		// CHECK); the constraint is introduced only here in the operations-layer rebuild.
-		fmt.Sprintf(`CREATE TABLE journal_new (
+		`CREATE TABLE journal_new (
 			journal_id   INTEGER PRIMARY KEY AUTOINCREMENT,
 			kind_id     INTEGER NOT NULL REFERENCES journal_kinds(id),
 			actor_id    TEXT REFERENCES agents(id),
 			recorded_at INTEGER NOT NULL,
 			produced_by_operation_journal_id INTEGER REFERENCES journal_operations(journal_id),
 			CHECK ((actor_id IS NULL) = (produced_by_operation_journal_id IS NOT NULL)),
-			CHECK (kind_id <> %d OR produced_by_operation_journal_id IS NOT NULL)
-		) STRICT`, int(journal.JournalKindTaskEvent)),
+			CHECK (kind_id <> 1 OR produced_by_operation_journal_id IS NOT NULL)
+		) STRICT`,
 		`INSERT INTO journal_new (journal_id, kind_id, actor_id, recorded_at, produced_by_operation_journal_id)
 			SELECT journal_id, kind_id, actor_id, recorded_at, produced_by_operation_journal_id FROM journal`,
 		`DROP TABLE journal`,
@@ -381,7 +406,7 @@ func (db *DB) completeJournalOperationFK() error {
 		// journal table, it must be rebuilt so the display order keeps its index.
 		`CREATE INDEX IF NOT EXISTS idx_journal_recorded_at ON journal (recorded_at, journal_id)`,
 		// Recreate the §8.5 attribution view now that journal exists again.
-		journalAttributedViewDDL,
+		`CREATE VIEW IF NOT EXISTS journal_attributed AS SELECT j.journal_id AS journal_id,j.kind_id AS kind_id,COALESCE(j.actor_id,anchor.actor_id) AS effective_actor_id,j.recorded_at AS recorded_at,j.produced_by_operation_journal_id AS produced_by_operation_journal_id FROM journal j LEFT JOIN journal anchor ON anchor.journal_id=j.produced_by_operation_journal_id`,
 	}
 	for _, stmt := range rebuild {
 		if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
@@ -748,11 +773,11 @@ func (db *DB) foldTaskCreateLocked(in journal.OperationInput, jid int64, eff jou
 		`INSERT INTO tasks
 			(id, namespace, title, description, status_id, priority_id, type_id,
 			 phase_id, owner_id, notes, created_at, updated_at, closed_at, close_reason, last_journal_id)
-		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, '', ?9, ?10, NULL, '', ?11)`,
+		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, ?11, NULL, ?9, ?12)`,
 		&sqlitex.ExecOptions{Args: []any{
 			eff.TaskID.String(), eff.TaskID.Namespace, eff.Title, eff.Description,
 			statusOpenID, int(eff.Priority), int(eff.Type), int(eff.Phase),
-			recordedAt, recordedAt, jid,
+			"", recordedAt, recordedAt, jid,
 		}}); err != nil {
 		return fmt.Errorf("Apply: insert task row for %q: %w", eff.TaskID, err)
 	}

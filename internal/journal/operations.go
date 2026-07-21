@@ -153,25 +153,9 @@ const (
 	EffectTaskCreateAllocated
 )
 
-var effectSortStrings = [...]string{
-	EffectTaskEvent:           "task_event",
-	EffectBootstrapAuthority:  "bootstrap_authority",
-	EffectAssignmentStart:     "assignment_start",
-	EffectAssignmentEnd:       "assignment_end",
-	EffectDecision:            "decision",
-	EffectEvidence:            "evidence",
-	EffectTaskCreate:          "task_create",
-	EffectEdgeAdd:             "edge_add",
-	EffectEdgeRemove:          "edge_remove",
-	EffectLabelAdd:            "label_add",
-	EffectLabelRemove:         "label_remove",
-	EffectCommentAdd:          "comment_add",
-	EffectTaskCreateAllocated: "task_create_allocated",
-}
-
 func (s EffectSort) String() string {
-	if int(s) >= 0 && int(s) < len(effectSortStrings) {
-		return effectSortStrings[s]
+	if tag, ok := mutationV1Codec.familyTag(s); ok {
+		return tag
 	}
 	return fmt.Sprintf("EffectSort(%d)", int(s))
 }

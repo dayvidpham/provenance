@@ -147,17 +147,14 @@ func (db *DB) GetActivities(agentID *ptypes.AgentID) ([]ptypes.Activity, error) 
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	query := `SELECT id, agent_id, phase_id, stage_id, started_at, ended_at, notes FROM activities`
-	var args []any
+	var agent any
 	if agentID != nil {
-		query += ` WHERE agent_id = ?1`
-		args = append(args, agentID.String())
+		agent = agentID.String()
 	}
-	query += ` ORDER BY started_at ASC`
 
 	var activities []ptypes.Activity
-	err := sqlitex.Execute(db.conn, query, &sqlitex.ExecOptions{
-		Args: args,
+	err := sqlitex.Execute(db.conn, `SELECT id,agent_id,phase_id,stage_id,started_at,ended_at,notes FROM activities WHERE (NOT ?1 OR agent_id=?2) ORDER BY started_at ASC`, &sqlitex.ExecOptions{
+		Args: []any{agentID != nil, agent},
 		ResultFunc: func(stmt *zs.Stmt) error {
 			act, err := ScanActivity(stmt)
 			if err != nil {

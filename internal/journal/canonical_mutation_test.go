@@ -518,3 +518,105 @@ func TestCanonicalWireHasNoUnconsumedFieldNames(t *testing.T) {
 		}
 	}
 }
+
+func TestCanonicalCodecRegistryIsExactUniqueAndComplete(t *testing.T) {
+	if len(canonicalCodecRegistry) != 1 {
+		t.Fatalf("codec registry cardinality=%d, want 1", len(canonicalCodecRegistry))
+	}
+	versions, tags := map[MutationEncodingVersion]bool{}, map[string]bool{}
+	for _, descriptor := range canonicalCodecRegistry {
+		if descriptor.version == 0 || descriptor.wireTag == "" || descriptor.decoder == nil {
+			t.Fatalf("incomplete codec descriptor: %+v", descriptor)
+		}
+		if versions[descriptor.version] || tags[descriptor.wireTag] {
+			t.Fatalf("duplicate codec descriptor: %+v", descriptor)
+		}
+		versions[descriptor.version], tags[descriptor.wireTag] = true, true
+		resolved, ok := inspectMutationEncodingTag(descriptor.wireTag).version()
+		if !ok || resolved != descriptor.version || !IsSupportedMutationEncoding(resolved) {
+			t.Fatalf("codec descriptor does not round trip: %+v", descriptor)
+		}
+	}
+}
+
+func TestCanonicalV1FamilyRegistryIsExactUniqueCompleteAndRoundTrips(t *testing.T) {
+	wantCount := int(EffectTaskCreateAllocated) + 1
+	if len(canonicalV1Families) != wantCount {
+		t.Fatalf("V1 family cardinality=%d, want %d", len(canonicalV1Families), wantCount)
+	}
+	sorts, tags := map[EffectSort]bool{}, map[string]bool{}
+	for sort := EffectSort(0); int(sort) < wantCount; sort++ {
+		tag, ok := mutationV1Codec.familyTag(sort)
+		if !ok || tag == "" || sorts[sort] || tags[tag] {
+			t.Fatalf("invalid V1 family mapping sort=%d tag=%q ok=%v", sort, tag, ok)
+		}
+		sorts[sort], tags[tag] = true, true
+		decoded, err := mutationV1Codec.parseFamilyTag(tag)
+		if err != nil || decoded != sort {
+			t.Fatalf("V1 family round trip sort=%d tag=%q decoded=%d err=%v", sort, tag, decoded, err)
+		}
+	}
+}
+
+func TestCanonicalV1FieldRegistriesAreExactUniqueCompleteAndBounded(t *testing.T) {
+	assertUnique := func(scope string, refs []canonicalV1FieldRef, want int) {
+		t.Helper()
+		if len(refs) != want {
+			t.Fatalf("%s field cardinality=%d want=%d", scope, len(refs), want)
+		}
+		names := map[string]bool{}
+		for _, ref := range refs {
+			name, err := mutationV1Codec.renderFieldName(ref)
+			if err != nil || name == "" || names[name] {
+				t.Fatalf("%s invalid field name=%q err=%v", scope, name, err)
+			}
+			names[name] = true
+		}
+	}
+	var envelopeRefs []canonicalV1FieldRef
+	for field := envelopeVersion; field <= envelopeEffectCount; field++ {
+		envelopeRefs = append(envelopeRefs, envelopeField(field))
+	}
+	assertUnique("envelope", envelopeRefs, 2)
+	var effectRefs []canonicalV1FieldRef
+	for field := effectFamily; field <= effectCommentBody; field++ {
+		effectRefs = append(effectRefs, effectField(0, field))
+	}
+	assertUnique("effect", effectRefs, int(effectCommentBody))
+	var contextRefs []canonicalV1FieldRef
+	for field := contextKind; field <= contextIdentity; field++ {
+		contextRefs = append(contextRefs, contextField(0, 0, field))
+	}
+	assertUnique("context", contextRefs, 2)
+	invalid := []canonicalV1FieldRef{
+		envelopeField(canonicalEnvelopeField(99)), effectField(-1, effectTask), effectField(MaxCanonicalEffects, effectTask),
+		effectField(0, canonicalEffectField(99)), contextField(-1, 0, contextKind), contextField(0, -1, contextKind),
+		contextField(0, MaxCanonicalContextsPerEffect, contextKind), contextField(0, 0, canonicalContextField(99)),
+	}
+	for _, ref := range invalid {
+		if name, err := mutationV1Codec.renderFieldName(ref); err == nil || name != "" {
+			t.Fatalf("invalid V1 reference rendered name=%q err=%v", name, err)
+		}
+	}
+}
+
+func TestCanonicalV2DescriptorExtensionCannotChangeV1(t *testing.T) {
+	before, err := PrepareMutationV1([]Effect{{Sort: EffectBootstrapAuthority, BootstrapLabel: "root"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	extended := append([]canonicalCodecDescriptor(nil), canonicalCodecRegistry[:]...)
+	extended = append(extended, canonicalCodecDescriptor{version: MutationEncodingVersion(2), wireTag: "fixture.mutation.v2", decoder: func([]byte, MutationEncodingVersion, string) (CanonicalMutation, error) {
+		return CanonicalMutation{}, nil
+	}})
+	if len(extended) != 2 || extended[0].version != MutationEncodingV1 || extended[1].version == MutationEncodingV1 {
+		t.Fatalf("invalid extension registry: %+v", extended)
+	}
+	after, err := PrepareMutationV1([]Effect{{Sort: EffectBootstrapAuthority, BootstrapLabel: "root"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before.CanonicalBytes(), after.CanonicalBytes()) || !bytes.Equal(before.DerivedDigest(), after.DerivedDigest()) {
+		t.Fatal("independent V2 descriptor extension changed V1 output")
+	}
+}

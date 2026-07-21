@@ -311,8 +311,14 @@ func (db *DB) ensureSchema(models []ptypes.ModelEntry) error {
 		// (§13). The column body and shape live in schema_watermark.go so ensureSchema and
 		// every watermark rebuild share one source of truth. FK target journal(journal_id)
 		// is created by ensureJournalSchema (SQLite resolves cross-table FKs at row time).
-		fmt.Sprintf("CREATE TABLE IF NOT EXISTS tasks (\n\t\t\t%s,\n\t\t\t%s\n\t\t) STRICT",
-			tasksTableColumns, tasksWatermarkClause(true)),
+		`CREATE TABLE IF NOT EXISTS tasks (
+			id TEXT PRIMARY KEY, namespace TEXT NOT NULL, title TEXT NOT NULL,
+			description TEXT NOT NULL DEFAULT '', status_id INTEGER NOT NULL DEFAULT 0 REFERENCES statuses(id),
+			priority_id INTEGER NOT NULL DEFAULT 2 REFERENCES priorities(id), type_id INTEGER NOT NULL DEFAULT 2 REFERENCES task_types(id),
+			phase_id INTEGER NOT NULL REFERENCES phases(id), owner_id TEXT REFERENCES agents(id), notes TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, closed_at INTEGER, close_reason TEXT NOT NULL DEFAULT '',
+			last_journal_id INTEGER NOT NULL REFERENCES journal(journal_id)
+		) STRICT`,
 		`CREATE INDEX IF NOT EXISTS idx_tasks_namespace ON tasks (namespace)`,
 		`CREATE INDEX IF NOT EXISTS idx_tasks_status    ON tasks (status_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_tasks_priority  ON tasks (priority_id)`,
@@ -376,20 +382,25 @@ func (db *DB) ensureSchema(models []ptypes.ModelEntry) error {
 // ---------------------------------------------------------------------------
 
 func (db *DB) seedReferenceData(models []ptypes.ModelEntry) error {
-	seeds := []string{
-		`INSERT OR IGNORE INTO statuses (id, name) VALUES (0,'open'),(1,'in_progress'),(2,'closed')`,
-		`INSERT OR IGNORE INTO priorities (id, name) VALUES (0,'critical'),(1,'high'),(2,'medium'),(3,'low'),(4,'backlog')`,
-		`INSERT OR IGNORE INTO task_types (id, name) VALUES (0,'bug'),(1,'feature'),(2,'task'),(3,'epic'),(4,'chore')`,
-		`INSERT OR IGNORE INTO edge_kinds (id, name) VALUES (0,'blocked_by'),(1,'derived_from'),(2,'supersedes'),(3,'discovered_from'),(4,'generated_by'),(5,'attributed_to')`,
-		`INSERT OR IGNORE INTO agent_kinds (id, name) VALUES (0,'human'),(1,'machine_learning'),(2,'software')`,
-		`INSERT OR IGNORE INTO providers (id, name) VALUES (0,'anthropic'),(1,'google'),(2,'openai'),(3,'local')`,
-		`INSERT OR IGNORE INTO roles (id, name) VALUES (0,'human'),(1,'architect'),(2,'supervisor'),(3,'worker'),(4,'reviewer')`,
-		`INSERT OR IGNORE INTO phases (id, name) VALUES (0,'request'),(1,'elicit'),(2,'propose'),(3,'review'),(4,'plan_uat'),(5,'ratify'),(6,'handoff'),(7,'impl_plan'),(8,'worker_slices'),(9,'code_review'),(10,'impl_uat'),(11,'landing'),(12,'unscoped')`,
-		`INSERT OR IGNORE INTO stages (id, name) VALUES (0,'not_started'),(1,'in_progress'),(2,'blocked'),(3,'complete')`,
+	seeds := []struct {
+		kind  referenceSeedKind
+		names []string
+	}{
+		{seedStatuses, []string{"open", "in_progress", "closed"}},
+		{seedPriorities, []string{"critical", "high", "medium", "low", "backlog"}},
+		{seedTaskTypes, []string{"bug", "feature", "task", "epic", "chore"}},
+		{seedEdgeKinds, []string{"blocked_by", "derived_from", "supersedes", "discovered_from", "generated_by", "attributed_to"}},
+		{seedAgentKinds, []string{"human", "machine_learning", "software"}},
+		{seedProviders, []string{"anthropic", "google", "openai", "local"}},
+		{seedRoles, []string{"human", "architect", "supervisor", "worker", "reviewer"}},
+		{seedPhases, []string{"request", "elicit", "propose", "review", "plan_uat", "ratify", "handoff", "impl_plan", "worker_slices", "code_review", "impl_uat", "landing", "unscoped"}},
+		{seedStages, []string{"not_started", "in_progress", "blocked", "complete"}},
 	}
 	for _, seed := range seeds {
-		if err := sqlitex.ExecuteTransient(db.conn, seed, nil); err != nil {
-			return fmt.Errorf("seedReferenceData: %w — seed: %s", err, seed[:min(len(seed), 80)])
+		for id, name := range seed.names {
+			if err := executeStatement(db.conn, seed.kind.statement(), &sqlitex.ExecOptions{Args: []any{id, name}}); err != nil {
+				return fmt.Errorf("seedReferenceData: kind %d id %d: %w", seed.kind, id, err)
+			}
 		}
 	}
 
@@ -398,6 +409,45 @@ func (db *DB) seedReferenceData(models []ptypes.ModelEntry) error {
 		return fmt.Errorf("seedReferenceData: %w", err)
 	}
 	return nil
+}
+
+type referenceSeedKind uint8
+
+const (
+	seedStatuses referenceSeedKind = iota + 1
+	seedPriorities
+	seedTaskTypes
+	seedEdgeKinds
+	seedAgentKinds
+	seedProviders
+	seedRoles
+	seedPhases
+	seedStages
+)
+
+func (kind referenceSeedKind) statement() sqlStatement {
+	switch kind {
+	case seedStatuses:
+		return sqlStatement{text: `INSERT OR IGNORE INTO statuses (id,name) VALUES (?1,?2)`}
+	case seedPriorities:
+		return sqlStatement{text: `INSERT OR IGNORE INTO priorities (id,name) VALUES (?1,?2)`}
+	case seedTaskTypes:
+		return sqlStatement{text: `INSERT OR IGNORE INTO task_types (id,name) VALUES (?1,?2)`}
+	case seedEdgeKinds:
+		return sqlStatement{text: `INSERT OR IGNORE INTO edge_kinds (id,name) VALUES (?1,?2)`}
+	case seedAgentKinds:
+		return sqlStatement{text: `INSERT OR IGNORE INTO agent_kinds (id,name) VALUES (?1,?2)`}
+	case seedProviders:
+		return sqlStatement{text: `INSERT OR IGNORE INTO providers (id,name) VALUES (?1,?2)`}
+	case seedRoles:
+		return sqlStatement{text: `INSERT OR IGNORE INTO roles (id,name) VALUES (?1,?2)`}
+	case seedPhases:
+		return sqlStatement{text: `INSERT OR IGNORE INTO phases (id,name) VALUES (?1,?2)`}
+	case seedStages:
+		return sqlStatement{text: `INSERT OR IGNORE INTO stages (id,name) VALUES (?1,?2)`}
+	default:
+		panic("unknown reference seed kind")
+	}
 }
 
 // seedMLModels inserts model entries into the ml_models table.

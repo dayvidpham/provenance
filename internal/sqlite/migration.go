@@ -305,7 +305,7 @@ func (db *DB) migrateLockedWithFault(in journal.MigrationInput, faultHook func(t
 		return journal.MigrationResult{}, err
 	}
 	if unanchored == 0 {
-		if err := db.rebuildTasksWatermarkLocked(tasksWatermarkClause(true), true /*copyWatermark*/); err != nil {
+		if err := db.rebuildTasksWatermarkLocked(tasksWatermarkNative); err != nil {
 			return journal.MigrationResult{}, fmt.Errorf(
 				"MigrateLegacyBaseline: re-tighten tasks.last_journal_id to NOT NULL — where: post-anchor "+
 					"schema re-tightening (§8.1, §13); when: after every legacy row was anchored and its "+

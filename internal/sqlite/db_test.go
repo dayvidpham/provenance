@@ -859,6 +859,63 @@ func TestListTasksWithLabelFilter(t *testing.T) {
 	}
 }
 
+func TestBoundQueryValuesRemainOpaqueAcrossTaskActivityAndEdgeReads(t *testing.T) {
+	hostileValues := []string{"' OR 1=1 --", "x' /* comment */ OR '1'='1", "nul\x00suffix"}
+	for _, hostile := range hostileValues {
+		t.Run(fmt.Sprintf("%q", hostile), func(t *testing.T) {
+			db := openTestDB(t)
+			matching := makeTask(hostile, "matching")
+			other := makeTask("safe", "other")
+			for _, task := range []ptypes.Task{matching, other} {
+				if err := db.SeedLegacyTaskRow(task); err != nil {
+					t.Fatalf("seed task: %v", err)
+				}
+			}
+			if err := db.AddLabel(matching.ID, hostile); err != nil {
+				t.Fatalf("add hostile label: %v", err)
+			}
+			byNamespace, err := db.ListTasks(ptypes.ListFilter{Namespace: hostile})
+			if err != nil || len(byNamespace) != 1 || byNamespace[0].ID != matching.ID {
+				t.Fatalf("namespace filter escaped binding: tasks=%v err=%v", byNamespace, err)
+			}
+			byLabel, err := db.ListTasks(ptypes.ListFilter{Label: hostile})
+			if err != nil || len(byLabel) != 1 || byLabel[0].ID != matching.ID {
+				t.Fatalf("label filter escaped binding: tasks=%v err=%v", byLabel, err)
+			}
+
+			agent, err := db.RegisterHumanAgent(hostile, "reader", hostile)
+			if err != nil {
+				t.Fatalf("register hostile agent: %v", err)
+			}
+			if _, err := db.StartActivity(agent.ID, ptypes.PhaseRequest, ptypes.StageInProgress, hostile); err != nil {
+				t.Fatalf("start hostile activity: %v", err)
+			}
+			activities, err := db.GetActivities(&agent.ID)
+			if err != nil || len(activities) != 1 || activities[0].AgentID != agent.ID {
+				t.Fatalf("activity filter escaped binding: activities=%v err=%v", activities, err)
+			}
+
+			if err := db.InsertEdge(matching.ID, other.ID.String(), ptypes.EdgeBlockedBy, time.Now().UTC()); err != nil {
+				t.Fatalf("insert hostile edge: %v", err)
+			}
+			kind := ptypes.EdgeBlockedBy
+			edges, err := db.GetEdges(matching.ID, &kind)
+			if err != nil || len(edges) != 1 || edges[0].TargetID != other.ID.String() {
+				t.Fatalf("edge filter escaped binding: edges=%v err=%v", edges, err)
+			}
+
+			ready, err := db.ReadyTasks()
+			if err != nil || len(ready) != 1 || ready[0].ID != other.ID {
+				t.Fatalf("ready query mishandled hostile persisted values: tasks=%v err=%v", ready, err)
+			}
+			blocked, err := db.BlockedTasks()
+			if err != nil || len(blocked) != 1 || blocked[0].ID != matching.ID {
+				t.Fatalf("blocked query mishandled hostile persisted values: tasks=%v err=%v", blocked, err)
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // YAML fixture types
 // ---------------------------------------------------------------------------
