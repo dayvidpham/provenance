@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -248,48 +249,83 @@ func (db *DB) ensureGenericCanonicalConstraints() error {
 func (db *DB) preflightCanonicalColumnsReadOnly() error {
 	columns, err := db.tableColumnsLocked("journal_operations")
 	if err != nil {
-		return err
+		return canonicalStartupPreflightError(fmt.Errorf("%w: %v", journal.ErrProjectionDivergence, err), "journal_operations canonical column shape could not be read", "SQLite rejected the read-only table-info query: "+err.Error(), "repair the journal_operations schema from a known-good backup, then retry Open")
 	}
 	_, hasVersion := columns["mutation_encoding_version"]
 	_, hasBytes := columns["canonical_mutation"]
 	if hasVersion != hasBytes {
-		return fmt.Errorf("journal_operations has only one canonical encoding column; restore both columns or neither for a genuine legacy schema")
+		found := "canonical_mutation only"
+		if hasVersion {
+			found = "mutation_encoding_version only"
+		}
+		return canonicalStartupPreflightError(journal.ErrProjectionDivergence, "journal_operations has a one-column canonical shape: "+found, "canonical version and bytes are an atomic pair, but exactly one column exists", "restore both mutation_encoding_version and canonical_mutation columns together, or remove both only for a genuine legacy schema")
 	}
 	if !hasVersion {
 		return nil
 	}
-	malformed := ""
-	if err := sqlitex.Execute(db.conn, `SELECT operation_id FROM journal_operations WHERE (mutation_encoding_version IS NULL) != (canonical_mutation IS NULL) OR (mutation_encoding_version IS NOT NULL AND (length(mutation_encoding_version)=0 OR length(canonical_mutation)=0)) LIMIT 1`, &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { malformed = stmt.ColumnText(0); return nil }}); err != nil {
-		return err
+	malformed, versionState, bytesState := "", "", ""
+	if err := sqlitex.Execute(db.conn, `SELECT operation_id,mutation_encoding_version,canonical_mutation FROM journal_operations WHERE (mutation_encoding_version IS NULL) != (canonical_mutation IS NULL) OR (mutation_encoding_version IS NOT NULL AND (length(mutation_encoding_version)=0 OR length(canonical_mutation)=0)) LIMIT 1`, &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
+		malformed = stmt.ColumnText(0)
+		versionState = canonicalColumnState(stmt, 1)
+		bytesState = canonicalColumnState(stmt, 2)
+		return nil
+	}}); err != nil {
+		return canonicalStartupPreflightError(fmt.Errorf("%w: %v", journal.ErrProjectionDivergence, err), "canonical version/bytes pairing could not be inspected", "SQLite rejected the read-only canonical-pair query: "+err.Error(), "repair the journal_operations canonical columns from a known-good backup, then retry Open")
 	}
 	if malformed != "" {
-		return fmt.Errorf("operation %q has malformed canonical version/bytes NULL pairing or unsupported version; startup stopped before schema writes", malformed)
+		return canonicalStartupPreflightError(journal.ErrProjectionDivergence, fmt.Sprintf("operation %q has malformed canonical pairing (version=%s, bytes=%s)", malformed, versionState, bytesState), "version and bytes must either both be NULL for a legacy row or both be nonempty for a canonical row", "restore both canonical columns from the same committed operation, or set both NULL only if the row is genuinely legacy")
 	}
 	oversized := ""
 	if err := sqlitex.Execute(db.conn, `SELECT operation_id FROM journal_operations WHERE canonical_mutation IS NOT NULL AND length(canonical_mutation)>?1 LIMIT 1`, &sqlitex.ExecOptions{Args: []any{journal.MaxCanonicalMutationBytes}, ResultFunc: func(stmt *zs.Stmt) error {
 		oversized = stmt.ColumnText(0)
 		return nil
 	}}); err != nil {
-		return err
+		return canonicalStartupPreflightError(fmt.Errorf("%w: %v", journal.ErrCanonicalMutation, err), "canonical mutation size could not be inspected", "SQLite rejected the read-only canonical-size query: "+err.Error(), "repair journal_operations from a known-good backup, then retry Open")
 	}
 	if oversized != "" {
-		return fmt.Errorf("operation %q canonical mutation exceeds %d bytes; startup stopped before allocating or writing schema", oversized, journal.MaxCanonicalMutationBytes)
+		cause := &journal.CanonicalMutationError{Field: "mutation", Reason: fmt.Sprintf("operation %q exceeds maximum %d bytes", oversized, journal.MaxCanonicalMutationBytes), Fix: "restore bounded canonical bytes"}
+		return canonicalStartupPreflightError(cause, fmt.Sprintf("operation %q has an oversized canonical mutation", oversized), "the stored wire exceeds the allocation-safe canonical mutation limit", "restore canonical bytes and their digest from a bounded known-good committed backup")
 	}
 	if err := sqlitex.Execute(db.conn, `SELECT operation_id,mutation_encoding_version,canonical_mutation FROM journal_operations WHERE canonical_mutation IS NOT NULL`, &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 		opID := stmt.ColumnText(0)
 		version := stmt.ColumnText(1)
-		decoded, err := journal.DecodeCanonicalMutation(readBlob(stmt, 2))
+		wire := readBlob(stmt, 2)
+		wireVersion, err := journal.InspectCanonicalMutationEncodingVersion(wire)
 		if err != nil {
-			return fmt.Errorf("operation %q canonical mutation is malformed; startup stopped before schema writes: %w", opID, err)
+			return canonicalStartupPreflightError(err, fmt.Sprintf("operation %q has a malformed canonical wire-version frame", opID), "the canonical bytes do not begin with one valid framed version field", "restore canonical bytes and mutation digest from the same committed backup")
 		}
-		if decoded.EncodingVersion() != version {
-			return fmt.Errorf("operation %q canonical column version %q differs from wire version %q", opID, version, decoded.EncodingVersion())
+		if wireVersion != version {
+			return canonicalStartupPreflightError(journal.ErrProjectionDivergence, fmt.Sprintf("operation %q column version %q differs from wire version %q", opID, version, wireVersion), "the redundant column and framed wire version identify different codecs", "restore mutation_encoding_version, canonical_mutation, and mutation_digest from the same committed operation")
+		}
+		if !journal.IsSupportedMutationEncoding(version) {
+			cause := &journal.CanonicalMutationError{Field: "version", Reason: fmt.Sprintf("unsupported canonical codec version %q for operation %q", version, opID), Fix: "open with a build that supports this codec or restore bytes written by a supported codec"}
+			return canonicalStartupPreflightError(cause, fmt.Sprintf("operation %q uses unsupported canonical codec version %q", opID, version), "the column and wire agree, but this build has no registered decoder for that version", "upgrade to a codec-capable build, or restore the operation's version, bytes, and digest from a supported backup")
+		}
+		if _, err := journal.DecodeCanonicalMutation(wire); err != nil {
+			return canonicalStartupPreflightError(err, fmt.Sprintf("operation %q has malformed canonical wire for supported version %q", opID, version), "the full canonical frame is invalid, incomplete, duplicated, or has trailing data", "restore canonical bytes and mutation digest from the same committed operation")
 		}
 		return nil
 	}}); err != nil {
-		return err
+		if errors.Is(err, journal.ErrCanonicalMutation) || errors.Is(err, journal.ErrProjectionDivergence) {
+			return err
+		}
+		return canonicalStartupPreflightError(fmt.Errorf("%w: %v", journal.ErrProjectionDivergence, err), "canonical operation rows could not be inspected", "SQLite rejected the read-only canonical operation scan: "+err.Error(), "repair journal_operations from a known-good backup, then retry Open")
 	}
 	return nil
+}
+
+func canonicalColumnState(stmt *zs.Stmt, column int) string {
+	if stmt.ColumnType(column) == zs.TypeNull {
+		return "NULL"
+	}
+	if stmt.ColumnLen(column) == 0 {
+		return "empty"
+	}
+	return fmt.Sprintf("nonempty(%d bytes)", stmt.ColumnLen(column))
+}
+
+func canonicalStartupPreflightError(cause error, what, why, fix string) error {
+	return fmt.Errorf("%w: canonical startup preflight failed — what: %s; why: %s; where: preflightCanonicalColumnsReadOnly on journal_operations; when: read-only startup before schema migration, activation transaction, or WAL enablement; impact: Open fails closed and the caller receives no tracker; no schema, journal, projection, or mode change is written; fix: %s", cause, what, why, fix)
 }
 
 // completeJournalOperationFK completes the journal.produced_by_operation_journal_id

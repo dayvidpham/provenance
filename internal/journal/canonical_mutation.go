@@ -166,6 +166,25 @@ func DecodeCanonicalMutation(data []byte) (CanonicalMutation, error) {
 	return CanonicalMutation{}, canonicalMutationError("wire", err.Error(), "restore bytes produced by a registered canonical codec with complete ordered fields")
 }
 
+// InspectCanonicalMutationEncodingVersion reads only the framed wire-version
+// field. It does not require that this build support the version, allowing
+// startup to distinguish a column/wire mismatch from a matching unknown codec.
+func InspectCanonicalMutationEncodingVersion(data []byte) (string, error) {
+	if len(data) > MaxCanonicalMutationBytes {
+		return "", canonicalMutationError("mutation", fmt.Sprintf("%d bytes exceeds maximum %d", len(data), MaxCanonicalMutationBytes), "restore bounded canonical bytes")
+	}
+	r := canonicalReader{r: bufio.NewReader(bytes.NewReader(data))}
+	version, err := r.field("version")
+	if err == nil {
+		return string(version), nil
+	}
+	var typed *CanonicalMutationError
+	if errors.As(err, &typed) {
+		return "", err
+	}
+	return "", canonicalMutationError("wire version", err.Error(), "restore the leading framed version field from a committed canonical mutation")
+}
+
 func decodeCanonicalMutation(data []byte) (CanonicalMutation, error) {
 	if len(data) > MaxCanonicalMutationBytes {
 		return CanonicalMutation{}, canonicalMutationError("mutation", fmt.Sprintf("%d bytes exceeds maximum %d", len(data), MaxCanonicalMutationBytes), "restore bounded canonical bytes")
