@@ -309,6 +309,9 @@ func (db *DB) AppendBareJournalRow(kind journal.JournalKind, actorID journal.Act
 func (db *DB) VerifyIntegrity() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	if err := db.verifyForeignKeyTopologyLocked(); err != nil {
+		return err
+	}
 	if err := db.verifySubtypeIntegrityLocked(); err != nil {
 		return err
 	}
@@ -322,6 +325,30 @@ func (db *DB) VerifyIntegrity() error {
 	// journal-row violations by their own sentinel without a coexisting legacy task
 	// row masking them.
 	return db.verifyWatermarkPresenceLocked()
+}
+
+func (db *DB) verifyForeignKeyTopologyLocked() error {
+	var table, parent string
+	var rowID int64
+	if err := sqlitex.Execute(db.conn, `PRAGMA foreign_key_check`, &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
+		if table == "" {
+			table, rowID, parent = stmt.ColumnText(0), stmt.ColumnInt64(1), stmt.ColumnText(2)
+		}
+		return nil
+	}}); err != nil {
+		return fmt.Errorf("verify foreign-key topology: %w", err)
+	}
+	if table != "" {
+		return fmt.Errorf("%w: table %s row %d references missing parent %s — where: read-only startup topology preflight; impact: activation stopped before persistent pragmas or writes; fix: restore the missing canonical support/supertype row", journal.ErrSubtypeIntegrity, table, rowID, parent)
+	}
+	var produced int64
+	if err := sqlitex.Execute(db.conn, `SELECT j.journal_id FROM journal j LEFT JOIN journal_operations o ON o.journal_id=j.produced_by_operation_journal_id WHERE j.produced_by_operation_journal_id IS NOT NULL AND o.journal_id IS NULL LIMIT 1`, &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { produced = stmt.ColumnInt64(0); return nil }}); err != nil {
+		return fmt.Errorf("verify operation producer topology: %w", err)
+	}
+	if produced != 0 {
+		return fmt.Errorf("%w: journal row %d references a missing producing operation — where: read-only startup topology preflight; impact: activation stopped before writes; fix: restore its journal_operations anchor", journal.ErrSubtypeIntegrity, produced)
+	}
+	return nil
 }
 
 // verifyWatermarkPresenceLocked enforces the §8.1 watermark tightening over stored

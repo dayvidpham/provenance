@@ -94,6 +94,9 @@ func (db *DB) preflightSchemaLocked() error {
 		if err != nil {
 			return err
 		}
+		if want.name == "journal_operations" && isLegacyOperationsColumnSet(actual) {
+			continue
+		}
 		if perr := checkColumns(want, actual); perr != nil {
 			return perr
 		}
@@ -101,6 +104,19 @@ func (db *DB) preflightSchemaLocked() error {
 	// Extra-table direction (§13): every live `journal`-prefixed table must be a
 	// recognized journal-spine relation. An unrecognized one fails closed.
 	return db.preflightNoUnexpectedSpineTableLocked()
+}
+
+func isLegacyOperationsColumnSet(actual map[string]struct{}) bool {
+	legacy := []string{"journal_id", "operation_id", "authority_journal_id", "command_digest", "mutation_digest"}
+	if len(actual) != len(legacy) {
+		return false
+	}
+	for _, column := range legacy {
+		if _, ok := actual[column]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // preflightNoUnexpectedSpineTableLocked enumerates every live table whose name

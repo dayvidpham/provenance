@@ -12,6 +12,8 @@ package sqlite
 
 import (
 	"fmt"
+	"net/url"
+	"os"
 	"sync"
 	"time"
 
@@ -99,7 +101,24 @@ func (db *DB) projComments() string {
 // Reference data (enums) is inserted via INSERT OR IGNORE.
 // The models parameter provides the ML model entries to seed into ml_models.
 func Open(dbPath string, models []ptypes.ModelEntry) (*DB, error) {
-	conn, err := zs.OpenConn(dbPath, zs.OpenReadWrite|zs.OpenCreate|zs.OpenWAL|zs.OpenURI)
+	existed := false
+	if dbPath != ":memory:" {
+		if info, err := os.Stat(dbPath); err == nil {
+			existed = info.Size() > 0
+		} else if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("sqlite.Open: inspect path %q before read-only preflight: %w", dbPath, err)
+		}
+	}
+	existingJournal := false
+	if existed {
+		var err error
+		existingJournal, err = preflightExistingReadOnly(dbPath)
+		if err != nil {
+			return nil, fmt.Errorf("sqlite.Open: read-only startup preflight failed on %q: %w", dbPath, err)
+		}
+	}
+
+	conn, err := zs.OpenConn(dbPath, zs.OpenReadWrite|zs.OpenCreate|zs.OpenURI)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"sqlite.Open: failed to open SQLite at %q: %w — "+
@@ -111,7 +130,7 @@ func Open(dbPath string, models []ptypes.ModelEntry) (*DB, error) {
 
 	db := &DB{conn: conn}
 
-	if err := db.applyPragmas(); err != nil {
+	if err := db.applyPreActivationPragmas(); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("sqlite.Open: failed to apply pragmas on %q: %w", dbPath, err)
 	}
@@ -121,15 +140,9 @@ func Open(dbPath string, models []ptypes.ModelEntry) (*DB, error) {
 		_ = conn.Close()
 		return nil, fmt.Errorf("sqlite.Open: inspect existing schema on %q: %w", dbPath, err)
 	}
-	if existing {
-		if err := db.preflightCanonicalColumnsReadOnly(); err != nil {
-			_ = conn.Close()
-			return nil, fmt.Errorf("sqlite.Open: canonical schema preflight failed on %q: %w", dbPath, err)
-		}
-		if err := db.VerifyIntegrity(); err != nil {
-			_ = conn.Close()
-			return nil, fmt.Errorf("sqlite.Open: read-only integrity preflight failed on %q: %w", dbPath, err)
-		}
+	if existing != existingJournal {
+		_ = conn.Close()
+		return nil, fmt.Errorf("sqlite.Open: schema changed between read-only preflight (journal=%t) and activation (journal=%t) on %q; retry after concurrent schema work finishes", existingJournal, existing, dbPath)
 	}
 	activate := func() error {
 		if err := db.ensureSchema(models); err != nil {
@@ -143,21 +156,52 @@ func Open(dbPath string, models []ptypes.ModelEntry) (*DB, error) {
 		}
 		return nil
 	}
-	if existing {
-		var activationErr error
-		end := sqlitex.Save(conn)
-		activationErr = activate()
-		end(&activationErr)
-		err = activationErr
-	} else {
-		err = activate()
-	}
+	var activationErr error
+	end := sqlitex.Save(conn)
+	activationErr = activate()
+	end(&activationErr)
+	err = activationErr
 	if err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("sqlite.Open: transactional startup validation failed on %q: %w", dbPath, err)
 	}
+	if err := db.enableForeignKeys(); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("sqlite.Open: enable runtime foreign-key enforcement on %q: %w", dbPath, err)
+	}
 
 	return db, nil
+}
+
+func preflightExistingReadOnly(dbPath string) (bool, error) {
+	u := url.URL{Scheme: "file", Path: dbPath}
+	if _, err := os.Stat(dbPath + "-wal"); os.IsNotExist(err) {
+		query := u.Query()
+		query.Set("immutable", "1")
+		u.RawQuery = query.Encode()
+	} else if err != nil {
+		return false, fmt.Errorf("inspect WAL sidecar before read-only preflight: %w", err)
+	}
+	conn, err := zs.OpenConn(u.String(), zs.OpenReadOnly|zs.OpenURI)
+	if err != nil {
+		return false, err
+	}
+	db := &DB{conn: conn}
+	defer conn.Close()
+	existing, err := db.tableExistsLocked("journal")
+	if err != nil || !existing {
+		return existing, err
+	}
+	if err := db.preflightCanonicalColumnsReadOnly(); err != nil {
+		return true, err
+	}
+	if err := db.VerifyIntegrity(); err != nil {
+		return true, err
+	}
+	if _, err := db.ReplayProjections(); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 // Conn returns the underlying SQLite connection. This is exposed so that
@@ -201,17 +245,21 @@ func (db *DB) Close() error {
 // Pragmas
 // ---------------------------------------------------------------------------
 
-func (db *DB) applyPragmas() error {
+func (db *DB) applyPreActivationPragmas() error {
 	for _, p := range []string{
 		"PRAGMA journal_mode=WAL;",
 		"PRAGMA busy_timeout=5000;",
-		"PRAGMA foreign_keys=ON;",
+		"PRAGMA foreign_keys=OFF;",
 	} {
 		if err := sqlitex.ExecuteTransient(db.conn, p, nil); err != nil {
 			return fmt.Errorf("pragma %q: %w", p, err)
 		}
 	}
 	return nil
+}
+
+func (db *DB) enableForeignKeys() error {
+	return sqlitex.ExecuteTransient(db.conn, `PRAGMA foreign_keys=ON`, nil)
 }
 
 // ---------------------------------------------------------------------------

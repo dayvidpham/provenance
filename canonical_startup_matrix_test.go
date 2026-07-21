@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"zombiezen.com/go/sqlite"
@@ -13,9 +14,10 @@ import (
 )
 
 type startupFixture struct {
-	task, target           TaskID
-	comment                CommentID
-	anchor, event1, event2 JournalID
+	task, target                                                                 TaskID
+	comment                                                                      CommentID
+	anchor, event1, event2                                                       JournalID
+	bootstrap, supportAnchor, assignmentStart, assignmentEnd, decision, evidence JournalID
 }
 
 func buildStartupFixture(t *testing.T, path string) (Tracker, startupFixture) {
@@ -64,7 +66,15 @@ func buildStartupFixture(t *testing.T, path string) (Tracker, startupFixture) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return tr, startupFixture{task: task.ID, target: target.ID, comment: comment.ID, anchor: res.AnchorJournalID, event1: res.EmittedEvents[0], event2: res.EmittedEvents[1]}
+	support, err := tr.Journal().Apply(OperationInput{OperationID: "matrix-support", ActorID: actor.ID, AuthorityJournalID: &boot, CommandDigest: []byte("support"), Effects: []Effect{{Sort: EffectAssignmentStart, TaskID: target.ID, AssignmentID: "matrix-assignment", SlotID: SlotOwnerResponsibility, Occupant: actor.ID, ResultSlot: "start"}, {Sort: EffectAssignmentEnd, TaskID: target.ID, AssignmentID: "matrix-assignment", SlotID: SlotOwnerResponsibility, ResultSlot: "end"}, {Sort: EffectDecision, TaskID: task.ID, DecisionKind: "matrix.decision", Payload: []byte(`{"decision":1}`), ResultSlot: "decision"}, {Sort: EffectEvidence, TaskID: task.ID, EvidenceKind: "matrix.evidence", ContentDigest: []byte{1, 2}, Payload: []byte(`{"evidence":1}`), ResultSlot: "evidence"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, _ := slotJournalID(support, "start")
+	end, _ := slotJournalID(support, "end")
+	decision, _ := slotJournalID(support, "decision")
+	evidence, _ := slotJournalID(support, "evidence")
+	return tr, startupFixture{task: task.ID, target: target.ID, comment: comment.ID, anchor: res.AnchorJournalID, event1: res.EmittedEvents[0], event2: res.EmittedEvents[1], bootstrap: boot, supportAnchor: support.AnchorJournalID, assignmentStart: start, assignmentEnd: end, decision: decision, evidence: evidence}
 }
 
 func corruptSQL(t *testing.T, tr Tracker, statement string, args ...any) {
@@ -79,6 +89,23 @@ func corruptSQL(t *testing.T, tr Tracker, statement string, args ...any) {
 		t.Fatal(err)
 	}
 	if err := sqlitex.Execute(db.Conn(), statement, &sqlitex.ExecOptions{Args: args}); err != nil {
+		t.Fatal(err)
+	}
+	changed := 0
+	if err := sqlitex.ExecuteTransient(db.Conn(), `SELECT changes()`, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error { changed = stmt.ColumnInt(0); return nil }}); err != nil {
+		t.Fatal(err)
+	}
+	if changed != 1 {
+		t.Fatalf("corruption statement changed %d rows, want exactly one: %s", changed, statement)
+	}
+}
+
+func corruptDDL(t *testing.T, tr Tracker, statement string) {
+	t.Helper()
+	db := tr.(*sqliteTracker).db
+	db.Lock()
+	defer db.Unlock()
+	if err := sqlitex.ExecuteTransient(db.Conn(), statement, nil); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -97,7 +124,7 @@ func corruptCanonicalWire(t *testing.T, tr Tracker, anchor JournalID, mutate fun
 	if err != nil {
 		t.Fatal(err)
 	}
-	corruptSQL(t, tr, `DROP TRIGGER journal_operations_canonical_update`)
+	corruptDDL(t, tr, `DROP TRIGGER journal_operations_canonical_update`)
 	corruptSQL(t, tr, `UPDATE journal_operations SET canonical_mutation=?1 WHERE journal_id=?2`, mutate(wire), int64(anchor))
 }
 
@@ -220,8 +247,26 @@ func TestStartupCorruptionMatrixLeavesBytesUnchanged(t *testing.T) {
 		"result-slot-redirected": func(t *testing.T, tr Tracker, f startupFixture) {
 			corruptSQL(t, tr, `UPDATE journal_operation_result_slots SET produced_journal_id=?1 WHERE journal_id=?2 AND result_slot_id='one'`, int64(f.event2), int64(f.anchor))
 		},
+		"result-slot-renamed": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE journal_operation_result_slots SET result_slot_id='renamed' WHERE journal_id=?1 AND result_slot_id='one'`, int64(f.anchor))
+		},
+		"result-slot-spurious": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `INSERT INTO journal_operation_result_slots(journal_id,result_slot_id,produced_journal_id) VALUES(?1,'spurious',?2)`, int64(f.anchor), int64(f.event1))
+		},
 		"context-attached-by": func(t *testing.T, tr Tracker, f startupFixture) {
 			corruptSQL(t, tr, `UPDATE journal_task_event_contexts SET attached_by_journal_id=?1 WHERE event_journal_id=?2`, int64(f.event2), int64(f.event1))
+		},
+		"context-missing": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `DELETE FROM journal_task_event_contexts WHERE event_journal_id=?1`, int64(f.event1))
+		},
+		"context-spurious": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `INSERT INTO journal_task_event_contexts(event_journal_id,context_kind,context_identity,attached_by_journal_id) VALUES(?1,'task',?2,?1)`, int64(f.event2), f.target.String())
+		},
+		"context-kind": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE journal_task_event_contexts SET context_kind='actor' WHERE event_journal_id=?1`, int64(f.event1))
+		},
+		"context-identity": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE journal_task_event_contexts SET context_identity=?1 WHERE event_journal_id=?2`, f.target.String(), int64(f.event1))
 		},
 		"effect-timestamp": func(t *testing.T, tr Tracker, f startupFixture) {
 			corruptSQL(t, tr, `UPDATE journal SET recorded_at=recorded_at+1 WHERE journal_id=?1`, int64(f.event1))
@@ -229,16 +274,121 @@ func TestStartupCorruptionMatrixLeavesBytesUnchanged(t *testing.T) {
 		"missing-subtype": func(t *testing.T, tr Tracker, f startupFixture) {
 			corruptSQL(t, tr, `DELETE FROM journal_task_events WHERE journal_id=?1`, int64(f.event1))
 		},
+		"task-event-task": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE journal_task_events SET task_id=?1 WHERE journal_id=?2`, f.target.String(), int64(f.event1))
+		},
+		"task-event-kind": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE journal_task_events SET event_kind='matrix.changed' WHERE journal_id=?1`, int64(f.event1))
+		},
+		"task-event-payload": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE journal_task_events SET payload='{"changed":true}' WHERE journal_id=?1`, int64(f.event1))
+		},
+		"task-event-spurious": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `INSERT INTO journal_task_events(journal_id,task_id,event_kind,payload) VALUES(?1,?2,'matrix.spurious','{}')`, int64(f.decision), f.task.String())
+		},
+		"operation-missing": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `DELETE FROM journal_operations WHERE journal_id=?1`, int64(f.supportAnchor))
+		},
+		"operation-spurious": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `INSERT INTO journal_operations(journal_id,operation_id,authority_journal_id,command_digest,mutation_digest,mutation_encoding_version,canonical_mutation) VALUES(?1,'spurious-operation',NULL,X'01',X'02',NULL,NULL)`, int64(f.event1))
+		},
+		"operation-authority": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE journal_operations SET authority_journal_id=NULL WHERE journal_id=?1`, int64(f.supportAnchor))
+		},
+		"operation-mutation-digest": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE journal_operations SET mutation_digest=X'09' WHERE journal_id=?1`, int64(f.supportAnchor))
+		},
+		"authority-kind": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE journal_authorities SET authority_kind_id=1 WHERE journal_id=?1`, int64(f.bootstrap))
+		},
+		"authority-identity": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE journal_authorities SET operation_authority_id='changed' WHERE journal_id=?1`, int64(f.bootstrap))
+		},
+		"authority-missing": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `DELETE FROM journal_authorities WHERE journal_id=?1`, int64(f.bootstrap))
+		},
+		"authority-spurious": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `INSERT INTO journal_authorities(journal_id,authority_kind_id,operation_authority_id) VALUES(?1,0,'spurious')`, int64(f.decision))
+		},
+		"bootstrap-label": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE journal_authority_bootstraps SET label='changed' WHERE journal_id=?1`, int64(f.bootstrap))
+		},
+		"bootstrap-missing": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `DELETE FROM journal_authority_bootstraps WHERE journal_id=?1`, int64(f.bootstrap))
+		},
+		"bootstrap-spurious": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `INSERT INTO journal_authority_bootstraps(journal_id,label) VALUES(?1,'spurious')`, int64(f.decision))
+		},
+		"assignment-transition": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE journal_authority_assignment_transitions SET transition_id=99 WHERE journal_id=?1`, int64(f.assignmentStart))
+		},
+		"assignment-transition-missing": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `DELETE FROM journal_authority_assignment_transitions WHERE journal_id=?1`, int64(f.assignmentStart))
+		},
+		"assignment-transition-spurious": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `INSERT INTO journal_authority_assignment_transitions(journal_id,assignment_id,transition_id) VALUES(?1,'spurious-assignment',0)`, int64(f.decision))
+		},
+		"assignment-task": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE journal_authority_assignment_episodes SET task_id=?1 WHERE assignment_id='matrix-assignment'`, f.task.String())
+		},
+		"assignment-slot": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE journal_authority_assignment_episodes SET slot_id=99 WHERE assignment_id='matrix-assignment'`)
+		},
+		"assignment-actor": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE journal_authority_assignment_episodes SET actor_id=(SELECT agent_id FROM agents_software WHERE name='other') WHERE assignment_id='matrix-assignment'`)
+		},
+		"assignment-predecessor": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE journal_authority_assignment_episodes SET predecessor_assignment_id='missing' WHERE assignment_id='matrix-assignment'`)
+		},
+		"assignment-parent": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE journal_authority_assignment_episodes SET parent_assignment_id='missing' WHERE assignment_id='matrix-assignment'`)
+		},
+		"assignment-episode-missing": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `DELETE FROM journal_authority_assignment_episodes WHERE assignment_id='matrix-assignment'`)
+		},
+		"decision-kind": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE journal_decisions SET decision_kind='matrix.changed' WHERE journal_id=?1`, int64(f.decision))
+		},
+		"decision-task": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE journal_decisions SET task_id=?1 WHERE journal_id=?2`, f.target.String(), int64(f.decision))
+		},
+		"decision-payload": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE journal_decisions SET payload='{"changed":true}' WHERE journal_id=?1`, int64(f.decision))
+		},
+		"decision-missing": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `DELETE FROM journal_decisions WHERE journal_id=?1`, int64(f.decision))
+		},
+		"decision-spurious": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `INSERT INTO journal_decisions(journal_id,decision_kind,task_id,payload) VALUES(?1,'matrix.spurious',?2,'{}')`, int64(f.evidence), f.task.String())
+		},
+		"evidence-kind": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE journal_evidence SET evidence_kind='matrix.changed' WHERE journal_id=?1`, int64(f.evidence))
+		},
+		"evidence-task": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE journal_evidence SET task_id=?1 WHERE journal_id=?2`, f.target.String(), int64(f.evidence))
+		},
+		"evidence-digest": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE journal_evidence SET content_digest=X'09' WHERE journal_id=?1`, int64(f.evidence))
+		},
+		"evidence-payload": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE journal_evidence SET payload='{"changed":true}' WHERE journal_id=?1`, int64(f.evidence))
+		},
+		"evidence-missing": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `DELETE FROM journal_evidence WHERE journal_id=?1`, int64(f.evidence))
+		},
+		"evidence-spurious": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `INSERT INTO journal_evidence(journal_id,evidence_kind,task_id,content_digest,payload) VALUES(?1,'matrix.spurious',?2,X'01','{}')`, int64(f.decision), f.task.String())
+		},
 		"canonical-version-only": func(t *testing.T, tr Tracker, f startupFixture) {
-			corruptSQL(t, tr, `DROP TRIGGER journal_operations_canonical_update`)
+			corruptDDL(t, tr, `DROP TRIGGER journal_operations_canonical_update`)
 			corruptSQL(t, tr, `UPDATE journal_operations SET canonical_mutation=NULL WHERE journal_id=?1`, int64(f.anchor))
 		},
 		"canonical-bytes-only": func(t *testing.T, tr Tracker, f startupFixture) {
-			corruptSQL(t, tr, `DROP TRIGGER journal_operations_canonical_update`)
+			corruptDDL(t, tr, `DROP TRIGGER journal_operations_canonical_update`)
 			corruptSQL(t, tr, `UPDATE journal_operations SET mutation_encoding_version=NULL WHERE journal_id=?1`, int64(f.anchor))
 		},
 		"canonical-unknown-version": func(t *testing.T, tr Tracker, f startupFixture) {
-			corruptSQL(t, tr, `DROP TRIGGER journal_operations_canonical_update`)
+			corruptDDL(t, tr, `DROP TRIGGER journal_operations_canonical_update`)
 			corruptSQL(t, tr, `UPDATE journal_operations SET mutation_encoding_version='unknown.v9' WHERE journal_id=?1`, int64(f.anchor))
 		},
 		"canonical-effect-limit": func(t *testing.T, tr Tracker, f startupFixture) {
@@ -279,11 +429,26 @@ func TestStartupCorruptionMatrixLeavesBytesUnchanged(t *testing.T) {
 			if openErr == nil {
 				t.Fatal("corrupt database opened")
 			}
-			if name[:4] == "task" || name[:4] == "edge" || name[:5] == "label" || name[:7] == "comment" || name[:11] == "attribution" {
+			projectionCase := strings.HasPrefix(name, "task-") || strings.HasPrefix(name, "edge-") || strings.HasPrefix(name, "label-") || strings.HasPrefix(name, "comment-") || strings.HasPrefix(name, "attribution")
+			if projectionCase {
 				var divergence *ProjectionDivergenceError
-				if !errors.As(openErr, &divergence) {
-					t.Fatalf("projection corruption returned %T, want ProjectionDivergenceError: %v", openErr, openErr)
+				if !errors.As(openErr, &divergence) && !errors.Is(openErr, ErrProjectionDivergence) && !errors.Is(openErr, ErrSubtypeIntegrity) {
+					t.Fatalf("projection corruption returned %T, want typed divergence/topology error: %v", openErr, openErr)
 				}
+			}
+			supportCase := strings.HasPrefix(name, "result-slot") || strings.HasPrefix(name, "context-") || strings.HasPrefix(name, "effect-") || name == "missing-subtype" || strings.HasPrefix(name, "task-event") || strings.HasPrefix(name, "operation-") || strings.HasPrefix(name, "authority-") || strings.HasPrefix(name, "bootstrap-") || strings.HasPrefix(name, "assignment-") || strings.HasPrefix(name, "decision-") || strings.HasPrefix(name, "evidence-")
+			if supportCase && !errors.Is(openErr, ErrProjectionDivergence) && !errors.Is(openErr, ErrSubtypeIntegrity) {
+				t.Fatalf("support corruption returned untyped error: %T %v", openErr, openErr)
+			}
+			token := strings.Split(name, "-")[0]
+			if strings.HasPrefix(name, "result-slot") {
+				token = "result slot"
+			}
+			if name == "missing-subtype" {
+				token = "subtype"
+			}
+			if !strings.Contains(strings.ToLower(openErr.Error()), strings.ReplaceAll(token, "_", " ")) {
+				t.Fatalf("error does not identify %q corruption: %v", token, openErr)
 			}
 			after, err := os.ReadFile(path)
 			if err != nil {

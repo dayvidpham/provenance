@@ -3,6 +3,7 @@ package journal
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"reflect"
 	"strconv"
 	"strings"
@@ -46,7 +47,7 @@ func validFamilyEffects(t *testing.T) []Effect {
 	recordedAt := int64(42)
 	ctx, _ := TaskContext(task)
 	return []Effect{
-		{Sort: EffectTaskEvent, ResultSlot: "event", RecordedAtOverride: &recordedAt, TaskID: task, EventKind: EventKindTaskUpdated, Payload: []byte(`{"b":2,"a":1}`), Contexts: []EventContext{ctx}, UpdateTitle: &title, UpdateDescription: &description, UpdatePriority: &priority, UpdatePhase: &phase, UpdateNotes: &notes},
+		{Sort: EffectTaskEvent, ResultSlot: "event", RecordedAtOverride: &recordedAt, TaskID: task, EventKind: EventKindTaskUpdated, Payload: []byte(`{"a":1,"b":2}`), Contexts: []EventContext{ctx}, UpdateTitle: &title, UpdateDescription: &description, UpdatePriority: &priority, UpdatePhase: &phase, UpdateNotes: &notes},
 		{Sort: EffectTaskEvent, ResultSlot: "close", RecordedAtOverride: &recordedAt, TaskID: task, EventKind: EventKindTaskClosed, CloseReason: "done", Forced: true},
 		{Sort: EffectBootstrapAuthority, ResultSlot: "bootstrap", RecordedAtOverride: &recordedAt, BootstrapLabel: "root", OperationAuthorityID: "auth"},
 		{Sort: EffectAssignmentStart, ResultSlot: "start", RecordedAtOverride: &recordedAt, TaskID: task, AssignmentID: "a", SlotID: SlotOwnerResponsibility, Occupant: actor, Predecessor: "p", Parent: "parent"},
@@ -64,7 +65,7 @@ func validFamilyEffects(t *testing.T) []Effect {
 
 func TestCanonicalMutationV1EveryFamilyRoundTripsMeaningfulSemantics(t *testing.T) {
 	covered := map[string]bool{}
-	for _, effect := range validFamilyEffects(t) {
+	for fixtureIndex, effect := range validFamilyEffects(t) {
 		t.Run(effect.Sort.String(), func(t *testing.T) {
 			prepared, err := PrepareMutationV1([]Effect{effect})
 			if err != nil {
@@ -74,15 +75,14 @@ func TestCanonicalMutationV1EveryFamilyRoundTripsMeaningfulSemantics(t *testing.
 			if err != nil {
 				t.Fatal(err)
 			}
-			expected, err := normalizeCanonicalEffect(effect, 0)
+			expected := effect
+			literalWire := independentFixtureWire(independentFamilyFields(t)[fixtureIndex])
+			if !bytes.Equal(prepared.CanonicalBytes(), literalWire) {
+				t.Fatalf("family %s wire drifted\n got %q\nwant %q", effect.Sort, prepared.CanonicalBytes(), literalWire)
+			}
+			decoded, err = DecodeCanonicalMutation(literalWire)
 			if err != nil {
 				t.Fatal(err)
-			}
-			if len(expected.Payload) > 0 {
-				expected.Payload, err = canonicalJSON(expected.Payload)
-				if err != nil {
-					t.Fatal(err)
-				}
 			}
 			if !reflect.DeepEqual(decoded.NormalizedEffects(), []Effect{expected}) {
 				t.Fatalf("family round trip = %#v, want %#v", decoded.NormalizedEffects(), []Effect{expected})
@@ -97,37 +97,67 @@ func TestCanonicalMutationV1EveryFamilyRoundTripsMeaningfulSemantics(t *testing.
 				covered[field.Name] = true
 				changed := expected
 				changedValue := reflect.ValueOf(&changed).Elem().Field(i)
-				switch changedValue.Kind() {
-				case reflect.String:
-					changedValue.SetString(changedValue.String() + "-changed")
-				case reflect.Bool:
-					changedValue.SetBool(!changedValue.Bool())
-				case reflect.Int:
-					changedValue.SetInt(changedValue.Int() + 1)
-				case reflect.Slice:
-					changedValue.Set(reflect.Zero(changedValue.Type()))
-				case reflect.Struct:
-					changedValue.Set(reflect.Zero(changedValue.Type()))
-				case reflect.Ptr:
-					replacement := reflect.New(changedValue.Type().Elem())
-					switch replacement.Elem().Kind() {
-					case reflect.String:
-						replacement.Elem().SetString(changedValue.Elem().String() + "-changed")
-					case reflect.Int, reflect.Int64:
-						replacement.Elem().SetInt(changedValue.Elem().Int() + 1)
-					default:
-						t.Fatalf("unhandled pointer operand %s", field.Name)
+				skipAlternative := false
+				switch field.Name {
+				case "TaskID":
+					changed.TaskID, _ = ptypes.ParseTaskID("fixture--018f0000-0000-7000-8000-000000000004")
+				case "Occupant", "CommentAuthor":
+					alternate, _ := ptypes.ParseActorID("fixture--018f0000-0000-7000-8000-000000000005")
+					if field.Name == "Occupant" {
+						changed.Occupant = alternate
+					} else {
+						changed.CommentAuthor = alternate
 					}
-					changedValue.Set(replacement)
+				case "CommentIdentity":
+					changed.CommentIdentity, _ = ptypes.ParseCommentID("fixture--018f0000-0000-7000-8000-000000000006")
+				case "Type":
+					changed.Type = ptypes.TaskTypeFeature
+				case "Priority":
+					changed.Priority = ptypes.PriorityCritical
+				case "Phase":
+					changed.Phase = ptypes.PhaseCodeReview
+				case "EdgeRelKind":
+					changed.EdgeRelKind = ptypes.EdgeBlockedBy
+				case "ContentDigest":
+					changed.ContentDigest = []byte{9, 8}
+				case "EventKind", "SlotID":
+					skipAlternative = true
 				default:
-					t.Fatalf("unhandled operand %s (%s)", field.Name, changedValue.Kind())
+					switch changedValue.Kind() {
+					case reflect.String:
+						changedValue.SetString(changedValue.String() + "-changed")
+					case reflect.Bool:
+						changedValue.SetBool(!changedValue.Bool())
+					case reflect.Int:
+						changedValue.SetInt(changedValue.Int() + 1)
+					case reflect.Slice:
+						changedValue.Set(reflect.Zero(changedValue.Type()))
+					case reflect.Struct:
+						changedValue.Set(reflect.Zero(changedValue.Type()))
+					case reflect.Ptr:
+						replacement := reflect.New(changedValue.Type().Elem())
+						switch replacement.Elem().Kind() {
+						case reflect.String:
+							replacement.Elem().SetString(changedValue.Elem().String() + "-changed")
+						case reflect.Int, reflect.Int64:
+							replacement.Elem().SetInt(changedValue.Elem().Int() + 1)
+						default:
+							t.Fatalf("unhandled pointer operand %s", field.Name)
+						}
+						changedValue.Set(replacement)
+					default:
+						t.Fatalf("unhandled operand %s (%s)", field.Name, changedValue.Kind())
+					}
+				}
+				if skipAlternative {
+					continue
 				}
 				other, changeErr := PrepareMutationV1([]Effect{changed})
-				if changeErr == nil && bytes.Equal(prepared.CanonicalBytes(), other.CanonicalBytes()) {
-					t.Fatalf("meaningful operand %s did not change identity", field.Name)
+				if changeErr != nil {
+					t.Fatalf("valid alternative for %s rejected: %v", field.Name, changeErr)
 				}
-				if changeErr != nil && !errors.Is(changeErr, ErrCanonicalMutation) {
-					t.Fatalf("meaningful operand %s returned untyped error: %v", field.Name, changeErr)
+				if bytes.Equal(prepared.CanonicalBytes(), other.CanonicalBytes()) {
+					t.Fatalf("meaningful operand %s did not change identity", field.Name)
 				}
 			}
 		})
@@ -136,6 +166,84 @@ func TestCanonicalMutationV1EveryFamilyRoundTripsMeaningfulSemantics(t *testing.
 		if !covered[field] {
 			t.Errorf("meaningful Effect operand %s has no round-trip/identity guard", field)
 		}
+	}
+}
+
+func TestCanonicalEventKindValidAlternativeAndActorRejection(t *testing.T) {
+	task, actor, _ := fixtureIDs(t)
+	left, err := PrepareMutationV1([]Effect{{Sort: EffectTaskEvent, TaskID: task, EventKind: "fixture.one"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := PrepareMutationV1([]Effect{{Sort: EffectTaskEvent, TaskID: task, EventKind: "fixture.two"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(left.CanonicalBytes(), right.CanonicalBytes()) {
+		t.Fatal("valid event-kind alternative did not change canonical identity")
+	}
+	if _, err := PrepareMutationV1([]Effect{{Sort: EffectTaskEvent, ActorID: actor, TaskID: task, EventKind: "fixture.one"}}); !errors.Is(err, ErrCanonicalMutation) {
+		t.Fatalf("per-effect ActorID error=%v", err)
+	}
+}
+
+type independentField struct{ name, value string }
+
+func independentFixtureWire(fields []independentField) []byte {
+	var out bytes.Buffer
+	write := func(name, value string) { fmt.Fprintf(&out, "%s:%d:%s\n", name, len(value), value) }
+	write("version", "provenance.mutation.v1")
+	write("effect-count", "1")
+	for _, field := range fields {
+		write("effect.0."+field.name, field.value)
+	}
+	return out.Bytes()
+}
+
+func independentFamilyFields(t *testing.T) [][]independentField {
+	t.Helper()
+	task, actor, comment := fixtureIDs(t)
+	common := func(family, slot string, rest ...independentField) []independentField {
+		return append([]independentField{{"family", family}, {"result-slot", slot}, {"recorded-at-override", "142"}}, rest...)
+	}
+	ctx := []independentField{{"context-count", "1"}, {"context.0.kind", "task"}, {"context.0.identity", task.String()}}
+	withCtx := func(fields []independentField) []independentField { return append(fields, ctx...) }
+	return [][]independentField{
+		append(append(common("task_event", "event", independentField{"task", task.String()}, independentField{"event-kind", string(EventKindTaskUpdated)}, independentField{"payload", `{"a":1,"b":2}`}), ctx...), independentField{"update-title", "1new"}, independentField{"update-description", "1new description"}, independentField{"update-priority", "1high"}, independentField{"update-phase", "1code_review"}, independentField{"update-notes", "1notes"}),
+		common("task_event", "close", independentField{"task", task.String()}, independentField{"event-kind", string(EventKindTaskClosed)}, independentField{"payload", "{}"}, independentField{"context-count", "0"}, independentField{"forced", "true"}, independentField{"close-reason", "done"}),
+		common("bootstrap_authority", "bootstrap", independentField{"bootstrap-label", "root"}, independentField{"operation-authority", "auth"}),
+		common("assignment_start", "start", independentField{"task", task.String()}, independentField{"assignment", "a"}, independentField{"slot", "owner-responsibility"}, independentField{"occupant", actor.String()}, independentField{"predecessor", "p"}, independentField{"parent", "parent"}),
+		common("assignment_end", "end", independentField{"task", task.String()}, independentField{"assignment", "a"}, independentField{"slot", "owner-responsibility"}),
+		common("decision", "decision", independentField{"task", task.String()}, independentField{"decision-kind", "fixture.decision"}, independentField{"payload", `{"x":1}`}),
+		common("evidence", "evidence", independentField{"task", task.String()}, independentField{"evidence-kind", "fixture.evidence"}, independentField{"content-digest", string([]byte{1, 2})}, independentField{"payload", `{"x":1}`}),
+		append(append(common("task_create", "create", independentField{"task", task.String()}, independentField{"payload", `{"x":1}`}), ctx...), independentField{"title", "title"}, independentField{"description", "description"}, independentField{"type", "task"}, independentField{"priority", "medium"}, independentField{"phase", "unscoped"}),
+		withCtx(common("edge_add", "edge-add", independentField{"task", task.String()}, independentField{"edge-target", task.String()}, independentField{"edge-kind", "derived_from"})),
+		withCtx(common("edge_remove", "edge-remove", independentField{"task", task.String()}, independentField{"edge-target", task.String()}, independentField{"edge-kind", "derived_from"})),
+		withCtx(common("label_add", "label-add", independentField{"task", task.String()}, independentField{"label", "label"})),
+		withCtx(common("label_remove", "label-remove", independentField{"task", task.String()}, independentField{"label", "label"})),
+		withCtx(common("comment_add", "comment", independentField{"task", task.String()}, independentField{"comment", comment.String()}, independentField{"comment-author", actor.String()}, independentField{"comment-body", "body"})),
+	}
+}
+
+func TestIndependentCanonicalOracleNegativeControls(t *testing.T) {
+	fixture := independentFixtureWire(independentFamilyFields(t)[7])
+	prepared, err := PrepareMutationV1([]Effect{validFamilyEffects(t)[7]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, changed := range map[string][]byte{
+		"family-tag":  bytes.Replace(prepared.CanonicalBytes(), []byte("task_create"), []byte("task_create_x"), 1),
+		"field-name":  bytes.Replace(prepared.CanonicalBytes(), []byte("effect.0.title"), []byte("effect.0.titel"), 1),
+		"field-order": bytes.Replace(prepared.CanonicalBytes(), []byte("effect.0.title:5:title\neffect.0.description:11:description"), []byte("effect.0.description:11:description\neffect.0.title:5:title"), 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if bytes.Equal(changed, fixture) {
+				t.Fatal("mutated production wire matched independent oracle")
+			}
+			if _, err := DecodeCanonicalMutation(changed); err == nil {
+				t.Fatal("mutated production wire decoded")
+			}
+		})
 	}
 }
 

@@ -240,7 +240,7 @@ func (db *DB) preflightCanonicalColumnsReadOnly() error {
 
 // completeJournalOperationFK completes the journal.produced_by_operation_journal_id
 // foreign key the journal-base layer staged without an FK (§2.1 staging note).
-// It rebuilds the journal table (the standard SQLite 12-step table rebuild)
+// It rebuilds the journal table inside the startup transaction owned by Open
 // preserving every child FK that references journal(journal_id), so an
 // operation-produced row can no longer name a producing operation that does not
 // exist. Idempotent: it is a no-op once the FK is present.
@@ -252,22 +252,10 @@ func (db *DB) completeJournalOperationFK() error {
 	if present {
 		return nil
 	}
-	// PRAGMA foreign_keys is a no-op inside a transaction, so toggle it around
-	// an explicit rebuild transaction. The journal is empty at first Open, so
-	// the row copy is trivial; child tables reference journal(journal_id) by name
-	// and remain valid across the drop+rename.
-	if err := sqlitex.ExecuteTransient(db.conn, `PRAGMA foreign_keys=OFF`, nil); err != nil {
-		return fmt.Errorf("completeJournalOperationFK: disable FK enforcement: %w", err)
-	}
-	// Restore FK enforcement no matter how the rebuild ends (commit, rollback on a
-	// step error, or rollback on a detected violation). PRAGMA foreign_keys=ON is
-	// itself a no-op inside a transaction, so it runs here in autocommit after the
-	// transaction has already ended.
-	defer func() { _ = sqlitex.ExecuteTransient(db.conn, `PRAGMA foreign_keys=ON`, nil) }()
-	// Steps 3-9 of the canonical SQLite 12-step table rebuild, up to but NOT
-	// including COMMIT. idx_journal_pboj is created here (its single owner).
+	// Open disables FK enforcement before beginning its one activation transaction
+	// and restores it after commit/rollback. This function must remain composable:
+	// it neither starts a nested transaction nor changes connection pragmas.
 	rebuild := []string{
-		`BEGIN IMMEDIATE`,
 		// The journal_attributed view (§8.5) references journal; SQLite cannot rename
 		// journal_new→journal while a view points at the (dropped) journal table, so
 		// drop it before the rebuild and recreate it (below) once journal exists again.
@@ -306,7 +294,6 @@ func (db *DB) completeJournalOperationFK() error {
 	}
 	for _, stmt := range rebuild {
 		if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
-			_ = sqlitex.ExecuteTransient(db.conn, `ROLLBACK`, nil)
 			return fmt.Errorf("completeJournalOperationFK: rebuild step %q: %w", stmt[:min(len(stmt), 40)], err)
 		}
 	}
@@ -318,18 +305,12 @@ func (db *DB) completeJournalOperationFK() error {
 	var violations int
 	if err := sqlitex.ExecuteTransient(db.conn, `PRAGMA foreign_key_check`,
 		&sqlitex.ExecOptions{ResultFunc: func(*zs.Stmt) error { violations++; return nil }}); err != nil {
-		_ = sqlitex.ExecuteTransient(db.conn, `ROLLBACK`, nil)
 		return fmt.Errorf("completeJournalOperationFK: foreign_key_check: %w", err)
 	}
 	if violations > 0 {
-		_ = sqlitex.ExecuteTransient(db.conn, `ROLLBACK`, nil)
 		return fmt.Errorf("completeJournalOperationFK: rebuild left %d foreign-key violations, rolled back — "+
 			"where: journal FK completion; impact: the rebuild was reverted and the database left unchanged; "+
 			"fix: this indicates a producing operation referenced by a journal row does not exist", violations)
-	}
-	if err := sqlitex.ExecuteTransient(db.conn, `COMMIT`, nil); err != nil {
-		_ = sqlitex.ExecuteTransient(db.conn, `ROLLBACK`, nil)
-		return fmt.Errorf("completeJournalOperationFK: commit rebuild: %w", err)
 	}
 	return nil
 }

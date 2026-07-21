@@ -383,8 +383,12 @@ func TestCanonicalSchemaMigrationAndMixedLegacyRowsAreIdempotent(t *testing.T) {
 		t.Fatalf("genuine pre-canonical migration: %v", err)
 	}
 	retried, err := tracker.Journal().Apply(legacyInput)
-	if err != nil || !retried.ShortCircuited || retried.AnchorJournalID != genesis.AnchorJournalID {
+	if err != nil || !retried.ShortCircuited {
 		t.Fatalf("legacy identity/result not preserved: %+v %v", retried, err)
+	}
+	retried.ShortCircuited = false
+	if !reflect.DeepEqual(retried, genesis) {
+		t.Fatalf("complete legacy result changed across migration: got=%+v want=%+v", retried, genesis)
 	}
 	task := newCorpusTaskID()
 	if _, err = tracker.Journal().Apply(OperationInput{OperationID: "mixed-new", ActorID: actor.ID, AuthorityJournalID: &boot, CommandDigest: []byte("c"), Effects: []Effect{{Sort: EffectTaskCreate, TaskID: task, Title: "new", Type: TaskTypeTask, Priority: PriorityMedium, Phase: PhaseUnscoped}}}); err != nil {
@@ -529,7 +533,7 @@ func TestMixedLegacyCanonicalMalformedPairsFailWithoutByteDrift(t *testing.T) {
 			if _, err = tr.Journal().Apply(OperationInput{OperationID: "mixed-pair-new", ActorID: actor.ID, AuthorityJournalID: &boot, CommandDigest: []byte("c"), Effects: []Effect{{Sort: EffectTaskCreate, TaskID: task, Title: "new", Type: TaskTypeTask, Priority: PriorityMedium, Phase: PhaseUnscoped}}}); err != nil {
 				t.Fatal(err)
 			}
-			corruptSQL(t, tr, `DROP TRIGGER journal_operations_canonical_update`)
+			corruptDDL(t, tr, `DROP TRIGGER journal_operations_canonical_update`)
 			corruptSQL(t, tr, statement)
 			if err := tr.Close(); err != nil {
 				t.Fatal(err)
@@ -554,4 +558,185 @@ func TestMixedLegacyCanonicalMalformedPairsFailWithoutByteDrift(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDeleteModeCorruptionPreflightIsByteAndModeReadOnly(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		name := "current"
+		if legacy {
+			name = "legacy-columns"
+		}
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "delete-mode.sqlite")
+			tr, err := OpenSQLite(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			actor, err := tr.RegisterSoftwareAgent("canonical", "delete-mode", "1", "test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			genesis, err := tr.Journal().Apply(OperationInput{OperationID: "delete-mode-genesis", ActorID: actor.ID, CommandDigest: []byte("c"), Effects: []Effect{{Sort: EffectBootstrapAuthority, ResultSlot: "authority"}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			boot, _ := slotJournalID(genesis, "authority")
+			task, err := tr.As(actor.ID, boot).Create("canonical", "title", "description", TaskTypeTask, PriorityMedium, PhaseUnscoped, WithOperationID("delete-mode-task"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if legacy {
+				makeOperationsSchemaLegacy(t, tr)
+			}
+			if err := tr.Close(); err != nil {
+				t.Fatal(err)
+			}
+			conn, err := sqlite.OpenConn(path, sqlite.OpenReadWrite|sqlite.OpenURI)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := sqlitex.ExecuteTransient(conn, `PRAGMA journal_mode=DELETE`, nil); err != nil {
+				t.Fatal(err)
+			}
+			if legacy {
+				if err := sqlitex.Execute(conn, `DELETE FROM journal_authority_bootstraps WHERE journal_id=?1`, &sqlitex.ExecOptions{Args: []any{int64(boot)}}); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := sqlitex.Execute(conn, `UPDATE tasks SET title='corrupt' WHERE id=?1`, &sqlitex.ExecOptions{Args: []any{task.ID.String()}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := conn.Close(); err != nil {
+				t.Fatal(err)
+			}
+			before := snapshotSQLiteFiles(t, path)
+			opened, openErr := OpenSQLite(path)
+			if opened != nil {
+				_ = opened.Close()
+			}
+			if openErr == nil {
+				t.Fatal("DELETE-mode corruption opened")
+			}
+			after := snapshotSQLiteFiles(t, path)
+			if !reflect.DeepEqual(after, before) {
+				t.Fatalf("failed Open changed DELETE-mode database files\nbefore=%v\nafter=%v", before, after)
+			}
+			if mode := sqliteJournalMode(t, path); mode != "delete" {
+				t.Fatalf("journal mode=%q, want delete", mode)
+			}
+		})
+	}
+}
+
+func snapshotSQLiteFiles(t *testing.T, path string) map[string][]byte {
+	t.Helper()
+	result := map[string][]byte{}
+	for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+		data, err := os.ReadFile(path + suffix)
+		if err == nil {
+			result[suffix] = data
+			continue
+		}
+		if !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+	}
+	return result
+}
+
+func sqliteJournalMode(t *testing.T, path string) string {
+	t.Helper()
+	conn, err := sqlite.OpenConn(path, sqlite.OpenReadOnly|sqlite.OpenURI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mode := ""
+	if err := sqlitex.ExecuteTransient(conn, `PRAGMA journal_mode`, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error { mode = stmt.ColumnText(0); return nil }}); err != nil {
+		t.Fatal(err)
+	}
+	return mode
+}
+
+func TestMissingJournalOperationFKMigrationIsComposableAndIdempotent(t *testing.T) {
+	for _, corrupt := range []bool{false, true} {
+		name := "valid"
+		if corrupt {
+			name = "corrupt-producer"
+		}
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "missing-journal-fk.sqlite")
+			tr, err := OpenSQLite(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			actor, err := tr.RegisterSoftwareAgent("canonical", "missing-fk", "1", "test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			genesis, err := tr.Journal().Apply(OperationInput{OperationID: "missing-fk-genesis", ActorID: actor.ID, CommandDigest: []byte("c"), Effects: []Effect{{Sort: EffectBootstrapAuthority, ResultSlot: "authority"}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			boot, _ := slotJournalID(genesis, "authority")
+			if _, err := tr.As(actor.ID, boot).Create("canonical", "task", "task", TaskTypeTask, PriorityMedium, PhaseUnscoped, WithOperationID("missing-fk-task")); err != nil {
+				t.Fatal(err)
+			}
+			store := tr.(*sqliteTracker)
+			if err := store.db.AdversarialRemoveJournalOperationFK(); err != nil {
+				t.Fatal(err)
+			}
+			if corrupt {
+				corruptSQL(t, tr, `UPDATE journal SET produced_by_operation_journal_id=999999 WHERE produced_by_operation_journal_id IS NOT NULL AND journal_id=(SELECT max(journal_id) FROM journal)`)
+			}
+			if err := tr.Close(); err != nil {
+				t.Fatal(err)
+			}
+			before := snapshotSQLiteFiles(t, path)
+			tr, err = OpenSQLite(path)
+			if corrupt {
+				if err == nil {
+					_ = tr.Close()
+					t.Fatal("invalid producer topology opened")
+				}
+				if after := snapshotSQLiteFiles(t, path); !reflect.DeepEqual(before, after) {
+					t.Fatal("failed pre-FK startup changed corrupt database")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("supported pre-FK migration: %v", err)
+			}
+			if !journalOperationFKPresent(t, tr) {
+				t.Fatal("migration did not add operation FK")
+			}
+			if err := tr.Close(); err != nil {
+				t.Fatal(err)
+			}
+			tr, err = OpenSQLite(path)
+			if err != nil {
+				t.Fatalf("idempotent reopen: %v", err)
+			}
+			defer tr.Close()
+			if !journalOperationFKPresent(t, tr) {
+				t.Fatal("operation FK missing after idempotent reopen")
+			}
+		})
+	}
+}
+
+func journalOperationFKPresent(t *testing.T, tr Tracker) bool {
+	t.Helper()
+	db := tr.(*sqliteTracker).db
+	db.Lock()
+	defer db.Unlock()
+	present := false
+	if err := sqlitex.ExecuteTransient(db.Conn(), `PRAGMA foreign_key_list(journal)`, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error {
+		if stmt.ColumnText(3) == "produced_by_operation_journal_id" && stmt.ColumnText(2) == "journal_operations" {
+			present = true
+		}
+		return nil
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	return present
 }

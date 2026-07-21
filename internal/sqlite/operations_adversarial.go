@@ -8,6 +8,32 @@ import (
 	"zombiezen.com/go/sqlite/sqlitex"
 )
 
+// AdversarialRemoveJournalOperationFK recreates the supported pre-FK journal
+// shape while preserving all rows and other constraints. It exists only for the
+// end-to-end migration and rollback corpus.
+func (db *DB) AdversarialRemoveJournalOperationFK() (err error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if err = sqlitex.ExecuteTransient(db.conn, `PRAGMA foreign_keys=OFF`, nil); err != nil {
+		return err
+	}
+	defer func() { _ = sqlitex.ExecuteTransient(db.conn, `PRAGMA foreign_keys=ON`, nil) }()
+	end := sqlitex.Transaction(db.conn)
+	defer end(&err)
+	steps := []string{
+		`DROP VIEW IF EXISTS journal_attributed`,
+		fmt.Sprintf(`CREATE TABLE journal_legacy (journal_id INTEGER PRIMARY KEY AUTOINCREMENT,kind_id INTEGER NOT NULL REFERENCES journal_kinds(id),actor_id TEXT REFERENCES agents(id),recorded_at INTEGER NOT NULL,produced_by_operation_journal_id INTEGER,CHECK ((actor_id IS NULL) = (produced_by_operation_journal_id IS NOT NULL)),CHECK (kind_id <> %d OR produced_by_operation_journal_id IS NOT NULL)) STRICT`, int(journal.JournalKindTaskEvent)),
+		`INSERT INTO journal_legacy SELECT * FROM journal`, `DROP TABLE journal`, `ALTER TABLE journal_legacy RENAME TO journal`,
+		`CREATE INDEX idx_journal_kind ON journal(kind_id)`, `CREATE INDEX idx_journal_actor ON journal(actor_id)`, `CREATE INDEX idx_journal_pboj ON journal(produced_by_operation_journal_id)`, `CREATE INDEX idx_journal_recorded_at ON journal(recorded_at,journal_id)`, journalAttributedViewDDL,
+	}
+	for _, step := range steps {
+		if err = sqlitex.ExecuteTransient(db.conn, step, nil); err != nil {
+			return fmt.Errorf("remove journal operation FK fixture: %w", err)
+		}
+	}
+	return nil
+}
+
 // operations_adversarial.go holds narrow write seams that deliberately leave the
 // journal in a state a production writer never would, so the adversarial proof
 // corpus can drive the production VerifyIntegrity guard (§10 rule 8) and the

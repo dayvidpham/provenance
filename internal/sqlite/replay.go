@@ -431,6 +431,7 @@ func (db *DB) ReplayProjections() (journal.ReplayResult, error) {
 
 type canonicalStoredOperation struct {
 	anchor       int64
+	authority    *journal.JournalID
 	version      string
 	wire, digest []byte
 	actor        journal.ActorID
@@ -441,22 +442,35 @@ type canonicalStoredOperation struct {
 
 func (db *DB) validateCanonicalOperationsLocked() error {
 	var operations []canonicalStoredOperation
-	if err := sqlitex.Execute(db.conn,
-		`SELECT o.journal_id, o.mutation_encoding_version, o.canonical_mutation,
+	columns, err := db.tableColumnsLocked("journal_operations")
+	if err != nil {
+		return err
+	}
+	versionExpr, wireExpr := "o.mutation_encoding_version", "o.canonical_mutation"
+	if isLegacyOperationsColumnSet(columns) {
+		versionExpr, wireExpr = "NULL", "NULL"
+	}
+	query := fmt.Sprintf(`SELECT o.journal_id, o.authority_journal_id, %s, %s,
 		        o.mutation_digest, j.actor_id, j.recorded_at
 		 FROM journal_operations o JOIN journal j ON j.journal_id=o.journal_id
-		 ORDER BY o.journal_id`,
+		 ORDER BY o.journal_id`, versionExpr, wireExpr)
+	if err := sqlitex.Execute(db.conn,
+		query,
 		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
-			op := canonicalStoredOperation{anchor: stmt.ColumnInt64(0), digest: readBlob(stmt, 3), recordedAt: stmt.ColumnInt64(5)}
+			op := canonicalStoredOperation{anchor: stmt.ColumnInt64(0), digest: readBlob(stmt, 4), recordedAt: stmt.ColumnInt64(6)}
 			if stmt.ColumnType(1) != zs.TypeNull {
-				op.versionSet = true
-				op.version = stmt.ColumnText(1)
+				authority := journal.JournalID(stmt.ColumnInt64(1))
+				op.authority = &authority
 			}
 			if stmt.ColumnType(2) != zs.TypeNull {
-				op.wireSet = true
-				op.wire = readBlob(stmt, 2)
+				op.versionSet = true
+				op.version = stmt.ColumnText(2)
 			}
-			actor, err := journalParseActor(stmt.ColumnText(4))
+			if stmt.ColumnType(3) != zs.TypeNull {
+				op.wireSet = true
+				op.wire = readBlob(stmt, 3)
+			}
+			actor, err := journalParseActor(stmt.ColumnText(5))
 			if err != nil {
 				return err
 			}
@@ -500,6 +514,26 @@ func (db *DB) validateCanonicalOperationsLocked() error {
 				}
 			}
 			return canonicalCorruption(op.anchor, field, strconv.Itoa(len(rows)), strconv.Itoa(len(effects)))
+		}
+		isGenesis := len(effects) == 1 && effects[0].Sort == journal.EffectBootstrapAuthority
+		if isGenesis && op.authority != nil {
+			return canonicalCorruption(op.anchor, "authority", fmt.Sprint(*op.authority), "NULL genesis authority")
+		}
+		if !isGenesis {
+			if op.authority == nil {
+				return canonicalCorruption(op.anchor, "authority", "NULL", "non-NULL governing authority")
+			}
+			if err := db.requireAuthorityExistsLocked(*op.authority); err != nil {
+				return fmt.Errorf("startup canonical operation %d authority: %w", op.anchor, err)
+			}
+			in := journal.OperationInput{ActorID: op.actor, AuthorityJournalID: op.authority}
+			for i, effect := range effects {
+				if effect.TaskID.Namespace != "" {
+					if err := db.requireAuthorityGovernsLocked(in, rows[i], effect.TaskID); err != nil {
+						return fmt.Errorf("startup canonical operation %d authority for effect %d: %w", op.anchor, i, err)
+					}
+				}
+			}
 		}
 		if err := db.validateCanonicalResultSlotsLocked(op.anchor, rows, effects); err != nil {
 			return err
@@ -830,8 +864,15 @@ func (db *DB) createProjectionShadowLocked() error {
 	// Only opaque legacy task births are seeded from their materialized row. New
 	// canonical births must be reconstructed from canonical effects, making missing
 	// and spurious task rows observable while retaining mixed legacy/new databases.
-	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO shadow_tasks
+	columns, err := db.tableColumnsLocked("journal_operations")
+	if err != nil {
+		return err
+	}
+	legacyBirth := "o.canonical_mutation IS NULL"
+	if isLegacyOperationsColumnSet(columns) {
+		legacyBirth = "1"
+	}
+	seedLegacy := fmt.Sprintf(`INSERT INTO shadow_tasks
 		 (id, namespace, title, description, owner_id, status_id, priority_id, type_id,
 		  phase_id, notes, created_at, updated_at, closed_at, close_reason, last_journal_id)
 		 SELECT t.id, t.namespace, t.title, t.description, NULL, ?1, t.priority_id, t.type_id,
@@ -842,9 +883,10 @@ func (db *DB) createProjectionShadowLocked() error {
 		   JOIN journal j ON j.journal_id=e.journal_id
 		   JOIN journal_operations o ON o.journal_id=j.produced_by_operation_journal_id
 		   WHERE e.task_id=t.id AND (
-		     (e.event_kind=?2 AND o.canonical_mutation IS NULL) OR e.event_kind=?3
+		     (e.event_kind=?2 AND %s) OR e.event_kind=?3
 		   )
-		 )`,
+		 )`, legacyBirth)
+	if err := sqlitex.Execute(db.conn, seedLegacy,
 		&sqlitex.ExecOptions{Args: []any{statusOpenID, string(journal.EventKindTaskCreated), string(journal.EventKindTaskMigrated)}}); err != nil {
 		return fmt.Errorf("seed shadow_tasks legacy slate: %w", err)
 	}
@@ -856,10 +898,18 @@ func (db *DB) canonicalEffectForJournalRowLocked(jid int64) (journal.Effect, boo
 	var wire []byte
 	var anchor int64
 	found := false
-	if err := sqlitex.Execute(db.conn,
-		`SELECT o.journal_id, o.mutation_encoding_version, o.canonical_mutation
+	columns, err := db.tableColumnsLocked("journal_operations")
+	if err != nil {
+		return journal.Effect{}, false, err
+	}
+	versionExpr, wireExpr := "o.mutation_encoding_version", "o.canonical_mutation"
+	if isLegacyOperationsColumnSet(columns) {
+		versionExpr, wireExpr = "NULL", "NULL"
+	}
+	query := fmt.Sprintf(`SELECT o.journal_id, %s, %s
 		 FROM journal j JOIN journal_operations o ON o.journal_id=j.produced_by_operation_journal_id
-		 WHERE j.journal_id=?1`,
+		 WHERE j.journal_id=?1`, versionExpr, wireExpr)
+	if err := sqlitex.Execute(db.conn, query,
 		&sqlitex.ExecOptions{Args: []any{jid}, ResultFunc: func(stmt *zs.Stmt) error {
 			found = true
 			anchor = stmt.ColumnInt64(0)
