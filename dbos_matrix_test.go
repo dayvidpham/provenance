@@ -114,8 +114,8 @@ func TestMatrix_AbsentExact_ReplaySucceeds(t *testing.T) {
 	// The adapter step folded once and that fold short-circuited on the
 	// already-committed operation (§9.4) — the domain is unchanged, so the anchor
 	// matches the directly-committed one.
-	if c.commits-before != 1 {
-		t.Errorf("adapter step committed folds = %d, want 1 (the replay fold)", c.commits-before)
+	if c.commits-before != 2 {
+		t.Errorf("successful replay folds = %d, want preflight plus first DBOS callback", c.commits-before)
 	}
 }
 
@@ -141,9 +141,9 @@ func TestMatrix_AbsentConflict_TypedConflict(t *testing.T) {
 	}
 }
 
-// Row 4: present-success (DBOS) | exact equal digest/result → callback count zero;
-// succeed. Re-Apply the identical operation: DBOS returns the completed workflow
-// without re-running the step.
+// Row 4: present-success (DBOS) | exact equal canonical mutation → the read-only
+// replay preflight runs once, then DBOS returns the completed workflow without
+// re-running its step callback.
 func TestMatrix_PresentSuccessExact_ZeroCallback(t *testing.T) {
 	var c counters
 	s := stackWithJournal(t, &c, nil)
@@ -162,13 +162,79 @@ func TestMatrix_PresentSuccessExact_ZeroCallback(t *testing.T) {
 	if res.Kind != provenance.CommittedExact {
 		t.Errorf("res.Kind = %v, want CommittedExact", res.Kind)
 	}
-	// Zero callback: DBOS returns the completed workflow without re-running the step,
-	// so the fold is not even attempted on the re-Apply.
-	if c.attempts != attemptsBefore {
-		t.Errorf("fold attempts on re-Apply = %d, want 0 (DBOS skipped the step)", c.attempts-attemptsBefore)
+	// One journal replay preflight, zero DBOS callbacks. A second attempt would mean
+	// the durable workflow step ran again.
+	if c.attempts-attemptsBefore != 1 {
+		t.Errorf("fold attempts on re-Apply = %d, want 1 preflight and zero DBOS callbacks", c.attempts-attemptsBefore)
 	}
-	if c.commits != 1 {
-		t.Errorf("committed folds after re-Apply = %d, want 1", c.commits)
+	if c.commits != 2 {
+		t.Errorf("successful folds after re-Apply = %d, want initial commit plus read-only replay", c.commits)
+	}
+}
+
+func TestMatrix_PresentSuccessChangedCanonicalOperand_ConflictsBeforeWorkflow(t *testing.T) {
+	var c counters
+	s := stackWithJournal(t, &c, nil)
+	op := s.createTaskOp("op-canonical-conflict", "aura", "original")
+	first, err := s.adapter.Apply(context.Background(), op)
+	if err != nil {
+		t.Fatalf("first Apply: %v", err)
+	}
+	tasksBefore, err := s.tracker.List(provenance.ListFilter{})
+	if err != nil {
+		t.Fatalf("List before retry: %v", err)
+	}
+	attemptsBefore := c.attempts
+	changed := op
+	changed.Effects = append([]provenance.Effect(nil), op.Effects...)
+	changed.Effects[0].Title = "changed while caller digest stays identical"
+	_, err = s.adapter.Apply(context.Background(), changed)
+	if !errors.Is(err, provenance.ErrOperationConflict) {
+		t.Fatalf("changed canonical retry err = %v, want ErrOperationConflict", err)
+	}
+	var conflict *provenance.OperationConflict
+	if !errors.As(err, &conflict) {
+		t.Fatalf("changed canonical retry lacks typed OperationConflict: %v", err)
+	}
+	if c.attempts-attemptsBefore != 1 {
+		t.Fatalf("retry fold attempts = %d, want one replay preflight and zero DBOS callbacks", c.attempts-attemptsBefore)
+	}
+	tasksAfter, err := s.tracker.List(provenance.ListFilter{})
+	if err != nil {
+		t.Fatalf("List after retry: %v", err)
+	}
+	looked, err := s.tracker.Journal().LookupCommitted(op.OperationID)
+	if err != nil {
+		t.Fatalf("LookupCommitted after retry: %v", err)
+	}
+	if len(tasksAfter) != len(tasksBefore) || looked.AnchorJournalID != first.AnchorJournalID || len(looked.EmittedEvents) != len(first.EmittedEvents) || len(looked.ResultSlots) != len(first.ResultSlots) {
+		t.Fatalf("conflicting retry changed durable state: tasks %d->%d, first=%+v looked=%+v", len(tasksBefore), len(tasksAfter), first, looked)
+	}
+}
+
+func TestMatrix_AllocatedCreateChangedProvisionalUUIDReturnsOriginal(t *testing.T) {
+	var c counters
+	s := stackWithJournal(t, &c, nil)
+	op := s.createTaskOp("op-allocated-retry", "aura", "allocated")
+	op.Effects[0].Sort = provenance.EffectTaskCreateAllocated
+	first, err := s.adapter.Apply(context.Background(), op)
+	if err != nil {
+		t.Fatalf("first Apply: %v", err)
+	}
+	wantTask := *first.ResultSlots[0].TaskID
+	retry := op
+	retry.Effects = append([]provenance.Effect(nil), op.Effects...)
+	retry.Effects[0].TaskID = newTaskID("aura")
+	attemptsBefore := c.attempts
+	got, err := s.adapter.Apply(context.Background(), retry)
+	if err != nil {
+		t.Fatalf("allocated retry: %v", err)
+	}
+	if c.attempts-attemptsBefore != 1 {
+		t.Fatalf("allocated retry fold attempts = %d, want one replay preflight and zero DBOS callbacks", c.attempts-attemptsBefore)
+	}
+	if len(got.ResultSlots) != 1 || got.ResultSlots[0].TaskID == nil || *got.ResultSlots[0].TaskID != wantTask {
+		t.Fatalf("allocated retry result = %+v, want original task %s", got, wantTask)
 	}
 }
 

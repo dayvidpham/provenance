@@ -49,7 +49,7 @@ func TestCrashGapChild(t *testing.T) {
 	if gap == "" {
 		t.Skip("child entry point; runs only under PROV_CRASH_GAP")
 	}
-	runCrashChild(gap, os.Getenv("PROV_DBPATH"), os.Getenv("PROV_ACTOR"), os.Getenv("PROV_AUTH"))
+	runCrashChild(gap, os.Getenv("PROV_DBPATH"), os.Getenv("PROV_ACTOR"), os.Getenv("PROV_AUTH"), os.Getenv("PROV_TASK"))
 	// If we reach here the crash hook did not fire.
 	os.Exit(crashExitFinished)
 }
@@ -66,7 +66,7 @@ func openSharedSQL(path string) (*sql.DB, error) {
 	return db, nil
 }
 
-func crashOp(actor ptypes.ActorID, auth journal.JournalID) journal.OperationInput {
+func crashOp(actor ptypes.ActorID, auth journal.JournalID, taskID ptypes.TaskID) journal.OperationInput {
 	a := auth
 	return journal.OperationInput{
 		OperationID:        "op-crash",
@@ -78,7 +78,7 @@ func crashOp(actor ptypes.ActorID, auth journal.JournalID) journal.OperationInpu
 		Effects: []journal.Effect{{
 			Sort:       EffectTaskCreate,
 			ResultSlot: "task",
-			TaskID:     ptypes.TaskID{Namespace: "aura", UUID: uuid.Must(uuid.NewV7())},
+			TaskID:     taskID,
 			Title:      "crash-task",
 			Type:       TaskTypeTask,
 			Priority:   PriorityMedium,
@@ -89,7 +89,7 @@ func crashOp(actor ptypes.ActorID, auth journal.JournalID) journal.OperationInpu
 
 // runCrashChild builds the stack, arms the crash hook for gap, and drives one Apply
 // that must crash via os.Exit inside the step.
-func runCrashChild(gap, dbpath, actorStr, authStr string) {
+func runCrashChild(gap, dbpath, actorStr, authStr, taskStr string) {
 	db, err := openSharedSQL(dbpath)
 	if err != nil {
 		os.Exit(20)
@@ -127,7 +127,11 @@ func runCrashChild(gap, dbpath, actorStr, authStr string) {
 	if err != nil {
 		os.Exit(27)
 	}
-	_, _ = adapter.Apply(context.Background(), crashOp(actor, journal.JournalID(auth)))
+	taskID, err := ptypes.ParseTaskID(taskStr)
+	if err != nil {
+		os.Exit(28)
+	}
+	_, _ = adapter.Apply(context.Background(), crashOp(actor, journal.JournalID(auth), taskID))
 }
 
 func runCrashGap(t *testing.T, gap string, wantExit int) {
@@ -138,6 +142,7 @@ func runCrashGap(t *testing.T, gap string, wantExit int) {
 	// Parent establishes the genesis authority + committing actor (no DBOS needed),
 	// then releases the file before spawning the child.
 	actor, auth := seedCrashGenesis(t, dbpath)
+	taskID := ptypes.TaskID{Namespace: "aura", UUID: uuid.Must(uuid.NewV7())}
 
 	// Spawn the child, which crashes mid-Apply at the gap boundary.
 	cmd := exec.Command(os.Args[0], "-test.run=^TestCrashGapChild$", "-test.v")
@@ -146,6 +151,7 @@ func runCrashGap(t *testing.T, gap string, wantExit int) {
 		"PROV_DBPATH="+dbpath,
 		"PROV_ACTOR="+actor.String(),
 		"PROV_AUTH="+strconv.FormatInt(int64(auth), 10),
+		"PROV_TASK="+taskID.String(),
 	)
 	out, err := cmd.CombinedOutput()
 	code := exitCode(err)
@@ -180,7 +186,7 @@ func runCrashGap(t *testing.T, gap string, wantExit int) {
 	defer func() { root.Shutdown(5 * time.Second); _ = tracker.Close() }()
 
 	// Drive the same operation to completion: it attaches to the recovered workflow.
-	res, err := adapter.Apply(context.Background(), crashOp(actor, auth))
+	res, err := adapter.Apply(context.Background(), crashOp(actor, auth, taskID))
 	if err != nil {
 		t.Fatalf("post-recovery Apply: %v", err)
 	}

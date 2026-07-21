@@ -11,6 +11,7 @@ package provenance
 // authorized by the user at Impl-UAT C7a.
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 
@@ -88,8 +89,11 @@ func NewDBOSAdapter(root dbos.DBOSContext, tracker Tracker, config DBOSAdapterCo
 		applicationVersion: actual,
 		testHooks:          defaultApplyTestHooks(),
 	}
-	// One stable workflow, registered before Launch so recovery can re-run it.
+	// Keep the V1 function registered under its historical runtime identity and add
+	// V2 separately. DBOS can therefore resume persisted V1 executions while all new
+	// Apply calls use canonical V2 transport and identities.
 	dbos.RegisterWorkflow(root, a.applyWorkflow)
+	dbos.RegisterWorkflow(root, a.applyWorkflowV2)
 	return a, nil
 }
 
@@ -112,18 +116,41 @@ func (a *DBOSAdapter) Apply(ctx context.Context, in journal.OperationInput) (Com
 		}
 	}
 
-	input, err := encodeApplyInput(in)
+	input, normalized, err := encodeApplyInputV2(in)
 	if err != nil {
 		return CommittedResult{}, fmt.Errorf("provenance.DBOSAdapter.Apply: canonicalize operation %q: %w", in.OperationID, err)
 	}
-	fp := fingerprint(a.applicationVersion, in)
-	workflowID := applyWorkflowIDPrefix + fp
+
+	// DBOS executes zero callbacks when a workflow is already complete. Ask the
+	// journal's reviewed replay path to validate the proposed canonical effects
+	// before attaching. It performs no writes for an existing operation and is the
+	// sole authority for the allocated-create UUID exception.
+	existing, err := a.tracker.Journal().LookupCommitted(normalized.OperationID)
+	if err != nil {
+		return CommittedResult{}, fmt.Errorf("provenance.DBOSAdapter.Apply: preflight LookupCommitted for operation %q: %w", normalized.OperationID, err)
+	}
+	if existing.Kind == journal.CommittedExact {
+		validated, applyErr := a.tracker.Journal().Apply(normalized)
+		if applyErr != nil {
+			return CommittedResult{}, applyErr
+		}
+		normalized, err = reconcileDBOSAllocatedCreates(normalized, validated)
+		if err != nil {
+			return CommittedResult{}, err
+		}
+		input, normalized, err = encodeApplyInputV2(normalized)
+		if err != nil {
+			return CommittedResult{}, fmt.Errorf("provenance.DBOSAdapter.Apply: canonicalize reconciled operation %q: %w", in.OperationID, err)
+		}
+	}
+	fp := fingerprintV2(a.applicationVersion, input)
+	workflowID := applyWorkflowIDPrefixV2 + fp
 
 	// Start (or attach to) the durable workflow on the UN-CANCELLED adapter root, so
 	// caller cancellation never cancels durable work.
 	if _, err := dbos.RunWorkflow(
 		a.root,
-		a.applyWorkflow,
+		a.applyWorkflowV2,
 		input,
 		dbos.WithWorkflowID(workflowID),
 		dbos.WithApplicationVersion(a.applicationVersion),
@@ -135,11 +162,31 @@ func (a *DBOSAdapter) Apply(ctx context.Context, in journal.OperationInput) (Com
 			workflowID, in.OperationID, err)
 	}
 
-	outcome, err := awaitWorkflowResult[DBOSStepOutcomeV1](ctx, a.root, workflowID, in.OperationID)
+	outcome, err := awaitWorkflowResult[DBOSStepOutcomeV1](ctx, a.root, workflowID, normalized.OperationID)
 	if err != nil {
 		return CommittedResult{}, err
 	}
-	return a.postValidate(in, outcome)
+	return a.postValidate(normalized, outcome)
+}
+
+func reconcileDBOSAllocatedCreates(in journal.OperationInput, result journal.CommittedResult) (journal.OperationInput, error) {
+	slots := make(map[journal.ResultSlotID]journal.ResultSlotBinding, len(result.ResultSlots))
+	for _, binding := range result.ResultSlots {
+		slots[binding.Slot] = binding
+	}
+	in.Effects = append([]journal.Effect(nil), in.Effects...)
+	for i := range in.Effects {
+		effect := &in.Effects[i]
+		if effect.Sort != journal.EffectTaskCreateAllocated {
+			continue
+		}
+		binding, ok := slots[effect.ResultSlot]
+		if !ok || binding.TaskID == nil || binding.Kind != journal.JournalKindTaskEvent || binding.TaskID.Namespace != effect.TaskID.Namespace {
+			return journal.OperationInput{}, fmt.Errorf("%w: allocated create operation %q slot %q does not resolve to a task in namespace %q — where: DBOS completed-workflow preflight; impact: no workflow starts and no writes occur; fix: restore the operation result slot and canonical mutation from the same committed backup", journal.ErrResultSlotIntegrity, in.OperationID, effect.ResultSlot, effect.TaskID.Namespace)
+		}
+		effect.TaskID.UUID = binding.TaskID.UUID
+	}
+	return in, nil
 }
 
 // applyWorkflow is the single registered durable workflow: decode/validate/
@@ -151,7 +198,7 @@ func (a *DBOSAdapter) applyWorkflow(wfCtx dbos.DBOSContext, input DBOSApplyInput
 	if err != nil {
 		return DBOSStepOutcomeV1{}, fmt.Errorf("provenance.applyWorkflow: %w", err)
 	}
-	fp := fingerprint(a.applicationVersion, in)
+	fp := fingerprintV1(a.applicationVersion, in)
 
 	outcome, err := dbos.RunAsStep(
 		wfCtx,
@@ -175,6 +222,30 @@ func (a *DBOSAdapter) applyWorkflow(wfCtx dbos.DBOSContext, input DBOSApplyInput
 		},
 		dbos.WithStepName(applyStepNamePrefix+fp),
 	)
+	if err != nil {
+		return DBOSStepOutcomeV1{}, err
+	}
+	a.testHooks.afterStepCheckpoint()
+	return outcome, nil
+}
+
+func (a *DBOSAdapter) applyWorkflowV2(wfCtx dbos.DBOSContext, input DBOSApplyInputV2) (DBOSStepOutcomeV1, error) {
+	in, err := decodeApplyInputV2(input)
+	if err != nil {
+		return DBOSStepOutcomeV1{}, fmt.Errorf("provenance.applyWorkflowV2: %w", err)
+	}
+	fp := fingerprintV2(a.applicationVersion, input)
+	outcome, err := dbos.RunAsStep(wfCtx, func(stepCtx context.Context) (DBOSStepOutcomeV1, error) {
+		result, applyErr := a.foldDomainMutation(in)
+		if applyErr != nil {
+			if isInfrastructureError(applyErr) {
+				return DBOSStepOutcomeV1{}, applyErr
+			}
+			return encodeDBOSApplyFailure(in.OperationID, in.MutationDigest, applyErr)
+		}
+		a.testHooks.afterDomainCommit()
+		return encodeDBOSApplySuccess(in.OperationID, in.MutationDigest, result)
+	}, dbos.WithStepName(applyStepNamePrefixV2+fp))
 	if err != nil {
 		return DBOSStepOutcomeV1{}, err
 	}
@@ -229,6 +300,14 @@ func (a *DBOSAdapter) postValidate(in journal.OperationInput, outcome DBOSStepOu
 			Fix:       "this indicates a corrupted or mis-keyed checkpoint; investigate the workflow ID derivation",
 			Cause: fmt.Errorf("outcome operation %q != requested %q",
 				outcome.OperationID, in.OperationID),
+		}
+	}
+	if !bytes.Equal(outcome.MutationDigest, in.MutationDigest) {
+		return CommittedResult{}, &CheckpointDivergenceError{
+			Operation: in.OperationID, Stage: "post-validation canonical mutation identity",
+			Impact: "the checkpoint belongs to different canonical effects; nothing is trusted",
+			Fix:    "restore the DBOS checkpoint and journal operation from the same committed execution",
+			Cause:  fmt.Errorf("outcome canonical digest %x != requested %x", outcome.MutationDigest, in.MutationDigest),
 		}
 	}
 	success, decodeErr := outcome.Decode()

@@ -15,8 +15,11 @@ package provenance
 // validated inverse pair — reconstructing an identical, revalidated EventContext.
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 
 	"github.com/dayvidpham/provenance/internal/journal"
 	"github.com/dayvidpham/provenance/pkg/ptypes"
@@ -25,6 +28,12 @@ import (
 // DBOSApplyInputSchemaV1 is the closed schema tag stamped on every
 // DBOSApplyInputV1; a decoded input carrying any other tag fails closed.
 const DBOSApplyInputSchemaV1 = "provenance.dbos-apply-input/v1"
+
+const (
+	DBOSApplyInputSchemaV2 = "provenance.dbos-apply-input/v2"
+	dbosContextSchemaV2    = "provenance.dbos-context/v2"
+	maxDBOSContextBytes    = 3*MaxCanonicalFieldBytes + 64
+)
 
 // CanonicalMutationContextV1 is the deterministic byte encoding of one operation's
 // replay-identity context (OperationID, committing actor, governing authority,
@@ -44,6 +53,150 @@ type DBOSApplyInputV1 struct {
 	Schema   string                     `json:"schema"`
 	Context  CanonicalMutationContextV1 `json:"context"`
 	Mutation CanonicalMutationBytes     `json:"mutation"`
+}
+
+// DBOSApplyInputV2 transports the reviewed canonical mutation bytes directly.
+// Context uses a closed ordered frame rather than JSON so missing, duplicate,
+// unknown, and trailing fields cannot be silently accepted by DBOS's serializer.
+type DBOSApplyInputV2 struct {
+	Schema   string                     `json:"schema"`
+	Context  CanonicalMutationContextV1 `json:"context"`
+	Mutation CanonicalMutationBytes     `json:"mutation"`
+}
+
+func encodeApplyInputV2(in journal.OperationInput) (DBOSApplyInputV2, journal.OperationInput, error) {
+	prepared, err := journal.PrepareMutationV1(in.Effects)
+	if err != nil {
+		return DBOSApplyInputV2{}, journal.OperationInput{}, err
+	}
+	in.Effects = prepared.NormalizedEffects()
+	in.MutationDigest = prepared.DerivedDigest()
+	contextBytes, err := encodeDBOSContextV2(in)
+	if err != nil {
+		return DBOSApplyInputV2{}, journal.OperationInput{}, err
+	}
+	return DBOSApplyInputV2{
+		Schema: DBOSApplyInputSchemaV2, Context: contextBytes,
+		Mutation: prepared.CanonicalBytes(),
+	}, in, nil
+}
+
+func decodeApplyInputV2(input DBOSApplyInputV2) (journal.OperationInput, error) {
+	if input.Schema != DBOSApplyInputSchemaV2 {
+		return journal.OperationInput{}, fmt.Errorf("provenance: decode V2 apply-input: schema %q is not %q — where: DBOS V2 workflow decode; impact: no domain fold runs; fix: restore the persisted input written by DBOSAdapter.Apply", input.Schema, DBOSApplyInputSchemaV2)
+	}
+	in, err := decodeDBOSContextV2(input.Context)
+	if err != nil {
+		return journal.OperationInput{}, err
+	}
+	prepared, err := journal.DecodeCanonicalMutation(input.Mutation)
+	if err != nil {
+		return journal.OperationInput{}, fmt.Errorf("provenance: decode V2 apply-input canonical mutation: %w", err)
+	}
+	in.Effects = prepared.NormalizedEffects()
+	in.MutationDigest = prepared.DerivedDigest()
+	return in, nil
+}
+
+func encodeDBOSContextV2(in journal.OperationInput) ([]byte, error) {
+	if err := journal.ValidateOperationID(in.OperationID); err != nil {
+		return nil, fmt.Errorf("provenance: encode V2 DBOS context operation ID: %w", err)
+	}
+	actor := actorToWire(in.ActorID)
+	if _, err := actorFromWire(actor); err != nil {
+		return nil, fmt.Errorf("provenance: encode V2 DBOS context actor: %w", err)
+	}
+	fields := [][]byte{[]byte(dbosContextSchemaV2), []byte(in.OperationID), []byte(actor)}
+	if in.AuthorityJournalID == nil {
+		fields = append(fields, []byte{0})
+	} else {
+		var authority [9]byte
+		authority[0] = 1
+		binary.BigEndian.PutUint64(authority[1:], uint64(*in.AuthorityJournalID))
+		fields = append(fields, authority[:])
+	}
+	fields = append(fields, append([]byte(nil), in.CommandDigest...))
+	var recorded [8]byte
+	binary.BigEndian.PutUint64(recorded[:], uint64(in.RecordedAt))
+	fields = append(fields, recorded[:])
+	var out bytes.Buffer
+	for i, field := range fields {
+		if len(field) > MaxCanonicalFieldBytes {
+			return nil, fmt.Errorf("provenance: encode V2 DBOS context field %d is %d bytes, maximum %d — where: adapter preflight; impact: no workflow starts; fix: use bounded operation identity and digest operands", i, len(field), MaxCanonicalFieldBytes)
+		}
+		var size [4]byte
+		binary.BigEndian.PutUint32(size[:], uint32(len(field)))
+		out.Write(size[:])
+		out.Write(field)
+	}
+	if out.Len() > maxDBOSContextBytes {
+		return nil, fmt.Errorf("provenance: encoded V2 DBOS context is %d bytes, maximum %d — where: adapter preflight; impact: no workflow starts; fix: reduce context operands", out.Len(), maxDBOSContextBytes)
+	}
+	return out.Bytes(), nil
+}
+
+func decodeDBOSContextV2(data []byte) (journal.OperationInput, error) {
+	if len(data) > maxDBOSContextBytes {
+		return journal.OperationInput{}, fmt.Errorf("provenance: V2 DBOS context is %d bytes, maximum %d — where: workflow decode; impact: no domain fold runs; fix: restore bounded persisted context bytes", len(data), maxDBOSContextBytes)
+	}
+	r := bytes.NewReader(data)
+	read := func(name string) ([]byte, error) {
+		var size uint32
+		if err := binary.Read(r, binary.BigEndian, &size); err != nil {
+			return nil, fmt.Errorf("provenance: decode V2 DBOS context missing %s length: %w", name, err)
+		}
+		if size > MaxCanonicalFieldBytes || uint64(size) > uint64(r.Len()) {
+			return nil, fmt.Errorf("provenance: decode V2 DBOS context %s length %d exceeds bounds or remaining %d bytes", name, size, r.Len())
+		}
+		value := make([]byte, int(size))
+		if _, err := io.ReadFull(r, value); err != nil {
+			return nil, fmt.Errorf("provenance: decode V2 DBOS context %s: %w", name, err)
+		}
+		return value, nil
+	}
+	names := []string{"version", "operation", "actor", "authority", "command", "recorded-at"}
+	values := make([][]byte, len(names))
+	for i := range names {
+		var err error
+		values[i], err = read(names[i])
+		if err != nil {
+			return journal.OperationInput{}, err
+		}
+	}
+	if r.Len() != 0 {
+		return journal.OperationInput{}, fmt.Errorf("provenance: decode V2 DBOS context has %d trailing bytes — where: workflow decode; impact: ambiguous context is rejected; fix: restore the exact closed V2 frame", r.Len())
+	}
+	if string(values[0]) != dbosContextSchemaV2 {
+		return journal.OperationInput{}, fmt.Errorf("provenance: decode V2 DBOS context version %q is unsupported", values[0])
+	}
+	operation := journal.OperationID(values[1])
+	if err := journal.ValidateOperationID(operation); err != nil {
+		return journal.OperationInput{}, fmt.Errorf("provenance: decode V2 DBOS context operation: %w", err)
+	}
+	actor, err := actorFromWire(string(values[2]))
+	if err != nil {
+		return journal.OperationInput{}, fmt.Errorf("provenance: decode V2 DBOS context actor: %w", err)
+	}
+	var authority *journal.JournalID
+	switch len(values[3]) {
+	case 1:
+		if values[3][0] != 0 {
+			return journal.OperationInput{}, fmt.Errorf("provenance: decode V2 DBOS context authority has invalid absent tag %d", values[3][0])
+		}
+	case 9:
+		if values[3][0] != 1 {
+			return journal.OperationInput{}, fmt.Errorf("provenance: decode V2 DBOS context authority has invalid present tag %d", values[3][0])
+		}
+		value := journal.JournalID(int64(binary.BigEndian.Uint64(values[3][1:])))
+		authority = &value
+	default:
+		return journal.OperationInput{}, fmt.Errorf("provenance: decode V2 DBOS context authority length %d is neither 1 nor 9", len(values[3]))
+	}
+	if len(values[5]) != 8 {
+		return journal.OperationInput{}, fmt.Errorf("provenance: decode V2 DBOS context recorded-at length %d is not 8", len(values[5]))
+	}
+	return journal.OperationInput{OperationID: operation, ActorID: actor, AuthorityJournalID: authority,
+		CommandDigest: append([]byte(nil), values[4]...), RecordedAt: int64(binary.BigEndian.Uint64(values[5]))}, nil
 }
 
 // wireContext is the JSON-stable form of an operation's replay-identity context.

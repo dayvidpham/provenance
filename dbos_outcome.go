@@ -35,11 +35,14 @@ import (
 // and step ID (a different code contract must not silently reuse a checkpoint).
 const (
 	ApplyWorkflowSchemaV1     = "provenance.apply/v1"
+	ApplyWorkflowSchemaV2     = "provenance.apply/v2"
 	DBOSStepOutcomeSchemaV1   = "provenance.dbos-step-outcome/v1"
 	PinnedDBOSContractVersion = "github.com/dbos-inc/dbos-transact-golang v0.16.0"
 
-	applyWorkflowIDPrefix = "provenance.apply/v1/"
-	applyStepNamePrefix   = "provenance.apply-step/v1/"
+	applyWorkflowIDPrefix   = "provenance.apply/v1/"
+	applyStepNamePrefix     = "provenance.apply-step/v1/"
+	applyWorkflowIDPrefixV2 = "provenance.apply/v2/"
+	applyStepNamePrefixV2   = "provenance.apply-step/v2/"
 )
 
 // CanonicalResultSlotV1 is one slot→produced-row binding in the canonical result:
@@ -286,7 +289,7 @@ func (f *CanonicalApplyFailureV1) asError() error {
 // operation's four-field replay identity and structural mutation. It is stable for
 // an exact input and changes for any version/actor/authority/OperationID/command/
 // mutation change.
-func fingerprint(applicationVersion string, in journal.OperationInput) string {
+func fingerprintV1(applicationVersion string, in journal.OperationInput) string {
 	h := sha256.New()
 	write := func(b []byte) {
 		var n [8]byte
@@ -317,6 +320,26 @@ func fingerprint(applicationVersion string, in journal.OperationInput) string {
 
 	sum := h.Sum(nil)
 	return fmt.Sprintf("%x", sum)
+}
+
+// fingerprintV2 binds the runtime contract and the complete closed V2 input.
+// Mutation is the reviewed canonical byte stream, never the caller's digest.
+func fingerprintV2(applicationVersion string, input DBOSApplyInputV2) string {
+	h := sha256.New()
+	write := func(value []byte) {
+		var size [8]byte
+		binary.BigEndian.PutUint64(size[:], uint64(len(value)))
+		_, _ = h.Write(size[:])
+		_, _ = h.Write(value)
+	}
+	for _, value := range [][]byte{
+		[]byte(DBOSApplyInputSchemaV2), []byte(ApplyWorkflowSchemaV2),
+		[]byte(DBOSStepOutcomeSchemaV1), []byte(PinnedDBOSContractVersion),
+		[]byte(applicationVersion), input.Context, input.Mutation,
+	} {
+		write(value)
+	}
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
 // journalValidateTaskID mirrors the journal package's task-ID validity check for a
