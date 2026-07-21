@@ -13,6 +13,7 @@ package provenance
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 
 	dbos "github.com/dbos-inc/dbos-transact-golang/dbos"
@@ -150,6 +151,20 @@ func (a *DBOSAdapter) Apply(ctx context.Context, in journal.OperationInput) (Com
 		return CommittedResult{}, fmt.Errorf("provenance.DBOSAdapter.Apply: derive V2 workflow identity for operation %q: %w", in.OperationID, err)
 	}
 	workflowID := applyWorkflowIDPrefixV2 + fp
+	if existing.Kind == journal.CommittedExact {
+		outcome, retrieveErr := awaitWorkflowResult[DBOSStepOutcomeV1](ctx, a.root, workflowID, normalized.OperationID)
+		if retrieveErr == nil {
+			return a.postValidate(normalized, outcome)
+		}
+		var waitCanceled *ApplyWaitCanceledError
+		if errors.As(retrieveErr, &waitCanceled) {
+			return CommittedResult{}, retrieveErr
+		}
+		var dbosErr *dbos.DBOSError
+		if !errors.As(retrieveErr, &dbosErr) || dbosErr.Code != dbos.NonExistentWorkflowError {
+			return CommittedResult{}, fmt.Errorf("provenance.DBOSAdapter.Apply: retrieve existing V2 workflow %q for operation %q before read-only replay: %w — where: completed-operation attachment; impact: no workflow or domain write is attempted; fix: repair or recover the matching DBOS workflow history, then retry", workflowID, normalized.OperationID, retrieveErr)
+		}
+	}
 
 	// Start (or attach to) the durable workflow on the UN-CANCELLED adapter root, so
 	// caller cancellation never cancels durable work.

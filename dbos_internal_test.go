@@ -171,7 +171,7 @@ func TestWireV2_TransportsCanonicalBytesAndRejectsMalformedFrames(t *testing.T) 
 			if err == nil {
 				t.Fatal("malformed V2 input decoded successfully")
 			}
-			if name != "unknown input version" && name != "malformed canonical mutation" && name != "oversized canonical mutation" {
+			if name != "malformed canonical mutation" && name != "oversized canonical mutation" {
 				if !errors.Is(err, ErrDBOSContextFrame) {
 					t.Fatalf("context error %v does not wrap ErrDBOSContextFrame", err)
 				}

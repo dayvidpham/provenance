@@ -1,11 +1,10 @@
 package provenance
 
-// dbos_wire.go is the canonical, deterministic serialization bridge between a
-// validated in-memory journal.OperationInput and the closed DBOSApplyInputV1 the
-// DBOS durable-workflow layer persists and re-runs on recovery (issue
-// dayvidpham/provenance#6). DBOS re-executes a registered workflow from its
-// PERSISTED input on recovery, so the whole OperationInput — identity plus the
-// ordered effect list — must survive an encode/decode round trip byte-for-byte.
+// dbos_wire.go is the deterministic serialization bridge between a validated
+// journal.OperationInput and DBOS durable workflow history. V1 is retained only
+// to recover already-persisted workflows. V2 is the current write format and
+// carries the reviewed canonical mutation bytes without a lossy effect mirror.
+// DBOS recovers from persisted input, so each version remains strictly decodable.
 //
 // A journal.EventContext is an opaque value with unexported fields and no public
 // JSON decoder (internal/journal/context.go), so an Effect cannot be marshaled
@@ -39,7 +38,7 @@ const (
 var ErrDBOSContextFrame = errors.New("provenance: invalid DBOS V2 context frame")
 
 // DBOSContextFrameError is the uniform typed recovery diagnostic for malformed
-// V2 context bytes. No workflow fold has run when this error is returned.
+// V2 envelope or context bytes. No workflow fold has run when it is returned.
 type DBOSContextFrameError struct {
 	Field  string
 	Reason string
@@ -47,7 +46,7 @@ type DBOSContextFrameError struct {
 }
 
 func (e *DBOSContextFrameError) Error() string {
-	return fmt.Sprintf("%v: what: V2 context field %s is invalid; why: %s; where: DBOS V2 context codec; when: before workflow identity or domain fold; impact: the persisted input is rejected and no domain write runs; fix: %s", ErrDBOSContextFrame, e.Field, e.Reason, e.Fix)
+	return fmt.Sprintf("%v: what: V2 input field %s is invalid; why: %s; where: DBOS V2 envelope/context codec; when: before workflow identity or domain fold; impact: the persisted input is rejected and no domain write runs; fix: %s", ErrDBOSContextFrame, e.Field, e.Reason, e.Fix)
 }
 
 func (e *DBOSContextFrameError) Is(target error) bool { return target == ErrDBOSContextFrame }
@@ -56,33 +55,39 @@ func dbosContextFrameError(field, reason, fix string) error {
 	return &DBOSContextFrameError{Field: field, Reason: reason, Fix: fix}
 }
 
-// CanonicalMutationContextV1 is the deterministic byte encoding of one operation's
-// replay-identity context (OperationID, committing actor, governing authority,
-// command digest, and audit RecordedAt). It is the §9.4 alternate-key half of the
-// input, distinct from the structural mutation.
-type CanonicalMutationContextV1 []byte
+// DBOSOperationContextBytes is the shared opaque byte carrier for versioned DBOS
+// operation context. V2 transports OperationID, actor, authority, command digest,
+// and audit RecordedAt; RecordedAt is persisted for audit but excluded from logical
+// workflow and step identity.
+type DBOSOperationContextBytes []byte
 
-// CanonicalMutationBytes is the deterministic byte encoding of one operation's
-// structural mutation: its MutationDigest and its ordered effect list (§9.3.1).
-type CanonicalMutationBytes []byte
+// DBOSMutationBytes is the shared opaque byte carrier for a versioned mutation.
+// V2 stores the reviewed canonical effect bytes and derives MutationDigest from
+// those bytes; a caller-supplied digest is never authoritative for new workflows.
+type DBOSMutationBytes []byte
 
-// DBOSApplyInputV1 is the closed, serializable workflow input the adapter
-// canonicalizes a journal.OperationInput into before durable execution. Its two
-// opaque byte fields are produced only by encodeApplyInput and consumed only by
-// decodeApplyInput, so the DBOS layer never interprets Provenance identity.
+// Historical exported names remain aliases for source compatibility. They do not
+// imply that V1 is the current write format.
+type (
+	CanonicalMutationContextV1 = DBOSOperationContextBytes
+	CanonicalMutationBytes     = DBOSMutationBytes
+)
+
+// DBOSApplyInputV1 is the historical closed workflow input retained solely for
+// decoding and resuming persisted V1 durable history. New Apply calls never emit it.
 type DBOSApplyInputV1 struct {
-	Schema   string                     `json:"schema"`
-	Context  CanonicalMutationContextV1 `json:"context"`
-	Mutation CanonicalMutationBytes     `json:"mutation"`
+	Schema   string                    `json:"schema"`
+	Context  DBOSOperationContextBytes `json:"context"`
+	Mutation DBOSMutationBytes         `json:"mutation"`
 }
 
-// DBOSApplyInputV2 transports the reviewed canonical mutation bytes directly.
-// Context uses a closed ordered frame rather than JSON so missing, duplicate,
-// unknown, and trailing fields cannot be silently accepted by DBOS's serializer.
+// DBOSApplyInputV2 is the current durable write format. It transports reviewed
+// canonical mutation bytes directly. Context uses a closed ordered frame so
+// missing, duplicate, unknown, and trailing fields fail closed.
 type DBOSApplyInputV2 struct {
-	Schema   string                     `json:"schema"`
-	Context  CanonicalMutationContextV1 `json:"context"`
-	Mutation CanonicalMutationBytes     `json:"mutation"`
+	Schema   string                    `json:"schema"`
+	Context  DBOSOperationContextBytes `json:"context"`
+	Mutation DBOSMutationBytes         `json:"mutation"`
 }
 
 func encodeApplyInputV2(in journal.OperationInput) (DBOSApplyInputV2, journal.OperationInput, error) {
@@ -104,7 +109,7 @@ func encodeApplyInputV2(in journal.OperationInput) (DBOSApplyInputV2, journal.Op
 
 func decodeApplyInputV2(input DBOSApplyInputV2) (journal.OperationInput, error) {
 	if input.Schema != DBOSApplyInputSchemaV2 {
-		return journal.OperationInput{}, fmt.Errorf("provenance: decode V2 apply-input: schema %q is not %q — where: DBOS V2 workflow decode; impact: no domain fold runs; fix: restore the persisted input written by DBOSAdapter.Apply", input.Schema, DBOSApplyInputSchemaV2)
+		return journal.OperationInput{}, dbosContextFrameError("schema", fmt.Sprintf("outer input schema %q is not supported V2 schema %q", input.Schema, DBOSApplyInputSchemaV2), "restore the original V2 envelope or recover it with a build supporting its schema")
 	}
 	in, err := decodeDBOSContextV2(input.Context)
 	if err != nil {
