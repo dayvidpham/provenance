@@ -759,48 +759,31 @@ func TestNamespaceClaimRejectsOverlap(t *testing.T) {
 	}
 }
 
-// TestRegisterSoftwareAgentWithIDSatisfiesFixedActorEntryFK is the exact
-// pasture#14 seeding scenario the gap analysis found: manifest-v1 ordinal-zero,
-// the all-zero-UUID default pasture-system software agent. Before this seam
-// existed, no released API could create an agents row with a caller-supplied
-// ID, so RegisterFixedActorEntry's ActorID FK into agents(id) could never be
-// satisfied for a fixed system actor. This proves the FK now resolves
-// end-to-end: claim the namespace, register the fixed-ID software agent, then
-// register its fixed_actor_manifest_entries row.
-func TestRegisterSoftwareAgentWithIDSatisfiesFixedActorEntryFK(t *testing.T) {
+// TestRegisterFixedSoftwareAgentSatisfiesManifestFK proves the aggregate
+// registration creates a readable software agent and its FK-backed manifest.
+func TestRegisterFixedSoftwareAgentSatisfiesManifestFK(t *testing.T) {
 	db := newJournalDB(t)
 	claim := journal.ActorNamespaceClaim{
 		Namespace: "pasture-system", ClaimantID: "pasture-system",
 		Range: journal.UUIDRange{Min: journal.BigEndianUUID(0), Max: journal.BigEndianUUID(1023)},
 		Codec: journal.OrdinalV1CodecName,
 	}
-	if err := db.RegisterNamespaceClaim(claim); err != nil {
-		t.Fatalf("RegisterNamespaceClaim: %v", err)
-	}
-
 	ordinalZero := journal.BigEndianUUID(0) // all-zero UUID: ordinal 0 under OrdinalV1Codec starting at Min=0.
 	fixedID := ptypes.AgentID{Namespace: "pasture-system", UUID: uuid.UUID(ordinalZero)}
-
-	sa, err := db.RegisterSoftwareAgentWithID(fixedID, "pasture-system", "0", "provenance")
-	if err != nil {
-		t.Fatalf("RegisterSoftwareAgentWithID: %v", err)
-	}
-	if sa.ID != fixedID {
-		t.Errorf("registered agent ID = %v, want %v", sa.ID, fixedID)
-	}
-	if sa.Kind != ptypes.AgentKindSoftware {
-		t.Errorf("registered agent Kind = %v, want AgentKindSoftware", sa.Kind)
-	}
-
 	entry := journal.FixedActorEntry{
 		ActorID:   journal.ActorID(fixedID),
 		Namespace: "pasture-system",
 		ActorKind: ptypes.AgentKindSoftware,
 		Name:      "pasture-system-default",
 	}
-	if err := db.RegisterFixedActorEntry(entry, ordinalZero); err != nil {
-		t.Fatalf("RegisterFixedActorEntry: %v — the agents(id) FK must now resolve "+
-			"for a fixed-ID agent registered via RegisterSoftwareAgentWithID", err)
+	sa, err := db.RegisterFixedSoftwareAgent(journal.FixedSoftwareAgentRegistration{
+		Claim: claim, Entry: entry, AgentName: "pasture-system", Version: "0", Source: "provenance",
+	})
+	if err != nil {
+		t.Fatalf("RegisterFixedSoftwareAgent: %v", err)
+	}
+	if sa.ID != fixedID || sa.Kind != ptypes.AgentKindSoftware {
+		t.Errorf("registered agent = %+v, want ID %v and software kind", sa, fixedID)
 	}
 
 	// Round-trip: the agent is readable through the normal typed accessor too.
@@ -813,70 +796,64 @@ func TestRegisterSoftwareAgentWithIDSatisfiesFixedActorEntryFK(t *testing.T) {
 	}
 }
 
-// TestRegisterSoftwareAgentWithIDRejectsDuplicate proves the typed-duplicate
-// rejection: a second registration of the same fixed ID is a conflict, never
-// an idempotent no-op or silent overwrite (unlike StartActivityWithID).
-func TestRegisterSoftwareAgentWithIDRejectsDuplicate(t *testing.T) {
+// TestRegisterFixedSoftwareAgentRetryAndDrift proves exact retry convergence and
+// deterministic conflict on changed agent data.
+func TestRegisterFixedSoftwareAgentRetryAndDrift(t *testing.T) {
 	db := newJournalDB(t)
 	claim := journal.ActorNamespaceClaim{
 		Namespace: "pasture-system", ClaimantID: "pasture-system",
 		Range: journal.UUIDRange{Min: journal.BigEndianUUID(0), Max: journal.BigEndianUUID(1023)},
 		Codec: journal.OrdinalV1CodecName,
-	}
-	if err := db.RegisterNamespaceClaim(claim); err != nil {
-		t.Fatalf("RegisterNamespaceClaim: %v", err)
 	}
 	id := ptypes.AgentID{Namespace: "pasture-system", UUID: uuid.UUID(journal.BigEndianUUID(1))}
-	if _, err := db.RegisterSoftwareAgentWithID(id, "agent-one", "0", "test"); err != nil {
+	reg := journal.FixedSoftwareAgentRegistration{Claim: claim, AgentName: "agent-one", Version: "0", Source: "test",
+		Entry: journal.FixedActorEntry{ActorID: id, Namespace: id.Namespace, ActorKind: ptypes.AgentKindSoftware, Name: "agent-one/default"}}
+	if _, err := db.RegisterFixedSoftwareAgent(reg); err != nil {
 		t.Fatalf("first registration: %v", err)
 	}
-	if _, err := db.RegisterSoftwareAgentWithID(id, "agent-one-again", "0", "test"); !errors.Is(err, ptypes.ErrAgentAlreadyExists) {
-		t.Errorf("duplicate registration: got %v, want ErrAgentAlreadyExists", err)
+	if _, err := db.RegisterFixedSoftwareAgent(reg); err != nil {
+		t.Errorf("exact retry: %v", err)
+	}
+	reg.AgentName = "agent-one-again"
+	if _, err := db.RegisterFixedSoftwareAgent(reg); !errors.Is(err, ptypes.ErrAgentAlreadyExists) {
+		t.Errorf("drift registration: got %v, want ErrAgentAlreadyExists", err)
 	}
 }
 
-// TestRegisterSoftwareAgentWithIDRejectsMalformed proves rejection of a
-// structurally malformed ID (empty namespace) and of a well-formed ID whose
-// namespace has no registered claim.
-func TestRegisterSoftwareAgentWithIDRejectsMalformed(t *testing.T) {
+// TestRegisterFixedSoftwareAgentRejectsMalformed proves shape validation.
+func TestRegisterFixedSoftwareAgentRejectsMalformed(t *testing.T) {
 	db := newJournalDB(t)
-
-	// Empty namespace: malformed shape.
-	malformed := ptypes.AgentID{Namespace: "", UUID: uuid.New()}
-	if _, err := db.RegisterSoftwareAgentWithID(malformed, "x", "0", "test"); !errors.Is(err, ptypes.ErrInvalidID) {
+	reg := journal.FixedSoftwareAgentRegistration{
+		Claim: journal.ActorNamespaceClaim{Namespace: "pasture-system", ClaimantID: "pasture-system", Range: journal.UUIDRange{Min: journal.BigEndianUUID(0), Max: journal.BigEndianUUID(1)}, Codec: journal.OrdinalV1CodecName},
+		Entry: journal.FixedActorEntry{ActorID: ptypes.AgentID{UUID: uuid.New()}, Namespace: "pasture-system", ActorKind: ptypes.AgentKindSoftware, Name: "x"}, AgentName: "x",
+	}
+	if _, err := db.RegisterFixedSoftwareAgent(reg); !errors.Is(err, ptypes.ErrInvalidID) {
 		t.Errorf("empty-namespace ID: got %v, want ErrInvalidID", err)
 	}
-
-	// Well-formed but unclaimed namespace.
-	unclaimed := ptypes.AgentID{Namespace: "no-such-claim", UUID: uuid.New()}
-	if _, err := db.RegisterSoftwareAgentWithID(unclaimed, "x", "0", "test"); !errors.Is(err, journal.ErrNamespaceClaim) {
-		t.Errorf("unclaimed namespace: got %v, want ErrNamespaceClaim", err)
-	}
 }
 
-// TestRegisterSoftwareAgentWithIDRejectsOutOfRange proves the §7.3 rule 2
+// TestRegisterFixedSoftwareAgentRejectsOutOfRange proves the §7.3 rule 2
 // consistency requirement: a fixed ID whose UUID does not decode inside its
 // namespace's claimed range is rejected, exactly like RegisterFixedActorEntry.
-func TestRegisterSoftwareAgentWithIDRejectsOutOfRange(t *testing.T) {
+func TestRegisterFixedSoftwareAgentRejectsOutOfRange(t *testing.T) {
 	db := newJournalDB(t)
 	claim := journal.ActorNamespaceClaim{
 		Namespace: "pasture-system", ClaimantID: "pasture-system",
 		Range: journal.UUIDRange{Min: journal.BigEndianUUID(0), Max: journal.BigEndianUUID(1023)},
 		Codec: journal.OrdinalV1CodecName,
 	}
-	if err := db.RegisterNamespaceClaim(claim); err != nil {
-		t.Fatalf("RegisterNamespaceClaim: %v", err)
-	}
 	outOfRange := ptypes.AgentID{Namespace: "pasture-system", UUID: uuid.UUID(journal.BigEndianUUID(4096))}
-	if _, err := db.RegisterSoftwareAgentWithID(outOfRange, "x", "0", "test"); !errors.Is(err, journal.ErrEntryOutOfRange) {
+	reg := journal.FixedSoftwareAgentRegistration{Claim: claim, AgentName: "x",
+		Entry: journal.FixedActorEntry{ActorID: outOfRange, Namespace: outOfRange.Namespace, ActorKind: ptypes.AgentKindSoftware, Name: "x"}}
+	if _, err := db.RegisterFixedSoftwareAgent(reg); !errors.Is(err, journal.ErrEntryOutOfRange) {
 		t.Errorf("out-of-range ID: got %v, want ErrEntryOutOfRange", err)
 	}
 }
 
-// TestRegisterSoftwareAgentUnchangedByFixedIDSeam proves the existing
+// TestRegisterSoftwareAgentUnchangedByFixedRegistration proves the existing
 // random-UUIDv7 registration path's signature and behavior are unaffected: it
 // still mints its own ID and needs no namespace claim at all.
-func TestRegisterSoftwareAgentUnchangedByFixedIDSeam(t *testing.T) {
+func TestRegisterSoftwareAgentUnchangedByFixedRegistration(t *testing.T) {
 	db := newJournalDB(t)
 	sa, err := db.RegisterSoftwareAgent("no-claim-needed", "agent", "1.0", "test")
 	if err != nil {

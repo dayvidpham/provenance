@@ -1,21 +1,11 @@
 package provenance
 
 // dbos_store.go implements the borrowed-storage bridge that lets Provenance share
-// one physical SQLite database with a DBOS durable-execution root (issue
-// dayvidpham/provenance#6), plus the StoreUnavailableError lifecycle error.
-//
-// ARCHITECTURE DEVIATION (Option B; architect ruling for issue #6, flagged for UAT
-// ratification):
-//
-// Issue #6 acceptance criterion #1 was written assuming Provenance persisted through
-// database/sql, so the borrowed *sql.DB could be the single literal handle and
-// migrations could run "through it". The delivered, UAT-accepted journal foundation
-// (S1.0–S1.3) persists entirely on zombiezen.com/go/sqlite (*zs.Conn), which cannot
-// be constructed from or share a connection object with a database/sql *sql.DB.
-// Porting the whole persistence layer to database/sql would re-open every reviewed,
-// accepted slice — an architectural reset no leaf may perform. The newer
-// user-accepted foundation therefore governs, and the criterion's literal wording is
-// amended to its INTENT: ONE shared physical database.
+// one physical SQLite database with a DBOS durable-execution root, plus the
+// StoreUnavailableError lifecycle error. Provenance persists through
+// zombiezen.com/go/sqlite, whose connection cannot be constructed from a
+// database/sql connection, so the bridge shares the database file and WAL rather
+// than a connection object.
 //
 // OpenBorrowedSQLite validates the borrowed *sql.DB, derives its on-disk path via
 // PRAGMA database_list ON THE BORROWED HANDLE, and opens ONE internal zombiezen
@@ -295,12 +285,12 @@ func (b *borrowedTracker) RegisterSoftwareAgent(namespace, name, version, source
 	})
 }
 
-func (b *borrowedTracker) RegisterSoftwareAgentWithID(id AgentID, name, version, source string) (SoftwareAgent, error) {
-	if err := b.available("RegisterSoftwareAgentWithID"); err != nil {
+func (b *borrowedTracker) RegisterFixedSoftwareAgent(reg FixedSoftwareAgentRegistration) (SoftwareAgent, error) {
+	if err := b.available("RegisterFixedSoftwareAgent"); err != nil {
 		return SoftwareAgent{}, err
 	}
-	return retryOnTransientLock("RegisterSoftwareAgentWithID", func() (SoftwareAgent, error) {
-		return b.inner.RegisterSoftwareAgentWithID(id, name, version, source)
+	return retryOnTransientLock("RegisterFixedSoftwareAgent", func() (SoftwareAgent, error) {
+		return b.inner.RegisterFixedSoftwareAgent(reg)
 	})
 }
 
@@ -406,12 +396,12 @@ func (j *borrowedJournal) RegisterNamespaceClaim(claim ActorNamespaceClaim) erro
 	return err
 }
 
-func (j *borrowedJournal) RegisterFixedActorEntry(entry FixedActorEntry, fixedUUID [16]byte) error {
+func (j *borrowedJournal) RegisterFixedActorEntry(entry FixedActorEntry) error {
 	if err := j.owner.available("Journal.RegisterFixedActorEntry"); err != nil {
 		return err
 	}
 	_, err := retryOnTransientLock("Journal.RegisterFixedActorEntry", func() (struct{}, error) {
-		return struct{}{}, j.inner.RegisterFixedActorEntry(entry, fixedUUID)
+		return struct{}{}, j.inner.RegisterFixedActorEntry(entry)
 	})
 	return err
 }

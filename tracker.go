@@ -216,10 +216,10 @@ func (t *sqliteTracker) RegisterSoftwareAgent(namespace, name, version, source s
 	return sa, nil
 }
 
-func (t *sqliteTracker) RegisterSoftwareAgentWithID(id AgentID, name, version, source string) (SoftwareAgent, error) {
-	sa, err := t.db.RegisterSoftwareAgentWithID(id, name, version, source)
+func (t *sqliteTracker) RegisterFixedSoftwareAgent(reg FixedSoftwareAgentRegistration) (SoftwareAgent, error) {
+	sa, err := t.db.RegisterFixedSoftwareAgent(reg)
 	if err != nil {
-		return SoftwareAgent{}, fmt.Errorf("provenance.Tracker.RegisterSoftwareAgentWithID: %w", err)
+		return SoftwareAgent{}, fmt.Errorf("provenance.Tracker.RegisterFixedSoftwareAgent: %w", err)
 	}
 	return sa, nil
 }

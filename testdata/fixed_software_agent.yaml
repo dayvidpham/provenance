@@ -1,0 +1,15 @@
+validationCases:
+  - {name: valid, mutation: none, wantError: ""}
+  - {name: empty-claim-namespace, mutation: empty-claim-namespace, wantError: namespace-claim}
+  - {name: empty-actor-namespace, mutation: empty-actor-namespace, wantError: invalid-id}
+  - {name: mismatched-entry-namespace, mutation: mismatched-entry-namespace, wantError: namespace-claim}
+  - {name: wrong-kind, mutation: wrong-kind, wantError: agent-kind}
+  - {name: malformed-metadata, mutation: malformed-metadata, wantError: namespace-claim}
+  - {name: out-of-range, mutation: out-of-range, wantError: entry-range}
+  - {name: reversed-range, mutation: reversed-range, wantError: namespace-range}
+
+rollbackCases:
+  - {name: claim-insert-fails, boundary: claim}
+  - {name: base-agent-insert-fails, boundary: agent}
+  - {name: software-agent-insert-fails, boundary: software}
+  - {name: manifest-insert-fails, boundary: manifest}

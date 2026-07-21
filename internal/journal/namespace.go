@@ -3,6 +3,7 @@ package journal
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -182,11 +183,55 @@ type FixedActorEntry struct {
 	Metadata  string
 }
 
+// FixedSoftwareAgentRegistration is the complete input for atomically claiming
+// a namespace and registering one fixed software actor and its manifest entry.
+// Entry.ActorID is the single source of truth for the actor identity.
+type FixedSoftwareAgentRegistration struct {
+	Claim     ActorNamespaceClaim
+	Entry     FixedActorEntry
+	AgentName string
+	Version   string
+	Source    string
+}
+
+// Validate checks all cross-row invariants before a registration transaction
+// starts. Empty metadata is normalized to an empty JSON object by persistence.
+func (r FixedSoftwareAgentRegistration) Validate() error {
+	if err := r.Claim.Validate(); err != nil {
+		return err
+	}
+	if r.Entry.ActorID.Namespace == "" {
+		return fmt.Errorf("%w: fixed software actor ID requires a namespace", ptypes.ErrInvalidID)
+	}
+	if r.Entry.Namespace != r.Claim.Namespace || r.Entry.ActorID.Namespace != r.Claim.Namespace {
+		return fmt.Errorf("%w: claim namespace %q, entry namespace %q, and actor namespace %q must match",
+			ErrNamespaceClaim, r.Claim.Namespace, r.Entry.Namespace, r.Entry.ActorID.Namespace)
+	}
+	if r.Entry.ActorKind != ptypes.AgentKindSoftware {
+		return fmt.Errorf("%w: fixed software actor %q has kind %d; use software kind %d",
+			ptypes.ErrAgentKindMismatch, r.Entry.ActorID.String(), r.Entry.ActorKind, ptypes.AgentKindSoftware)
+	}
+	if r.AgentName == "" {
+		return fmt.Errorf("%w: fixed software actor %q requires an agent name", ErrNamespaceClaim, r.Entry.ActorID.String())
+	}
+	if r.Entry.Name == "" {
+		return fmt.Errorf("%w: fixed software actor %q requires a manifest name", ErrNamespaceClaim, r.Entry.ActorID.String())
+	}
+	metadata := r.Entry.Metadata
+	if metadata == "" {
+		metadata = "{}"
+	}
+	if !json.Valid([]byte(metadata)) {
+		return fmt.Errorf("%w: fixed software actor %q metadata is not valid JSON",
+			ErrNamespaceClaim, r.Entry.ActorID.String())
+	}
+	return CheckEntryInRange(r.Claim, r.Entry.Namespace, [16]byte(r.Entry.ActorID.UUID))
+}
+
 // CheckEntryInRange rejects a fixed-actor entry whose 16-byte fixed UUID does
 // not decode, under the namespace codec, to an ordinal inside the claimed range
-// (§7.3 rule 2). fixedUUID is the entry's ActorID rendered as its 16-byte
-// fixed-UUID form.
-func CheckEntryInRange(claim ActorNamespaceClaim, entryNamespace string, fixedUUID [16]byte) error {
+// (§7.3 rule 2). actorUUID is derived from the entry's ActorID.
+func CheckEntryInRange(claim ActorNamespaceClaim, entryNamespace string, actorUUID [16]byte) error {
 	if entryNamespace != claim.Namespace {
 		return fmt.Errorf("%w: entry namespace %q does not match claim namespace %q",
 			ErrEntryOutOfRange, entryNamespace, claim.Namespace)
@@ -195,17 +240,17 @@ func CheckEntryInRange(claim ActorNamespaceClaim, entryNamespace string, fixedUU
 	if err != nil {
 		return fmt.Errorf("namespace %q: %w", claim.Namespace, err)
 	}
-	if !claim.Range.Contains(fixedUUID) {
+	if !claim.Range.Contains(actorUUID) {
 		return fmt.Errorf(
 			"%w: fixed actor %x is outside namespace %q's claimed range "+
 				"[%x, %x] — where: fixed-actor manifest registration; when: before "+
 				"commit; impact: the entry is rejected so it cannot collide with an "+
 				"actor from a neighbouring range; fix: register the entry within "+
 				"[RangeMin, RangeMax] or widen the namespace claim",
-			ErrEntryOutOfRange, fixedUUID, claim.Namespace, claim.Range.Min, claim.Range.Max,
+			ErrEntryOutOfRange, actorUUID, claim.Namespace, claim.Range.Min, claim.Range.Max,
 		)
 	}
-	if _, err := codec.Decode(claim.Range, fixedUUID); err != nil {
+	if _, err := codec.Decode(claim.Range, actorUUID); err != nil {
 		return fmt.Errorf("namespace %q entry-in-range: %w", claim.Namespace, err)
 	}
 	return nil

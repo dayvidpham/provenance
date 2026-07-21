@@ -645,7 +645,7 @@ func opManifestEntryOutOfRange(t *testing.T, input, expected anyMap, _ testcorpu
 		Namespace: ns,
 		Name:      "out-of-range-actor",
 	}
-	err = env.tr.Journal().RegisterFixedActorEntry(entry, fixed)
+	err = env.tr.Journal().RegisterFixedActorEntry(entry)
 	if err == nil {
 		return fmt.Errorf("out-of-range entry (ordinal %d) was accepted; expected rejection", ordinal)
 	}

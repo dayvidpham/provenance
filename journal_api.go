@@ -1,7 +1,7 @@
 package provenance
 
-// journal_api.go re-exports the global-journal surface (issue
-// dayvidpham/provenance#4, docs/journal-relational-contract.md) from
+// journal_api.go re-exports the global-journal surface defined by
+// docs/journal-relational-contract.md from
 // internal/journal and exposes the JournalID-ordered journal API through the
 // Tracker.
 
@@ -11,25 +11,26 @@ import (
 
 // Journal identity and discriminator types.
 type (
-	JournalID              = journal.JournalID
-	JournalKind            = journal.JournalKind
-	EventKind              = journal.EventKind
-	OperationID            = journal.OperationID
-	EventContext           = journal.EventContext
-	EventContextKind       = journal.EventContextKind
-	GitOID                 = journal.GitOID
-	Row                    = journal.Row
-	TaskEventRow           = journal.TaskEventRow
-	AppendTaskEventInput   = journal.AppendTaskEventInput
-	JournalQueryV1         = journal.JournalQueryV1
-	JournalCursorV1        = journal.JournalCursorV1
-	JournalTaskEventPageV1 = journal.JournalTaskEventPageV1
-	OrderDimension         = journal.OrderDimension
-	TaskAttribution        = journal.TaskAttribution
-	ActorNamespaceClaim    = journal.ActorNamespaceClaim
-	FixedActorEntry        = journal.FixedActorEntry
-	UUIDRange              = journal.UUIDRange
-	NamespaceCodec         = journal.NamespaceCodec
+	JournalID                      = journal.JournalID
+	JournalKind                    = journal.JournalKind
+	EventKind                      = journal.EventKind
+	OperationID                    = journal.OperationID
+	EventContext                   = journal.EventContext
+	EventContextKind               = journal.EventContextKind
+	GitOID                         = journal.GitOID
+	Row                            = journal.Row
+	TaskEventRow                   = journal.TaskEventRow
+	AppendTaskEventInput           = journal.AppendTaskEventInput
+	JournalQueryV1                 = journal.JournalQueryV1
+	JournalCursorV1                = journal.JournalCursorV1
+	JournalTaskEventPageV1         = journal.JournalTaskEventPageV1
+	OrderDimension                 = journal.OrderDimension
+	TaskAttribution                = journal.TaskAttribution
+	ActorNamespaceClaim            = journal.ActorNamespaceClaim
+	FixedActorEntry                = journal.FixedActorEntry
+	FixedSoftwareAgentRegistration = journal.FixedSoftwareAgentRegistration
+	UUIDRange                      = journal.UUIDRange
+	NamespaceCodec                 = journal.NamespaceCodec
 
 	// Operations, effects, results, and authority-lifecycle surface (§2-§4, §9).
 	OperationAuthorityID    = journal.OperationAuthorityID
@@ -232,8 +233,8 @@ type JournalAPI interface {
 	RegisterNamespaceClaim(claim ActorNamespaceClaim) error
 	// RegisterFixedActorEntry registers a fixed system actor within a claimed
 	// range (§7.2), rejecting out-of-range entries with ErrEntryOutOfRange
-	// (§7.3 rule 2). fixedUUID is the entry's 16-byte fixed-UUID form.
-	RegisterFixedActorEntry(entry FixedActorEntry, fixedUUID [16]byte) error
+	// (§7.3 rule 2). The fixed UUID is derived from entry.ActorID.
+	RegisterFixedActorEntry(entry FixedActorEntry) error
 	// NamespaceClaims returns every registered claim.
 	NamespaceClaims() ([]ActorNamespaceClaim, error)
 
