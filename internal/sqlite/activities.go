@@ -25,9 +25,8 @@ func (db *DB) StartActivity(agentID ptypes.AgentID, phase ptypes.Phase, stage pt
 
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO activities (id, agent_id, phase_id, stage_id, started_at, ended_at, notes)
-		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
+	if err := executeStatement(db.conn,
+		sqlStatement001,
 		&sqlitex.ExecOptions{Args: []any{
 			activity.ID.String(), activity.AgentID.String(),
 			int(activity.Phase), int(activity.Stage),
@@ -55,10 +54,8 @@ func (db *DB) StartActivityWithID(id ptypes.ActivityID, agentID ptypes.AgentID, 
 
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO activities (id, agent_id, phase_id, stage_id, started_at, ended_at, notes)
-		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-		 ON CONFLICT(id) DO NOTHING`,
+	if err := executeStatement(db.conn,
+		sqlStatement002,
 		&sqlitex.ExecOptions{Args: []any{
 			id.String(), agentID.String(),
 			int(phase), int(stage),
@@ -75,9 +72,8 @@ func (db *DB) StartActivityWithID(id ptypes.ActivityID, agentID ptypes.AgentID, 
 	// on conflict (idempotent replay).
 	var act ptypes.Activity
 	var found bool
-	if err := sqlitex.Execute(db.conn,
-		`SELECT id, agent_id, phase_id, stage_id, started_at, ended_at, notes
-		 FROM activities WHERE id = ?1`,
+	if err := executeStatement(db.conn,
+		sqlStatement003,
 		&sqlitex.ExecOptions{
 			Args: []any{id.String()},
 			ResultFunc: func(stmt *zs.Stmt) error {
@@ -106,17 +102,16 @@ func (db *DB) EndActivity(id ptypes.ActivityID) (ptypes.Activity, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	if err := sqlitex.Execute(db.conn,
-		`UPDATE activities SET ended_at = ?2 WHERE id = ?1`,
+	if err := executeStatement(db.conn,
+		sqlStatement004,
 		&sqlitex.ExecOptions{Args: []any{id.String(), endTime.UnixNano()}}); err != nil {
 		return ptypes.Activity{}, fmt.Errorf("sqlite.EndActivity: %w", err)
 	}
 
 	var act ptypes.Activity
 	var found bool
-	if err := sqlitex.Execute(db.conn,
-		`SELECT id, agent_id, phase_id, stage_id, started_at, ended_at, notes
-		 FROM activities WHERE id = ?1`,
+	if err := executeStatement(db.conn,
+		sqlStatement003,
 		&sqlitex.ExecOptions{
 			Args: []any{id.String()},
 			ResultFunc: func(stmt *zs.Stmt) error {
@@ -153,7 +148,7 @@ func (db *DB) GetActivities(agentID *ptypes.AgentID) ([]ptypes.Activity, error) 
 	}
 
 	var activities []ptypes.Activity
-	err := sqlitex.Execute(db.conn, `SELECT id,agent_id,phase_id,stage_id,started_at,ended_at,notes FROM activities WHERE (NOT ?1 OR agent_id=?2) ORDER BY started_at ASC`, &sqlitex.ExecOptions{
+	err := executeStatement(db.conn, sqlStatement005, &sqlitex.ExecOptions{
 		Args: []any{agentID != nil, agent},
 		ResultFunc: func(stmt *zs.Stmt) error {
 			act, err := ScanActivity(stmt)

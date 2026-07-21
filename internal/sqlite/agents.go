@@ -16,15 +16,15 @@ func (db *DB) RegisterHumanAgent(namespace, name, contact string) (ptypes.HumanA
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO agents (id, kind_id) VALUES (?1, 0)`,
+	if err := executeStatement(db.conn,
+		sqlStatement019,
 		&sqlitex.ExecOptions{Args: []any{id.String()}}); err != nil {
 		return ptypes.HumanAgent{}, fmt.Errorf(
 			"sqlite.RegisterHumanAgent: failed to insert agent row: %w", err,
 		)
 	}
-	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO agents_human (agent_id, name, contact) VALUES (?1, ?2, ?3)`,
+	if err := executeStatement(db.conn,
+		sqlStatement020,
 		&sqlitex.ExecOptions{Args: []any{id.String(), name, contact}}); err != nil {
 		return ptypes.HumanAgent{}, fmt.Errorf(
 			"sqlite.RegisterHumanAgent: failed to insert human row: %w", err,
@@ -46,8 +46,8 @@ func (db *DB) RegisterMLAgent(namespace string, role ptypes.Role, provider ptype
 
 	var modelID int
 	var modelFound bool
-	if err := sqlitex.Execute(db.conn,
-		`SELECT id FROM ml_models WHERE provider_id = (SELECT id FROM providers WHERE name = ?1) AND name = ?2`,
+	if err := executeStatement(db.conn,
+		sqlStatement021,
 		&sqlitex.ExecOptions{
 			Args: []any{string(provider), string(modelName)},
 			ResultFunc: func(stmt *zs.Stmt) error {
@@ -70,15 +70,15 @@ func (db *DB) RegisterMLAgent(namespace string, role ptypes.Role, provider ptype
 	}
 
 	id := ptypes.AgentID{Namespace: namespace, UUID: uuid.Must(uuid.NewV7())}
-	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO agents (id, kind_id) VALUES (?1, 1)`,
+	if err := executeStatement(db.conn,
+		sqlStatement022,
 		&sqlitex.ExecOptions{Args: []any{id.String()}}); err != nil {
 		return ptypes.MLAgent{}, fmt.Errorf(
 			"sqlite.RegisterMLAgent: failed to insert base agent row: %w", err,
 		)
 	}
-	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO agents_ml (agent_id, role_id, model_id) VALUES (?1, ?2, ?3)`,
+	if err := executeStatement(db.conn,
+		sqlStatement023,
 		&sqlitex.ExecOptions{Args: []any{id.String(), int(role), modelID}}); err != nil {
 		return ptypes.MLAgent{}, fmt.Errorf(
 			"sqlite.RegisterMLAgent: failed to insert ml agent row: %w", err,
@@ -98,15 +98,15 @@ func (db *DB) RegisterSoftwareAgent(namespace, name, version, source string) (pt
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO agents (id, kind_id) VALUES (?1, 2)`,
+	if err := executeStatement(db.conn,
+		sqlStatement024,
 		&sqlitex.ExecOptions{Args: []any{id.String()}}); err != nil {
 		return ptypes.SoftwareAgent{}, fmt.Errorf(
 			"sqlite.RegisterSoftwareAgent: failed to insert base agent row: %w", err,
 		)
 	}
-	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO agents_software (agent_id, name, version, source) VALUES (?1, ?2, ?3, ?4)`,
+	if err := executeStatement(db.conn,
+		sqlStatement011,
 		&sqlitex.ExecOptions{Args: []any{id.String(), name, version, source}}); err != nil {
 		return ptypes.SoftwareAgent{}, fmt.Errorf(
 			"sqlite.RegisterSoftwareAgent: failed to insert software agent row: %w", err,
@@ -127,8 +127,8 @@ func (db *DB) GetAgent(id ptypes.AgentID) (ptypes.Agent, error) {
 	defer db.mu.Unlock()
 	var agent ptypes.Agent
 	var found bool
-	err := sqlitex.Execute(db.conn,
-		`SELECT id, kind_id FROM agents WHERE id = ?1`,
+	err := executeStatement(db.conn,
+		sqlStatement025,
 		&sqlitex.ExecOptions{
 			Args: []any{id.String()},
 			ResultFunc: func(stmt *zs.Stmt) error {
@@ -158,10 +158,8 @@ func (db *DB) GetHumanAgent(id ptypes.AgentID) (ptypes.HumanAgent, error) {
 	defer db.mu.Unlock()
 	var ha ptypes.HumanAgent
 	var found bool
-	err := sqlitex.Execute(db.conn,
-		`SELECT a.kind_id, h.name, h.contact
-		 FROM agents a JOIN agents_human h ON a.id = h.agent_id
-		 WHERE a.id = ?1`,
+	err := executeStatement(db.conn,
+		sqlStatement026,
 		&sqlitex.ExecOptions{
 			Args: []any{id.String()},
 			ResultFunc: func(stmt *zs.Stmt) error {
@@ -195,13 +193,8 @@ func (db *DB) GetMLAgent(id ptypes.AgentID) (ptypes.MLAgent, error) {
 	defer db.mu.Unlock()
 	var mla ptypes.MLAgent
 	var found bool
-	err := sqlitex.Execute(db.conn,
-		`SELECT a.kind_id, m.role_id, ml.id, p.name, ml.name
-		 FROM agents a
-		 JOIN agents_ml m ON a.id = m.agent_id
-		 JOIN ml_models ml ON m.model_id = ml.id
-		 JOIN providers p ON ml.provider_id = p.id
-		 WHERE a.id = ?1`,
+	err := executeStatement(db.conn,
+		sqlStatement027,
 		&sqlitex.ExecOptions{
 			Args: []any{id.String()},
 			ResultFunc: func(stmt *zs.Stmt) error {
@@ -239,10 +232,8 @@ func (db *DB) GetSoftwareAgent(id ptypes.AgentID) (ptypes.SoftwareAgent, error) 
 	defer db.mu.Unlock()
 	var sa ptypes.SoftwareAgent
 	var found bool
-	err := sqlitex.Execute(db.conn,
-		`SELECT a.kind_id, s.name, s.version, s.source
-		 FROM agents a JOIN agents_software s ON a.id = s.agent_id
-		 WHERE a.id = ?1`,
+	err := executeStatement(db.conn,
+		sqlStatement028,
 		&sqlitex.ExecOptions{
 			Args: []any{id.String()},
 			ResultFunc: func(stmt *zs.Stmt) error {

@@ -14,6 +14,10 @@ import (
 	"github.com/google/uuid"
 )
 
+type invalidCanonicalV1Ref struct{}
+
+func (invalidCanonicalV1Ref) canonicalV1FieldRef() {}
+
 func fixtureIDs(t *testing.T) (TaskID, ActorID, CommentID) {
 	t.Helper()
 	task, _ := ptypes.ParseTaskID("fixture--018f0000-0000-7000-8000-000000000001")
@@ -592,10 +596,16 @@ func TestCanonicalV1FieldRegistriesAreExactUniqueCompleteAndBounded(t *testing.T
 		envelopeField(canonicalEnvelopeField(99)), effectField(-1, effectTask), effectField(MaxCanonicalEffects, effectTask),
 		effectField(0, canonicalEffectField(99)), contextField(-1, 0, contextKind), contextField(0, -1, contextKind),
 		contextField(0, MaxCanonicalContextsPerEffect, contextKind), contextField(0, 0, canonicalContextField(99)),
+		invalidCanonicalV1Ref{},
 	}
 	for _, ref := range invalid {
-		if name, err := mutationV1Codec.renderFieldName(ref); err == nil || name != "" {
+		name, err := mutationV1Codec.renderFieldName(ref)
+		var typed *CanonicalMutationError
+		if err == nil || name != "" || !errors.Is(err, ErrCanonicalMutation) || !errors.As(err, &typed) {
 			t.Fatalf("invalid V1 reference rendered name=%q err=%v", name, err)
+		}
+		if typed.Field == "" || typed.Reason == "" || typed.Fix == "" {
+			t.Fatalf("invalid V1 reference returned incomplete actionable error: %+v", typed)
 		}
 	}
 }
@@ -605,18 +615,48 @@ func TestCanonicalV2DescriptorExtensionCannotChangeV1(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	extended := append([]canonicalCodecDescriptor(nil), canonicalCodecRegistry[:]...)
-	extended = append(extended, canonicalCodecDescriptor{version: MutationEncodingVersion(2), wireTag: "fixture.mutation.v2", decoder: func([]byte, MutationEncodingVersion, string) (CanonicalMutation, error) {
-		return CanonicalMutation{}, nil
+	extended := append(canonicalCodecDescriptors(nil), canonicalCodecRegistry...)
+	v2Called := false
+	extended = append(extended, canonicalCodecDescriptor{version: MutationEncodingVersion(2), wireTag: "provenance.mutation.v2", decoder: func(data []byte, version MutationEncodingVersion, _ string) (CanonicalMutation, error) {
+		v2Called = true
+		return CanonicalMutation{version: version, bytes: append([]byte(nil), data...)}, nil
 	}})
+	if err := extended.validate(); err != nil {
+		t.Fatalf("valid V2 extension rejected: %v", err)
+	}
 	if len(extended) != 2 || extended[0].version != MutationEncodingV1 || extended[1].version == MutationEncodingV1 {
 		t.Fatalf("invalid extension registry: %+v", extended)
 	}
-	after, err := PrepareMutationV1([]Effect{{Sort: EffectBootstrapAuthority, BootstrapLabel: "root"}})
+	if descriptor, ok := extended.codecForVersion(MutationEncodingVersion(2)); !ok || descriptor.decoder == nil {
+		t.Fatal("production version lookup cannot resolve registered V2 codec")
+	}
+	v2Bytes := bytes.Replace(before.CanonicalBytes(), []byte("provenance.mutation.v1"), []byte("provenance.mutation.v2"), 1)
+	v2, err := decodeCanonicalMutationWithRegistry(v2Bytes, extended)
+	if err != nil || !v2Called || v2.EncodingVersion() != MutationEncodingVersion(2) || !bytes.Equal(v2.CanonicalBytes(), v2Bytes) {
+		t.Fatalf("production dispatch did not route V2 descriptor: mutation=%+v called=%v err=%v", v2, v2Called, err)
+	}
+	after, err := decodeCanonicalMutationWithRegistry(before.CanonicalBytes(), extended)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(before.CanonicalBytes(), after.CanonicalBytes()) || !bytes.Equal(before.DerivedDigest(), after.DerivedDigest()) {
-		t.Fatal("independent V2 descriptor extension changed V1 output")
+		t.Fatal("production registry dispatch changed V1 output after V2 extension")
 	}
+	assertInvalidRegistry := func(registry canonicalCodecDescriptors) {
+		t.Helper()
+		err := registry.validate()
+		var typed *CanonicalMutationError
+		if !errors.Is(err, ErrCanonicalMutation) || !errors.As(err, &typed) || typed.Field == "" || typed.Reason == "" || typed.Fix == "" {
+			t.Fatalf("shadow registry returned non-actionable error: %v", err)
+		}
+		if _, err := decodeCanonicalMutationWithRegistry(before.CanonicalBytes(), registry); !errors.Is(err, ErrCanonicalMutation) {
+			t.Fatalf("production dispatch accepted shadow registry: %v", err)
+		}
+	}
+	assertInvalidRegistry(append(append(canonicalCodecDescriptors(nil), canonicalCodecRegistry...), canonicalCodecDescriptor{
+		version: MutationEncodingV1, wireTag: "fixture.shadow.v1", decoder: extended[1].decoder,
+	}))
+	assertInvalidRegistry(append(append(canonicalCodecDescriptors(nil), canonicalCodecRegistry...), canonicalCodecDescriptor{
+		version: MutationEncodingVersion(2), wireTag: MutationEncodingV1.String(), decoder: extended[1].decoder,
+	}))
 }

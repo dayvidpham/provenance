@@ -13,8 +13,8 @@ import (
 func (db *DB) AddLabel(id ptypes.TaskID, label string) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	return sqlitex.Execute(db.conn,
-		`INSERT OR IGNORE INTO labels (task_id, name) VALUES (?1, ?2)`,
+	return executeStatement(db.conn,
+		sqlStatement085,
 		&sqlitex.ExecOptions{Args: []any{id.String(), label}})
 }
 
@@ -23,8 +23,8 @@ func (db *DB) AddLabel(id ptypes.TaskID, label string) error {
 func (db *DB) RemoveLabel(id ptypes.TaskID, label string) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	return sqlitex.Execute(db.conn,
-		`DELETE FROM labels WHERE task_id = ?1 AND name = ?2`,
+	return executeStatement(db.conn,
+		sqlStatement086,
 		&sqlitex.ExecOptions{Args: []any{id.String(), label}})
 }
 
@@ -34,8 +34,8 @@ func (db *DB) GetLabels(id ptypes.TaskID) ([]string, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	var labels []string
-	err := sqlitex.Execute(db.conn,
-		`SELECT name FROM labels WHERE task_id = ?1 ORDER BY name ASC`,
+	err := executeStatement(db.conn,
+		sqlStatement087,
 		&sqlitex.ExecOptions{
 			Args: []any{id.String()},
 			ResultFunc: func(stmt *zs.Stmt) error {

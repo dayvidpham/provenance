@@ -56,113 +56,24 @@ func slotDBID(slot journal.AssignmentSlotID) (int, error) {
 // their closed lookups, then completes the deferred journal.produced_by FK the
 // journal-base layer staged as NULL (§2.1 staging note, §10 rule 2). Idempotent.
 func (db *DB) ensureOperationsSchema() error {
-	ddl := []string{
-		// Closed lookups (§4.1, §4.5), same shape/BCNF as journal_kinds (§2.2).
-		`CREATE TABLE IF NOT EXISTS authority_kinds (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT`,
-		`CREATE TABLE IF NOT EXISTS assignment_slots (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT`,
-		`CREATE TABLE IF NOT EXISTS assignment_transitions (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT`,
-		// Committed operations (§3.1). OperationID is the UNIQUE alternate key,
-		// never the PK and never an ordering source (§11). The four-field replay
-		// identity (§9.4) is deliberately NOT a UNIQUE constraint here.
-		`CREATE TABLE IF NOT EXISTS journal_operations (
-			journal_id            INTEGER PRIMARY KEY REFERENCES journal(journal_id),
-			operation_id         TEXT NOT NULL UNIQUE,
-			authority_journal_id INTEGER REFERENCES journal_authorities(journal_id),
-			command_digest       BLOB NOT NULL,
-			mutation_digest      BLOB NOT NULL,
-			mutation_encoding_version TEXT,
-			canonical_mutation   BLOB,
-			CHECK ((mutation_encoding_version IS NULL AND canonical_mutation IS NULL) OR
-			       (length(mutation_encoding_version) > 0 AND length(canonical_mutation) > 0))
-		) STRICT`,
-		`CREATE TRIGGER IF NOT EXISTS journal_operations_canonical_insert
-		 BEFORE INSERT ON journal_operations
-		 WHEN NOT ((NEW.mutation_encoding_version IS NULL AND NEW.canonical_mutation IS NULL) OR
-			           (length(NEW.mutation_encoding_version) > 0 AND length(NEW.canonical_mutation) > 0))
-		 BEGIN SELECT RAISE(ABORT, 'invalid canonical mutation version/bytes pair'); END`,
-		`CREATE TRIGGER IF NOT EXISTS journal_operations_canonical_update
-		 BEFORE UPDATE OF mutation_encoding_version, canonical_mutation ON journal_operations
-		 WHEN NOT ((NEW.mutation_encoding_version IS NULL AND NEW.canonical_mutation IS NULL) OR
-			           (length(NEW.mutation_encoding_version) > 0 AND length(NEW.canonical_mutation) > 0))
-		 BEGIN SELECT RAISE(ABORT, 'invalid canonical mutation version/bytes pair'); END`,
-		// Slot-keyed committed-result mapping (§3.2). rule-9 own-operation
-		// integrity is reducer-enforced (the two FKs alone cannot express it).
-		`CREATE TABLE IF NOT EXISTS journal_operation_result_slots (
-			journal_id           INTEGER NOT NULL REFERENCES journal_operations(journal_id),
-			result_slot_id      TEXT NOT NULL,
-			produced_journal_id INTEGER NOT NULL REFERENCES journal(journal_id),
-			PRIMARY KEY (journal_id, result_slot_id)
-		) STRICT, WITHOUT ROWID`,
-		// Authority supertype (§4.2) and its bootstrap detail (§4.3).
-		`CREATE TABLE IF NOT EXISTS journal_authorities (
-			journal_id              INTEGER PRIMARY KEY REFERENCES journal(journal_id),
-			authority_kind_id      INTEGER NOT NULL REFERENCES authority_kinds(id),
-			operation_authority_id TEXT NOT NULL UNIQUE
-		) STRICT`,
-		`CREATE TABLE IF NOT EXISTS journal_authority_bootstraps (
-			journal_id INTEGER PRIMARY KEY REFERENCES journal_authorities(journal_id),
-			label     TEXT NOT NULL
-		) STRICT`,
-		// Assignment lifecycle BCNF decomposition (§4.4): whole-episode identity
-		// separate from per-transition journal rows. PredecessorAssignmentID is
-		// UNIQUE — single-consumption evidence (§14.2).
-		`CREATE TABLE IF NOT EXISTS journal_authority_assignment_episodes (
-			assignment_id             TEXT PRIMARY KEY,
-			task_id                   TEXT NOT NULL REFERENCES tasks(id),
-			slot_id                   INTEGER NOT NULL REFERENCES assignment_slots(id),
-			actor_id                  TEXT NOT NULL REFERENCES agents(id),
-			predecessor_assignment_id TEXT UNIQUE REFERENCES journal_authority_assignment_episodes(assignment_id),
-			-- ParentAssignmentID (§14.5): deliberate governance-citation edge, cited at
-			-- start; NOT UNIQUE (one parent may govern many children), distinct from the
-			-- UNIQUE predecessor (succession) edge above.
-			parent_assignment_id      TEXT REFERENCES journal_authority_assignment_episodes(assignment_id)
-		) STRICT`,
-		`CREATE TABLE IF NOT EXISTS journal_authority_assignment_transitions (
-			journal_id     INTEGER PRIMARY KEY REFERENCES journal_authorities(journal_id),
-			assignment_id TEXT NOT NULL REFERENCES journal_authority_assignment_episodes(assignment_id),
-			transition_id INTEGER NOT NULL REFERENCES assignment_transitions(id),
-			UNIQUE (assignment_id, transition_id)
-		) STRICT`,
-		// Decisions (§6.1) and material-work evidence (§6.2).
-		`CREATE TABLE IF NOT EXISTS journal_decisions (
-			journal_id     INTEGER PRIMARY KEY REFERENCES journal(journal_id),
-			decision_kind TEXT NOT NULL,
-			task_id       TEXT REFERENCES tasks(id),
-			payload       TEXT NOT NULL CHECK (json_valid(payload))
-		) STRICT`,
-		`CREATE TABLE IF NOT EXISTS journal_evidence (
-			journal_id      INTEGER PRIMARY KEY REFERENCES journal(journal_id),
-			evidence_kind  TEXT NOT NULL,
-			task_id        TEXT REFERENCES tasks(id),
-			content_digest BLOB NOT NULL,
-			payload        TEXT NOT NULL CHECK (json_valid(payload))
-		) STRICT`,
-		// idx_journal_pboj is owned solely by the journal rebuild in
-		// completeJournalOperationFK (which drops and recreates the journal table),
-		// so it is deliberately NOT created here — creating it in both places would
-		// build it, drop it, then rebuild it on a first open (§ single-owner index).
-		`CREATE INDEX IF NOT EXISTS idx_transitions_assignment ON journal_authority_assignment_transitions (assignment_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_episodes_task ON journal_authority_assignment_episodes (task_id)`,
-		// Covering index for the §14.5 governance walk over parent citations.
-		`CREATE INDEX IF NOT EXISTS idx_episodes_parent ON journal_authority_assignment_episodes (parent_assignment_id)`,
-	}
+	ddl := []sqlStatement{sqlStatement320, sqlStatement321, sqlStatement322, sqlStatement323, sqlStatement324, sqlStatement325, sqlStatement326, sqlStatement327, sqlStatement328, sqlStatement329, sqlStatement330, sqlStatement331, sqlStatement332, sqlStatement333, sqlStatement334, sqlStatement335}
 	for _, stmt := range ddl {
-		if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
-			return fmt.Errorf("ensureOperationsSchema: %w — statement: %s", err, stmt[:min(len(stmt), 80)])
+		if err := executeStatement(db.conn, stmt, nil); err != nil {
+			return fmt.Errorf("ensureOperationsSchema: statement %d: %w", stmt, err)
 		}
 	}
 	for id, name := range map[int]string{authKindBootstrapID: "bootstrap", authKindAssignmentID: "assignment"} {
-		if err := sqlitex.Execute(db.conn, `INSERT OR IGNORE INTO authority_kinds (id, name) VALUES (?1, ?2)`,
+		if err := executeStatement(db.conn, sqlStatement108,
 			&sqlitex.ExecOptions{Args: []any{id, name}}); err != nil {
 			return fmt.Errorf("ensureOperationsSchema: seed authority_kinds: %w", err)
 		}
 	}
-	if err := sqlitex.Execute(db.conn, `INSERT OR IGNORE INTO assignment_slots (id, name) VALUES (?1, ?2)`,
+	if err := executeStatement(db.conn, sqlStatement109,
 		&sqlitex.ExecOptions{Args: []any{slotOwnerResponsibilityID, string(journal.SlotOwnerResponsibility)}}); err != nil {
 		return fmt.Errorf("ensureOperationsSchema: seed assignment_slots: %w", err)
 	}
 	for id, name := range map[int]string{transitionStartedID: "started", transitionEndedID: "ended"} {
-		if err := sqlitex.Execute(db.conn, `INSERT OR IGNORE INTO assignment_transitions (id, name) VALUES (?1, ?2)`,
+		if err := executeStatement(db.conn, sqlStatement110,
 			&sqlitex.ExecOptions{Args: []any{id, name}}); err != nil {
 			return fmt.Errorf("ensureOperationsSchema: seed assignment_transitions: %w", err)
 		}
@@ -184,14 +95,14 @@ func (db *DB) ensureCanonicalMutationColumns() error {
 		canonicalOperationVersionColumn, canonicalOperationBytesColumn,
 	} {
 		present := false
-		if err := sqlitex.ExecuteTransient(db.conn, `PRAGMA table_info(journal_operations)`, &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
+		if err := executeStatement(db.conn, sqlStatement111, &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 			present = present || stmt.ColumnText(1) == column.name()
 			return nil
 		}}); err != nil {
 			return fmt.Errorf("ensure canonical mutation schema: inspect %s: %w", column.name(), err)
 		}
 		if !present {
-			if err := executeTransientStatement(db.conn, column.addStatement(), nil); err != nil {
+			if err := executeStatement(db.conn, column.addStatement(), nil); err != nil {
 				return fmt.Errorf("ensure canonical mutation schema: add %s: %w", column.name(), err)
 			}
 		}
@@ -217,29 +128,29 @@ func (column canonicalOperationColumn) name() string {
 }
 func (column canonicalOperationColumn) addStatement() sqlStatement {
 	if column == canonicalOperationVersionColumn {
-		return sqlStatement{text: `ALTER TABLE journal_operations ADD COLUMN mutation_encoding_version TEXT`}
+		return sqlStatement112
 	}
 	if column == canonicalOperationBytesColumn {
-		return sqlStatement{text: `ALTER TABLE journal_operations ADD COLUMN canonical_mutation BLOB`}
+		return sqlStatement113
 	}
 	panic("unknown canonical operation column")
 }
 
 func (db *DB) ensureGenericCanonicalConstraints() error {
 	var tableSQL string
-	if err := sqlitex.Execute(db.conn, `SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2`, &sqlitex.ExecOptions{Args: []any{"table", "journal_operations"}, ResultFunc: func(stmt *zs.Stmt) error { tableSQL = stmt.ColumnText(0); return nil }}); err != nil {
+	if err := executeStatement(db.conn, sqlStatement114, &sqlitex.ExecOptions{Args: []any{"table", "journal_operations"}, ResultFunc: func(stmt *zs.Stmt) error { tableSQL = stmt.ColumnText(0); return nil }}); err != nil {
 		return fmt.Errorf("inspect journal_operations constraint: %w", err)
 	}
 	needsTriggers := false
 	if strings.Contains(tableSQL, journal.MutationEncodingV1.String()) {
 		needsTriggers = true
 		steps := []sqlStatement{
-			{text: `DROP TRIGGER IF EXISTS journal_operations_canonical_insert`}, {text: `DROP TRIGGER IF EXISTS journal_operations_canonical_update`},
-			{text: `CREATE TABLE journal_operations_generic (journal_id INTEGER PRIMARY KEY REFERENCES journal(journal_id),operation_id TEXT NOT NULL UNIQUE,authority_journal_id INTEGER REFERENCES journal_authorities(journal_id),command_digest BLOB NOT NULL,mutation_digest BLOB NOT NULL,mutation_encoding_version TEXT,canonical_mutation BLOB,CHECK ((mutation_encoding_version IS NULL AND canonical_mutation IS NULL) OR (length(mutation_encoding_version)>0 AND length(canonical_mutation)>0))) STRICT`},
-			{text: `INSERT INTO journal_operations_generic SELECT * FROM journal_operations`}, {text: `DROP TABLE journal_operations`}, {text: `ALTER TABLE journal_operations_generic RENAME TO journal_operations`},
+			sqlStatement115, sqlStatement116,
+			sqlStatement117,
+			sqlStatement118, sqlStatement119, sqlStatement120,
 		}
 		for _, step := range steps {
-			if err := executeTransientStatement(db.conn, step, nil); err != nil {
+			if err := executeStatement(db.conn, step, nil); err != nil {
 				return fmt.Errorf("replace V1-specific journal_operations constraint: %w", err)
 			}
 		}
@@ -247,7 +158,7 @@ func (db *DB) ensureGenericCanonicalConstraints() error {
 	if !needsTriggers {
 		for _, name := range []string{"journal_operations_canonical_insert", "journal_operations_canonical_update"} {
 			sql := ""
-			if err := sqlitex.Execute(db.conn, `SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2`, &sqlitex.ExecOptions{Args: []any{"trigger", name}, ResultFunc: func(stmt *zs.Stmt) error { sql = stmt.ColumnText(0); return nil }}); err != nil {
+			if err := executeStatement(db.conn, sqlStatement114, &sqlitex.ExecOptions{Args: []any{"trigger", name}, ResultFunc: func(stmt *zs.Stmt) error { sql = stmt.ColumnText(0); return nil }}); err != nil {
 				return err
 			}
 			if sql == "" || strings.Contains(sql, journal.MutationEncodingV1.String()) {
@@ -259,12 +170,8 @@ func (db *DB) ensureGenericCanonicalConstraints() error {
 	if !needsTriggers {
 		return nil
 	}
-	for _, trigger := range []string{
-		`DROP TRIGGER IF EXISTS journal_operations_canonical_insert`, `DROP TRIGGER IF EXISTS journal_operations_canonical_update`,
-		`CREATE TRIGGER journal_operations_canonical_insert BEFORE INSERT ON journal_operations WHEN NOT ((NEW.mutation_encoding_version IS NULL AND NEW.canonical_mutation IS NULL) OR (length(NEW.mutation_encoding_version)>0 AND length(NEW.canonical_mutation)>0)) BEGIN SELECT RAISE(ABORT,'invalid canonical mutation version/bytes pair'); END`,
-		`CREATE TRIGGER journal_operations_canonical_update BEFORE UPDATE OF mutation_encoding_version,canonical_mutation ON journal_operations WHEN NOT ((NEW.mutation_encoding_version IS NULL AND NEW.canonical_mutation IS NULL) OR (length(NEW.mutation_encoding_version)>0 AND length(NEW.canonical_mutation)>0)) BEGIN SELECT RAISE(ABORT,'invalid canonical mutation version/bytes pair'); END`,
-	} {
-		if err := sqlitex.ExecuteTransient(db.conn, trigger, nil); err != nil {
+	for _, trigger := range []sqlStatement{sqlStatement115, sqlStatement116, sqlStatement336, sqlStatement337} {
+		if err := executeStatement(db.conn, trigger, nil); err != nil {
 			return fmt.Errorf("install generic canonical constraint trigger: %w", err)
 		}
 	}
@@ -289,7 +196,7 @@ func (db *DB) preflightCanonicalColumnsReadOnly() error {
 		return nil
 	}
 	malformed, versionState, bytesState := "", "", ""
-	if err := sqlitex.Execute(db.conn, `SELECT operation_id,mutation_encoding_version,canonical_mutation FROM journal_operations WHERE (mutation_encoding_version IS NULL) != (canonical_mutation IS NULL) OR (mutation_encoding_version IS NOT NULL AND (NOT length(mutation_encoding_version) OR NOT length(canonical_mutation))) LIMIT 1`, &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
+	if err := executeStatement(db.conn, sqlStatement121, &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 		malformed = stmt.ColumnText(0)
 		versionState = canonicalColumnState(stmt, 1)
 		bytesState = canonicalColumnState(stmt, 2)
@@ -301,7 +208,7 @@ func (db *DB) preflightCanonicalColumnsReadOnly() error {
 		return canonicalStartupPreflightError(journal.ErrProjectionDivergence, fmt.Sprintf("operation %q has malformed canonical pairing (version=%s, bytes=%s)", malformed, versionState, bytesState), "version and bytes must either both be NULL for a legacy row or both be nonempty for a canonical row", "restore both canonical columns from the same committed operation, or set both NULL only if the row is genuinely legacy")
 	}
 	oversized := ""
-	if err := sqlitex.Execute(db.conn, `SELECT operation_id FROM journal_operations WHERE canonical_mutation IS NOT NULL AND length(canonical_mutation)>?1 LIMIT 1`, &sqlitex.ExecOptions{Args: []any{journal.MaxCanonicalMutationBytes}, ResultFunc: func(stmt *zs.Stmt) error {
+	if err := executeStatement(db.conn, sqlStatement122, &sqlitex.ExecOptions{Args: []any{journal.MaxCanonicalMutationBytes}, ResultFunc: func(stmt *zs.Stmt) error {
 		oversized = stmt.ColumnText(0)
 		return nil
 	}}); err != nil {
@@ -311,7 +218,7 @@ func (db *DB) preflightCanonicalColumnsReadOnly() error {
 		cause := &journal.CanonicalMutationError{Field: "mutation", Reason: fmt.Sprintf("operation %q exceeds maximum %d bytes", oversized, journal.MaxCanonicalMutationBytes), Fix: "restore bounded canonical bytes"}
 		return canonicalStartupPreflightError(cause, fmt.Sprintf("operation %q has an oversized canonical mutation", oversized), "the stored wire exceeds the allocation-safe canonical mutation limit", "restore canonical bytes and their digest from a bounded known-good committed backup")
 	}
-	if err := sqlitex.Execute(db.conn, `SELECT operation_id,mutation_encoding_version,canonical_mutation FROM journal_operations WHERE canonical_mutation IS NOT NULL`, &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
+	if err := executeStatement(db.conn, sqlStatement123, &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 		opID := stmt.ColumnText(0)
 		version := stmt.ColumnText(1)
 		wire := readBlob(stmt, 2)
@@ -371,46 +278,10 @@ func (db *DB) completeJournalOperationFK() error {
 	// Open disables FK enforcement before beginning its one activation transaction
 	// and restores it after commit/rollback. This function must remain composable:
 	// it neither starts a nested transaction nor changes connection pragmas.
-	rebuild := []string{
-		// The journal_attributed view (§8.5) references journal; SQLite cannot rename
-		// journal_new→journal while a view points at the (dropped) journal table, so
-		// drop it before the rebuild and recreate it (below) once journal exists again.
-		`DROP VIEW IF EXISTS journal_attributed`,
-		// actor_id stays nullable with the anchor-only CHECK (§2.1, §10 rule 5): the
-		// rebuild only completes the produced_by FK, it does not relax the actor
-		// placement invariant the journal-base layer already established. It ALSO adds
-		// the task-event producer CHECK: every task_event (kind_id = JournalKindTaskEvent)
-		// must be produced by an operation (produced_by_operation_journal_id NOT NULL). In
-		// the journaled model every task_event is emitted by an operation — a native
-		// create, an update/lifecycle event, or a migration baseline marker — so the only
-		// thing this rejects is a bare NULL-producer append (the retired AppendTaskEvent
-		// path). The journal-base layer keeps NULL-producer task_events (no FK, no this
-		// CHECK); the constraint is introduced only here in the operations-layer rebuild.
-		`CREATE TABLE journal_new (
-			journal_id   INTEGER PRIMARY KEY AUTOINCREMENT,
-			kind_id     INTEGER NOT NULL REFERENCES journal_kinds(id),
-			actor_id    TEXT REFERENCES agents(id),
-			recorded_at INTEGER NOT NULL,
-			produced_by_operation_journal_id INTEGER REFERENCES journal_operations(journal_id),
-			CHECK ((actor_id IS NULL) = (produced_by_operation_journal_id IS NOT NULL)),
-			CHECK (kind_id <> 1 OR produced_by_operation_journal_id IS NOT NULL)
-		) STRICT`,
-		`INSERT INTO journal_new (journal_id, kind_id, actor_id, recorded_at, produced_by_operation_journal_id)
-			SELECT journal_id, kind_id, actor_id, recorded_at, produced_by_operation_journal_id FROM journal`,
-		`DROP TABLE journal`,
-		`ALTER TABLE journal_new RENAME TO journal`,
-		`CREATE INDEX IF NOT EXISTS idx_journal_kind  ON journal (kind_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_journal_actor ON journal (actor_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_journal_pboj  ON journal (produced_by_operation_journal_id)`,
-		// Recreate the readable-timeline covering index (§12.1): dropped with the old
-		// journal table, it must be rebuilt so the display order keeps its index.
-		`CREATE INDEX IF NOT EXISTS idx_journal_recorded_at ON journal (recorded_at, journal_id)`,
-		// Recreate the §8.5 attribution view now that journal exists again.
-		`CREATE VIEW IF NOT EXISTS journal_attributed AS SELECT j.journal_id AS journal_id,j.kind_id AS kind_id,COALESCE(j.actor_id,anchor.actor_id) AS effective_actor_id,j.recorded_at AS recorded_at,j.produced_by_operation_journal_id AS produced_by_operation_journal_id FROM journal j LEFT JOIN journal anchor ON anchor.journal_id=j.produced_by_operation_journal_id`,
-	}
+	rebuild := []sqlStatement{sqlStatement338, sqlStatement339, sqlStatement340, sqlStatement147, sqlStatement341, sqlStatement306, sqlStatement307, sqlStatement342, sqlStatement308, sqlStatement343}
 	for _, stmt := range rebuild {
-		if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
-			return fmt.Errorf("completeJournalOperationFK: rebuild step %q: %w", stmt[:min(len(stmt), 40)], err)
+		if err := executeStatement(db.conn, stmt, nil); err != nil {
+			return fmt.Errorf("completeJournalOperationFK: rebuild statement %d: %w", stmt, err)
 		}
 	}
 	// Step 10 of the canonical rebuild: foreign_key_check runs INSIDE the
@@ -419,7 +290,7 @@ func (db *DB) completeJournalOperationFK() error {
 	// (foreign_key_check IS permitted inside a transaction; only the
 	// foreign_keys=ON/OFF toggle is the no-op-inside-a-tx pragma handled above.)
 	var violations int
-	if err := sqlitex.ExecuteTransient(db.conn, `PRAGMA foreign_key_check`,
+	if err := executeStatement(db.conn, sqlStatement124,
 		&sqlitex.ExecOptions{ResultFunc: func(*zs.Stmt) error { violations++; return nil }}); err != nil {
 		return fmt.Errorf("completeJournalOperationFK: foreign_key_check: %w", err)
 	}
@@ -433,7 +304,7 @@ func (db *DB) completeJournalOperationFK() error {
 
 func (db *DB) journalProducedByFKPresent() (bool, error) {
 	present := false
-	if err := sqlitex.ExecuteTransient(db.conn, `PRAGMA foreign_key_list(journal)`,
+	if err := executeStatement(db.conn, sqlStatement125,
 		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 			// columns: id, seq, table, from, to, on_update, on_delete, match
 			if stmt.ColumnText(3) == "produced_by_operation_journal_id" {
@@ -455,8 +326,8 @@ func (db *DB) JournalIsEmpty() (bool, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	empty := true
-	if err := sqlitex.Execute(db.conn,
-		`SELECT 1 FROM journal LIMIT 1`,
+	if err := executeStatement(db.conn,
+		sqlStatement126,
 		&sqlitex.ExecOptions{ResultFunc: func(*zs.Stmt) error { empty = false; return nil }}); err != nil {
 		return false, fmt.Errorf("JournalIsEmpty: %w", err)
 	}
@@ -753,8 +624,8 @@ func (db *DB) foldTaskCreateLocked(in journal.OperationInput, jid int64, eff jou
 	// Existence guard: creating a task id that already has a row is a typed conflict,
 	// not a silent duplicate (the UNIQUE PK would otherwise surface a raw driver error).
 	exists := false
-	if err := sqlitex.Execute(db.conn,
-		`SELECT 1 FROM tasks WHERE id = ?1`,
+	if err := executeStatement(db.conn,
+		sqlStatement127,
 		&sqlitex.ExecOptions{Args: []any{eff.TaskID.String()}, ResultFunc: func(*zs.Stmt) error { exists = true; return nil }}); err != nil {
 		return fmt.Errorf("Apply: task-create existence check for %q: %w", eff.TaskID, err)
 	}
@@ -769,11 +640,8 @@ func (db *DB) foldTaskCreateLocked(in journal.OperationInput, jid int64, eff jou
 	if eff.RecordedAtOverride != nil {
 		recordedAt = *eff.RecordedAtOverride
 	}
-	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO tasks
-			(id, namespace, title, description, status_id, priority_id, type_id,
-			 phase_id, owner_id, notes, created_at, updated_at, closed_at, close_reason, last_journal_id)
-		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, ?11, NULL, ?9, ?12)`,
+	if err := executeStatement(db.conn,
+		sqlStatement128,
 		&sqlitex.ExecOptions{Args: []any{
 			eff.TaskID.String(), eff.TaskID.Namespace, eff.Title, eff.Description,
 			statusOpenID, int(eff.Priority), int(eff.Type), int(eff.Phase),
@@ -790,8 +658,8 @@ func (db *DB) foldTaskCreateLocked(in journal.OperationInput, jid int64, eff jou
 	if !json.Valid(payload) {
 		return fmt.Errorf("Apply: task-create payload for %q is not valid JSON", eff.TaskID)
 	}
-	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO journal_task_events (journal_id, task_id, event_kind, payload) VALUES (?1, ?2, ?3, ?4)`,
+	if err := executeStatement(db.conn,
+		sqlStatement094,
 		&sqlitex.ExecOptions{Args: []any{jid, eff.TaskID.String(), string(journal.EventKindTaskCreated), string(payload)}}); err != nil {
 		return fmt.Errorf("Apply: insert journal_task_events (task-create): %w", err)
 	}
@@ -804,9 +672,8 @@ func (db *DB) foldTaskCreateLocked(in journal.OperationInput, jid int64, eff jou
 		if encErr != nil {
 			return fmt.Errorf("Apply: encode context (task-create): %w", encErr)
 		}
-		if err := sqlitex.Execute(db.conn,
-			`INSERT OR IGNORE INTO journal_task_event_contexts (event_journal_id, context_kind, context_identity, attached_by_journal_id)
-			 VALUES (?1, ?2, ?3, ?4)`,
+		if err := executeStatement(db.conn,
+			sqlStatement129,
 			&sqlitex.ExecOptions{Args: []any{jid, string(ck), identity, jid}}); err != nil {
 			return fmt.Errorf("Apply: insert context edge (task-create): %w", err)
 		}
@@ -835,8 +702,8 @@ func (db *DB) foldTaskEventLocked(in journal.OperationInput, jid int64, eff jour
 	if !json.Valid(payload) {
 		return fmt.Errorf("Apply: task_event payload for %q is not valid JSON", eff.EventKind)
 	}
-	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO journal_task_events (journal_id, task_id, event_kind, payload) VALUES (?1, ?2, ?3, ?4)`,
+	if err := executeStatement(db.conn,
+		sqlStatement094,
 		&sqlitex.ExecOptions{Args: []any{jid, eff.TaskID.String(), string(eff.EventKind), string(payload)}}); err != nil {
 		return fmt.Errorf("Apply: insert journal_task_events: %w", err)
 	}
@@ -849,9 +716,8 @@ func (db *DB) foldTaskEventLocked(in journal.OperationInput, jid int64, eff jour
 		if encErr != nil {
 			return fmt.Errorf("Apply: encode context: %w", encErr)
 		}
-		if err := sqlitex.Execute(db.conn,
-			`INSERT OR IGNORE INTO journal_task_event_contexts (event_journal_id, context_kind, context_identity, attached_by_journal_id)
-			 VALUES (?1, ?2, ?3, ?4)`,
+		if err := executeStatement(db.conn,
+			sqlStatement129,
 			&sqlitex.ExecOptions{Args: []any{jid, string(ck), identity, jid}}); err != nil {
 			return fmt.Errorf("Apply: insert context edge: %w", err)
 		}
@@ -904,15 +770,7 @@ func (db *DB) materializeTaskEventColumnsLocked(in journal.OperationInput, jid i
 	if eff.UpdatePhase != nil {
 		phase = int(*eff.UpdatePhase)
 	}
-	if err := sqlitex.Execute(db.conn, `UPDATE tasks SET
-		updated_at=?1,
-		title=CASE WHEN ?2 THEN ?3 ELSE title END,
-		description=CASE WHEN ?4 THEN ?5 ELSE description END,
-		priority_id=CASE WHEN ?6 THEN ?7 ELSE priority_id END,
-		phase_id=CASE WHEN ?8 THEN ?9 ELSE phase_id END,
-		notes=CASE WHEN ?10 THEN ?11 ELSE notes END,
-		close_reason=CASE WHEN ?12 THEN ?13 ELSE close_reason END
-		WHERE id=?14`, &sqlitex.ExecOptions{Args: []any{
+	if err := executeStatement(db.conn, sqlStatement130, &sqlitex.ExecOptions{Args: []any{
 		recordedAt,
 		flag(eff.UpdateTitle != nil), value(eff.UpdateTitle),
 		flag(eff.UpdateDescription != nil), value(eff.UpdateDescription),
@@ -934,8 +792,8 @@ func (db *DB) foldBootstrapAuthorityLocked(jid int64, eff journal.Effect) error 
 	if authorityID == "" {
 		authorityID = fmt.Sprintf("authority--bootstrap--%d", jid)
 	}
-	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO journal_authorities (journal_id, authority_kind_id, operation_authority_id) VALUES (?1, ?2, ?3)`,
+	if err := executeStatement(db.conn,
+		sqlStatement131,
 		&sqlitex.ExecOptions{Args: []any{jid, authKindBootstrapID, authorityID}}); err != nil {
 		return fmt.Errorf("Apply: insert journal_authorities (bootstrap): %w", err)
 	}
@@ -943,8 +801,8 @@ func (db *DB) foldBootstrapAuthorityLocked(jid int64, eff journal.Effect) error 
 	if label == "" {
 		label = "bootstrap"
 	}
-	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO journal_authority_bootstraps (journal_id, label) VALUES (?1, ?2)`,
+	if err := executeStatement(db.conn,
+		sqlStatement132,
 		&sqlitex.ExecOptions{Args: []any{jid, label}}); err != nil {
 		return fmt.Errorf("Apply: insert journal_authority_bootstraps: %w", err)
 	}
@@ -996,9 +854,8 @@ func (db *DB) foldAssignmentStartLocked(in journal.OperationInput, jid int64, ef
 	// Episode identity row (append-only; created once per AssignmentID). The
 	// UNIQUE(predecessor_assignment_id) constraint is the single-consumption
 	// backstop (§14.2); a second successor of the same predecessor fails here.
-	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO journal_authority_assignment_episodes (assignment_id, task_id, slot_id, actor_id, predecessor_assignment_id, parent_assignment_id)
-		 VALUES (?1, ?2, ?3, ?4, ?5, ?6)`,
+	if err := executeStatement(db.conn,
+		sqlStatement133,
 		&sqlitex.ExecOptions{Args: []any{string(eff.AssignmentID), eff.TaskID.String(), slot, occupant.String(), predecessor, parent}}); err != nil {
 		if eff.Predecessor != "" && isUniqueViolation(err) {
 			return fmt.Errorf("%w: predecessor episode %q is already consumed by another successor (§14.2)",
@@ -1074,8 +931,8 @@ func (db *DB) foldDecisionLocked(in journal.OperationInput, jid int64, eff journ
 	if len(payload) == 0 {
 		payload = json.RawMessage(`{}`)
 	}
-	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO journal_decisions (journal_id, decision_kind, task_id, payload) VALUES (?1, ?2, ?3, ?4)`,
+	if err := executeStatement(db.conn,
+		sqlStatement134,
 		&sqlitex.ExecOptions{Args: []any{jid, string(eff.DecisionKind), taskID, string(payload)}}); err != nil {
 		return fmt.Errorf("Apply: insert journal_decisions: %w", err)
 	}
@@ -1097,8 +954,8 @@ func (db *DB) foldEvidenceLocked(in journal.OperationInput, jid int64, eff journ
 	if len(payload) == 0 {
 		payload = json.RawMessage(`{}`)
 	}
-	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO journal_evidence (journal_id, evidence_kind, task_id, content_digest, payload) VALUES (?1, ?2, ?3, ?4, ?5)`,
+	if err := executeStatement(db.conn,
+		sqlStatement135,
 		&sqlitex.ExecOptions{Args: []any{jid, string(eff.EvidenceKind), taskID, eff.ContentDigest, string(payload)}}); err != nil {
 		return fmt.Errorf("Apply: insert journal_evidence: %w", err)
 	}

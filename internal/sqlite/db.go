@@ -243,11 +243,8 @@ func (db *DB) Close() error {
 // ---------------------------------------------------------------------------
 
 func (db *DB) applyNonPersistentPragmas() error {
-	for _, p := range []string{
-		"PRAGMA busy_timeout=5000;",
-		"PRAGMA foreign_keys=OFF;",
-	} {
-		if err := sqlitex.ExecuteTransient(db.conn, p, nil); err != nil {
+	for _, p := range []sqlStatement{sqlStatement270, sqlStatement271} {
+		if err := executeStatement(db.conn, p, nil); err != nil {
 			return fmt.Errorf("pragma %q: %w", p, err)
 		}
 	}
@@ -255,11 +252,11 @@ func (db *DB) applyNonPersistentPragmas() error {
 }
 
 func (db *DB) enableWAL() error {
-	return sqlitex.ExecuteTransient(db.conn, `PRAGMA journal_mode=WAL`, nil)
+	return executeStatement(db.conn, sqlStatement032, nil)
 }
 
 func (db *DB) enableForeignKeys() error {
-	return sqlitex.ExecuteTransient(db.conn, `PRAGMA foreign_keys=ON`, nil)
+	return executeStatement(db.conn, sqlStatement033, nil)
 }
 
 // ---------------------------------------------------------------------------
@@ -267,105 +264,11 @@ func (db *DB) enableForeignKeys() error {
 // ---------------------------------------------------------------------------
 
 func (db *DB) ensureSchema(models []ptypes.ModelEntry) error {
-	ddl := []string{
-		`CREATE TABLE IF NOT EXISTS statuses (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT`,
-		`CREATE TABLE IF NOT EXISTS priorities (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT`,
-		`CREATE TABLE IF NOT EXISTS task_types (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT`,
-		`CREATE TABLE IF NOT EXISTS edge_kinds (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT`,
-		`CREATE TABLE IF NOT EXISTS agent_kinds (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT`,
-		`CREATE TABLE IF NOT EXISTS providers (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT`,
-		`CREATE TABLE IF NOT EXISTS roles (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT`,
-		`CREATE TABLE IF NOT EXISTS phases (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT`,
-		`CREATE TABLE IF NOT EXISTS stages (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT`,
-		`CREATE TABLE IF NOT EXISTS ml_models (
-			id          INTEGER PRIMARY KEY,
-			provider_id INTEGER NOT NULL REFERENCES providers(id),
-			name        TEXT NOT NULL,
-			UNIQUE (provider_id, name)
-		) STRICT`,
-		`CREATE TABLE IF NOT EXISTS agents (
-			id      TEXT PRIMARY KEY,
-			kind_id INTEGER NOT NULL REFERENCES agent_kinds(id)
-		) STRICT`,
-		`CREATE TABLE IF NOT EXISTS agents_human (
-			agent_id TEXT PRIMARY KEY REFERENCES agents(id),
-			name     TEXT NOT NULL,
-			contact  TEXT NOT NULL DEFAULT ''
-		) STRICT, WITHOUT ROWID`,
-		`CREATE TABLE IF NOT EXISTS agents_ml (
-			agent_id TEXT PRIMARY KEY REFERENCES agents(id),
-			role_id  INTEGER NOT NULL REFERENCES roles(id),
-			model_id INTEGER NOT NULL REFERENCES ml_models(id)
-		) STRICT, WITHOUT ROWID`,
-		`CREATE TABLE IF NOT EXISTS agents_software (
-			agent_id TEXT PRIMARY KEY REFERENCES agents(id),
-			name     TEXT NOT NULL,
-			version  TEXT NOT NULL DEFAULT '',
-			source   TEXT NOT NULL DEFAULT ''
-		) STRICT, WITHOUT ROWID`,
-		// tasks carries the last_journal_id projection watermark (§8.1): the JournalID
-		// whose ordered history this row's derived state reflects. A fresh native
-		// database ships it NOT NULL — every production tasks-row INSERT is the reducer
-		// fold, which carries the watermark, so no un-journaled task row can exist. A
-		// legacy database predates the tightening and is upgraded by MigrateLegacyBaseline
-		// (§13). The column body and shape live in schema_watermark.go so ensureSchema and
-		// every watermark rebuild share one source of truth. FK target journal(journal_id)
-		// is created by ensureJournalSchema (SQLite resolves cross-table FKs at row time).
-		`CREATE TABLE IF NOT EXISTS tasks (
-			id TEXT PRIMARY KEY, namespace TEXT NOT NULL, title TEXT NOT NULL,
-			description TEXT NOT NULL DEFAULT '', status_id INTEGER NOT NULL DEFAULT 0 REFERENCES statuses(id),
-			priority_id INTEGER NOT NULL DEFAULT 2 REFERENCES priorities(id), type_id INTEGER NOT NULL DEFAULT 2 REFERENCES task_types(id),
-			phase_id INTEGER NOT NULL REFERENCES phases(id), owner_id TEXT REFERENCES agents(id), notes TEXT NOT NULL DEFAULT '',
-			created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, closed_at INTEGER, close_reason TEXT NOT NULL DEFAULT '',
-			last_journal_id INTEGER NOT NULL REFERENCES journal(journal_id)
-		) STRICT`,
-		`CREATE INDEX IF NOT EXISTS idx_tasks_namespace ON tasks (namespace)`,
-		`CREATE INDEX IF NOT EXISTS idx_tasks_status    ON tasks (status_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_tasks_priority  ON tasks (priority_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_tasks_type      ON tasks (type_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_tasks_phase     ON tasks (phase_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_tasks_owner     ON tasks (owner_id)`,
-		`CREATE TABLE IF NOT EXISTS edges (
-			source_id  TEXT NOT NULL REFERENCES tasks(id),
-			target_id  TEXT NOT NULL,
-			kind_id    INTEGER NOT NULL REFERENCES edge_kinds(id),
-			created_at INTEGER NOT NULL,
-			PRIMARY KEY (source_id, target_id, kind_id)
-		) STRICT, WITHOUT ROWID`,
-		`CREATE INDEX IF NOT EXISTS idx_edges_source ON edges (source_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_edges_target ON edges (target_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_edges_kind   ON edges (kind_id)`,
-		`CREATE TABLE IF NOT EXISTS activities (
-			id         TEXT PRIMARY KEY,
-			agent_id   TEXT NOT NULL REFERENCES agents(id),
-			phase_id   INTEGER NOT NULL REFERENCES phases(id),
-			stage_id   INTEGER NOT NULL REFERENCES stages(id),
-			started_at INTEGER NOT NULL,
-			ended_at   INTEGER,
-			notes      TEXT NOT NULL DEFAULT ''
-		) STRICT`,
-		`CREATE INDEX IF NOT EXISTS idx_activities_agent ON activities (agent_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_activities_phase ON activities (phase_id)`,
-		`CREATE TABLE IF NOT EXISTS labels (
-			task_id TEXT NOT NULL REFERENCES tasks(id),
-			name    TEXT NOT NULL,
-			PRIMARY KEY (task_id, name)
-		) STRICT, WITHOUT ROWID`,
-		`CREATE INDEX IF NOT EXISTS idx_labels_name ON labels (name)`,
-		`CREATE TABLE IF NOT EXISTS comments (
-			id         TEXT PRIMARY KEY,
-			task_id    TEXT NOT NULL REFERENCES tasks(id),
-			author_id  TEXT NOT NULL REFERENCES agents(id),
-			body       TEXT NOT NULL,
-			created_at INTEGER NOT NULL
-		) STRICT`,
-		`CREATE INDEX IF NOT EXISTS idx_comments_task   ON comments (task_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_comments_author ON comments (author_id)`,
-	}
+	ddl := []sqlStatement{sqlStatement272, sqlStatement273, sqlStatement274, sqlStatement275, sqlStatement276, sqlStatement277, sqlStatement278, sqlStatement279, sqlStatement280, sqlStatement281, sqlStatement282, sqlStatement283, sqlStatement284, sqlStatement285, sqlStatement286, sqlStatement231, sqlStatement287, sqlStatement288, sqlStatement289, sqlStatement290, sqlStatement291, sqlStatement292, sqlStatement293, sqlStatement294, sqlStatement295, sqlStatement296, sqlStatement297, sqlStatement298, sqlStatement299, sqlStatement300, sqlStatement301, sqlStatement302, sqlStatement303}
 
 	for _, stmt := range ddl {
-		if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
-			return fmt.Errorf("ensureSchema: %w — statement: %s", err, stmt[:min(len(stmt), 80)])
+		if err := executeStatement(db.conn, stmt, nil); err != nil {
+			return fmt.Errorf("ensureSchema: statement %d: %w", stmt, err)
 		}
 	}
 	if err := db.seedReferenceData(models); err != nil {
@@ -428,23 +331,23 @@ const (
 func (kind referenceSeedKind) statement() sqlStatement {
 	switch kind {
 	case seedStatuses:
-		return sqlStatement{text: `INSERT OR IGNORE INTO statuses (id,name) VALUES (?1,?2)`}
+		return sqlStatement034
 	case seedPriorities:
-		return sqlStatement{text: `INSERT OR IGNORE INTO priorities (id,name) VALUES (?1,?2)`}
+		return sqlStatement035
 	case seedTaskTypes:
-		return sqlStatement{text: `INSERT OR IGNORE INTO task_types (id,name) VALUES (?1,?2)`}
+		return sqlStatement036
 	case seedEdgeKinds:
-		return sqlStatement{text: `INSERT OR IGNORE INTO edge_kinds (id,name) VALUES (?1,?2)`}
+		return sqlStatement037
 	case seedAgentKinds:
-		return sqlStatement{text: `INSERT OR IGNORE INTO agent_kinds (id,name) VALUES (?1,?2)`}
+		return sqlStatement038
 	case seedProviders:
-		return sqlStatement{text: `INSERT OR IGNORE INTO providers (id,name) VALUES (?1,?2)`}
+		return sqlStatement039
 	case seedRoles:
-		return sqlStatement{text: `INSERT OR IGNORE INTO roles (id,name) VALUES (?1,?2)`}
+		return sqlStatement040
 	case seedPhases:
-		return sqlStatement{text: `INSERT OR IGNORE INTO phases (id,name) VALUES (?1,?2)`}
+		return sqlStatement041
 	case seedStages:
-		return sqlStatement{text: `INSERT OR IGNORE INTO stages (id,name) VALUES (?1,?2)`}
+		return sqlStatement042
 	default:
 		panic("unknown reference seed kind")
 	}
@@ -455,8 +358,8 @@ func (kind referenceSeedKind) statement() sqlStatement {
 // Each model is inserted with parameterized queries to prevent SQL injection.
 func (db *DB) seedMLModels(models []ptypes.ModelEntry) error {
 	var existing int
-	if err := sqlitex.Execute(db.conn,
-		`SELECT COUNT(*) FROM ml_models`,
+	if err := executeStatement(db.conn,
+		sqlStatement043,
 		&sqlitex.ExecOptions{
 			ResultFunc: func(stmt *zs.Stmt) error {
 				existing = stmt.ColumnInt(0)
@@ -474,8 +377,8 @@ func (db *DB) seedMLModels(models []ptypes.ModelEntry) error {
 	endTx := sqlitex.Save(db.conn)
 	defer endTx(&err)
 	for _, m := range models {
-		if err = sqlitex.Execute(db.conn,
-			`INSERT OR IGNORE INTO ml_models (provider_id, name) VALUES ((SELECT id FROM providers WHERE name = ?1), ?2)`,
+		if err = executeStatement(db.conn,
+			sqlStatement044,
 			&sqlitex.ExecOptions{Args: []any{string(m.Provider), string(m.Name)}},
 		); err != nil {
 			return fmt.Errorf("seedMLModels: inserting model (%s, %q): %w",

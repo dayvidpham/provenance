@@ -31,10 +31,8 @@ func (db *DB) GetTask(id ptypes.TaskID) (ptypes.Task, bool, error) {
 
 	var task ptypes.Task
 	var found bool
-	err := sqlitex.Execute(db.conn,
-		`SELECT id, namespace, title, description, status_id, priority_id, type_id,
-		        phase_id, owner_id, notes, created_at, updated_at, closed_at, close_reason
-		 FROM tasks WHERE id = ?1`,
+	err := executeStatement(db.conn,
+		sqlStatement265,
 		&sqlitex.ExecOptions{
 			Args: []any{id.String()},
 			ResultFunc: func(stmt *zs.Stmt) error {
@@ -80,15 +78,7 @@ func (db *DB) ListTasks(filter ptypes.ListFilter) ([]ptypes.Task, error) {
 	}
 
 	var tasks []ptypes.Task
-	err := sqlitex.Execute(db.conn, `SELECT id,namespace,title,description,status_id,priority_id,type_id,
-		phase_id,owner_id,notes,created_at,updated_at,closed_at,close_reason FROM tasks
-		WHERE (NOT ?1 OR status_id=?2)
-		  AND (NOT ?3 OR priority_id=?4)
-		  AND (NOT ?5 OR type_id=?6)
-		  AND (NOT ?7 OR phase_id=?8)
-		  AND (NOT ?9 OR namespace=?10)
-		  AND (NOT ?11 OR EXISTS (SELECT 1 FROM labels l WHERE l.task_id=tasks.id AND l.name=?12))
-		ORDER BY created_at ASC`, &sqlitex.ExecOptions{
+	err := executeStatement(db.conn, sqlStatement266, &sqlitex.ExecOptions{
 		Args: []any{
 			flag(filter.Status != nil), status,
 			flag(filter.Priority != nil), priority,
@@ -119,8 +109,8 @@ func (db *DB) TaskCount() (int, error) {
 	defer db.mu.Unlock()
 
 	var count int
-	err := sqlitex.Execute(db.conn,
-		`SELECT COUNT(*) FROM tasks`,
+	err := executeStatement(db.conn,
+		sqlStatement267,
 		&sqlitex.ExecOptions{
 			ResultFunc: func(stmt *zs.Stmt) error {
 				count = stmt.ColumnInt(0)
@@ -140,18 +130,7 @@ func (db *DB) ReadyTasks() ([]ptypes.Task, error) {
 	defer db.mu.Unlock()
 
 	var tasks []ptypes.Task
-	err := sqlitex.Execute(db.conn, `
-		SELECT t.id, t.namespace, t.title, t.description, t.status_id, t.priority_id,
-		       t.type_id, t.phase_id, t.owner_id, t.notes, t.created_at, t.updated_at,
-		       t.closed_at, t.close_reason
-		FROM tasks t
-		WHERE t.status_id != ?1
-		AND NOT EXISTS (
-			SELECT 1 FROM edges e
-			JOIN tasks blocker ON e.target_id = blocker.id
-			WHERE e.source_id = t.id AND e.kind_id = ?2 AND blocker.status_id != ?1
-		)
-		ORDER BY t.priority_id ASC, t.created_at ASC`, &sqlitex.ExecOptions{
+	err := executeStatement(db.conn, sqlStatement268, &sqlitex.ExecOptions{
 		Args: []any{int(ptypes.StatusClosed), int(ptypes.EdgeBlockedBy)},
 		ResultFunc: func(stmt *zs.Stmt) error {
 			task, err := ScanTask(stmt)
@@ -175,18 +154,7 @@ func (db *DB) BlockedTasks() ([]ptypes.Task, error) {
 	defer db.mu.Unlock()
 
 	var tasks []ptypes.Task
-	err := sqlitex.Execute(db.conn, `
-		SELECT t.id, t.namespace, t.title, t.description, t.status_id, t.priority_id,
-		       t.type_id, t.phase_id, t.owner_id, t.notes, t.created_at, t.updated_at,
-		       t.closed_at, t.close_reason
-		FROM tasks t
-		WHERE t.status_id != ?1
-		AND EXISTS (
-			SELECT 1 FROM edges e
-			JOIN tasks blocker ON e.target_id = blocker.id
-			WHERE e.source_id = t.id AND e.kind_id = ?2 AND blocker.status_id != ?1
-		)
-		ORDER BY t.priority_id ASC, t.created_at ASC`, &sqlitex.ExecOptions{
+	err := executeStatement(db.conn, sqlStatement269, &sqlitex.ExecOptions{
 		Args: []any{int(ptypes.StatusClosed), int(ptypes.EdgeBlockedBy)},
 		ResultFunc: func(stmt *zs.Stmt) error {
 			task, err := ScanTask(stmt)

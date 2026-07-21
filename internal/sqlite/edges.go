@@ -13,8 +13,8 @@ import (
 func (db *DB) InsertEdge(sourceID ptypes.TaskID, targetID string, kind ptypes.EdgeKind, now time.Time) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	return sqlitex.Execute(db.conn,
-		`INSERT OR IGNORE INTO edges (source_id, target_id, kind_id, created_at) VALUES (?1, ?2, ?3, ?4)`,
+	return executeStatement(db.conn,
+		sqlStatement045,
 		&sqlitex.ExecOptions{Args: []any{sourceID.String(), targetID, int(kind), now.UnixNano()}})
 }
 
@@ -22,8 +22,8 @@ func (db *DB) InsertEdge(sourceID ptypes.TaskID, targetID string, kind ptypes.Ed
 func (db *DB) DeleteEdge(sourceID ptypes.TaskID, targetID string, kind ptypes.EdgeKind) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	return sqlitex.Execute(db.conn,
-		`DELETE FROM edges WHERE source_id = ?1 AND target_id = ?2 AND kind_id = ?3`,
+	return executeStatement(db.conn,
+		sqlStatement046,
 		&sqlitex.ExecOptions{Args: []any{sourceID.String(), targetID, int(kind)}})
 }
 
@@ -39,7 +39,7 @@ func (db *DB) GetEdges(sourceID ptypes.TaskID, kind *ptypes.EdgeKind) ([]ptypes.
 	}
 
 	var edges []ptypes.Edge
-	err := sqlitex.Execute(db.conn, `SELECT source_id,target_id,kind_id FROM edges WHERE source_id=?1 AND (NOT ?2 OR kind_id=?3) ORDER BY created_at ASC`, &sqlitex.ExecOptions{
+	err := executeStatement(db.conn, sqlStatement047, &sqlitex.ExecOptions{
 		Args: []any{sourceID.String(), kind != nil, kindValue},
 		ResultFunc: func(stmt *zs.Stmt) error {
 			edges = append(edges, ptypes.Edge{
@@ -63,8 +63,8 @@ func (db *DB) GetBlockedByEdges() ([]ptypes.Edge, error) {
 	defer db.mu.Unlock()
 
 	var edges []ptypes.Edge
-	err := sqlitex.Execute(db.conn,
-		`SELECT source_id, target_id, kind_id FROM edges WHERE kind_id = ?1 ORDER BY created_at ASC`,
+	err := executeStatement(db.conn,
+		sqlStatement048,
 		&sqlitex.ExecOptions{Args: []any{int(ptypes.EdgeBlockedBy)},
 			ResultFunc: func(stmt *zs.Stmt) error {
 				edges = append(edges, ptypes.Edge{
@@ -88,8 +88,8 @@ func (db *DB) GetDepTree(rootID ptypes.TaskID) ([]ptypes.Edge, error) {
 	defer db.mu.Unlock()
 
 	adj := make(map[string][]string)
-	if err := sqlitex.Execute(db.conn,
-		`SELECT source_id, target_id FROM edges WHERE kind_id = ?1`,
+	if err := executeStatement(db.conn,
+		sqlStatement049,
 		&sqlitex.ExecOptions{Args: []any{int(ptypes.EdgeBlockedBy)},
 			ResultFunc: func(stmt *zs.Stmt) error {
 				src := stmt.ColumnText(0)

@@ -91,11 +91,8 @@ func (db *DB) insertLegacyTaskRowLocked(task ptypes.Task) error {
 	if task.ClosedAt != nil {
 		closedAt = task.ClosedAt.UTC().UnixNano()
 	}
-	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO tasks
-			(id, namespace, title, description, status_id, priority_id, type_id,
-			 phase_id, owner_id, notes, created_at, updated_at, closed_at, close_reason)
-		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)`,
+	if err := executeStatement(db.conn,
+		sqlStatement088,
 		&sqlitex.ExecOptions{Args: []any{
 			task.ID.String(), task.ID.Namespace, task.Title, task.Description,
 			int(task.Status), int(task.Priority), int(task.Type), int(task.Phase),

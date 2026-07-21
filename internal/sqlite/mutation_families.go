@@ -74,8 +74,8 @@ func (db *DB) foldMutationFamilyLocked(in journal.OperationInput, jid int64, eff
 				ptypes.ErrCycleDetected, eff.TaskID.String(), eff.EdgeTargetID)
 		}
 	}
-	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO journal_task_events (journal_id, task_id, event_kind, payload) VALUES (?1, ?2, ?3, ?4)`,
+	if err := executeStatement(db.conn,
+		sqlStatement094,
 		&sqlitex.ExecOptions{Args: []any{jid, eff.TaskID.String(), string(kind), string(payload)}}); err != nil {
 		return fmt.Errorf("Apply: insert journal_task_events (%s): %w", kind, err)
 	}
@@ -88,8 +88,8 @@ func (db *DB) foldMutationFamilyLocked(in journal.OperationInput, jid int64, eff
 		if err != nil {
 			return fmt.Errorf("Apply: encode context (%s): %w", kind, err)
 		}
-		if err := sqlitex.Execute(db.conn,
-			`INSERT INTO journal_task_event_contexts (event_journal_id, context_kind, context_identity, attached_by_journal_id) VALUES (?1, ?2, ?3, ?4)`,
+		if err := executeStatement(db.conn,
+			sqlStatement095,
 			&sqlitex.ExecOptions{Args: []any{jid, string(contextKind), identity, jid}}); err != nil {
 			return fmt.Errorf("Apply: insert context (%s): %w", kind, err)
 		}
@@ -201,42 +201,42 @@ func (db *DB) projectMutationFamilyRowLocked(task journal.TaskID, kind journal.E
 
 func (target projectionTarget) edgeCycleStatement() sqlStatement {
 	if target == projectionTargetShadow {
-		return sqlStatement{text: `WITH RECURSIVE reach(node) AS (SELECT ?1 UNION SELECT e.target_id FROM shadow_edges e JOIN reach r ON e.source_id=r.node WHERE e.kind_id=?3) SELECT 1 FROM reach WHERE node=?2 LIMIT 1`}
+		return sqlStatement096
 	}
-	return sqlStatement{text: `WITH RECURSIVE reach(node) AS (SELECT ?1 UNION SELECT e.target_id FROM edges e JOIN reach r ON e.source_id=r.node WHERE e.kind_id=?3) SELECT 1 FROM reach WHERE node=?2 LIMIT 1`}
+	return sqlStatement097
 }
 
 func (target projectionTarget) projectEdgeAddStatement() sqlStatement {
 	if target == projectionTargetShadow {
-		return sqlStatement{text: `INSERT OR IGNORE INTO shadow_edges (source_id,target_id,kind_id,created_at) VALUES (?1,?2,?3,?4)`}
+		return sqlStatement098
 	}
-	return sqlStatement{text: `INSERT OR IGNORE INTO edges (source_id,target_id,kind_id,created_at) VALUES (?1,?2,?3,?4)`}
+	return sqlStatement099
 }
 
 func (target projectionTarget) projectEdgeRemoveStatement() sqlStatement {
 	if target == projectionTargetShadow {
-		return sqlStatement{text: `DELETE FROM shadow_edges WHERE source_id=?1 AND target_id=?2 AND kind_id=?3`}
+		return sqlStatement100
 	}
-	return sqlStatement{text: `DELETE FROM edges WHERE source_id=?1 AND target_id=?2 AND kind_id=?3`}
+	return sqlStatement101
 }
 
 func (target projectionTarget) projectLabelAddStatement() sqlStatement {
 	if target == projectionTargetShadow {
-		return sqlStatement{text: `INSERT OR IGNORE INTO shadow_labels (task_id,name) VALUES (?1,?2)`}
+		return sqlStatement102
 	}
-	return sqlStatement{text: `INSERT OR IGNORE INTO labels (task_id,name) VALUES (?1,?2)`}
+	return sqlStatement103
 }
 
 func (target projectionTarget) projectLabelRemoveStatement() sqlStatement {
 	if target == projectionTargetShadow {
-		return sqlStatement{text: `DELETE FROM shadow_labels WHERE task_id=?1 AND name=?2`}
+		return sqlStatement104
 	}
-	return sqlStatement{text: `DELETE FROM labels WHERE task_id=?1 AND name=?2`}
+	return sqlStatement105
 }
 
 func (target projectionTarget) projectCommentAddStatement() sqlStatement {
 	if target == projectionTargetShadow {
-		return sqlStatement{text: `INSERT OR IGNORE INTO shadow_comments (id,task_id,author_id,body,created_at) VALUES (?1,?2,?3,?4,?5)`}
+		return sqlStatement106
 	}
-	return sqlStatement{text: `INSERT OR IGNORE INTO comments (id,task_id,author_id,body,created_at) VALUES (?1,?2,?3,?4,?5)`}
+	return sqlStatement107
 }

@@ -40,17 +40,59 @@ type canonicalCodecDescriptor struct {
 	decoder canonicalMutationDecoder
 }
 
-var canonicalCodecRegistry = [...]canonicalCodecDescriptor{
-	{version: MutationEncodingV1, wireTag: "provenance.mutation.v1", decoder: decodeCanonicalMutationV1},
+type canonicalCodecDescriptors []canonicalCodecDescriptor
+
+var canonicalCodecRegistry = canonicalCodecDescriptors{
+	canonicalCodecDescriptor{version: MutationEncodingV1, wireTag: "provenance.mutation.v1", decoder: decodeCanonicalMutationV1},
 }
 
 func canonicalCodecForVersion(version MutationEncodingVersion) (canonicalCodecDescriptor, bool) {
-	for _, descriptor := range canonicalCodecRegistry {
+	return canonicalCodecRegistry.codecForVersion(version)
+}
+
+func (registry canonicalCodecDescriptors) validate() error {
+	versions := make(map[MutationEncodingVersion]struct{}, len(registry))
+	tags := make(map[string]struct{}, len(registry))
+	for _, descriptor := range registry {
+		if descriptor.version == 0 || descriptor.wireTag == "" || descriptor.decoder == nil {
+			return canonicalMutationError("codec-registry", "codec descriptor has an empty version, wire tag, or decoder", "register a complete codec descriptor")
+		}
+		if _, exists := versions[descriptor.version]; exists {
+			return canonicalMutationError("codec-registry", fmt.Sprintf("duplicate mutation encoding version %d", descriptor.version), "register each encoding version exactly once")
+		}
+		if _, exists := tags[descriptor.wireTag]; exists {
+			return canonicalMutationError("codec-registry", fmt.Sprintf("duplicate mutation encoding wire tag %q", descriptor.wireTag), "register each wire tag exactly once")
+		}
+		versions[descriptor.version] = struct{}{}
+		tags[descriptor.wireTag] = struct{}{}
+	}
+	return nil
+}
+
+func (registry canonicalCodecDescriptors) codecForVersion(version MutationEncodingVersion) (canonicalCodecDescriptor, bool) {
+	if registry.validate() != nil {
+		var zero canonicalCodecDescriptor
+		return zero, false
+	}
+	for _, descriptor := range registry {
 		if descriptor.version == version {
 			return descriptor, true
 		}
 	}
-	return canonicalCodecDescriptor{}, false
+	var zero canonicalCodecDescriptor
+	return zero, false
+}
+
+func (registry canonicalCodecDescriptors) versionForTag(tag string) (MutationEncodingVersion, bool) {
+	if registry.validate() != nil {
+		return 0, false
+	}
+	for _, descriptor := range registry {
+		if descriptor.wireTag == tag {
+			return descriptor.version, true
+		}
+	}
+	return 0, false
 }
 
 func inspectMutationEncodingTag(text string) inspectedMutationEncodingTag {
@@ -58,12 +100,7 @@ func inspectMutationEncodingTag(text string) inspectedMutationEncodingTag {
 }
 
 func (tag inspectedMutationEncodingTag) version() (MutationEncodingVersion, bool) {
-	for _, descriptor := range canonicalCodecRegistry {
-		if descriptor.wireTag == tag.text {
-			return descriptor.version, true
-		}
-	}
-	return 0, false
+	return canonicalCodecRegistry.versionForTag(tag.text)
 }
 
 // MatchesStoredText compares an opaque inspected wire tag with the redundant
@@ -153,20 +190,22 @@ type canonicalV1FamilyDescriptor struct {
 	tag  string
 }
 
-var canonicalV1Families = [...]canonicalV1FamilyDescriptor{
-	{EffectTaskEvent, "task_event"},
-	{EffectBootstrapAuthority, "bootstrap_authority"},
-	{EffectAssignmentStart, "assignment_start"},
-	{EffectAssignmentEnd, "assignment_end"},
-	{EffectDecision, "decision"},
-	{EffectEvidence, "evidence"},
-	{EffectTaskCreate, "task_create"},
-	{EffectEdgeAdd, "edge_add"},
-	{EffectEdgeRemove, "edge_remove"},
-	{EffectLabelAdd, "label_add"},
-	{EffectLabelRemove, "label_remove"},
-	{EffectCommentAdd, "comment_add"},
-	{EffectTaskCreateAllocated, "task_create_allocated"},
+type canonicalV1FamilyRegistry []canonicalV1FamilyDescriptor
+
+var canonicalV1Families = canonicalV1FamilyRegistry{
+	canonicalV1FamilyDescriptor{sort: EffectTaskEvent, tag: "task_event"},
+	canonicalV1FamilyDescriptor{sort: EffectBootstrapAuthority, tag: "bootstrap_authority"},
+	canonicalV1FamilyDescriptor{sort: EffectAssignmentStart, tag: "assignment_start"},
+	canonicalV1FamilyDescriptor{sort: EffectAssignmentEnd, tag: "assignment_end"},
+	canonicalV1FamilyDescriptor{sort: EffectDecision, tag: "decision"},
+	canonicalV1FamilyDescriptor{sort: EffectEvidence, tag: "evidence"},
+	canonicalV1FamilyDescriptor{sort: EffectTaskCreate, tag: "task_create"},
+	canonicalV1FamilyDescriptor{sort: EffectEdgeAdd, tag: "edge_add"},
+	canonicalV1FamilyDescriptor{sort: EffectEdgeRemove, tag: "edge_remove"},
+	canonicalV1FamilyDescriptor{sort: EffectLabelAdd, tag: "label_add"},
+	canonicalV1FamilyDescriptor{sort: EffectLabelRemove, tag: "label_remove"},
+	canonicalV1FamilyDescriptor{sort: EffectCommentAdd, tag: "comment_add"},
+	canonicalV1FamilyDescriptor{sort: EffectTaskCreateAllocated, tag: "task_create_allocated"},
 }
 
 type canonicalV1Codec struct{}
@@ -430,7 +469,7 @@ func (w *canonicalSizeCounter) Write(p []byte) (int, error) {
 // DecodeCanonicalMutation strictly decodes one complete canonical mutation. Field
 // order is fixed, so unknown, missing, duplicate, and trailing fields all fail closed.
 func DecodeCanonicalMutation(data []byte) (CanonicalMutation, error) {
-	mutation, err := decodeCanonicalMutation(data)
+	mutation, err := decodeCanonicalMutationWithRegistry(data, canonicalCodecRegistry)
 	if err == nil {
 		return mutation, nil
 	}
@@ -460,7 +499,10 @@ func InspectCanonicalMutationEncodingVersion(data []byte) (inspectedMutationEnco
 	return inspectedMutationEncodingTag{}, canonicalMutationError("wire version", err.Error(), "restore the leading framed version field from a committed canonical mutation")
 }
 
-func decodeCanonicalMutation(data []byte) (CanonicalMutation, error) {
+func decodeCanonicalMutationWithRegistry(data []byte, registry canonicalCodecDescriptors) (CanonicalMutation, error) {
+	if err := registry.validate(); err != nil {
+		return CanonicalMutation{}, err
+	}
 	if len(data) > MaxCanonicalMutationBytes {
 		return CanonicalMutation{}, canonicalMutationError("mutation", fmt.Sprintf("%d bytes exceeds maximum %d", len(data), MaxCanonicalMutationBytes), "restore bounded canonical bytes")
 	}
@@ -470,11 +512,11 @@ func decodeCanonicalMutation(data []byte) (CanonicalMutation, error) {
 		return CanonicalMutation{}, err
 	}
 	inspected := inspectMutationEncodingTag(string(version))
-	registered, ok := inspected.version()
+	registered, ok := registry.versionForTag(inspected.text)
 	if !ok {
 		return CanonicalMutation{}, fmt.Errorf("unsupported encoding version %q", version)
 	}
-	descriptor, ok := canonicalCodecForVersion(registered)
+	descriptor, ok := registry.codecForVersion(registered)
 	if !ok {
 		return CanonicalMutation{}, fmt.Errorf("unsupported encoding version %q", version)
 	}

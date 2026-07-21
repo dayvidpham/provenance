@@ -48,8 +48,8 @@ func (db *DB) projectJournalRowLocked(jid int64) error {
 	// never a bare read of the NULL column. The single shared reducer step therefore
 	// attributes the same committing actor whether Apply folds a just-produced
 	// subordinate row or Open replays it (§9.2).
-	if err := sqlitex.Execute(db.conn,
-		`SELECT kind_id, effective_actor_id, recorded_at FROM journal_attributed WHERE journal_id = ?1`,
+	if err := executeStatement(db.conn,
+		sqlStatement184,
 		&sqlitex.ExecOptions{Args: []any{jid}, ResultFunc: func(stmt *zs.Stmt) error {
 			found = true
 			kind = stmt.ColumnInt(0)
@@ -92,8 +92,8 @@ func (db *DB) projectTaskEventRowLocked(jid int64, committing journal.ActorID, r
 		kindStr string
 		payload []byte
 	)
-	if err := sqlitex.Execute(db.conn,
-		`SELECT task_id, event_kind, payload FROM journal_task_events WHERE journal_id = ?1`,
+	if err := executeStatement(db.conn,
+		sqlStatement185,
 		&sqlitex.ExecOptions{Args: []any{jid}, ResultFunc: func(stmt *zs.Stmt) error {
 			taskRaw = stmt.ColumnText(0)
 			kindStr = stmt.ColumnText(1)
@@ -218,8 +218,8 @@ func (db *DB) projectAuthorityRowLocked(jid int64) error {
 		transition = -1
 		hasTrans   bool
 	)
-	if err := sqlitex.Execute(db.conn,
-		`SELECT assignment_id, transition_id FROM journal_authority_assignment_transitions WHERE journal_id = ?1`,
+	if err := executeStatement(db.conn,
+		sqlStatement186,
 		&sqlitex.ExecOptions{Args: []any{jid}, ResultFunc: func(stmt *zs.Stmt) error {
 			hasTrans = true
 			assignment = stmt.ColumnText(0)
@@ -236,8 +236,8 @@ func (db *DB) projectAuthorityRowLocked(jid int64) error {
 		occupantRaw string
 		slot        = -1
 	)
-	if err := sqlitex.Execute(db.conn,
-		`SELECT task_id, actor_id, slot_id FROM journal_authority_assignment_episodes WHERE assignment_id = ?1`,
+	if err := executeStatement(db.conn,
+		sqlStatement187,
 		&sqlitex.ExecOptions{Args: []any{assignment}, ResultFunc: func(stmt *zs.Stmt) error {
 			taskRaw = stmt.ColumnText(0)
 			occupantRaw = stmt.ColumnText(1)
@@ -330,23 +330,23 @@ func (db *DB) projectTaskStatusLocked(task journal.TaskID, status journal.TaskSt
 
 func (target projectionTarget) readTaskStatusStatement() sqlStatement {
 	if target == projectionTargetShadow {
-		return sqlStatement{text: `SELECT status_id FROM shadow_tasks WHERE id=?1`}
+		return sqlStatement188
 	}
-	return sqlStatement{text: `SELECT status_id FROM tasks WHERE id=?1`}
+	return sqlStatement189
 }
 
 func (table taskScopedTable) statement() sqlStatement {
 	if table == taskScopedEvidence {
-		return sqlStatement{text: `SELECT task_id FROM journal_evidence WHERE journal_id=?1`}
+		return sqlStatement190
 	}
-	return sqlStatement{text: `SELECT task_id FROM journal_decisions WHERE journal_id=?1`}
+	return sqlStatement191
 }
 
 func (target projectionTarget) projectTaskStatusStatement() sqlStatement {
 	if target == projectionTargetShadow {
-		return sqlStatement{text: `UPDATE shadow_tasks SET status_id=?1,closed_at=?2,last_journal_id=?3 WHERE id=?4`}
+		return sqlStatement192
 	}
-	return sqlStatement{text: `UPDATE tasks SET status_id=?1,closed_at=?2,last_journal_id=?3 WHERE id=?4`}
+	return sqlStatement193
 }
 
 // ---------------------------------------------------------------------------
@@ -484,23 +484,23 @@ const (
 
 func (shape canonicalColumnShape) operationsStatement() sqlStatement {
 	if shape == canonicalColumnsLegacy {
-		return sqlStatement{text: `SELECT o.journal_id,o.authority_journal_id,NULL,NULL,o.mutation_digest,j.actor_id,j.recorded_at FROM journal_operations o JOIN journal j ON j.journal_id=o.journal_id ORDER BY o.journal_id`}
+		return sqlStatement194
 	}
-	return sqlStatement{text: `SELECT o.journal_id,o.authority_journal_id,o.mutation_encoding_version,o.canonical_mutation,o.mutation_digest,j.actor_id,j.recorded_at FROM journal_operations o JOIN journal j ON j.journal_id=o.journal_id ORDER BY o.journal_id`}
+	return sqlStatement195
 }
 
 func (shape canonicalColumnShape) effectForRowStatement() sqlStatement {
 	if shape == canonicalColumnsLegacy {
-		return sqlStatement{text: `SELECT o.journal_id,NULL,NULL FROM journal j JOIN journal_operations o ON o.journal_id=j.produced_by_operation_journal_id WHERE j.journal_id=?1`}
+		return sqlStatement196
 	}
-	return sqlStatement{text: `SELECT o.journal_id,o.mutation_encoding_version,o.canonical_mutation FROM journal j JOIN journal_operations o ON o.journal_id=j.produced_by_operation_journal_id WHERE j.journal_id=?1`}
+	return sqlStatement197
 }
 
 func (shape canonicalColumnShape) seedLegacyTasksStatement() sqlStatement {
 	if shape == canonicalColumnsLegacy {
-		return sqlStatement{text: `INSERT INTO shadow_tasks (id,namespace,title,description,owner_id,status_id,priority_id,type_id,phase_id,notes,created_at,updated_at,closed_at,close_reason,last_journal_id) SELECT t.id,t.namespace,t.title,t.description,NULL,?1,t.priority_id,t.type_id,t.phase_id,t.notes,t.created_at,t.updated_at,NULL,t.close_reason,NULL FROM tasks t WHERE EXISTS (SELECT 1 FROM journal_task_events e JOIN journal j ON j.journal_id=e.journal_id JOIN journal_operations o ON o.journal_id=j.produced_by_operation_journal_id WHERE e.task_id=t.id AND (e.event_kind=?2 OR e.event_kind=?3))`}
+		return sqlStatement198
 	}
-	return sqlStatement{text: `INSERT INTO shadow_tasks (id,namespace,title,description,owner_id,status_id,priority_id,type_id,phase_id,notes,created_at,updated_at,closed_at,close_reason,last_journal_id) SELECT t.id,t.namespace,t.title,t.description,NULL,?1,t.priority_id,t.type_id,t.phase_id,t.notes,t.created_at,t.updated_at,NULL,t.close_reason,NULL FROM tasks t WHERE EXISTS (SELECT 1 FROM journal_task_events e JOIN journal j ON j.journal_id=e.journal_id JOIN journal_operations o ON o.journal_id=j.produced_by_operation_journal_id WHERE e.task_id=t.id AND ((e.event_kind=?2 AND o.canonical_mutation IS NULL) OR e.event_kind=?3))`}
+	return sqlStatement199
 }
 
 func (db *DB) validateCanonicalOperationsLocked() error {
@@ -561,7 +561,7 @@ func (db *DB) validateCanonicalOperationsLocked() error {
 		}
 		effects := prepared.NormalizedEffects()
 		var rows []int64
-		if err := sqlitex.Execute(db.conn, `SELECT journal_id FROM journal WHERE produced_by_operation_journal_id=?1 ORDER BY journal_id`, &sqlitex.ExecOptions{Args: []any{op.anchor}, ResultFunc: func(stmt *zs.Stmt) error { rows = append(rows, stmt.ColumnInt64(0)); return nil }}); err != nil {
+		if err := executeStatement(db.conn, sqlStatement179, &sqlitex.ExecOptions{Args: []any{op.anchor}, ResultFunc: func(stmt *zs.Stmt) error { rows = append(rows, stmt.ColumnInt64(0)); return nil }}); err != nil {
 			return err
 		}
 		if len(rows) != len(effects) {
@@ -618,7 +618,7 @@ func (db *DB) validateCanonicalResultSlotsLocked(anchor int64, rows []int64, eff
 		}
 	}
 	actual := map[string]int64{}
-	if err := sqlitex.Execute(db.conn, `SELECT result_slot_id,produced_journal_id FROM journal_operation_result_slots WHERE journal_id=?1`, &sqlitex.ExecOptions{Args: []any{anchor}, ResultFunc: func(stmt *zs.Stmt) error { slot := stmt.ColumnText(0); actual[slot] = stmt.ColumnInt64(1); return nil }}); err != nil {
+	if err := executeStatement(db.conn, sqlStatement200, &sqlitex.ExecOptions{Args: []any{anchor}, ResultFunc: func(stmt *zs.Stmt) error { slot := stmt.ColumnText(0); actual[slot] = stmt.ColumnInt64(1); return nil }}); err != nil {
 		return err
 	}
 	for slot, want := range expected {
@@ -649,7 +649,7 @@ func (db *DB) validateCanonicalEffectRowLocked(op canonicalStoredOperation, jid 
 	}
 	var kind int
 	var recordedAt int64
-	if err := sqlitex.Execute(db.conn, `SELECT kind_id, recorded_at FROM journal WHERE journal_id=?1`, &sqlitex.ExecOptions{Args: []any{jid}, ResultFunc: func(stmt *zs.Stmt) error { kind = stmt.ColumnInt(0); recordedAt = stmt.ColumnInt64(1); return nil }}); err != nil {
+	if err := executeStatement(db.conn, sqlStatement201, &sqlitex.ExecOptions{Args: []any{jid}, ResultFunc: func(stmt *zs.Stmt) error { kind = stmt.ColumnInt(0); recordedAt = stmt.ColumnInt64(1); return nil }}); err != nil {
 		return err
 	}
 	if kind != int(expectedKind) {
@@ -674,20 +674,20 @@ func (db *DB) validateCanonicalEffectRowLocked(op canonicalStoredOperation, jid 
 		if auth == "" {
 			auth = fmt.Sprintf("authority--bootstrap--%d", jid)
 		}
-		return db.compareSingleRowLocked(op.anchor, jid, sqlStatement{text: `SELECT a.operation_authority_id, b.label FROM journal_authorities a JOIN journal_authority_bootstraps b ON b.journal_id=a.journal_id WHERE a.journal_id=?1`}, []string{auth, label})
+		return db.compareSingleRowLocked(op.anchor, jid, sqlStatement202, []string{auth, label})
 	case journal.EffectAssignmentStart:
 		occupant := effect.Occupant
 		if occupant.Namespace == "" {
 			occupant = op.actor
 		}
 		slot, _ := slotDBID(effect.SlotID)
-		return db.compareSingleRowLocked(op.anchor, jid, sqlStatement{text: `SELECT e.assignment_id,e.task_id,e.slot_id,e.actor_id,e.predecessor_assignment_id,e.parent_assignment_id,t.transition_id FROM journal_authority_assignment_transitions t JOIN journal_authority_assignment_episodes e ON e.assignment_id=t.assignment_id WHERE t.journal_id=?1`}, []string{string(effect.AssignmentID), effect.TaskID.String(), strconv.Itoa(slot), occupant.String(), string(effect.Predecessor), string(effect.Parent), strconv.Itoa(transitionStartedID)})
+		return db.compareSingleRowLocked(op.anchor, jid, sqlStatement203, []string{string(effect.AssignmentID), effect.TaskID.String(), strconv.Itoa(slot), occupant.String(), string(effect.Predecessor), string(effect.Parent), strconv.Itoa(transitionStartedID)})
 	case journal.EffectAssignmentEnd:
-		return db.compareSingleRowLocked(op.anchor, jid, sqlStatement{text: `SELECT assignment_id,transition_id FROM journal_authority_assignment_transitions WHERE journal_id=?1`}, []string{string(effect.AssignmentID), strconv.Itoa(transitionEndedID)})
+		return db.compareSingleRowLocked(op.anchor, jid, sqlStatement204, []string{string(effect.AssignmentID), strconv.Itoa(transitionEndedID)})
 	case journal.EffectDecision:
-		return db.compareSingleRowLocked(op.anchor, jid, sqlStatement{text: `SELECT decision_kind,task_id,payload FROM journal_decisions WHERE journal_id=?1`}, []string{string(effect.DecisionKind), optionalTaskString(effect.TaskID), string(effect.Payload)})
+		return db.compareSingleRowLocked(op.anchor, jid, sqlStatement205, []string{string(effect.DecisionKind), optionalTaskString(effect.TaskID), string(effect.Payload)})
 	case journal.EffectEvidence:
-		return db.compareSingleRowLocked(op.anchor, jid, sqlStatement{text: `SELECT evidence_kind,task_id,hex(content_digest),payload FROM journal_evidence WHERE journal_id=?1`}, []string{string(effect.EvidenceKind), optionalTaskString(effect.TaskID), strings.ToUpper(fmt.Sprintf("%x", effect.ContentDigest)), string(effect.Payload)})
+		return db.compareSingleRowLocked(op.anchor, jid, sqlStatement206, []string{string(effect.EvidenceKind), optionalTaskString(effect.TaskID), strings.ToUpper(fmt.Sprintf("%x", effect.ContentDigest)), string(effect.Payload)})
 	}
 	return nil
 }
@@ -719,7 +719,7 @@ func (db *DB) validateCanonicalTaskEventLocked(anchor, jid int64, effect journal
 	if len(payload) == 0 {
 		payload = []byte(`{}`)
 	}
-	if err := db.compareSingleRowLocked(anchor, jid, sqlStatement{text: `SELECT task_id,event_kind,payload FROM journal_task_events WHERE journal_id=?1`}, []string{effect.TaskID.String(), string(kind), string(payload)}); err != nil {
+	if err := db.compareSingleRowLocked(anchor, jid, sqlStatement207, []string{effect.TaskID.String(), string(kind), string(payload)}); err != nil {
 		return err
 	}
 	expected, err := journal.CanonicalEventContexts(effect.Contexts)
@@ -741,7 +741,7 @@ func (db *DB) validateCanonicalTaskEventLocked(anchor, jid int64, effect journal
 		}
 	}
 	attached := []int64{}
-	if err := sqlitex.Execute(db.conn, `SELECT attached_by_journal_id FROM journal_task_event_contexts WHERE event_journal_id=?1 ORDER BY context_kind,context_identity`, &sqlitex.ExecOptions{Args: []any{jid}, ResultFunc: func(stmt *zs.Stmt) error { attached = append(attached, stmt.ColumnInt64(0)); return nil }}); err != nil {
+	if err := executeStatement(db.conn, sqlStatement208, &sqlitex.ExecOptions{Args: []any{jid}, ResultFunc: func(stmt *zs.Stmt) error { attached = append(attached, stmt.ColumnInt64(0)); return nil }}); err != nil {
 		return err
 	}
 	for i, got := range attached {
@@ -812,8 +812,8 @@ func (db *DB) rederiveProjectionsShadowLocked() (
 	}()
 
 	var order []int64
-	if err = sqlitex.Execute(db.conn,
-		`SELECT journal_id FROM journal ORDER BY journal_id ASC`,
+	if err = executeStatement(db.conn,
+		sqlStatement209,
 		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 			order = append(order, stmt.ColumnInt64(0))
 			return nil
@@ -859,56 +859,9 @@ func (db *DB) createProjectionShadowLocked() error {
 	if err := db.dropProjectionShadowLocked(); err != nil {
 		return err
 	}
-	ddl := []string{
-		`CREATE TEMP TABLE shadow_tasks (
-			id              TEXT PRIMARY KEY,
-			namespace       TEXT,
-			title           TEXT,
-			description     TEXT,
-			owner_id        TEXT,
-			status_id       INTEGER,
-			priority_id     INTEGER,
-			type_id         INTEGER,
-			phase_id        INTEGER,
-			notes           TEXT,
-			created_at      INTEGER,
-			updated_at      INTEGER,
-			closed_at       INTEGER,
-			close_reason    TEXT,
-			last_journal_id INTEGER
-		)`,
-		`CREATE TEMP TABLE shadow_task_attributions (
-			task_id          TEXT NOT NULL,
-			actor_id         TEXT NOT NULL,
-			first_journal_id INTEGER NOT NULL,
-			PRIMARY KEY (task_id, actor_id)
-		)`,
-		// Journaled relationship/annotation domain projections (§6 amendment): shadow
-		// mirrors of the real edges/labels/comments tables, carrying the same projection
-		// columns but NONE of the real constraints (no FKs), started EMPTY so the
-		// from-empty refold re-derives them purely from journal history (§15).
-		`CREATE TEMP TABLE shadow_edges (
-			source_id  TEXT NOT NULL,
-			target_id  TEXT NOT NULL,
-			kind_id    INTEGER NOT NULL,
-			created_at INTEGER NOT NULL,
-			PRIMARY KEY (source_id, target_id, kind_id)
-		)`,
-		`CREATE TEMP TABLE shadow_labels (
-			task_id TEXT NOT NULL,
-			name    TEXT NOT NULL,
-			PRIMARY KEY (task_id, name)
-		)`,
-		`CREATE TEMP TABLE shadow_comments (
-			id         TEXT PRIMARY KEY,
-			task_id    TEXT NOT NULL,
-			author_id  TEXT NOT NULL,
-			body       TEXT NOT NULL,
-			created_at INTEGER NOT NULL
-		)`,
-	}
+	ddl := []sqlStatement{sqlStatement356, sqlStatement357, sqlStatement358, sqlStatement359, sqlStatement360}
 	for _, stmt := range ddl {
-		if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
+		if err := executeStatement(db.conn, stmt, nil); err != nil {
 			return fmt.Errorf("create shadow projection table: %w", err)
 		}
 	}
@@ -974,8 +927,8 @@ func (db *DB) canonicalEffectForJournalRowLocked(jid int64) (journal.Effect, boo
 		return journal.Effect{}, false, fmt.Errorf("operation %d canonical column version %q differs from registered wire version %q", anchor, version, prepared.EncodingVersion())
 	}
 	ordinal := 0
-	if err := sqlitex.Execute(db.conn,
-		`SELECT COUNT(*) FROM journal WHERE produced_by_operation_journal_id=?1 AND journal_id<=?2`,
+	if err := executeStatement(db.conn,
+		sqlStatement210,
 		&sqlitex.ExecOptions{Args: []any{anchor, jid}, ResultFunc: func(stmt *zs.Stmt) error { ordinal = stmt.ColumnInt(0) - 1; return nil }}); err != nil {
 		return journal.Effect{}, false, fmt.Errorf("resolve canonical effect ordinal for row %d: %w", jid, err)
 	}
@@ -987,11 +940,8 @@ func (db *DB) canonicalEffectForJournalRowLocked(jid int64) (journal.Effect, boo
 }
 
 func (db *DB) insertCanonicalShadowTaskLocked(e journal.Effect, recordedAt, jid int64) error {
-	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO shadow_tasks
-		 (id, namespace, title, description, owner_id, status_id, priority_id, type_id,
-		  phase_id, notes, created_at, updated_at, closed_at, close_reason, last_journal_id)
-		 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?10, NULL, ?9, ?11)`,
+	if err := executeStatement(db.conn,
+		sqlStatement211,
 		&sqlitex.ExecOptions{Args: []any{e.TaskID.String(), e.TaskID.Namespace, e.Title, e.Description,
 			statusOpenID, int(e.Priority), int(e.Type), int(e.Phase), "", recordedAt, jid}}); err != nil {
 		return fmt.Errorf("replay canonical task create %q: %w", e.TaskID, err)
@@ -1023,15 +973,7 @@ func (db *DB) materializeCanonicalShadowTaskEventLocked(e journal.Effect, record
 	if e.UpdatePhase != nil {
 		phase = int(*e.UpdatePhase)
 	}
-	if err := sqlitex.Execute(db.conn, `UPDATE shadow_tasks SET
-		updated_at=?1,
-		title=CASE WHEN ?2 THEN ?3 ELSE title END,
-		description=CASE WHEN ?4 THEN ?5 ELSE description END,
-		priority_id=CASE WHEN ?6 THEN ?7 ELSE priority_id END,
-		phase_id=CASE WHEN ?8 THEN ?9 ELSE phase_id END,
-		notes=CASE WHEN ?10 THEN ?11 ELSE notes END,
-		close_reason=CASE WHEN ?12 THEN ?13 ELSE close_reason END
-		WHERE id=?14`, &sqlitex.ExecOptions{Args: []any{
+	if err := executeStatement(db.conn, sqlStatement212, &sqlitex.ExecOptions{Args: []any{
 		recordedAt,
 		flag(e.UpdateTitle != nil), value(e.UpdateTitle),
 		flag(e.UpdateDescription != nil), value(e.UpdateDescription),
@@ -1048,12 +990,8 @@ func (db *DB) materializeCanonicalShadowTaskEventLocked(e journal.Effect, record
 
 // dropProjectionShadowLocked removes the connection-scoped shadow projection tables.
 func (db *DB) dropProjectionShadowLocked() error {
-	for _, stmt := range []string{
-		`DROP TABLE IF EXISTS shadow_tasks`, `DROP TABLE IF EXISTS shadow_task_attributions`,
-		`DROP TABLE IF EXISTS shadow_edges`, `DROP TABLE IF EXISTS shadow_labels`,
-		`DROP TABLE IF EXISTS shadow_comments`,
-	} {
-		if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
+	for _, stmt := range []sqlStatement{sqlStatement361, sqlStatement362, sqlStatement363, sqlStatement364, sqlStatement365} {
+		if err := executeStatement(db.conn, stmt, nil); err != nil {
 			return fmt.Errorf("drop shadow projection table: %w", err)
 		}
 	}
@@ -1066,11 +1004,8 @@ func (db *DB) dropProjectionShadowLocked() error {
 // therefore in scope for the §15 convergence assertion.
 func (db *DB) journalAnchoredTasksLocked() (map[string]struct{}, error) {
 	out := map[string]struct{}{}
-	if err := sqlitex.Execute(db.conn,
-		`SELECT task_id FROM journal_task_events
-		 UNION SELECT task_id FROM journal_authority_assignment_episodes
-		 UNION SELECT task_id FROM journal_decisions WHERE task_id IS NOT NULL
-		 UNION SELECT task_id FROM journal_evidence WHERE task_id IS NOT NULL`,
+	if err := executeStatement(db.conn,
+		sqlStatement213,
 		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 			if stmt.ColumnType(0) != zs.TypeNull {
 				out[stmt.ColumnText(0)] = struct{}{}
@@ -1117,44 +1052,44 @@ func (db *DB) snapshotTaskProjectionsLocked(target projectionTarget) (map[string
 
 func (target projectionTarget) snapshotTaskProjectionsStatement() sqlStatement {
 	if target == projectionTargetShadow {
-		return sqlStatement{text: `SELECT id,owner_id,status_id,last_journal_id FROM shadow_tasks`}
+		return sqlStatement214
 	}
-	return sqlStatement{text: `SELECT id,owner_id,status_id,last_journal_id FROM tasks`}
+	return sqlStatement215
 }
 
 func (target projectionTarget) snapshotAttributionsStatement() sqlStatement {
 	if target == projectionTargetShadow {
-		return sqlStatement{text: `SELECT task_id,actor_id,first_journal_id FROM shadow_task_attributions`}
+		return sqlStatement216
 	}
-	return sqlStatement{text: `SELECT task_id,actor_id,first_journal_id FROM task_attributions`}
+	return sqlStatement217
 }
 
 func (target projectionTarget) snapshotCompleteTaskStateStatement() sqlStatement {
 	if target == projectionTargetShadow {
-		return sqlStatement{text: `SELECT id,namespace,title,description,status_id,priority_id,type_id,phase_id,owner_id,notes,created_at,updated_at,closed_at,close_reason,last_journal_id FROM shadow_tasks`}
+		return sqlStatement218
 	}
-	return sqlStatement{text: `SELECT id,namespace,title,description,status_id,priority_id,type_id,phase_id,owner_id,notes,created_at,updated_at,closed_at,close_reason,last_journal_id FROM tasks`}
+	return sqlStatement219
 }
 
 func (target projectionTarget) snapshotEdgesStatement() sqlStatement {
 	if target == projectionTargetShadow {
-		return sqlStatement{text: `SELECT source_id,target_id,kind_id,created_at FROM shadow_edges`}
+		return sqlStatement220
 	}
-	return sqlStatement{text: `SELECT source_id,target_id,kind_id,created_at FROM edges`}
+	return sqlStatement221
 }
 
 func (target projectionTarget) snapshotLabelsStatement() sqlStatement {
 	if target == projectionTargetShadow {
-		return sqlStatement{text: `SELECT task_id,name FROM shadow_labels`}
+		return sqlStatement222
 	}
-	return sqlStatement{text: `SELECT task_id,name FROM labels`}
+	return sqlStatement223
 }
 
 func (target projectionTarget) snapshotCommentsStatement() sqlStatement {
 	if target == projectionTargetShadow {
-		return sqlStatement{text: `SELECT id,task_id,author_id,body,created_at FROM shadow_comments`}
+		return sqlStatement224
 	}
-	return sqlStatement{text: `SELECT id,task_id,author_id,body,created_at FROM comments`}
+	return sqlStatement225
 }
 
 // snapshotAttributionsLocked reads the attribution projection from the named table
