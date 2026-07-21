@@ -706,6 +706,58 @@ func journalIDPtrEqual(a, b *journal.JournalID) bool {
 	return *a == *b
 }
 
+// reconcileAllocatedTaskCreatesLocked resolves only explicitly allocated-create
+// provisional UUIDs from the already committed result slots. Fixed task_create
+// effects never enter this path. Namespace, slot, order, and every non-UUID
+// operand remain part of canonical replay identity.
+func (db *DB) reconcileAllocatedTaskCreatesLocked(in journal.OperationInput, existing storedOperation) (journal.OperationInput, error) {
+	hasAllocation := false
+	for _, effect := range in.Effects {
+		if effect.Sort == journal.EffectTaskCreateAllocated {
+			hasAllocation = true
+			break
+		}
+	}
+	if !hasAllocation {
+		return in, nil
+	}
+	committedMutation, err := journal.DecodeCanonicalMutation(existing.canonicalMutation)
+	if err != nil {
+		return journal.OperationInput{}, fmt.Errorf("reconcile allocated create for operation %q: decode committed mutation: %w", in.OperationID, err)
+	}
+	committedEffects := committedMutation.NormalizedEffects()
+	if len(committedEffects) != len(in.Effects) {
+		return in, nil
+	}
+	result, err := db.reconstructCommittedLocked(existing.anchor)
+	if err != nil {
+		return journal.OperationInput{}, err
+	}
+	slots := make(map[journal.ResultSlotID]journal.TaskID, len(result.ResultSlots))
+	for _, binding := range result.ResultSlots {
+		if binding.TaskID != nil {
+			slots[binding.Slot] = *binding.TaskID
+		}
+	}
+	reconciled := append([]journal.Effect(nil), in.Effects...)
+	for i := range reconciled {
+		proposed, committed := reconciled[i], committedEffects[i]
+		if proposed.Sort != journal.EffectTaskCreateAllocated {
+			continue
+		}
+		if committed.Sort != journal.EffectTaskCreateAllocated || proposed.ResultSlot == "" || proposed.ResultSlot != committed.ResultSlot || proposed.TaskID.Namespace != committed.TaskID.Namespace {
+			continue
+		}
+		allocated, ok := slots[proposed.ResultSlot]
+		if !ok || allocated != committed.TaskID {
+			return journal.OperationInput{}, fmt.Errorf("%w: allocated create operation %q slot %q does not resolve to its canonical task %q — where: replay allocation reconciliation; impact: retry fails closed without writes; fix: restore the operation result slot and canonical mutation from the same committed backup", journal.ErrResultSlotIntegrity, in.OperationID, proposed.ResultSlot, committed.TaskID)
+		}
+		reconciled[i].TaskID.UUID = allocated.UUID
+	}
+	in.Effects = reconciled
+	return in, nil
+}
+
 // committedOutcomeForExistingLocked resolves the §9.4 outcome for an OperationID
 // that already has a committed row. An exact four-field identity match returns the
 // original committed result short-circuited (no re-execution, nil error). Any
@@ -717,6 +769,19 @@ func journalIDPtrEqual(a, b *journal.JournalID) bool {
 // CommittedConflict (§11, §9.6). Shared by the Apply short-circuit and the
 // concurrent-insert race translation so both surface the identical typed shape.
 func (db *DB) committedOutcomeForExistingLocked(in journal.OperationInput, existing storedOperation, callerMutationDigest []byte) (journal.CommittedResult, error) {
+	var prepared journal.CanonicalMutation
+	if existing.encodingVersion != "" {
+		var err error
+		in, err = db.reconcileAllocatedTaskCreatesLocked(in, existing)
+		if err != nil {
+			return journal.CommittedResult{}, err
+		}
+		prepared, err = journal.PrepareMutationV1(in.Effects)
+		if err != nil {
+			return journal.CommittedResult{}, err
+		}
+		in.MutationDigest = prepared.DerivedDigest()
+	}
 	proposedMutationDigest := in.MutationDigest
 	if existing.encodingVersion == "" {
 		proposedMutationDigest = callerMutationDigest
@@ -735,10 +800,6 @@ func (db *DB) committedOutcomeForExistingLocked(in journal.OperationInput, exist
 			fmt.Errorf("%w: %w", journal.ErrOperationConflict, conflict)
 	}
 	if existing.encodingVersion != "" {
-		prepared, err := journal.PrepareMutationV1(in.Effects)
-		if err != nil {
-			return journal.CommittedResult{}, err
-		}
 		if existing.encodingVersion != prepared.EncodingVersion() || !bytes.Equal(existing.canonicalMutation, prepared.CanonicalBytes()) {
 			conflict := &journal.OperationConflict{OperationID: in.OperationID, Field: "canonical effects"}
 			return journal.CommittedResult{Kind: journal.CommittedConflict, Conflict: conflict},

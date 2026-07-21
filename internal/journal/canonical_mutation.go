@@ -92,7 +92,7 @@ var canonicalEffectSorts = []EffectSort{
 	EffectTaskEvent, EffectBootstrapAuthority, EffectAssignmentStart,
 	EffectAssignmentEnd, EffectDecision, EffectEvidence, EffectTaskCreate,
 	EffectEdgeAdd, EffectEdgeRemove, EffectLabelAdd, EffectLabelRemove,
-	EffectCommentAdd,
+	EffectCommentAdd, EffectTaskCreateAllocated,
 }
 
 // PrepareMutationV1 validates and normalizes effects, writes their canonical bytes,
@@ -298,7 +298,7 @@ func encodeCanonicalEffect(w *canonicalWriter, e Effect, index int) error {
 		}
 		payload := func() { p, _ := canonicalJSON(e.Payload); w.field(prefix+"payload", p) }
 		switch e.Sort {
-		case EffectTaskCreate:
+		case EffectTaskCreate, EffectTaskCreateAllocated:
 			w.field(prefix+"task", []byte(e.TaskID.String()))
 			payload()
 			contexts()
@@ -436,7 +436,7 @@ func decodeCanonicalEffect(r *canonicalReader, index int) (Effect, error) {
 			return x
 		}
 		switch sort {
-		case EffectTaskCreate:
+		case EffectTaskCreate, EffectTaskCreateAllocated:
 			if err = task(); err != nil {
 				return e, err
 			}
@@ -678,9 +678,12 @@ func normalizeCanonicalEffect(e Effect, index int) (Effect, error) {
 	}
 	n := Effect{Sort: e.Sort, ResultSlot: e.ResultSlot, RecordedAtOverride: e.RecordedAtOverride}
 	switch e.Sort {
-	case EffectTaskCreate:
+	case EffectTaskCreate, EffectTaskCreateAllocated:
 		if e.TaskID.Namespace == "" || !e.Type.IsValid() || !e.Priority.IsValid() || !e.Phase.IsValid() {
 			return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.task-create", index), "invalid task identity or classification enum", "supply a namespaced task and valid type/priority/phase")
+		}
+		if e.Sort == EffectTaskCreateAllocated && e.ResultSlot == "" {
+			return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.result-slot", index), "allocated task create requires a result slot for committed identity reconciliation", "supply a stable non-empty result slot")
 		}
 		n.TaskID = e.TaskID
 		n.Payload = e.Payload

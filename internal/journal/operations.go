@@ -146,21 +146,27 @@ const (
 	EffectLabelAdd    // JournalKindTaskEvent (provenance.label.added), + labels INSERT projection
 	EffectLabelRemove // JournalKindTaskEvent (provenance.label.removed), + labels DELETE projection
 	EffectCommentAdd  // JournalKindTaskEvent (provenance.comment.added), + comments INSERT projection
+	// EffectTaskCreateAllocated folds like EffectTaskCreate on first execution,
+	// but marks TaskID.UUID as a provisional Session allocation. On retry, Apply
+	// may replace only that UUID from this effect's committed result slot before
+	// canonical comparison. Namespace and every other operand remain fixed.
+	EffectTaskCreateAllocated
 )
 
 var effectSortStrings = [...]string{
-	EffectTaskEvent:          "task_event",
-	EffectBootstrapAuthority: "bootstrap_authority",
-	EffectAssignmentStart:    "assignment_start",
-	EffectAssignmentEnd:      "assignment_end",
-	EffectDecision:           "decision",
-	EffectEvidence:           "evidence",
-	EffectTaskCreate:         "task_create",
-	EffectEdgeAdd:            "edge_add",
-	EffectEdgeRemove:         "edge_remove",
-	EffectLabelAdd:           "label_add",
-	EffectLabelRemove:        "label_remove",
-	EffectCommentAdd:         "comment_add",
+	EffectTaskEvent:           "task_event",
+	EffectBootstrapAuthority:  "bootstrap_authority",
+	EffectAssignmentStart:     "assignment_start",
+	EffectAssignmentEnd:       "assignment_end",
+	EffectDecision:            "decision",
+	EffectEvidence:            "evidence",
+	EffectTaskCreate:          "task_create",
+	EffectEdgeAdd:             "edge_add",
+	EffectEdgeRemove:          "edge_remove",
+	EffectLabelAdd:            "label_add",
+	EffectLabelRemove:         "label_remove",
+	EffectCommentAdd:          "comment_add",
+	EffectTaskCreateAllocated: "task_create_allocated",
 }
 
 func (s EffectSort) String() string {
@@ -175,7 +181,7 @@ func (s EffectSort) String() string {
 // finer effect taxonomy to the closed JournalKind enum.
 func (s EffectSort) JournalKind() (JournalKind, error) {
 	switch s {
-	case EffectTaskEvent, EffectTaskCreate,
+	case EffectTaskEvent, EffectTaskCreate, EffectTaskCreateAllocated,
 		EffectEdgeAdd, EffectEdgeRemove, EffectLabelAdd, EffectLabelRemove, EffectCommentAdd:
 		// The relationship/annotation mutation families are journaled ON a
 		// journal_task_events row carrying their fixed per-family EventKind (§6 amendment).
@@ -235,7 +241,7 @@ type Effect struct {
 	Payload   json.RawMessage
 	Contexts  []EventContext
 
-	// task_create (EffectTaskCreate): the immutable birth metadata of the new task
+	// task_create (EffectTaskCreate / EffectTaskCreateAllocated): the immutable birth metadata of the new task
 	// whose row this effect inserts (§8.1). TaskID (above) is the new task's id;
 	// the reducer forces EventKind to provenance.task.created, so the created event
 	// and its status=Open projection are canonical. Title and Description are free

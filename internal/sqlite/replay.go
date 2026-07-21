@@ -119,7 +119,7 @@ func (db *DB) projectTaskEventRowLocked(jid int64, committing journal.ActorID, r
 		}
 		if db.projTasks() == shadowTasksTable {
 			switch canonicalEffect.Sort {
-			case journal.EffectTaskCreate:
+			case journal.EffectTaskCreate, journal.EffectTaskCreateAllocated:
 				if err := db.insertCanonicalShadowTaskLocked(canonicalEffect, recordedAt, jid); err != nil {
 					return err
 				}
@@ -604,7 +604,7 @@ func (db *DB) validateCanonicalEffectRowLocked(op canonicalStoredOperation, jid 
 		return canonicalCorruption(op.anchor, fmt.Sprintf("row %d recorded_at", jid), strconv.FormatInt(recordedAt, 10), strconv.FormatInt(expectedRecordedAt, 10))
 	}
 	switch effect.Sort {
-	case journal.EffectTaskCreate, journal.EffectTaskEvent, journal.EffectEdgeAdd, journal.EffectEdgeRemove, journal.EffectLabelAdd, journal.EffectLabelRemove, journal.EffectCommentAdd:
+	case journal.EffectTaskCreate, journal.EffectTaskCreateAllocated, journal.EffectTaskEvent, journal.EffectEdgeAdd, journal.EffectEdgeRemove, journal.EffectLabelAdd, journal.EffectLabelRemove, journal.EffectCommentAdd:
 		return db.validateCanonicalTaskEventLocked(op.anchor, jid, effect)
 	case journal.EffectBootstrapAuthority:
 		label := effect.BootstrapLabel
@@ -643,7 +643,7 @@ func optionalTaskString(id journal.TaskID) string {
 func (db *DB) validateCanonicalTaskEventLocked(anchor, jid int64, effect journal.Effect) error {
 	kind := effect.EventKind
 	payload := effect.Payload
-	if effect.Sort == journal.EffectTaskCreate {
+	if effect.Sort == journal.EffectTaskCreate || effect.Sort == journal.EffectTaskCreateAllocated {
 		kind = journal.EventKindTaskCreated
 	}
 	if effect.Sort == journal.EffectTaskEvent && effect.Forced && journal.IsTransitionLifecycleKind(kind) {

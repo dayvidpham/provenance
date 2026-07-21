@@ -34,16 +34,15 @@ package provenance
 // journaled mutation safe to retry, pin a stable OperationID with WithOperationID and
 // reuse it verbatim on the retry: an exact same-OperationID replay short-circuits to
 // the original committed result without re-executing (§9.4), and a reused OperationID
-// presenting different arguments is a typed conflict (§11). Create derives its TaskID
-// deterministically from a pinned OperationID, so overlapping pinned retries prepare
-// the same mutation and return the original task; unpinned calls still mint fresh IDs.
+// presenting different arguments is a typed conflict (§11). Create marks its freshly
+// minted UUIDv7 as an allocation, so overlapping pinned retries reconcile different
+// provisional UUIDs from the committed result and return the original task.
 
 import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -112,7 +111,6 @@ type applyConfig struct {
 	commandDigest  []byte
 	mutationDigest []byte
 	forced         bool
-	pinned         bool
 }
 
 // WithForce marks a lifecycle transition verb (Start/Stop/CloseTask/Reopen) as a
@@ -126,14 +124,13 @@ func WithForce() ApplyOption {
 	return func(c *applyConfig) { c.forced = true }
 }
 
-// WithOperationID pins the operation's OperationID instead of minting a fresh UUIDv7.
-// Pinned Create additionally requires the canonical provenance.op.<UUIDv7> form so
-// its deterministic TaskID preserves the public UUIDv7 identity contract.
+// WithOperationID pins the operation's caller-defined, nonempty, control-free
+// OperationID instead of minting a fresh UUIDv7-backed key.
 // Reuse the SAME id verbatim on a retry to make the mutation idempotent: an exact
 // same-identity replay short-circuits to the original result (§9.4); a reused id with
 // different arguments is a typed conflict (§11). See the package retry caveat.
 func WithOperationID(id OperationID) ApplyOption {
-	return func(c *applyConfig) { c.opID = id; c.pinned = true }
+	return func(c *applyConfig) { c.opID = id }
 }
 
 // WithCommandDigest overrides the operation's command digest (§3.1). By default the
@@ -241,25 +238,16 @@ func (s *Session) Create(namespace, title, description string, taskType TaskType
 	}
 	cfg := s.resolve(opts, "create", namespace, title, description,
 		fmt.Sprintf("%d/%d/%d", int(taskType), int(priority), int(phase)))
-	var taskUUID uuid.UUID
-	if cfg.pinned {
-		operationUUID, err := pinnedCreateOperationUUID(cfg.opID)
-		if err != nil {
-			return Task{}, err
-		}
-		// OperationID is globally unique. Reusing its genuine UUIDv7 in the task's
-		// separate namespace preserves timestamp ordering and gives overlap retries
-		// one canonical TaskID without forging version bits or check-then-act state.
-		taskUUID = operationUUID
-	} else {
-		taskUUID = uuid.Must(uuid.NewV7())
-	}
+	// Every attempt allocates a genuine UUIDv7. The allocated-create effect tells
+	// Apply that a retry's provisional UUID may be reconciled from the committed
+	// "task" result slot before canonical replay comparison.
+	taskUUID := uuid.Must(uuid.NewV7())
 	if err := s.requireInitialized("Create"); err != nil {
 		return Task{}, err
 	}
 	id := TaskID{Namespace: namespace, UUID: taskUUID}
 	res, err := s.applyOne(cfg, []Effect{{
-		Sort:        EffectTaskCreate,
+		Sort:        EffectTaskCreateAllocated,
 		TaskID:      id,
 		Title:       title,
 		Description: description,
@@ -287,25 +275,6 @@ func (s *Session) Create(namespace, title, description string, taskType TaskType
 				"fix: re-open the tracker and Show the task", id.String())
 	}
 	return task, nil
-}
-
-func pinnedCreateOperationUUID(operationID OperationID) (uuid.UUID, error) {
-	const prefix = "provenance.op."
-	raw := string(operationID)
-	if !strings.HasPrefix(raw, prefix) {
-		return uuid.Nil, fmt.Errorf("%w: Session.Create pinned OperationID %q is not in provenance.op.<UUIDv7> form — where: pinned Create identity validation; impact: no operation or task was written; fix: use a stable ID such as provenance.op.018f0000-0000-7000-8000-000000000001", ErrInvalidID, operationID)
-	}
-	parsed, err := uuid.Parse(strings.TrimPrefix(raw, prefix))
-	if err != nil {
-		return uuid.Nil, fmt.Errorf("%w: Session.Create pinned OperationID %q has an invalid UUID — where: pinned Create identity validation; impact: no operation or task was written; fix: supply provenance.op.<UUIDv7>: %v", ErrInvalidID, operationID, err)
-	}
-	if raw != prefix+parsed.String() {
-		return uuid.Nil, fmt.Errorf("%w: Session.Create pinned OperationID %q is not in canonical lowercase hyphenated form — where: pinned Create identity validation; impact: no operation or task was written; fix: use %s%s", ErrInvalidID, operationID, prefix, parsed.String())
-	}
-	if parsed.Version() != 7 || parsed.Variant() != uuid.RFC4122 {
-		return uuid.Nil, fmt.Errorf("%w: Session.Create pinned OperationID %q contains UUID version %d variant %v, want RFC4122 UUIDv7 — where: pinned Create identity validation; impact: no operation or task was written; fix: generate the operation UUID with uuid.NewV7", ErrInvalidID, operationID, parsed.Version(), parsed.Variant())
-	}
-	return parsed, nil
 }
 
 // Update applies a partial METADATA UpdateFields to an existing task as ONE journaled

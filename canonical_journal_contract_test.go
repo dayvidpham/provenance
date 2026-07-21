@@ -233,48 +233,63 @@ func TestPinnedSessionCreateAcrossIndependentHandles(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer second.Close()
-	var tasks [2]Task
-	var errs [2]error
-	var wg sync.WaitGroup
-	opID := pinnedCreateOperationID(4)
-	wg.Add(2)
-	call := func(i int, tr Tracker) {
-		defer wg.Done()
-		tasks[i], errs[i] = tr.As(actor.ID, boot).Create("canonical", "same", "same", TaskTypeTask, PriorityMedium, PhaseUnscoped, WithOperationID(opID))
-	}
-	go call(0, first)
-	go call(1, second)
-	wg.Wait()
-	for _, err := range errs {
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	if !reflect.DeepEqual(tasks[0], tasks[1]) {
-		t.Fatalf("concurrent pinned creates differ: %#v %#v", tasks[0], tasks[1])
-	}
-	assertPinnedTaskV7(t, tasks[0], opID)
-	firstResult, err := first.Journal().LookupCommitted(opID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	secondResult, err := second.Journal().LookupCommitted(opID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(firstResult, secondResult) {
-		t.Fatalf("independent complete retry results differ: %+v %+v", firstResult, secondResult)
+	before := readOperationCounts(t, first)
+	for name, opID := range map[string]OperationID{"arbitrary": "pinned-create-request", "typed-v7": pinnedCreateOperationID(4)} {
+		t.Run(name, func(t *testing.T) {
+			var tasks [2]Task
+			var errs [2]error
+			var wg sync.WaitGroup
+			wg.Add(2)
+			call := func(i int, tr Tracker) {
+				defer wg.Done()
+				tasks[i], errs[i] = tr.As(actor.ID, boot).Create("canonical", name, "same", TaskTypeTask, PriorityMedium, PhaseUnscoped, WithOperationID(opID))
+			}
+			go call(0, first)
+			go call(1, second)
+			wg.Wait()
+			for _, err := range errs {
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if !reflect.DeepEqual(tasks[0], tasks[1]) {
+				t.Fatalf("concurrent pinned creates differ: %#v %#v", tasks[0], tasks[1])
+			}
+			assertPinnedTaskV7(t, tasks[0])
+			firstResult, err := first.Journal().LookupCommitted(opID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			secondResult, err := second.Journal().LookupCommitted(opID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(firstResult, secondResult) {
+				t.Fatalf("independent complete retry results differ: %+v %+v", firstResult, secondResult)
+			}
+		})
 	}
 	listed, err := first.List(ListFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(listed) != 1 {
-		t.Fatalf("created %d tasks, want one", len(listed))
+	if len(listed) != 2 {
+		t.Fatalf("created %d tasks, want one per OperationID form", len(listed))
+	}
+	after := readOperationCounts(t, first)
+	if after.operations-before.operations != 2 || after.journal-before.journal != 4 || after.slots-before.slots != 2 {
+		t.Fatalf("simultaneous retries left extra/orphan rows: before=%+v after=%+v", before, after)
 	}
 }
 
 func TestPinnedSessionCreateSameProcessAndReopenUUIDv7(t *testing.T) {
+	for name, opID := range map[string]OperationID{"arbitrary": "pinned-create-reopen", "typed-v7": pinnedCreateOperationID(8)} {
+		t.Run(name, func(t *testing.T) { assertPinnedCreateSameProcessAndReopen(t, opID) })
+	}
+}
+
+func assertPinnedCreateSameProcessAndReopen(t *testing.T, opID OperationID) {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "pinned-create-reopen.sqlite")
 	tr, err := OpenSQLite(path)
 	if err != nil {
@@ -289,7 +304,6 @@ func TestPinnedSessionCreateSameProcessAndReopenUUIDv7(t *testing.T) {
 		t.Fatal(err)
 	}
 	boot, _ := slotJournalID(genesis, "authority")
-	opID := pinnedCreateOperationID(8)
 	session := tr.As(actor.ID, boot)
 	first, err := session.Create("canonical", "same", "same", TaskTypeTask, PriorityMedium, PhaseUnscoped, WithOperationID(opID))
 	if err != nil {
@@ -310,7 +324,7 @@ func TestPinnedSessionCreateSameProcessAndReopenUUIDv7(t *testing.T) {
 	if !reflect.DeepEqual(first, sameProcess) || !reflect.DeepEqual(firstResult, sameResult) {
 		t.Fatalf("same-process pinned retry changed task/result: %#v %#v %+v %+v", first, sameProcess, firstResult, sameResult)
 	}
-	assertPinnedTaskV7(t, first, opID)
+	assertPinnedTaskV7(t, first)
 	if err := tr.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -330,10 +344,10 @@ func TestPinnedSessionCreateSameProcessAndReopenUUIDv7(t *testing.T) {
 	if !reflect.DeepEqual(first, reopened) || !reflect.DeepEqual(firstResult, reopenedResult) {
 		t.Fatalf("reopened pinned retry changed task/result: %#v %#v %+v %+v", first, reopened, firstResult, reopenedResult)
 	}
-	assertPinnedTaskV7(t, reopened, opID)
+	assertPinnedTaskV7(t, reopened)
 }
 
-func TestPinnedSessionCreateRejectsInvalidOperationUUIDsBeforeWrite(t *testing.T) {
+func TestPinnedSessionCreatePreservesOperationIDContract(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "pinned-create-invalid.sqlite")
 	tr, err := OpenSQLite(path)
 	if err != nil {
@@ -349,44 +363,164 @@ func TestPinnedSessionCreateRejectsInvalidOperationUUIDsBeforeWrite(t *testing.T
 		t.Fatal(err)
 	}
 	boot, _ := slotJournalID(genesis, "authority")
-	before := readOperationCounts(t, tr)
-	invalidIDs := map[string]OperationID{
-		"empty":        "",
-		"arbitrary":    "pinned-create",
-		"malformed":    "provenance.op.not-a-uuid",
-		"noncanonical": "provenance.op.018F0000-0000-7000-8000-000000000001",
-		"uuid-v5":      "provenance.op.018f0000-0000-5000-8000-000000000001",
-		"uuid-v4":      "provenance.op.018f0000-0000-4000-8000-000000000001",
+	accepted := map[string]OperationID{
+		"arbitrary": "pinned-create-request",
+		"typed-v7":  pinnedCreateOperationID(9),
+		"uuid-v4":   "provenance.op.018f0000-0000-4000-8000-000000000001",
+		"opaque":    "provenance.op.not-a-uuid",
 	}
-	for name, opID := range invalidIDs {
+	for name, opID := range accepted {
 		t.Run(name, func(t *testing.T) {
-			_, err := tr.As(actor.ID, boot).Create("canonical", "invalid", "invalid", TaskTypeTask, PriorityMedium, PhaseUnscoped, WithOperationID(opID))
-			if !errors.Is(err, ErrInvalidID) {
-				t.Fatalf("error=%v, want ErrInvalidID", err)
+			task, err := tr.As(actor.ID, boot).Create("canonical", name, "accepted", TaskTypeTask, PriorityMedium, PhaseUnscoped, WithOperationID(opID))
+			if err != nil {
+				t.Fatalf("accepted OperationID %q: %v", opID, err)
 			}
-			for _, part := range []string{"where:", "impact:", "fix:"} {
-				if !strings.Contains(err.Error(), part) {
-					t.Fatalf("error lacks %s: %v", part, err)
-				}
+			assertPinnedTaskV7(t, task)
+		})
+	}
+	before := readOperationCounts(t, tr)
+	for name, opID := range map[string]OperationID{"empty": "", "control": "bad\nkey"} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := tr.As(actor.ID, boot).Create("canonical", "invalid", "invalid", TaskTypeTask, PriorityMedium, PhaseUnscoped, WithOperationID(opID)); err == nil {
+				t.Fatal("invalid OperationID accepted")
 			}
 			if after := readOperationCounts(t, tr); after != before {
-				t.Fatalf("invalid pinned ID wrote rows: before=%+v after=%+v", before, after)
+				t.Fatalf("invalid OperationID wrote rows: before=%+v after=%+v", before, after)
 			}
 		})
 	}
 }
 
-func assertPinnedTaskV7(t *testing.T, task Task, operationID OperationID) {
+func assertPinnedTaskV7(t *testing.T, task Task) {
 	t.Helper()
 	if task.ID.UUID.Version() != 7 || task.ID.UUID.Variant() != uuid.RFC4122 {
 		t.Fatalf("pinned task UUID=%s version=%d variant=%v, want RFC4122 UUIDv7", task.ID.UUID, task.ID.UUID.Version(), task.ID.UUID.Variant())
 	}
-	operationUUID, err := uuid.Parse(strings.TrimPrefix(string(operationID), "provenance.op."))
+}
+
+func TestAllocatedCreateReconcilesOnlyProvisionalUUID(t *testing.T) {
+	env := newOpsEnv(t)
+	boot := env.genesis(t, "allocated-create-genesis")
+	opID := OperationID("allocated-create-retry")
+	firstID := newCorpusTaskID()
+	base := OperationInput{
+		OperationID:        opID,
+		ActorID:            env.actor,
+		AuthorityJournalID: &boot,
+		CommandDigest:      []byte("allocated-create-command"),
+		Effects: []Effect{{
+			Sort:        EffectTaskCreateAllocated,
+			ResultSlot:  "task",
+			TaskID:      firstID,
+			Title:       "title",
+			Description: "description",
+			Type:        TaskTypeTask,
+			Priority:    PriorityMedium,
+			Phase:       PhaseUnscoped,
+		}},
+	}
+	first, err := env.tr.Journal().Apply(base)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if task.ID.UUID != operationUUID {
-		t.Fatalf("pinned task UUID=%s, want operation UUIDv7 %s", task.ID.UUID, operationUUID)
+	afterFirst := readOperationCounts(t, env.tr)
+	exact := base
+	exact.Effects = append([]Effect(nil), base.Effects...)
+	exact.Effects[0].TaskID.UUID = uuid.Must(uuid.NewV7())
+	retry, err := env.tr.Journal().Apply(exact)
+	if err != nil {
+		t.Fatalf("allocated UUID-only retry: %v", err)
+	}
+	if !retry.ShortCircuited {
+		t.Fatal("allocated UUID-only retry did not short circuit")
+	}
+	retry.ShortCircuited = false
+	if !reflect.DeepEqual(first, retry) {
+		t.Fatalf("allocated UUID-only retry result changed: first=%+v retry=%+v", first, retry)
+	}
+	if afterRetry := readOperationCounts(t, env.tr); afterRetry != afterFirst {
+		t.Fatalf("allocated UUID-only retry wrote extra rows: first=%+v retry=%+v", afterFirst, afterRetry)
+	}
+	if taskID, ok := taskSlotID(first, "task"); !ok || taskID != firstID {
+		t.Fatalf("committed allocation slot=%v ok=%v, want %v", taskID, ok, firstID)
+	}
+
+	changedAt := int64(42)
+	changedContext, err := TaskContext(firstID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changes := map[string]func(*Effect){
+		"family":      func(effect *Effect) { effect.Sort = EffectTaskCreate },
+		"namespace":   func(effect *Effect) { effect.TaskID.Namespace = "changed" },
+		"result-slot": func(effect *Effect) { effect.ResultSlot = "changed" },
+		"recorded-at": func(effect *Effect) { effect.RecordedAtOverride = &changedAt },
+		"payload":     func(effect *Effect) { effect.Payload = []byte(`{"changed":true}`) },
+		"contexts":    func(effect *Effect) { effect.Contexts = []EventContext{changedContext} },
+		"title":       func(effect *Effect) { effect.Title = "changed" },
+		"description": func(effect *Effect) { effect.Description = "changed" },
+		"type":        func(effect *Effect) { effect.Type = TaskTypeFeature },
+		"priority":    func(effect *Effect) { effect.Priority = PriorityHigh },
+		"phase":       func(effect *Effect) { effect.Phase = PhaseWorkerSlices },
+	}
+	before := readOperationCounts(t, env.tr)
+	for name, change := range changes {
+		t.Run(name, func(t *testing.T) {
+			candidate := base
+			candidate.Effects = append([]Effect(nil), base.Effects...)
+			candidate.Effects[0].TaskID.UUID = uuid.Must(uuid.NewV7())
+			change(&candidate.Effects[0])
+			result, err := env.tr.Journal().Apply(candidate)
+			if !errors.Is(err, ErrOperationConflict) || result.Kind != CommittedConflict {
+				t.Fatalf("changed allocated operand result=%+v err=%v, want canonical conflict", result, err)
+			}
+			if after := readOperationCounts(t, env.tr); after != before {
+				t.Fatalf("allocated conflict wrote rows: before=%+v after=%+v", before, after)
+			}
+		})
+	}
+}
+
+func TestFixedTaskCreateDoesNotReconcileCallerSuppliedID(t *testing.T) {
+	env := newOpsEnv(t)
+	boot := env.genesis(t, "fixed-create-genesis")
+	firstID := newCorpusTaskID()
+	input := OperationInput{
+		OperationID:        "fixed-create-retry",
+		ActorID:            env.actor,
+		AuthorityJournalID: &boot,
+		CommandDigest:      []byte("fixed-create-command"),
+		Effects: []Effect{{Sort: EffectTaskCreate, ResultSlot: "task", TaskID: firstID,
+			Title: "fixed", Type: TaskTypeTask, Priority: PriorityMedium, Phase: PhaseUnscoped}},
+	}
+	if _, err := env.tr.Journal().Apply(input); err != nil {
+		t.Fatal(err)
+	}
+	before := readOperationCounts(t, env.tr)
+	beforeTasks, err := env.tr.List(ListFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherID := newCorpusTaskID()
+	retry := input
+	retry.Effects = append([]Effect(nil), input.Effects...)
+	retry.Effects[0].TaskID = otherID
+	result, err := env.tr.Journal().Apply(retry)
+	if !errors.Is(err, ErrOperationConflict) || result.Kind != CommittedConflict {
+		t.Fatalf("fixed-ID retry result=%+v err=%v, want canonical conflict", result, err)
+	}
+	if after := readOperationCounts(t, env.tr); after != before {
+		t.Fatalf("fixed-ID conflict wrote rows: before=%+v after=%+v", before, after)
+	}
+	if _, err := env.tr.Show(otherID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("fixed-ID losing task error=%v, want ErrNotFound", err)
+	}
+	listed, err := env.tr.List(ListFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(listed, beforeTasks) {
+		t.Fatalf("fixed-ID conflict left orphan/extra tasks: before=%+v after=%+v", beforeTasks, listed)
 	}
 }
 

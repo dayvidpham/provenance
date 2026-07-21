@@ -97,13 +97,14 @@ const (
 	TransitionEnded         = journal.TransitionEnded
 
 	// Effect sorts (§9.3).
-	EffectTaskEvent          = journal.EffectTaskEvent
-	EffectBootstrapAuthority = journal.EffectBootstrapAuthority
-	EffectAssignmentStart    = journal.EffectAssignmentStart
-	EffectAssignmentEnd      = journal.EffectAssignmentEnd
-	EffectDecision           = journal.EffectDecision
-	EffectEvidence           = journal.EffectEvidence
-	EffectTaskCreate         = journal.EffectTaskCreate
+	EffectTaskEvent           = journal.EffectTaskEvent
+	EffectBootstrapAuthority  = journal.EffectBootstrapAuthority
+	EffectAssignmentStart     = journal.EffectAssignmentStart
+	EffectAssignmentEnd       = journal.EffectAssignmentEnd
+	EffectDecision            = journal.EffectDecision
+	EffectEvidence            = journal.EffectEvidence
+	EffectTaskCreate          = journal.EffectTaskCreate
+	EffectTaskCreateAllocated = journal.EffectTaskCreateAllocated
 
 	// Journaled relationship / annotation mutation-family effect sorts (§6 amendment).
 	EffectEdgeAdd     = journal.EffectEdgeAdd

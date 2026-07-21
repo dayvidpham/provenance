@@ -636,7 +636,7 @@ func (db *DB) foldEffectLocked(in journal.OperationInput, anchorJID int64, eff j
 		return 0, err
 	}
 	switch eff.Sort {
-	case journal.EffectTaskCreate:
+	case journal.EffectTaskCreate, journal.EffectTaskCreateAllocated:
 		return jid, db.foldTaskCreateLocked(in, jid, eff)
 	case journal.EffectTaskEvent:
 		return jid, db.foldTaskEventLocked(in, jid, eff)

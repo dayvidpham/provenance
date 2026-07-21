@@ -55,6 +55,7 @@ func validFamilyEffects(t *testing.T) []Effect {
 		{Sort: EffectDecision, ResultSlot: "decision", RecordedAtOverride: &recordedAt, TaskID: task, DecisionKind: "fixture.decision", Payload: []byte(`{"x":1}`)},
 		{Sort: EffectEvidence, ResultSlot: "evidence", RecordedAtOverride: &recordedAt, TaskID: task, EvidenceKind: "fixture.evidence", ContentDigest: []byte{1, 2}, Payload: []byte(`{"x":1}`)},
 		{Sort: EffectTaskCreate, ResultSlot: "create", RecordedAtOverride: &recordedAt, TaskID: task, Title: "title", Description: "description", Type: ptypes.TaskTypeTask, Priority: ptypes.PriorityMedium, Phase: ptypes.PhaseUnscoped, Payload: []byte(`{"x":1}`), Contexts: []EventContext{ctx}},
+		{Sort: EffectTaskCreateAllocated, ResultSlot: "allocated", RecordedAtOverride: &recordedAt, TaskID: task, Title: "title", Description: "description", Type: ptypes.TaskTypeTask, Priority: ptypes.PriorityMedium, Phase: ptypes.PhaseUnscoped, Payload: []byte(`{"x":1}`), Contexts: []EventContext{ctx}},
 		{Sort: EffectEdgeAdd, ResultSlot: "edge-add", RecordedAtOverride: &recordedAt, TaskID: task, EdgeTargetID: task.String(), EdgeRelKind: ptypes.EdgeDerivedFrom, Contexts: []EventContext{ctx}},
 		{Sort: EffectEdgeRemove, ResultSlot: "edge-remove", RecordedAtOverride: &recordedAt, TaskID: task, EdgeTargetID: task.String(), EdgeRelKind: ptypes.EdgeDerivedFrom, Contexts: []EventContext{ctx}},
 		{Sort: EffectLabelAdd, ResultSlot: "label-add", RecordedAtOverride: &recordedAt, TaskID: task, Label: "label", Contexts: []EventContext{ctx}},
@@ -238,6 +239,7 @@ func independentFamilyFields(t *testing.T) [][]independentField {
 		common("decision", "decision", independentField{"task", task.String()}, independentField{"decision-kind", "fixture.decision"}, independentField{"payload", `{"x":1}`}),
 		common("evidence", "evidence", independentField{"task", task.String()}, independentField{"evidence-kind", "fixture.evidence"}, independentField{"content-digest", string([]byte{1, 2})}, independentField{"payload", `{"x":1}`}),
 		append(append(common("task_create", "create", independentField{"task", task.String()}, independentField{"payload", `{"x":1}`}), ctx...), independentField{"title", "title"}, independentField{"description", "description"}, independentField{"type", "task"}, independentField{"priority", "medium"}, independentField{"phase", "unscoped"}),
+		append(append(common("task_create_allocated", "allocated", independentField{"task", task.String()}, independentField{"payload", `{"x":1}`}), ctx...), independentField{"title", "title"}, independentField{"description", "description"}, independentField{"type", "task"}, independentField{"priority", "medium"}, independentField{"phase", "unscoped"}),
 		withCtx(common("edge_add", "edge-add", independentField{"task", task.String()}, independentField{"edge-target", task.String()}, independentField{"edge-kind", "derived_from"})),
 		withCtx(common("edge_remove", "edge-remove", independentField{"task", task.String()}, independentField{"edge-target", task.String()}, independentField{"edge-kind", "derived_from"})),
 		withCtx(common("label_add", "label-add", independentField{"task", task.String()}, independentField{"label", "label"})),
@@ -275,6 +277,7 @@ func TestCanonicalMutationRejectsIrrelevantFieldsAndInvalidEnums(t *testing.T) {
 		"decision-label":      {Sort: EffectDecision, DecisionKind: "fixture.decision", Label: "ignored"},
 		"invalid-edge-enum":   {Sort: EffectEdgeAdd, TaskID: task, EdgeTargetID: "x", EdgeRelKind: ptypes.EdgeKind(99)},
 		"invalid-create-enum": {Sort: EffectTaskCreate, TaskID: task, Type: ptypes.TaskType(99), Priority: ptypes.PriorityMedium, Phase: ptypes.PhaseUnscoped},
+		"allocated-no-slot":   {Sort: EffectTaskCreateAllocated, TaskID: task, Type: ptypes.TaskTypeTask, Priority: ptypes.PriorityMedium, Phase: ptypes.PhaseUnscoped},
 	}
 	for name, effect := range cases {
 		t.Run(name, func(t *testing.T) {
