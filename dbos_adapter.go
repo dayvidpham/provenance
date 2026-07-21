@@ -31,11 +31,13 @@ type DBOSAdapterConfig struct {
 }
 
 // applyTestHooks are unexported, no-op-by-default seams the crash-gap subprocess
-// tests replace to os.Exit around the durable boundaries: beforeDomainCommit fires
-// before any domain fold, afterDomainCommit fires after commit but before the step
-// outcome checkpoint, and afterStepCheckpoint fires after the checkpoint but before
-// workflow completion. Production leaves all hooks as no-ops.
+// tests replace around durable boundaries. onWorkflowEntry observes the first
+// instruction of a registered callback and is never consulted for behavior;
+// beforeDomainCommit fires before the fold, afterDomainCommit after commit but
+// before checkpoint, and afterStepCheckpoint after checkpoint but before workflow
+// completion. Production leaves all hooks as no-ops.
 type applyTestHooks struct {
+	onWorkflowEntry     func()
 	beforeDomainCommit  func()
 	afterDomainCommit   func()
 	afterStepCheckpoint func()
@@ -43,6 +45,7 @@ type applyTestHooks struct {
 
 func defaultApplyTestHooks() applyTestHooks {
 	return applyTestHooks{
+		onWorkflowEntry:     func() {},
 		beforeDomainCommit:  func() {},
 		afterDomainCommit:   func() {},
 		afterStepCheckpoint: func() {},
@@ -214,6 +217,7 @@ func reconcileDBOSAllocatedCreates(in journal.OperationInput, result journal.Com
 // domain failure is checkpointed as a closed outcome (nil Go error); only DBOS
 // infrastructure failures use the Go-error channel.
 func (a *DBOSAdapter) applyWorkflow(wfCtx dbos.DBOSContext, input DBOSApplyInputV1) (DBOSStepOutcomeV1, error) {
+	a.testHooks.onWorkflowEntry()
 	in, err := decodeApplyInput(input)
 	if err != nil {
 		return DBOSStepOutcomeV1{}, fmt.Errorf("provenance.applyWorkflow: %w", err)
@@ -251,6 +255,7 @@ func (a *DBOSAdapter) applyWorkflow(wfCtx dbos.DBOSContext, input DBOSApplyInput
 }
 
 func (a *DBOSAdapter) applyWorkflowV2(wfCtx dbos.DBOSContext, input DBOSApplyInputV2) (DBOSStepOutcomeV1, error) {
+	a.testHooks.onWorkflowEntry()
 	in, err := decodeApplyInputV2(input)
 	if err != nil {
 		return DBOSStepOutcomeV1{}, fmt.Errorf("provenance.applyWorkflowV2: %w", err)

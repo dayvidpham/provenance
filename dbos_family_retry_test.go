@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -30,14 +31,14 @@ type dbosFamilyBaseline struct {
 }
 
 type dbosFamilyEnv struct {
-	db        *sql.DB
-	root      dbos.DBOSContext
-	tracker   Tracker
-	adapter   *DBOSAdapter
-	actor     ActorID
-	other     ActorID
-	authority JournalID
-	callbacks int
+	db              *sql.DB
+	root            dbos.DBOSContext
+	tracker         Tracker
+	adapter         *DBOSAdapter
+	actor           ActorID
+	other           ActorID
+	authority       JournalID
+	workflowEntries int
 }
 
 var dbosCanonicalFieldInventory = map[EffectSort][]string{
@@ -83,14 +84,15 @@ func TestDBOSCanonicalFieldInventoryIsClosed(t *testing.T) {
 
 func runDBOSFamilyBaseline(t *testing.T, env *dbosFamilyEnv, baseline dbosFamilyBaseline, tables []string) {
 	t.Helper()
+	entriesBeforeBaseline := env.workflowEntries
 	want, err := env.adapter.Apply(context.Background(), baseline.input)
 	if err != nil {
 		t.Fatalf("apply valid %s baseline: %v", baseline.name, err)
 	}
-	if env.callbacks == 0 {
-		t.Fatalf("valid %s baseline executed no DBOS callback", baseline.name)
+	if env.workflowEntries-entriesBeforeBaseline != 1 {
+		t.Fatalf("valid %s baseline workflow entries=%d, want exactly 1", baseline.name, env.workflowEntries-entriesBeforeBaseline)
 	}
-	beforeCallbacks := env.callbacks
+	beforeEntries := env.workflowEntries
 	before := snapshotSQLTables(t, env.db, tables...)
 	wantFields := append([]string(nil), dbosCanonicalFieldInventory[baseline.sort]...)
 	gotFields := make([]string, 0, len(baseline.mutations))
@@ -126,8 +128,8 @@ func runDBOSFamilyBaseline(t *testing.T, env *dbosFamilyEnv, baseline dbosFamily
 			if !errors.As(err, &conflict) {
 				t.Fatalf("error lacks *OperationConflict: %v", err)
 			}
-			if env.callbacks != beforeCallbacks {
-				t.Fatalf("forbidden field retry executed callback: %d -> %d", beforeCallbacks, env.callbacks)
+			if env.workflowEntries != beforeEntries {
+				t.Fatalf("forbidden field retry entered workflow callback: %d -> %d", beforeEntries, env.workflowEntries)
 			}
 			if after := snapshotSQLTables(t, env.db, tables...); !reflect.DeepEqual(after, before) {
 				t.Fatalf("forbidden field retry changed DBOS/journal/domain snapshot")
@@ -146,8 +148,8 @@ func runDBOSFamilyBaseline(t *testing.T, env *dbosFamilyEnv, baseline dbosFamily
 		if err != nil || !reflect.DeepEqual(got, want) {
 			t.Fatalf("allocation UUID-only retry got=%#v err=%v want=%#v", got, err, want)
 		}
-		if env.callbacks != beforeCallbacks {
-			t.Fatalf("allocation UUID-only retry executed callback: %d -> %d", beforeCallbacks, env.callbacks)
+		if env.workflowEntries != beforeEntries {
+			t.Fatalf("allocation UUID-only retry entered workflow callback: %d -> %d", beforeEntries, env.workflowEntries)
 		}
 		if after := snapshotSQLTables(t, env.db, tables...); !reflect.DeepEqual(after, before) {
 			for table := range before {
@@ -182,8 +184,6 @@ func changedEffectFields(before, after []Effect) []string {
 	}
 	return out
 }
-
-var dbosDeepSnapshotTables = []string{"workflow_status", "operation_outputs", "journal", "journal_operations", "journal_operation_result_slots", "journal_task_events", "journal_task_event_contexts", "journal_authorities", "journal_authority_bootstraps", "journal_authority_assignment_episodes", "journal_authority_assignment_transitions", "journal_decisions", "journal_evidence", "tasks", "edges", "labels", "comments"}
 
 func newDBOSFamilyEnv(t *testing.T, name string, withGenesis bool) *dbosFamilyEnv {
 	t.Helper()
@@ -220,7 +220,7 @@ func newDBOSFamilyEnv(t *testing.T, name string, withGenesis bool) *dbosFamilyEn
 		t.Fatal(err)
 	}
 	env := &dbosFamilyEnv{db: db, root: root, tracker: tracker, adapter: adapter, actor: actor.ID, other: other.ID, authority: authority}
-	adapter.testHooks.afterDomainCommit = func() { env.callbacks++ }
+	adapter.testHooks.onWorkflowEntry = func() { env.workflowEntries++ }
 	if err := dbos.Launch(root); err != nil {
 		t.Fatal(err)
 	}
@@ -270,7 +270,7 @@ func TestDBOSCompletedRetryUsesOneValidBaselineAndOneFieldChangePerFamily(t *tes
 		fieldChange("BootstrapLabel", 0, func(e *Effect) { e.BootstrapLabel = "changed-root" }),
 		fieldChange("OperationAuthorityID", 0, func(e *Effect) { e.OperationAuthorityID = "changed-authority" }),
 	)
-	runDBOSFamilyBaseline(t, bootstrapEnv, bootstrap, dbosDeepSnapshotTables)
+	runDBOSFamilyBaseline(t, bootstrapEnv, bootstrap, auditedSnapshotTableNames(t, bootstrapEnv.db))
 
 	env := newDBOSFamilyEnv(t, "family-main", true)
 	session := env.tracker.As(env.actor, env.authority)
@@ -402,7 +402,64 @@ func TestDBOSCompletedRetryUsesOneValidBaselineAndOneFieldChangePerFamily(t *tes
 		simpleContexts("label_remove", EffectLabelRemove, Effect{Sort: EffectLabelRemove, ResultSlot: "label", RecordedAtOverride: &at, TaskID: target.ID, Label: "remove-me", Contexts: contexts}, fieldChange("Label", 0, func(e *Effect) { e.Label = "changed" })),
 		simpleContexts("comment_add", EffectCommentAdd, Effect{Sort: EffectCommentAdd, ResultSlot: "comment", RecordedAtOverride: &at, TaskID: target.ID, CommentIdentity: comment, CommentAuthor: env.actor, CommentBody: "body", Contexts: contexts}, fieldChange("CommentIdentity", 0, func(e *Effect) { e.CommentIdentity = altComment }), fieldChange("CommentAuthor", 0, func(e *Effect) { e.CommentAuthor = env.other }), fieldChange("CommentBody", 0, func(e *Effect) { e.CommentBody = "changed" })),
 	}
+	tables := auditedSnapshotTableNames(t, env.db)
 	for _, family := range families {
-		runDBOSFamilyBaseline(t, env, family, dbosDeepSnapshotTables)
+		runDBOSFamilyBaseline(t, env, family, tables)
+	}
+
+	// Negative control: bypass Adapter.Apply's completed-operation preflight and
+	// deliberately start a fresh workflow whose step reaches Journal.Apply and
+	// conflicts. The entry oracle must increment even though no domain commit occurs.
+	conflicting := families[0].input
+	conflicting.Effects = cloneRetryEffects(conflicting.Effects)
+	conflicting.Effects[0].Title = "negative-control-conflict"
+	input, _, err := encodeApplyInputV2(conflicting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entriesBefore := env.workflowEntries
+	handle, err := dbos.RunWorkflow(env.root, env.adapter.applyWorkflowV2, input,
+		dbos.WithWorkflowID("dbos-callback-entry-negative-control-"+uuid.NewString()),
+		dbos.WithApplicationVersion(env.root.GetApplicationVersion()))
+	if err != nil {
+		t.Fatalf("start callback-entry negative control: %v", err)
+	}
+	outcome, err := handle.GetResult()
+	if err != nil {
+		t.Fatalf("await callback-entry negative control: %v", err)
+	}
+	if _, err := outcome.Decode(); !errors.Is(err, ErrOperationConflict) {
+		t.Fatalf("negative control outcome error=%v, want ErrOperationConflict", err)
+	}
+	if env.workflowEntries-entriesBefore != 1 {
+		t.Fatalf("entered-conflict negative control changed oracle by %d, want exactly 1", env.workflowEntries-entriesBefore)
+	}
+}
+
+func TestDBOSDurableSnapshotDetectsTaskAttributionMutation(t *testing.T) {
+	env := newDBOSFamilyEnv(t, "snapshot-attribution-negative-control", true)
+	session := env.tracker.As(env.actor, env.authority)
+	if _, err := session.Create("snapshot", "attributed", "", TaskTypeTask, PriorityMedium, PhaseUnscoped, WithOperationID("snapshot-attribution-task")); err != nil {
+		t.Fatal(err)
+	}
+	tables := auditedSnapshotTableNames(t, env.db)
+	if !slices.Contains(tables, "task_attributions") {
+		t.Fatal("audited durable snapshot omits task_attributions")
+	}
+	before := snapshotSQLTables(t, env.db, tables...)
+	result, err := env.db.Exec(`DELETE FROM task_attributions WHERE (task_id, actor_id) IN (SELECT task_id, actor_id FROM task_attributions LIMIT 1)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil || changed != 1 {
+		t.Fatalf("attribution negative control changed %d rows, err=%v", changed, err)
+	}
+	after := snapshotSQLTables(t, env.db, tables...)
+	if reflect.DeepEqual(before, after) {
+		t.Fatal("attribution mutation escaped complete durable snapshot")
+	}
+	if reflect.DeepEqual(before["task_attributions"], after["task_attributions"]) {
+		t.Fatal("task_attributions relation did not participate in snapshot inequality")
 	}
 }

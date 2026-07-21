@@ -16,13 +16,13 @@ import (
 )
 
 type internalDBOSStack struct {
-	root      dbos.DBOSContext
-	dbPath    string
-	tracker   Tracker
-	adapter   *DBOSAdapter
-	actor     ActorID
-	authority JournalID
-	callbacks atomic.Int64
+	root            dbos.DBOSContext
+	dbPath          string
+	tracker         Tracker
+	adapter         *DBOSAdapter
+	actor           ActorID
+	authority       JournalID
+	workflowEntries atomic.Int64
 }
 
 func newInternalDBOSStack(t *testing.T, name string) *internalDBOSStack {
@@ -54,7 +54,7 @@ func newInternalDBOSStack(t *testing.T, name string) *internalDBOSStack {
 		t.Fatal(err)
 	}
 	s := &internalDBOSStack{root: root, dbPath: path, tracker: tracker, adapter: adapter, actor: agent.ID, authority: authority}
-	adapter.testHooks.afterDomainCommit = func() { s.callbacks.Add(1) }
+	adapter.testHooks.onWorkflowEntry = func() { s.workflowEntries.Add(1) }
 	if err := dbos.Launch(root); err != nil {
 		t.Fatal(err)
 	}
@@ -92,8 +92,8 @@ func TestDBOSExplicitResponseLossRetrievesCompleteResult(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(got, looked) || s.callbacks.Load() != 1 {
-		t.Fatalf("response-loss recovery drift: got=%#v looked=%#v callbacks=%d", got, looked, s.callbacks.Load())
+	if !reflect.DeepEqual(got, looked) || s.workflowEntries.Load() != 1 {
+		t.Fatalf("response-loss recovery drift: got=%#v looked=%#v workflowEntries=%d", got, looked, s.workflowEntries.Load())
 	}
 	task, err := s.tracker.Show(normalized.Effects[0].TaskID)
 	if err != nil {
@@ -124,8 +124,8 @@ func TestDBOSSimultaneousExactAndChangedMutationRaces(t *testing.T) {
 			t.Fatalf("initial racer %d result=%#v want=%#v", i, results[i], results[0])
 		}
 	}
-	if s.callbacks.Load() != 1 {
-		t.Fatalf("initial exact race callbacks=%d want 1", s.callbacks.Load())
+	if s.workflowEntries.Load() != 1 {
+		t.Fatalf("initial exact race workflow entries=%d want 1", s.workflowEntries.Load())
 	}
 
 	for i := range observers {
@@ -150,8 +150,8 @@ func TestDBOSSimultaneousExactAndChangedMutationRaces(t *testing.T) {
 			t.Fatalf("changed completed racer %d err=%v want conflict", i, errs[i])
 		}
 	}
-	if s.callbacks.Load() != 1 {
-		t.Fatalf("completed exact/changed race callbacks=%d want still 1", s.callbacks.Load())
+	if s.workflowEntries.Load() != 1 {
+		t.Fatalf("completed exact/changed race workflow entries=%d want still 1", s.workflowEntries.Load())
 	}
 	looked, err := s.tracker.Journal().LookupCommitted(op.OperationID)
 	if err != nil || !reflect.DeepEqual(looked, results[0]) {

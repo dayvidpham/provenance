@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"sort"
 	"testing"
 	"time"
@@ -56,6 +57,43 @@ func snapshotSQLTables(t *testing.T, db *sql.DB, tables ...string) map[string][]
 	return out
 }
 
+var auditedDurableTables = []string{
+	"activities", "actor_namespace_claims", "agent_kinds", "agents", "agents_human", "agents_ml", "agents_software",
+	"application_versions", "assignment_slots", "assignment_transitions", "authority_kinds", "comments", "dbos_migrations",
+	"edge_kinds", "edges", "event_dispatch_kv", "fixed_actor_manifest_entries", "journal", "journal_authorities",
+	"journal_authority_assignment_episodes", "journal_authority_assignment_transitions", "journal_authority_bootstraps",
+	"journal_decisions", "journal_evidence", "journal_kinds", "journal_operation_result_slots", "journal_operations",
+	"journal_task_event_contexts", "journal_task_events", "labels", "ml_models", "notifications", "operation_outputs", "phases",
+	"priorities", "providers", "queues", "roles", "sqlite_sequence", "stages", "statuses", "streams", "task_attributions",
+	"task_types", "tasks", "workflow_events", "workflow_events_history", "workflow_schedules", "workflow_status",
+}
+
+func auditedSnapshotTableNames(t *testing.T, db *sql.DB) []string {
+	t.Helper()
+	rows, err := db.Query(`SELECT name FROM sqlite_master WHERE type='table' ORDER BY name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	var actual []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		actual = append(actual, name)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	want := append([]string(nil), auditedDurableTables...)
+	slices.Sort(want)
+	if !slices.Equal(actual, want) {
+		t.Fatalf("durable table inventory drifted; classify every new/removed mutable relation before updating the snapshot oracle\nactual=%v\nwant=%v", actual, want)
+	}
+	return actual
+}
+
 func TestDBOSCompletedRetryEveryCanonicalOperandHasZeroCallbackAndWrites(t *testing.T) {
 	dbPath := t.TempDir() + "/exhaustive.db"
 	db, err := openSharedSQL(dbPath)
@@ -103,8 +141,8 @@ func TestDBOSCompletedRetryEveryCanonicalOperandHasZeroCallbackAndWrites(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	callbacks := 0
-	adapter.testHooks.afterDomainCommit = func() { callbacks++ }
+	workflowEntries := 0
+	adapter.testHooks.onWorkflowEntry = func() { workflowEntries++ }
 	if err := dbos.Launch(root); err != nil {
 		t.Fatal(err)
 	}
@@ -114,16 +152,16 @@ func TestDBOSCompletedRetryEveryCanonicalOperandHasZeroCallbackAndWrites(t *test
 		t.Fatalf("initial exhaustive Apply: %v", err)
 	}
 	fixture.result = want
-	if callbacks != 1 {
-		t.Fatalf("initial callbacks=%d want 1", callbacks)
+	if workflowEntries != 1 {
+		t.Fatalf("initial workflow entries=%d want 1", workflowEntries)
 	}
-	tables := []string{"workflow_status", "operation_outputs", "journal", "journal_operations", "journal_operation_result_slots", "journal_task_events", "journal_task_event_contexts", "journal_authorities", "journal_authority_bootstraps", "journal_authority_assignment_episodes", "journal_authority_assignment_transitions", "journal_decisions", "journal_evidence", "tasks", "edges", "labels", "comments"}
+	tables := auditedSnapshotTableNames(t, db)
 	before := snapshotSQLTables(t, db, tables...)
 	candidates := retryMismatchCandidates(t, fixture)
 	for name, candidate := range candidates {
 		t.Run(name, func(t *testing.T) {
 			candidate.MutationDigest = append([]byte(nil), fixture.input.MutationDigest...)
-			callbacksBefore := callbacks
+			entriesBefore := workflowEntries
 			_, err := adapter.Apply(context.Background(), candidate)
 			if !errors.Is(err, ErrOperationConflict) {
 				t.Fatalf("error=%v want typed ErrOperationConflict", err)
@@ -132,8 +170,8 @@ func TestDBOSCompletedRetryEveryCanonicalOperandHasZeroCallbackAndWrites(t *test
 			if !errors.As(err, &conflict) {
 				t.Fatalf("error lacks *OperationConflict: %v", err)
 			}
-			if callbacks != callbacksBefore {
-				t.Fatalf("forbidden retry executed %d workflow callbacks", callbacks-callbacksBefore)
+			if workflowEntries != entriesBefore {
+				t.Fatalf("forbidden retry entered %d workflow callbacks", workflowEntries-entriesBefore)
 			}
 			after := snapshotSQLTables(t, db, tables...)
 			if !reflect.DeepEqual(after, before) {
