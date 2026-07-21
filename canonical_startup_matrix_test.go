@@ -322,8 +322,20 @@ func TestStartupCorruptionMatrixLeavesBytesUnchanged(t *testing.T) {
 		"assignment-transition": func(t *testing.T, tr Tracker, f startupFixture) {
 			corruptSQL(t, tr, `UPDATE journal_authority_assignment_transitions SET transition_id=99 WHERE journal_id=?1`, int64(f.assignmentStart))
 		},
+		"assignment-start-id": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE journal_authority_assignment_transitions SET assignment_id='missing-start' WHERE journal_id=?1`, int64(f.assignmentStart))
+		},
+		"assignment-end-id": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE journal_authority_assignment_transitions SET assignment_id='missing-end' WHERE journal_id=?1`, int64(f.assignmentEnd))
+		},
+		"assignment-end-transition": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE journal_authority_assignment_transitions SET transition_id=99 WHERE journal_id=?1`, int64(f.assignmentEnd))
+		},
 		"assignment-transition-missing": func(t *testing.T, tr Tracker, f startupFixture) {
 			corruptSQL(t, tr, `DELETE FROM journal_authority_assignment_transitions WHERE journal_id=?1`, int64(f.assignmentStart))
+		},
+		"assignment-end-missing": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `DELETE FROM journal_authority_assignment_transitions WHERE journal_id=?1`, int64(f.assignmentEnd))
 		},
 		"assignment-transition-spurious": func(t *testing.T, tr Tracker, f startupFixture) {
 			corruptSQL(t, tr, `INSERT INTO journal_authority_assignment_transitions(journal_id,assignment_id,transition_id) VALUES(?1,'spurious-assignment',0)`, int64(f.decision))
@@ -346,8 +358,17 @@ func TestStartupCorruptionMatrixLeavesBytesUnchanged(t *testing.T) {
 		"assignment-episode-missing": func(t *testing.T, tr Tracker, f startupFixture) {
 			corruptSQL(t, tr, `DELETE FROM journal_authority_assignment_episodes WHERE assignment_id='matrix-assignment'`)
 		},
+		"assignment-id": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE journal_authority_assignment_episodes SET assignment_id='renamed-assignment' WHERE assignment_id='matrix-assignment'`)
+		},
+		"assignment-episode-spurious": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `INSERT INTO journal_authority_assignment_episodes(assignment_id,task_id,slot_id,actor_id) SELECT 'spurious-episode',?1,0,agent_id FROM agents_software WHERE name='actor'`, f.task.String())
+		},
 		"decision-kind": func(t *testing.T, tr Tracker, f startupFixture) {
 			corruptSQL(t, tr, `UPDATE journal_decisions SET decision_kind='matrix.changed' WHERE journal_id=?1`, int64(f.decision))
+		},
+		"decision-kind-malformed": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE journal_decisions SET decision_kind='unnamespaced' WHERE journal_id=?1`, int64(f.decision))
 		},
 		"decision-task": func(t *testing.T, tr Tracker, f startupFixture) {
 			corruptSQL(t, tr, `UPDATE journal_decisions SET task_id=?1 WHERE journal_id=?2`, f.target.String(), int64(f.decision))
@@ -363,6 +384,9 @@ func TestStartupCorruptionMatrixLeavesBytesUnchanged(t *testing.T) {
 		},
 		"evidence-kind": func(t *testing.T, tr Tracker, f startupFixture) {
 			corruptSQL(t, tr, `UPDATE journal_evidence SET evidence_kind='matrix.changed' WHERE journal_id=?1`, int64(f.evidence))
+		},
+		"evidence-kind-malformed": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE journal_evidence SET evidence_kind='unnamespaced' WHERE journal_id=?1`, int64(f.evidence))
 		},
 		"evidence-task": func(t *testing.T, tr Tracker, f startupFixture) {
 			corruptSQL(t, tr, `UPDATE journal_evidence SET task_id=?1 WHERE journal_id=?2`, f.target.String(), int64(f.evidence))
@@ -388,7 +412,6 @@ func TestStartupCorruptionMatrixLeavesBytesUnchanged(t *testing.T) {
 			corruptSQL(t, tr, `UPDATE journal_operations SET mutation_encoding_version=NULL WHERE journal_id=?1`, int64(f.anchor))
 		},
 		"canonical-unknown-version": func(t *testing.T, tr Tracker, f startupFixture) {
-			corruptDDL(t, tr, `DROP TRIGGER journal_operations_canonical_update`)
 			corruptSQL(t, tr, `UPDATE journal_operations SET mutation_encoding_version='unknown.v9' WHERE journal_id=?1`, int64(f.anchor))
 		},
 		"canonical-effect-limit": func(t *testing.T, tr Tracker, f startupFixture) {

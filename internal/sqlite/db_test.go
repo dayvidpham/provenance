@@ -182,7 +182,7 @@ func TestGetTaskNotFound(t *testing.T) {
 
 // TestFoldUpdateMaterializesMetadata drives a task metadata update through the production
 // journaled fold (EffectTaskEvent / provenance.task.updated), the path Session.Update
-// reaches, and asserts the materialized-only columns land while the reducer-exclusive
+// reaches, and asserts the journal-reproducible columns land while the lifecycle
 // status projection is untouched. The retired db.UpdateTask direct-write mutator is gone.
 func TestFoldUpdateMaterializesMetadata(t *testing.T) {
 	db := openTestDB(t)

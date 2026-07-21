@@ -72,17 +72,17 @@ func (db *DB) ensureOperationsSchema() error {
 			mutation_encoding_version TEXT,
 			canonical_mutation   BLOB,
 			CHECK ((mutation_encoding_version IS NULL AND canonical_mutation IS NULL) OR
-			       (mutation_encoding_version = 'provenance.mutation.v1' AND length(canonical_mutation) > 0))
+			       (length(mutation_encoding_version) > 0 AND length(canonical_mutation) > 0))
 		) STRICT`,
 		`CREATE TRIGGER IF NOT EXISTS journal_operations_canonical_insert
 		 BEFORE INSERT ON journal_operations
 		 WHEN NOT ((NEW.mutation_encoding_version IS NULL AND NEW.canonical_mutation IS NULL) OR
-		           (NEW.mutation_encoding_version = 'provenance.mutation.v1' AND length(NEW.canonical_mutation) > 0))
+			           (length(NEW.mutation_encoding_version) > 0 AND length(NEW.canonical_mutation) > 0))
 		 BEGIN SELECT RAISE(ABORT, 'invalid canonical mutation version/bytes pair'); END`,
 		`CREATE TRIGGER IF NOT EXISTS journal_operations_canonical_update
 		 BEFORE UPDATE OF mutation_encoding_version, canonical_mutation ON journal_operations
 		 WHEN NOT ((NEW.mutation_encoding_version IS NULL AND NEW.canonical_mutation IS NULL) OR
-		           (NEW.mutation_encoding_version = 'provenance.mutation.v1' AND length(NEW.canonical_mutation) > 0))
+			           (length(NEW.mutation_encoding_version) > 0 AND length(NEW.canonical_mutation) > 0))
 		 BEGIN SELECT RAISE(ABORT, 'invalid canonical mutation version/bytes pair'); END`,
 		// Slot-keyed committed-result mapping (§3.2). rule-9 own-operation
 		// integrity is reducer-enforced (the two FKs alone cannot express it).
@@ -169,6 +169,9 @@ func (db *DB) ensureOperationsSchema() error {
 	if err := db.ensureCanonicalMutationColumns(); err != nil {
 		return err
 	}
+	if err := db.ensureGenericCanonicalConstraints(); err != nil {
+		return err
+	}
 	return db.completeJournalOperationFK()
 }
 
@@ -196,6 +199,52 @@ func (db *DB) ensureCanonicalMutationColumns() error {
 	return nil
 }
 
+func (db *DB) ensureGenericCanonicalConstraints() error {
+	var tableSQL string
+	if err := sqlitex.Execute(db.conn, `SELECT sql FROM sqlite_master WHERE type='table' AND name='journal_operations'`, &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { tableSQL = stmt.ColumnText(0); return nil }}); err != nil {
+		return fmt.Errorf("inspect journal_operations constraint: %w", err)
+	}
+	needsTriggers := false
+	if strings.Contains(tableSQL, journal.MutationEncodingV1) {
+		needsTriggers = true
+		steps := []string{
+			`DROP TRIGGER IF EXISTS journal_operations_canonical_insert`, `DROP TRIGGER IF EXISTS journal_operations_canonical_update`,
+			`CREATE TABLE journal_operations_generic (journal_id INTEGER PRIMARY KEY REFERENCES journal(journal_id),operation_id TEXT NOT NULL UNIQUE,authority_journal_id INTEGER REFERENCES journal_authorities(journal_id),command_digest BLOB NOT NULL,mutation_digest BLOB NOT NULL,mutation_encoding_version TEXT,canonical_mutation BLOB,CHECK ((mutation_encoding_version IS NULL AND canonical_mutation IS NULL) OR (length(mutation_encoding_version)>0 AND length(canonical_mutation)>0))) STRICT`,
+			`INSERT INTO journal_operations_generic SELECT * FROM journal_operations`, `DROP TABLE journal_operations`, `ALTER TABLE journal_operations_generic RENAME TO journal_operations`,
+		}
+		for _, step := range steps {
+			if err := sqlitex.ExecuteTransient(db.conn, step, nil); err != nil {
+				return fmt.Errorf("replace V1-specific journal_operations constraint: %w", err)
+			}
+		}
+	}
+	if !needsTriggers {
+		for _, name := range []string{"journal_operations_canonical_insert", "journal_operations_canonical_update"} {
+			sql := ""
+			if err := sqlitex.Execute(db.conn, `SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1`, &sqlitex.ExecOptions{Args: []any{name}, ResultFunc: func(stmt *zs.Stmt) error { sql = stmt.ColumnText(0); return nil }}); err != nil {
+				return err
+			}
+			if sql == "" || strings.Contains(sql, journal.MutationEncodingV1) {
+				needsTriggers = true
+				break
+			}
+		}
+	}
+	if !needsTriggers {
+		return nil
+	}
+	for _, trigger := range []string{
+		`DROP TRIGGER IF EXISTS journal_operations_canonical_insert`, `DROP TRIGGER IF EXISTS journal_operations_canonical_update`,
+		`CREATE TRIGGER journal_operations_canonical_insert BEFORE INSERT ON journal_operations WHEN NOT ((NEW.mutation_encoding_version IS NULL AND NEW.canonical_mutation IS NULL) OR (length(NEW.mutation_encoding_version)>0 AND length(NEW.canonical_mutation)>0)) BEGIN SELECT RAISE(ABORT,'invalid canonical mutation version/bytes pair'); END`,
+		`CREATE TRIGGER journal_operations_canonical_update BEFORE UPDATE OF mutation_encoding_version,canonical_mutation ON journal_operations WHEN NOT ((NEW.mutation_encoding_version IS NULL AND NEW.canonical_mutation IS NULL) OR (length(NEW.mutation_encoding_version)>0 AND length(NEW.canonical_mutation)>0)) BEGIN SELECT RAISE(ABORT,'invalid canonical mutation version/bytes pair'); END`,
+	} {
+		if err := sqlitex.ExecuteTransient(db.conn, trigger, nil); err != nil {
+			return fmt.Errorf("install generic canonical constraint trigger: %w", err)
+		}
+	}
+	return nil
+}
+
 func (db *DB) preflightCanonicalColumnsReadOnly() error {
 	columns, err := db.tableColumnsLocked("journal_operations")
 	if err != nil {
@@ -210,7 +259,7 @@ func (db *DB) preflightCanonicalColumnsReadOnly() error {
 		return nil
 	}
 	malformed := ""
-	if err := sqlitex.Execute(db.conn, `SELECT operation_id FROM journal_operations WHERE (mutation_encoding_version IS NULL) != (canonical_mutation IS NULL) OR (mutation_encoding_version IS NOT NULL AND (mutation_encoding_version != ?1 OR length(canonical_mutation)=0)) LIMIT 1`, &sqlitex.ExecOptions{Args: []any{journal.MutationEncodingV1}, ResultFunc: func(stmt *zs.Stmt) error { malformed = stmt.ColumnText(0); return nil }}); err != nil {
+	if err := sqlitex.Execute(db.conn, `SELECT operation_id FROM journal_operations WHERE (mutation_encoding_version IS NULL) != (canonical_mutation IS NULL) OR (mutation_encoding_version IS NOT NULL AND (length(mutation_encoding_version)=0 OR length(canonical_mutation)=0)) LIMIT 1`, &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { malformed = stmt.ColumnText(0); return nil }}); err != nil {
 		return err
 	}
 	if malformed != "" {
@@ -226,10 +275,15 @@ func (db *DB) preflightCanonicalColumnsReadOnly() error {
 	if oversized != "" {
 		return fmt.Errorf("operation %q canonical mutation exceeds %d bytes; startup stopped before allocating or writing schema", oversized, journal.MaxCanonicalMutationBytes)
 	}
-	if err := sqlitex.Execute(db.conn, `SELECT operation_id,canonical_mutation FROM journal_operations WHERE canonical_mutation IS NOT NULL`, &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
+	if err := sqlitex.Execute(db.conn, `SELECT operation_id,mutation_encoding_version,canonical_mutation FROM journal_operations WHERE canonical_mutation IS NOT NULL`, &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 		opID := stmt.ColumnText(0)
-		if _, err := journal.DecodeCanonicalMutation(readBlob(stmt, 1)); err != nil {
+		version := stmt.ColumnText(1)
+		decoded, err := journal.DecodeCanonicalMutation(readBlob(stmt, 2))
+		if err != nil {
 			return fmt.Errorf("operation %q canonical mutation is malformed; startup stopped before schema writes: %w", opID, err)
+		}
+		if decoded.EncodingVersion() != version {
+			return fmt.Errorf("operation %q canonical column version %q differs from wire version %q", opID, version, decoded.EncodingVersion())
 		}
 		return nil
 	}}); err != nil {
@@ -740,14 +794,8 @@ func (db *DB) foldTaskEventLocked(in journal.OperationInput, jid int64, eff jour
 			return fmt.Errorf("Apply: insert context edge: %w", err)
 		}
 	}
-	// Materialize the tasks-row columns this event carries (§8.1). These are
-	// materialized-only projections — title/description/priority/phase/notes for a
-	// provenance.task.updated event, and close_reason for a provenance.task.closed
-	// event — never part of the §15 owner/status/watermark convergence set, so writing
-	// them directly in the fold (exactly as EffectTaskCreate writes Title) is safe:
-	// the from-empty replay never re-derives or compares them. status_id/closed_at/
-	// last_journal_id remain reducer-exclusive and are advanced by the shared
-	// projectJournalRowLocked step after this fold.
+	// Materialize the complete tasks-row state carried by update/close events. Startup
+	// independently re-derives and compares these fields from canonical effects.
 	if err := db.materializeTaskEventColumnsLocked(in, jid, eff); err != nil {
 		return err
 	}
@@ -757,12 +805,12 @@ func (db *DB) foldTaskEventLocked(in journal.OperationInput, jid int64, eff jour
 	return nil
 }
 
-// materializeTaskEventColumnsLocked writes the materialized-only tasks-row columns a
+// materializeTaskEventColumnsLocked writes the journal-reproducible tasks-row columns a
 // task_event carries (§8.1): the provenance.task.updated metadata columns and the
 // provenance.task.closed close_reason. It touches nothing when the effect carries no
 // such column (a plain caller-domain event), and it updates updated_at to the effect's
 // recorded time so the mutable row's display timestamp stays honest. It runs only on
-// the live Apply fold, never during the read-only from-empty replay.
+// the live Apply fold; replay derives the equivalent shadow state separately.
 func (db *DB) materializeTaskEventColumnsLocked(in journal.OperationInput, jid int64, eff journal.Effect) error {
 	recordedAt := in.RecordedAt
 	if eff.RecordedAtOverride != nil {

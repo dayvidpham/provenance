@@ -158,8 +158,13 @@ func retryMismatchCandidates(t *testing.T, f retryMatrixFixture) map[string]Oper
 	add("edge-target", func(v *OperationInput) { v.Effects[7].EdgeTargetID = altTask.String() })
 	add("edge-kind", func(v *OperationInput) { v.Effects[7].EdgeRelKind = EdgeBlockedBy })
 	add("edge-context", func(v *OperationInput) { v.Effects[7].Contexts = []EventContext{altCtx} })
+	add("edge-remove-target", func(v *OperationInput) { v.Effects[8].EdgeTargetID = altTask.String() })
+	add("edge-remove-kind", func(v *OperationInput) { v.Effects[8].EdgeRelKind = EdgeBlockedBy })
+	add("edge-remove-context", func(v *OperationInput) { v.Effects[8].Contexts = []EventContext{altCtx} })
 	add("label", func(v *OperationInput) { v.Effects[9].Label = "changed" })
 	add("label-context", func(v *OperationInput) { v.Effects[9].Contexts = []EventContext{altCtx} })
+	add("label-remove", func(v *OperationInput) { v.Effects[10].Label = "changed" })
+	add("label-remove-context", func(v *OperationInput) { v.Effects[10].Contexts = []EventContext{altCtx} })
 	add("comment-id", func(v *OperationInput) { v.Effects[11].CommentIdentity = altComment })
 	add("comment-author", func(v *OperationInput) { v.Effects[11].CommentAuthor = f.other })
 	add("comment-body", func(v *OperationInput) { v.Effects[11].CommentBody = "changed" })
@@ -210,7 +215,7 @@ func assertMismatchMatrix(t *testing.T, tr Tracker, f retryMatrixFixture) {
 		t.Run(name, func(t *testing.T) {
 			before := readOperationCounts(t, tr)
 			got, err := tr.Journal().Apply(candidate)
-			if !errors.Is(err, ErrOperationConflict) || got.Kind != CommittedConflict || got.Conflict == nil {
+			if !errors.Is(err, ErrOperationConflict) || !completeConflictResult(got, candidate.OperationID) {
 				t.Fatalf("result=%+v error=%v, want typed committed conflict", got, err)
 			}
 			if after := readOperationCounts(t, tr); after != before {
@@ -218,6 +223,10 @@ func assertMismatchMatrix(t *testing.T, tr Tracker, f retryMatrixFixture) {
 			}
 		})
 	}
+}
+
+func completeConflictResult(result CommittedResult, operationID OperationID) bool {
+	return result.Kind == CommittedConflict && result.Conflict != nil && result.Conflict.OperationID == operationID && result.Conflict.Field != "" && result.AnchorJournalID == 0 && len(result.EmittedEvents) == 0 && len(result.ResultSlots) == 0 && !result.ShortCircuited
 }
 
 func bootstrapMismatchCandidates(f retryMatrixFixture) map[string]OperationInput {
@@ -256,7 +265,7 @@ func assertBootstrapRetryMatrix(t *testing.T, tr Tracker, f retryMatrixFixture) 
 		t.Run(name, func(t *testing.T) {
 			before := readOperationCounts(t, tr)
 			result, err := tr.Journal().Apply(candidate)
-			if !errors.Is(err, ErrOperationConflict) || result.Kind != CommittedConflict || result.Conflict == nil {
+			if !errors.Is(err, ErrOperationConflict) || !completeConflictResult(result, candidate.OperationID) {
 				t.Fatalf("result=%+v error=%v", result, err)
 			}
 			if after := readOperationCounts(t, tr); after != before {
@@ -311,7 +320,7 @@ func TestCanonicalRetryMatrixSimultaneousIndependentHandles(t *testing.T) {
 					if !reflect.DeepEqual(results[i], expected) {
 						t.Fatalf("handle %d result=%+v want=%+v", i, results[i], expected)
 					}
-				} else if !errors.Is(errs[i], ErrOperationConflict) || results[i].Kind != CommittedConflict || results[i].Conflict == nil {
+				} else if !errors.Is(errs[i], ErrOperationConflict) || !completeConflictResult(results[i], input.OperationID) {
 					t.Fatalf("handle %d result=%+v error=%v", i, results[i], errs[i])
 				}
 			}
@@ -327,5 +336,25 @@ func TestCanonicalRetryMatrixSimultaneousIndependentHandles(t *testing.T) {
 	}
 	for name, candidate := range retryMismatchCandidates(t, f) {
 		run(name, candidate, false, CommittedResult{})
+	}
+}
+
+func TestInvalidDecisionEvidenceKindsFailBeforeJournalWrites(t *testing.T) {
+	tr, f := buildRetryMatrixFixture(t)
+	defer tr.Close()
+	before := readOperationCounts(t, tr)
+	for _, test := range []struct {
+		name   string
+		effect Effect
+	}{{"decision", Effect{Sort: EffectDecision, TaskID: f.input.Effects[0].TaskID, DecisionKind: "unnamespaced"}}, {"evidence", Effect{Sort: EffectEvidence, TaskID: f.input.Effects[0].TaskID, EvidenceKind: "bad..kind", ContentDigest: []byte{1}}}} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := tr.Journal().Apply(OperationInput{OperationID: OperationID("invalid-kind-" + test.name), ActorID: f.actor, AuthorityJournalID: &f.authority, CommandDigest: []byte("invalid"), Effects: []Effect{test.effect}})
+			if !errors.Is(err, ErrCanonicalMutation) {
+				t.Fatalf("error=%v, want canonical rejection", err)
+			}
+			if after := readOperationCounts(t, tr); after != before {
+				t.Fatalf("invalid kind wrote rows: before=%+v after=%+v", before, after)
+			}
+		})
 	}
 }

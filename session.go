@@ -34,10 +34,9 @@ package provenance
 // journaled mutation safe to retry, pin a stable OperationID with WithOperationID and
 // reuse it verbatim on the retry: an exact same-OperationID replay short-circuits to
 // the original committed result without re-executing (§9.4), and a reused OperationID
-// presenting different arguments is a typed conflict (§11). NOTE that Create mints a
-// fresh TaskID on every call, so even a pinned-OperationID Create retry is idempotent
-// ONLY through the §9.4 short-circuit (which returns the ORIGINAL task, never a second
-// row) — the freshly minted id of the retry is discarded in that case.
+// presenting different arguments is a typed conflict (§11). Create derives its TaskID
+// deterministically from a pinned OperationID, so overlapping pinned retries prepare
+// the same mutation and return the original task; unpinned calls still mint fresh IDs.
 
 import (
 	"crypto/sha256"

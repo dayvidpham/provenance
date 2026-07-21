@@ -131,9 +131,8 @@ const (
 	// description, priority, phase, notes) of an existing task. It is a NON-lifecycle
 	// kind — StatusForEventKind returns ok=false for it, so it only attributes the
 	// committing actor and advances the watermark (§8.1, §8.2). The mutated columns it
-	// carries are materialized-only projections of the tasks row, written directly in
-	// the fold like the birth metadata EventKindTaskCreated writes, and are NOT part of
-	// the §15 owner/status/watermark convergence set.
+	// carries are journal-reproducible projections of the tasks row and participate in
+	// complete startup convergence alongside birth and lifecycle metadata.
 	EventKindTaskUpdated EventKind = "provenance.task.updated"
 
 	// Journaled relationship / annotation mutation-family kinds (§6, as amended by #5).

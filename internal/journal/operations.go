@@ -247,11 +247,9 @@ type Effect struct {
 	Priority    Priority
 	Phase       Phase
 
-	// task update/close materialization (EffectTaskEvent). These are materialized-only
-	// projections of the tasks row (§8.1), written directly in the fold exactly as
-	// EffectTaskCreate writes Title — safe because the reducer never re-derives or
-	// compares them during §15 convergence (which covers only owner/status/watermark/
-	// attribution). They let the Session.Update decomposition carry the mutated columns
+	// task update/close materialization (EffectTaskEvent). These are complete journaled
+	// projections of the tasks row (§8.1), written directly in the fold and re-derived
+	// and compared during startup convergence. They let Session.Update carry the columns
 	// alongside the provenance.task.updated event, and CloseReason alongside the
 	// provenance.task.closed lifecycle event, within one journaled operation. Each is
 	// applied only when non-nil (or, for CloseReason, only on a close event), so a

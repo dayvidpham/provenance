@@ -348,6 +348,13 @@ func (db *DB) verifyForeignKeyTopologyLocked() error {
 	if produced != 0 {
 		return fmt.Errorf("%w: journal row %d references a missing producing operation — where: read-only startup topology preflight; impact: activation stopped before writes; fix: restore its journal_operations anchor", journal.ErrSubtypeIntegrity, produced)
 	}
+	var orphanEpisode string
+	if err := sqlitex.Execute(db.conn, `SELECT e.assignment_id FROM journal_authority_assignment_episodes e LEFT JOIN journal_authority_assignment_transitions t ON t.assignment_id=e.assignment_id WHERE t.journal_id IS NULL LIMIT 1`, &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { orphanEpisode = stmt.ColumnText(0); return nil }}); err != nil {
+		return fmt.Errorf("verify assignment episode topology: %w", err)
+	}
+	if orphanEpisode != "" {
+		return fmt.Errorf("%w: assignment episode %q has no transition row — where: read-only startup topology preflight; impact: activation stopped before writes; fix: restore its canonical start transition or remove the spurious episode", journal.ErrSubtypeIntegrity, orphanEpisode)
+	}
 	return nil
 }
 

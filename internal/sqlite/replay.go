@@ -932,12 +932,12 @@ func (db *DB) canonicalEffectForJournalRowLocked(jid int64) (journal.Effect, boo
 	if version == "" {
 		return journal.Effect{}, false, nil
 	}
-	if version != journal.MutationEncodingV1 {
-		return journal.Effect{}, false, fmt.Errorf("provenance: operation %d uses unsupported canonical mutation version %q", anchor, version)
-	}
 	prepared, err := journal.DecodeCanonicalMutation(wire)
 	if err != nil {
 		return journal.Effect{}, false, fmt.Errorf("operation %d canonical mutation: %w", anchor, err)
+	}
+	if prepared.EncodingVersion() != version {
+		return journal.Effect{}, false, fmt.Errorf("operation %d canonical column version %q differs from registered wire version %q", anchor, version, prepared.EncodingVersion())
 	}
 	ordinal := 0
 	if err := sqlitex.Execute(db.conn,

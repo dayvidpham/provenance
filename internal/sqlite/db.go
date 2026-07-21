@@ -112,7 +112,7 @@ func Open(dbPath string, models []ptypes.ModelEntry) (*DB, error) {
 	existingJournal := false
 	if existed {
 		var err error
-		existingJournal, err = preflightExistingReadOnly(dbPath)
+		existingJournal, err = preflightExistingReadOnly(dbPath, models)
 		if err != nil {
 			return nil, fmt.Errorf("sqlite.Open: read-only startup preflight failed on %q: %w", dbPath, err)
 		}
@@ -130,7 +130,7 @@ func Open(dbPath string, models []ptypes.ModelEntry) (*DB, error) {
 
 	db := &DB{conn: conn}
 
-	if err := db.applyPreActivationPragmas(); err != nil {
+	if err := db.applyNonPersistentPragmas(); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("sqlite.Open: failed to apply pragmas on %q: %w", dbPath, err)
 	}
@@ -169,11 +169,15 @@ func Open(dbPath string, models []ptypes.ModelEntry) (*DB, error) {
 		_ = conn.Close()
 		return nil, fmt.Errorf("sqlite.Open: enable runtime foreign-key enforcement on %q: %w", dbPath, err)
 	}
+	if err := db.enableWAL(); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("sqlite.Open: enable WAL after validated activation on %q: %w", dbPath, err)
+	}
 
 	return db, nil
 }
 
-func preflightExistingReadOnly(dbPath string) (bool, error) {
+func preflightExistingReadOnly(dbPath string, models []ptypes.ModelEntry) (bool, error) {
 	u := url.URL{Scheme: "file", Path: dbPath}
 	if _, err := os.Stat(dbPath + "-wal"); os.IsNotExist(err) {
 		query := u.Query()
@@ -189,19 +193,60 @@ func preflightExistingReadOnly(dbPath string) (bool, error) {
 	db := &DB{conn: conn}
 	defer conn.Close()
 	existing, err := db.tableExistsLocked("journal")
-	if err != nil || !existing {
+	if err != nil {
 		return existing, err
 	}
-	if err := db.preflightCanonicalColumnsReadOnly(); err != nil {
-		return true, err
+	if existing {
+		if err := db.preflightCanonicalColumnsReadOnly(); err != nil {
+			return true, err
+		}
+		if err := db.VerifyIntegrity(); err != nil {
+			return true, err
+		}
+		if _, err := db.ReplayProjections(); err != nil {
+			return true, err
+		}
 	}
-	if err := db.VerifyIntegrity(); err != nil {
-		return true, err
+	if err := preflightActivationClone(conn, models); err != nil {
+		return existing, err
 	}
-	if _, err := db.ReplayProjections(); err != nil {
-		return true, err
+	return existing, nil
+}
+
+func preflightActivationClone(source *zs.Conn, models []ptypes.ModelEntry) error {
+	clone, err := zs.OpenConn(":memory:", zs.OpenReadWrite|zs.OpenCreate|zs.OpenURI)
+	if err != nil {
+		return fmt.Errorf("open isolated activation clone: %w", err)
 	}
-	return true, nil
+	defer clone.Close()
+	backup, err := zs.NewBackup(clone, "main", source, "main")
+	if err != nil {
+		return fmt.Errorf("start read-only activation clone: %w", err)
+	}
+	if _, err = backup.Step(-1); err != nil {
+		_ = backup.Close()
+		return fmt.Errorf("copy read-only activation clone: %w", err)
+	}
+	if err = backup.Close(); err != nil {
+		return fmt.Errorf("finish read-only activation clone: %w", err)
+	}
+	db := &DB{conn: clone}
+	if err = db.applyNonPersistentPragmas(); err != nil {
+		return err
+	}
+	var activationErr error
+	end := sqlitex.Save(clone)
+	if activationErr = db.ensureSchema(models); activationErr == nil {
+		activationErr = db.VerifyIntegrity()
+	}
+	if activationErr == nil {
+		_, activationErr = db.ReplayProjections()
+	}
+	end(&activationErr)
+	if activationErr != nil {
+		return fmt.Errorf("isolated activation clone rejected existing database: %w", activationErr)
+	}
+	return nil
 }
 
 // Conn returns the underlying SQLite connection. This is exposed so that
@@ -245,9 +290,8 @@ func (db *DB) Close() error {
 // Pragmas
 // ---------------------------------------------------------------------------
 
-func (db *DB) applyPreActivationPragmas() error {
+func (db *DB) applyNonPersistentPragmas() error {
 	for _, p := range []string{
-		"PRAGMA journal_mode=WAL;",
 		"PRAGMA busy_timeout=5000;",
 		"PRAGMA foreign_keys=OFF;",
 	} {
@@ -256,6 +300,10 @@ func (db *DB) applyPreActivationPragmas() error {
 		}
 	}
 	return nil
+}
+
+func (db *DB) enableWAL() error {
+	return sqlitex.ExecuteTransient(db.conn, `PRAGMA journal_mode=WAL`, nil)
 }
 
 func (db *DB) enableForeignKeys() error {

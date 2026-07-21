@@ -34,6 +34,26 @@ func (db *DB) AdversarialRemoveJournalOperationFK() (err error) {
 	return nil
 }
 
+// AdversarialInstallV1OperationConstraint recreates the schema emitted by the
+// previous release so migration tests can prove its V1-specific SQL authority is removed.
+func (db *DB) AdversarialInstallV1OperationConstraint() (err error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if err = sqlitex.ExecuteTransient(db.conn, `PRAGMA foreign_keys=OFF`, nil); err != nil {
+		return err
+	}
+	defer func() { _ = sqlitex.ExecuteTransient(db.conn, `PRAGMA foreign_keys=ON`, nil) }()
+	end := sqlitex.Transaction(db.conn)
+	defer end(&err)
+	steps := []string{`DROP TRIGGER IF EXISTS journal_operations_canonical_insert`, `DROP TRIGGER IF EXISTS journal_operations_canonical_update`, `CREATE TABLE journal_operations_v1 (journal_id INTEGER PRIMARY KEY REFERENCES journal(journal_id),operation_id TEXT NOT NULL UNIQUE,authority_journal_id INTEGER REFERENCES journal_authorities(journal_id),command_digest BLOB NOT NULL,mutation_digest BLOB NOT NULL,mutation_encoding_version TEXT,canonical_mutation BLOB,CHECK ((mutation_encoding_version IS NULL AND canonical_mutation IS NULL) OR (mutation_encoding_version='provenance.mutation.v1' AND length(canonical_mutation)>0))) STRICT`, `INSERT INTO journal_operations_v1 SELECT * FROM journal_operations`, `DROP TABLE journal_operations`, `ALTER TABLE journal_operations_v1 RENAME TO journal_operations`, `CREATE TRIGGER journal_operations_canonical_insert BEFORE INSERT ON journal_operations WHEN NEW.mutation_encoding_version IS NOT NULL AND NEW.mutation_encoding_version!='provenance.mutation.v1' BEGIN SELECT RAISE(ABORT,'V1 only'); END`, `CREATE TRIGGER journal_operations_canonical_update BEFORE UPDATE OF mutation_encoding_version ON journal_operations WHEN NEW.mutation_encoding_version IS NOT NULL AND NEW.mutation_encoding_version!='provenance.mutation.v1' BEGIN SELECT RAISE(ABORT,'V1 only'); END`}
+	for _, step := range steps {
+		if err = sqlitex.ExecuteTransient(db.conn, step, nil); err != nil {
+			return fmt.Errorf("install V1 operation constraint fixture: %w", err)
+		}
+	}
+	return nil
+}
+
 // operations_adversarial.go holds narrow write seams that deliberately leave the
 // journal in a state a production writer never would, so the adversarial proof
 // corpus can drive the production VerifyIntegrity guard (§10 rule 8) and the

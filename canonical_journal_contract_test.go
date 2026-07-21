@@ -627,6 +627,56 @@ func TestDeleteModeCorruptionPreflightIsByteAndModeReadOnly(t *testing.T) {
 	}
 }
 
+func TestDeleteModeActivationSchemaFailureDoesNotPersistWAL(t *testing.T) {
+	for name, statements := range map[string][]string{
+		"index-name-is-table": {`DROP INDEX idx_tasks_namespace`, `CREATE TABLE idx_tasks_namespace(value TEXT)`},
+		"index-name-is-view":  {`DROP INDEX idx_edges_source`, `CREATE VIEW idx_edges_source AS SELECT 1 AS value`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "schema-conflict.sqlite")
+			tr, err := OpenSQLite(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := tr.Close(); err != nil {
+				t.Fatal(err)
+			}
+			conn, err := sqlite.OpenConn(path, sqlite.OpenReadWrite|sqlite.OpenURI)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := sqlitex.ExecuteTransient(conn, `PRAGMA journal_mode=DELETE`, nil); err != nil {
+				t.Fatal(err)
+			}
+			for _, statement := range statements {
+				if err := sqlitex.ExecuteTransient(conn, statement, nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := conn.Close(); err != nil {
+				t.Fatal(err)
+			}
+			before := snapshotSQLiteFiles(t, path)
+			opened, openErr := OpenSQLite(path)
+			if opened != nil {
+				_ = opened.Close()
+			}
+			if openErr == nil {
+				t.Fatal("activation-relevant schema corruption opened")
+			}
+			if !strings.Contains(openErr.Error(), "isolated activation clone") {
+				t.Fatalf("schema corruption was not rejected by read-only activation preflight: %v", openErr)
+			}
+			if after := snapshotSQLiteFiles(t, path); !reflect.DeepEqual(before, after) {
+				t.Fatalf("failed Open changed DELETE database\nbefore=%v\nafter=%v", before, after)
+			}
+			if mode := sqliteJournalMode(t, path); mode != "delete" {
+				t.Fatalf("journal mode=%q, want delete", mode)
+			}
+		})
+	}
+}
+
 func snapshotSQLiteFiles(t *testing.T, path string) map[string][]byte {
 	t.Helper()
 	result := map[string][]byte{}
@@ -721,6 +771,76 @@ func TestMissingJournalOperationFKMigrationIsComposableAndIdempotent(t *testing.
 				t.Fatal("operation FK missing after idempotent reopen")
 			}
 		})
+	}
+}
+
+func TestCanonicalSQLConstraintsAreVersionAgnostic(t *testing.T) {
+	tr, err := OpenSQLite(filepath.Join(t.TempDir(), "generic-codec-schema.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+	db := tr.(*sqliteTracker).db
+	db.Lock()
+	defer db.Unlock()
+	if err := sqlitex.Execute(db.Conn(), `SELECT sql FROM sqlite_master WHERE name IN ('journal_operations','journal_operations_canonical_insert','journal_operations_canonical_update')`, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error {
+		sql := stmt.ColumnText(0)
+		if strings.Contains(sql, MutationEncodingV1) {
+			t.Fatalf("SQLite schema embeds codec version: %s", sql)
+		}
+		if !strings.Contains(sql, "mutation_encoding_version") || !strings.Contains(sql, "canonical_mutation") {
+			t.Fatalf("schema lost structural canonical pairing: %s", sql)
+		}
+		return nil
+	}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestV1SpecificSQLAuthorityMigratesOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v1-schema.sqlite")
+	tr, _ := buildStartupFixture(t, path)
+	if err := tr.(*sqliteTracker).db.AdversarialInstallV1OperationConstraint(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.Close(); err != nil {
+		t.Fatal(err)
+	}
+	tr, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatalf("migrate V1-specific schema: %v", err)
+	}
+	assertNoCodecVersionInSQLiteSchema(t, tr)
+	if err := tr.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotSQLiteFiles(t, path)
+	tr, err = OpenSQLite(path)
+	if err != nil {
+		t.Fatalf("idempotent reopen: %v", err)
+	}
+	assertNoCodecVersionInSQLiteSchema(t, tr)
+	if err := tr.Close(); err != nil {
+		t.Fatal(err)
+	}
+	after := snapshotSQLiteFiles(t, path)
+	if !reflect.DeepEqual(before, after) {
+		t.Fatal("idempotent generic-schema reopen changed database files")
+	}
+}
+
+func assertNoCodecVersionInSQLiteSchema(t *testing.T, tr Tracker) {
+	t.Helper()
+	db := tr.(*sqliteTracker).db
+	db.Lock()
+	defer db.Unlock()
+	if err := sqlitex.Execute(db.Conn(), `SELECT sql FROM sqlite_master WHERE name IN ('journal_operations','journal_operations_canonical_insert','journal_operations_canonical_update')`, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error {
+		if sql := stmt.ColumnText(0); strings.Contains(sql, MutationEncodingV1) {
+			t.Fatalf("SQLite schema embeds codec version: %s", sql)
+		}
+		return nil
+	}}); err != nil {
+		t.Fatal(err)
 	}
 }
 
