@@ -16,13 +16,7 @@ import (
 // including an actor that predates its claim, fails before the first write.
 func (db *DB) RegisterFixedSoftwareAgent(reg journal.FixedSoftwareAgentRegistration) (agent ptypes.SoftwareAgent, err error) {
 	if err := reg.Validate(); err != nil {
-		return ptypes.SoftwareAgent{}, fixedAgentActivationError(err,
-			"registration validation rejected the requested identity",
-			"one or more claim, actor, manifest, or range invariants are invalid",
-			"FixedSoftwareAgentRegistration.Validate",
-			"before opening the activation transaction",
-			"no database rows were read or changed",
-			"correct the field named by the wrapped typed error and retry")
+		return ptypes.SoftwareAgent{}, err
 	}
 	metadata := reg.Entry.Metadata
 	if metadata == "" {
@@ -105,25 +99,23 @@ func (db *DB) RegisterFixedSoftwareAgent(reg journal.FixedSoftwareAgentRegistrat
 		}
 	}
 	if err := journal.CheckNoOverlap(reg.Claim, claims); err != nil {
-		return ptypes.SoftwareAgent{}, fixedAgentActivationError(err,
-			"the requested namespace range overlaps an existing claim",
-			"fixed actor ranges must remain disjoint",
-			"DB.RegisterFixedSoftwareAgent namespace preflight",
-			"before activation writes",
-			"the activation is rejected and no rows are changed",
-			"choose a disjoint range or reconcile the conflicting claim")
+		return ptypes.SoftwareAgent{}, err
 	}
 
-	storedAgent, agentFound, err := db.fixedSoftwareAgentLocked(id)
+	storedAgent, agentMatch, err := db.fixedSoftwareAgentLocked(id)
 	if err != nil {
-		return ptypes.SoftwareAgent{}, fixedAgentActivationError(err,
-			fmt.Sprintf("existing actor %q could not be validated", id.String()),
-			"the actor query failed or stored actor rows are inconsistent",
+		return ptypes.SoftwareAgent{}, err
+	}
+	if agentMatch == fixedSoftwareAgentInconsistent {
+		return ptypes.SoftwareAgent{}, fixedAgentActivationError(ptypes.ErrAgentAlreadyExists,
+			fmt.Sprintf("actor %q has a non-software kind or no software-agent detail", id.String()),
+			"the existing base and software-agent rows do not form the requested software identity",
 			"DB.RegisterFixedSoftwareAgent actor preflight",
 			"before activation writes",
 			"the activation is rejected and no rows are changed",
-			"repair the actor and software-agent rows or database access, then retry")
+			"repair the inconsistent actor rows or choose a new actor ID")
 	}
+	agentFound := agentMatch == fixedSoftwareAgentExact
 	if !claimFound && agentFound {
 		return ptypes.SoftwareAgent{}, fixedAgentActivationError(ptypes.ErrAgentAlreadyExists,
 			fmt.Sprintf("actor %q exists before namespace %q is claimed", id.String(), reg.Claim.Namespace),
@@ -143,16 +135,20 @@ func (db *DB) RegisterFixedSoftwareAgent(reg journal.FixedSoftwareAgentRegistrat
 			"retry with the exact stored name, version, and source or choose a new actor ID")
 	}
 
-	entryFound, err := db.fixedActorEntryExactLocked(reg.Entry, metadata)
+	entryMatch, err := db.fixedActorEntryExactLocked(reg.Entry, metadata)
 	if err != nil {
-		return ptypes.SoftwareAgent{}, fixedAgentActivationError(err,
-			fmt.Sprintf("manifest identity %q/%q could not be validated", reg.Entry.Namespace, reg.Entry.Name),
-			"the manifest query failed or an existing entry differs from the request",
+		return ptypes.SoftwareAgent{}, err
+	}
+	if entryMatch == fixedActorEntryConflict {
+		return ptypes.SoftwareAgent{}, fixedAgentActivationError(journal.ErrNamespaceClaim,
+			fmt.Sprintf("manifest identity %q/%q conflicts with an existing entry", reg.Entry.Namespace, reg.Entry.Name),
+			"the stored actor ID, namespace, kind, name, or metadata differs from the request",
 			"DB.RegisterFixedSoftwareAgent manifest preflight",
 			"before activation writes",
 			"the activation is rejected and no rows are changed",
-			"repair database access or use the exact stored manifest; otherwise choose an unallocated actor ID and name")
+			"use the exact stored manifest or choose an unallocated actor ID and name")
 	}
+	entryFound := entryMatch == fixedActorEntryExact
 
 	if !claimFound {
 		if err = sqlitex.Execute(db.conn,
@@ -213,42 +209,73 @@ func fixedAgentActivationError(cause error, what, why, where, when, impact, fix 
 	)
 }
 
-func (db *DB) fixedSoftwareAgentLocked(id ptypes.AgentID) (ptypes.SoftwareAgent, bool, error) {
+type fixedSoftwareAgentMatch uint8
+
+const (
+	fixedSoftwareAgentAbsent fixedSoftwareAgentMatch = iota
+	fixedSoftwareAgentExact
+	fixedSoftwareAgentInconsistent
+)
+
+func (db *DB) fixedSoftwareAgentLocked(id ptypes.AgentID) (ptypes.SoftwareAgent, fixedSoftwareAgentMatch, error) {
 	var out ptypes.SoftwareAgent
-	found := false
+	match := fixedSoftwareAgentAbsent
 	err := sqlitex.Execute(db.conn,
 		`SELECT a.kind_id, s.name, s.version, s.source FROM agents a LEFT JOIN agents_software s ON s.agent_id = a.id WHERE a.id = ?1`,
 		&sqlitex.ExecOptions{Args: []any{id.String()}, ResultFunc: func(stmt *zs.Stmt) error {
-			found = true
 			if ptypes.AgentKind(stmt.ColumnInt(0)) != ptypes.AgentKindSoftware || stmt.ColumnIsNull(1) {
-				return fmt.Errorf("%w: actor %q exists with a non-software kind or missing software row", ptypes.ErrAgentAlreadyExists, id.String())
+				match = fixedSoftwareAgentInconsistent
+				return nil
 			}
+			match = fixedSoftwareAgentExact
 			out = ptypes.SoftwareAgent{Agent: ptypes.Agent{ID: id, Kind: ptypes.AgentKindSoftware}, Name: stmt.ColumnText(1), Version: stmt.ColumnText(2), Source: stmt.ColumnText(3)}
 			return nil
 		}})
 	if err != nil {
-		return ptypes.SoftwareAgent{}, false, fmt.Errorf("fixed software agent lookup %q: %w", id.String(), err)
+		return ptypes.SoftwareAgent{}, fixedSoftwareAgentAbsent, fixedAgentActivationError(err,
+			fmt.Sprintf("existing actor %q could not be loaded", id.String()),
+			"the actor preflight query failed",
+			"DB.fixedSoftwareAgentLocked",
+			"before activation writes",
+			"the activation is aborted and no rows are changed",
+			"repair database access or schema integrity, then retry")
 	}
-	return out, found, nil
+	return out, match, nil
 }
 
-func (db *DB) fixedActorEntryExactLocked(entry journal.FixedActorEntry, metadata string) (bool, error) {
-	found := false
+type fixedActorEntryMatch uint8
+
+const (
+	fixedActorEntryAbsent fixedActorEntryMatch = iota
+	fixedActorEntryExact
+	fixedActorEntryConflict
+)
+
+func (db *DB) fixedActorEntryExactLocked(entry journal.FixedActorEntry, metadata string) (fixedActorEntryMatch, error) {
+	match := fixedActorEntryAbsent
 	err := sqlitex.Execute(db.conn,
 		`SELECT actor_id, namespace, kind_id, name, metadata FROM fixed_actor_manifest_entries WHERE actor_id = ?1 OR (namespace = ?2 AND name = ?3)`,
 		&sqlitex.ExecOptions{Args: []any{entry.ActorID.String(), entry.Namespace, entry.Name}, ResultFunc: func(stmt *zs.Stmt) error {
-			found = true
 			if stmt.ColumnText(0) != entry.ActorID.String() || stmt.ColumnText(1) != entry.Namespace ||
 				ptypes.AgentKind(stmt.ColumnInt(2)) != entry.ActorKind || stmt.ColumnText(3) != entry.Name || stmt.ColumnText(4) != metadata {
-				return fmt.Errorf("%w: manifest identity %q/%q conflicts with an existing entry",
-					journal.ErrNamespaceClaim, entry.Namespace, entry.Name)
+				match = fixedActorEntryConflict
+				return nil
+			}
+			if match != fixedActorEntryConflict {
+				match = fixedActorEntryExact
 			}
 			return nil
 		}})
 	if err != nil {
-		return false, fmt.Errorf("fixed actor manifest lookup: %w", err)
+		return fixedActorEntryAbsent, fixedAgentActivationError(err,
+			fmt.Sprintf("manifest identity %q/%q could not be loaded", entry.Namespace, entry.Name),
+			"the manifest preflight query failed",
+			"DB.fixedActorEntryExactLocked",
+			"before activation writes",
+			"the activation is aborted and no rows are changed",
+			"repair database access or schema integrity, then retry")
 	}
-	return found, nil
+	return match, nil
 }
 
 // This file persists the actor-namespace registry of
@@ -340,8 +367,10 @@ func (db *DB) RegisterFixedActorEntry(entry journal.FixedActorEntry) error {
 			journal.ErrNamespaceClaim, entry.Namespace)
 	}
 	if entry.ActorID.Namespace != entry.Namespace {
-		return fmt.Errorf("%w: entry namespace %q does not match actor namespace %q",
-			journal.ErrNamespaceClaim, entry.Namespace, entry.ActorID.Namespace)
+		return fmt.Errorf(
+			"%w: fixed actor entry namespace %q does not match actor namespace %q; why: a manifest entry and its actor ID must share one namespace; where: DB.RegisterFixedActorEntry validation; when: before database lookup or mutation; impact: the entry is rejected and no rows are changed; fix: set Entry.Namespace and Entry.ActorID.Namespace to the same claimed namespace",
+			journal.ErrNamespaceClaim, entry.Namespace, entry.ActorID.Namespace,
+		)
 	}
 	if err := journal.CheckEntryInRange(claim, entry.Namespace, [16]byte(entry.ActorID.UUID)); err != nil {
 		return err

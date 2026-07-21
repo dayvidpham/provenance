@@ -165,7 +165,7 @@ func TestRegisterFixedSoftwareAgentErrorsAreActionable(t *testing.T) {
 			}
 			message := err.Error()
 			for _, marker := range []string{
-				"fixed software agent activation failed:", "why:", "where:", tc.WantWhere,
+				"why:", "where:", tc.WantWhere,
 				"when:", tc.WantWhen, "impact:", "fix:",
 			} {
 				if !strings.Contains(message, marker) {
@@ -173,6 +173,38 @@ func TestRegisterFixedSoftwareAgentErrorsAreActionable(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRegisterFixedSoftwareAgentManifestConflictIsActionableOnce(t *testing.T) {
+	tr, err := OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	reg := testFixedSoftwareAgentRegistration()
+	if _, err := tr.RegisterFixedSoftwareAgent(reg); err != nil {
+		t.Fatalf("seed activation: %v", err)
+	}
+	reg.Entry.Metadata = `{"manifest":"different"}`
+	_, err = tr.RegisterFixedSoftwareAgent(reg)
+	if !errors.Is(err, ErrNamespaceClaim) {
+		t.Fatalf("manifest conflict = %v, want errors.Is(ErrNamespaceClaim)", err)
+	}
+	message := err.Error()
+	for _, marker := range []string{
+		"manifest identity", "why:", "where:", "manifest preflight",
+		"when:", "before activation writes", "impact:", "fix:",
+	} {
+		if !strings.Contains(message, marker) {
+			t.Errorf("manifest conflict %q is missing %q", message, marker)
+		}
+	}
+	for _, marker := range []string{"why:", "where:", "when:", "impact:", "fix:"} {
+		if count := strings.Count(message, marker); count != 1 {
+			t.Errorf("manifest conflict has %d %q sections, want one authoritative section: %q", count, marker, message)
+		}
 	}
 }
 
