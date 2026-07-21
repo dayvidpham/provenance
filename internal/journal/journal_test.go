@@ -2,6 +2,7 @@ package journal
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/dayvidpham/provenance/pkg/ptypes"
@@ -189,6 +190,11 @@ func TestCheckNoOverlapNamesBothNamespaces(t *testing.T) {
 	for _, ns := range []string{"pasture-system", "pasture-intruder"} {
 		if !contains(msg, ns) {
 			t.Errorf("overlap error must name %q; got %q", ns, msg)
+		}
+	}
+	for _, marker := range []string{"what:", "why:", "where:", "when:", "impact:", "fix:"} {
+		if count := strings.Count(msg, marker); count != 1 {
+			t.Errorf("overlap error has %d %q sections, want one complete section: %q", count, marker, msg)
 		}
 	}
 	// A re-registration of the same namespace is not an overlap with itself.

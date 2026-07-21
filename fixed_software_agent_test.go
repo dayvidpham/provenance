@@ -183,6 +183,42 @@ func TestRegisterFixedSoftwareAgentErrorsAreActionable(t *testing.T) {
 	}
 }
 
+func TestRegisterFixedSoftwareAgentOverlapIsActionableOnce(t *testing.T) {
+	tr, err := OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	if _, err := tr.RegisterFixedSoftwareAgent(testFixedSoftwareAgentRegistration()); err != nil {
+		t.Fatalf("seed activation: %v", err)
+	}
+	overlap := testFixedSoftwareAgentRegistration()
+	overlap.Claim.Namespace = "pasture-overlap"
+	overlap.Claim.ClaimantID = "pasture-overlap"
+	overlap.Claim.Range = UUIDRange{Min: BigEndianUUID(512), Max: BigEndianUUID(1535)}
+	overlap.Entry.Namespace = overlap.Claim.Namespace
+	overlap.Entry.ActorID.Namespace = overlap.Claim.Namespace
+	overlap.Entry.ActorID.UUID = uuid.UUID(BigEndianUUID(512))
+	overlap.Entry.Name = "pasture-overlap/default"
+
+	_, err = tr.RegisterFixedSoftwareAgent(overlap)
+	if !errors.Is(err, ErrNamespaceRange) {
+		t.Fatalf("overlap error = %v, want errors.Is(ErrNamespaceRange)", err)
+	}
+	message := err.Error()
+	for _, text := range []string{"pasture-system", "pasture-overlap"} {
+		if !strings.Contains(message, text) {
+			t.Errorf("overlap error %q is missing namespace %q", message, text)
+		}
+	}
+	for _, marker := range []string{"what:", "why:", "where:", "when:", "impact:", "fix:"} {
+		if count := strings.Count(message, marker); count != 1 {
+			t.Errorf("overlap error has %d %q sections, want one authoritative section: %q", count, marker, message)
+		}
+	}
+}
+
 func TestRegisterFixedSoftwareAgentManifestConflictIsActionableOnce(t *testing.T) {
 	tr, err := OpenMemory()
 	if err != nil {

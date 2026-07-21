@@ -157,8 +157,9 @@ func CheckNoOverlap(newClaim ActorNamespaceClaim, existing []ActorNamespaceClaim
 		}
 		if newClaim.Range.Overlaps(ex.Range) {
 			return fmt.Errorf(
-				"%w: namespace %q claims range [%x, %x] which overlaps the "+
-					"existing claim of namespace %q ([%x, %x]) — where: actor "+
+				"%w: what: namespace %q claims range [%x, %x] which overlaps the "+
+					"existing claim of namespace %q ([%x, %x]); why: actor namespace "+
+					"claims must have disjoint fixed-UUID ranges; where: actor "+
 					"namespace registration; when: before commit; impact: the new "+
 					"claim is rejected and nothing is written, since an accepted "+
 					"overlap would later surface as an opaque fixed-actor primary-"+
