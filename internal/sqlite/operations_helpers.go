@@ -733,11 +733,19 @@ func (db *DB) reconcileAllocatedTaskCreatesLocked(in journal.OperationInput, exi
 	if err != nil {
 		return journal.OperationInput{}, err
 	}
-	slots := make(map[journal.ResultSlotID]journal.TaskID, len(result.ResultSlots))
+	slots := make(map[journal.ResultSlotID]journal.ResultSlotBinding, len(result.ResultSlots))
 	for _, binding := range result.ResultSlots {
-		if binding.TaskID != nil {
-			slots[binding.Slot] = *binding.TaskID
-		}
+		slots[binding.Slot] = binding
+	}
+	var produced []journal.JournalID
+	if err := sqlitex.Execute(db.conn, `SELECT journal_id FROM journal WHERE produced_by_operation_journal_id=?1 ORDER BY journal_id`, &sqlitex.ExecOptions{Args: []any{existing.anchor}, ResultFunc: func(stmt *zs.Stmt) error {
+		produced = append(produced, journal.JournalID(stmt.ColumnInt64(0)))
+		return nil
+	}}); err != nil {
+		return journal.OperationInput{}, err
+	}
+	if len(produced) != len(committedEffects) {
+		return journal.OperationInput{}, fmt.Errorf("%w: allocated create operation %q has %d produced rows for %d canonical effects — where: replay allocation reconciliation; impact: retry fails closed without writes; fix: restore the operation rows and canonical mutation from the same committed backup", journal.ErrResultSlotIntegrity, in.OperationID, len(produced), len(committedEffects))
 	}
 	reconciled := append([]journal.Effect(nil), in.Effects...)
 	for i := range reconciled {
@@ -748,11 +756,11 @@ func (db *DB) reconcileAllocatedTaskCreatesLocked(in journal.OperationInput, exi
 		if committed.Sort != journal.EffectTaskCreateAllocated || proposed.ResultSlot == "" || proposed.ResultSlot != committed.ResultSlot || proposed.TaskID.Namespace != committed.TaskID.Namespace {
 			continue
 		}
-		allocated, ok := slots[proposed.ResultSlot]
-		if !ok || allocated != committed.TaskID {
+		binding, ok := slots[proposed.ResultSlot]
+		if !ok || binding.Kind != journal.JournalKindTaskEvent || binding.TaskID == nil || *binding.TaskID != committed.TaskID || binding.ProducedJournalID != produced[i] {
 			return journal.OperationInput{}, fmt.Errorf("%w: allocated create operation %q slot %q does not resolve to its canonical task %q — where: replay allocation reconciliation; impact: retry fails closed without writes; fix: restore the operation result slot and canonical mutation from the same committed backup", journal.ErrResultSlotIntegrity, in.OperationID, proposed.ResultSlot, committed.TaskID)
 		}
-		reconciled[i].TaskID.UUID = allocated.UUID
+		reconciled[i].TaskID.UUID = binding.TaskID.UUID
 	}
 	in.Effects = reconciled
 	return in, nil
