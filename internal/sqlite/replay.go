@@ -435,6 +435,8 @@ type canonicalStoredOperation struct {
 	wire, digest []byte
 	actor        journal.ActorID
 	recordedAt   int64
+	versionSet   bool
+	wireSet      bool
 }
 
 func (db *DB) validateCanonicalOperationsLocked() error {
@@ -447,9 +449,11 @@ func (db *DB) validateCanonicalOperationsLocked() error {
 		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 			op := canonicalStoredOperation{anchor: stmt.ColumnInt64(0), digest: readBlob(stmt, 3), recordedAt: stmt.ColumnInt64(5)}
 			if stmt.ColumnType(1) != zs.TypeNull {
+				op.versionSet = true
 				op.version = stmt.ColumnText(1)
 			}
 			if stmt.ColumnType(2) != zs.TypeNull {
+				op.wireSet = true
 				op.wire = readBlob(stmt, 2)
 			}
 			actor, err := journalParseActor(stmt.ColumnText(4))
@@ -463,40 +467,79 @@ func (db *DB) validateCanonicalOperationsLocked() error {
 		return fmt.Errorf("startup canonical validation: enumerate operations: %w", err)
 	}
 	for _, op := range operations {
-		if (op.version == "") != (len(op.wire) == 0) {
+		if op.versionSet != op.wireSet {
 			return canonicalCorruption(op.anchor, "encoding columns", op.version, fmt.Sprintf("%d bytes", len(op.wire)))
 		}
-		if op.version == "" {
+		if !op.versionSet {
 			continue
+		}
+		if op.version == "" || len(op.wire) == 0 {
+			return canonicalCorruption(op.anchor, "encoding columns", op.version, fmt.Sprintf("%d bytes", len(op.wire)))
 		}
 		prepared, err := journal.DecodeCanonicalMutation(op.wire)
 		if err != nil {
 			return fmt.Errorf("startup canonical validation operation %d: %w", op.anchor, err)
 		}
-		if op.version != prepared.Version {
-			return canonicalCorruption(op.anchor, "encoding version", op.version, prepared.Version)
+		if op.version != prepared.EncodingVersion() {
+			return canonicalCorruption(op.anchor, "encoding version", op.version, prepared.EncodingVersion())
 		}
-		if !bytes.Equal(op.digest, prepared.Digest) {
-			return canonicalCorruption(op.anchor, "mutation digest", fmt.Sprintf("%x", op.digest), fmt.Sprintf("%x", prepared.Digest))
+		if !bytes.Equal(op.digest, prepared.DerivedDigest()) {
+			return canonicalCorruption(op.anchor, "mutation digest", fmt.Sprintf("%x", op.digest), fmt.Sprintf("%x", prepared.DerivedDigest()))
 		}
+		effects := prepared.NormalizedEffects()
 		var rows []int64
 		if err := sqlitex.Execute(db.conn, `SELECT journal_id FROM journal WHERE produced_by_operation_journal_id=?1 ORDER BY journal_id`, &sqlitex.ExecOptions{Args: []any{op.anchor}, ResultFunc: func(stmt *zs.Stmt) error { rows = append(rows, stmt.ColumnInt64(0)); return nil }}); err != nil {
 			return err
 		}
-		if len(rows) != len(prepared.Effects) {
+		if len(rows) != len(effects) {
 			field := "effect row count"
-			for _, effect := range prepared.Effects {
+			for _, effect := range effects {
 				if effect.TaskID.Namespace != "" {
 					field += " for task " + effect.TaskID.String()
 					break
 				}
 			}
-			return canonicalCorruption(op.anchor, field, strconv.Itoa(len(rows)), strconv.Itoa(len(prepared.Effects)))
+			return canonicalCorruption(op.anchor, field, strconv.Itoa(len(rows)), strconv.Itoa(len(effects)))
 		}
-		for i, effect := range prepared.Effects {
+		if err := db.validateCanonicalResultSlotsLocked(op.anchor, rows, effects); err != nil {
+			return err
+		}
+		for i, effect := range effects {
 			if err := db.validateCanonicalEffectRowLocked(op, rows[i], effect); err != nil {
 				return fmt.Errorf("operation %d effect %d: %w", op.anchor, i, err)
 			}
+		}
+	}
+	return nil
+}
+
+func (db *DB) validateCanonicalResultSlotsLocked(anchor int64, rows []int64, effects []journal.Effect) error {
+	expected := map[string]int64{}
+	for i, effect := range effects {
+		if effect.ResultSlot != "" {
+			slot := string(effect.ResultSlot)
+			if _, ok := expected[slot]; ok {
+				return canonicalCorruption(anchor, "duplicate canonical result slot", slot, "unique")
+			}
+			expected[slot] = rows[i]
+		}
+	}
+	actual := map[string]int64{}
+	if err := sqlitex.Execute(db.conn, `SELECT result_slot_id,produced_journal_id FROM journal_operation_result_slots WHERE journal_id=?1`, &sqlitex.ExecOptions{Args: []any{anchor}, ResultFunc: func(stmt *zs.Stmt) error { slot := stmt.ColumnText(0); actual[slot] = stmt.ColumnInt64(1); return nil }}); err != nil {
+		return err
+	}
+	for slot, want := range expected {
+		got, ok := actual[slot]
+		if !ok {
+			return canonicalCorruption(anchor, "result slot "+slot, "missing", strconv.FormatInt(want, 10))
+		}
+		if got != want {
+			return canonicalCorruption(anchor, "result slot "+slot, strconv.FormatInt(got, 10), strconv.FormatInt(want, 10))
+		}
+	}
+	for slot, got := range actual {
+		if _, ok := expected[slot]; !ok {
+			return canonicalCorruption(anchor, "result slot "+slot, strconv.FormatInt(got, 10), "absent")
 		}
 	}
 	return nil
@@ -519,8 +562,12 @@ func (db *DB) validateCanonicalEffectRowLocked(op canonicalStoredOperation, jid 
 	if kind != int(expectedKind) {
 		return canonicalCorruption(op.anchor, fmt.Sprintf("row %d kind", jid), strconv.Itoa(kind), expectedKind.String())
 	}
-	if effect.RecordedAtOverride != nil && recordedAt != *effect.RecordedAtOverride {
-		return canonicalCorruption(op.anchor, fmt.Sprintf("row %d recorded_at", jid), strconv.FormatInt(recordedAt, 10), strconv.FormatInt(*effect.RecordedAtOverride, 10))
+	expectedRecordedAt := op.recordedAt
+	if effect.RecordedAtOverride != nil {
+		expectedRecordedAt = *effect.RecordedAtOverride
+	}
+	if recordedAt != expectedRecordedAt {
+		return canonicalCorruption(op.anchor, fmt.Sprintf("row %d recorded_at", jid), strconv.FormatInt(recordedAt, 10), strconv.FormatInt(expectedRecordedAt, 10))
 	}
 	switch effect.Sort {
 	case journal.EffectTaskCreate, journal.EffectTaskEvent, journal.EffectEdgeAdd, journal.EffectEdgeRemove, journal.EffectLabelAdd, journal.EffectLabelRemove, journal.EffectCommentAdd:
@@ -598,6 +645,15 @@ func (db *DB) validateCanonicalTaskEventLocked(anchor, jid int64, effect journal
 		ak, ai, _ := journal.EncodeStoredEventContext(actual[i])
 		if ek != ak || ei != ai {
 			return canonicalCorruption(anchor, fmt.Sprintf("row %d context %d", jid, i), string(ak)+":"+ai, string(ek)+":"+ei)
+		}
+	}
+	attached := []int64{}
+	if err := sqlitex.Execute(db.conn, `SELECT attached_by_journal_id FROM journal_task_event_contexts WHERE event_journal_id=?1 ORDER BY context_kind,context_identity`, &sqlitex.ExecOptions{Args: []any{jid}, ResultFunc: func(stmt *zs.Stmt) error { attached = append(attached, stmt.ColumnInt64(0)); return nil }}); err != nil {
+		return err
+	}
+	for i, got := range attached {
+		if got != jid {
+			return canonicalCorruption(anchor, fmt.Sprintf("row %d context %d attached_by_journal_id", jid, i), strconv.FormatInt(got, 10), strconv.FormatInt(jid, 10))
 		}
 	}
 	return nil
@@ -839,10 +895,11 @@ func (db *DB) canonicalEffectForJournalRowLocked(jid int64) (journal.Effect, boo
 		&sqlitex.ExecOptions{Args: []any{anchor, jid}, ResultFunc: func(stmt *zs.Stmt) error { ordinal = stmt.ColumnInt(0) - 1; return nil }}); err != nil {
 		return journal.Effect{}, false, fmt.Errorf("resolve canonical effect ordinal for row %d: %w", jid, err)
 	}
-	if ordinal < 0 || ordinal >= len(prepared.Effects) {
-		return journal.Effect{}, false, fmt.Errorf("provenance: operation %d row %d has effect ordinal %d outside canonical effect count %d", anchor, jid, ordinal, len(prepared.Effects))
+	effects := prepared.NormalizedEffects()
+	if ordinal < 0 || ordinal >= len(effects) {
+		return journal.Effect{}, false, fmt.Errorf("provenance: operation %d row %d has effect ordinal %d outside canonical effect count %d", anchor, jid, ordinal, len(effects))
 	}
-	return prepared.Effects[ordinal], true, nil
+	return effects[ordinal], true, nil
 }
 
 func (db *DB) insertCanonicalShadowTaskLocked(e journal.Effect, recordedAt, jid int64) error {

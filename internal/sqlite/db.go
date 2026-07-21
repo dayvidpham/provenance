@@ -116,16 +116,45 @@ func Open(dbPath string, models []ptypes.ModelEntry) (*DB, error) {
 		return nil, fmt.Errorf("sqlite.Open: failed to apply pragmas on %q: %w", dbPath, err)
 	}
 
-	if err := db.ensureSchema(models); err != nil {
+	existing, err := db.tableExistsLocked("journal")
+	if err != nil {
 		_ = conn.Close()
-		return nil, fmt.Errorf("sqlite.Open: failed to apply schema on %q: %w", dbPath, err)
+		return nil, fmt.Errorf("sqlite.Open: inspect existing schema on %q: %w", dbPath, err)
 	}
-	// Activation accepts the database only after integrity and complete projection
-	// convergence have been checked against canonical history. Replay derives into
-	// TEMP tables, so corruption is reported without repairing or mutating it.
-	if _, err := db.ReplayProjections(); err != nil {
+	if existing {
+		if err := db.preflightCanonicalColumnsReadOnly(); err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("sqlite.Open: canonical schema preflight failed on %q: %w", dbPath, err)
+		}
+		if err := db.VerifyIntegrity(); err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("sqlite.Open: read-only integrity preflight failed on %q: %w", dbPath, err)
+		}
+	}
+	activate := func() error {
+		if err := db.ensureSchema(models); err != nil {
+			return fmt.Errorf("apply schema: %w", err)
+		}
+		if err := db.VerifyIntegrity(); err != nil {
+			return fmt.Errorf("whole-journal integrity: %w", err)
+		}
+		if _, err := db.ReplayProjections(); err != nil {
+			return fmt.Errorf("journal replay: %w", err)
+		}
+		return nil
+	}
+	if existing {
+		var activationErr error
+		end := sqlitex.Save(conn)
+		activationErr = activate()
+		end(&activationErr)
+		err = activationErr
+	} else {
+		err = activate()
+	}
+	if err != nil {
 		_ = conn.Close()
-		return nil, fmt.Errorf("sqlite.Open: startup journal validation failed on %q: %w", dbPath, err)
+		return nil, fmt.Errorf("sqlite.Open: transactional startup validation failed on %q: %w", dbPath, err)
 	}
 
 	return db, nil
@@ -344,7 +373,7 @@ func (db *DB) seedMLModels(models []ptypes.ModelEntry) error {
 	}
 
 	var err error
-	endTx := sqlitex.Transaction(db.conn)
+	endTx := sqlitex.Save(db.conn)
 	defer endTx(&err)
 	for _, m := range models {
 		if err = sqlitex.Execute(db.conn,

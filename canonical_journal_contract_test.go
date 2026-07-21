@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 
+	"zombiezen.com/go/sqlite"
 	"zombiezen.com/go/sqlite/sqlitex"
 )
 
@@ -32,13 +33,60 @@ func TestCanonicalRetryIgnoresCallerMutationDigestButRejectsEffectChange(t *test
 	if err != nil {
 		t.Fatalf("semantically identical canonical retry: %v", err)
 	}
-	if !second.ShortCircuited || second.AnchorJournalID != first.AnchorJournalID || !bytes.Equal(base.CommandDigest, retry.CommandDigest) {
+	if !second.ShortCircuited {
+		t.Fatal("retry did not short circuit")
+	}
+	second.ShortCircuited = false
+	if !reflect.DeepEqual(second, first) {
 		t.Fatalf("retry did not return complete original result: first=%+v retry=%+v", first, second)
 	}
-	retry.Effects[0].Payload = []byte(`{"a":1,"b":3}`)
-	if _, err := env.tr.Journal().Apply(retry); !errors.Is(err, ErrOperationConflict) {
-		t.Fatalf("changed canonical effect = %v, want ErrOperationConflict", err)
+	other, err := env.tr.RegisterSoftwareAgent("canonical", "other", "1", "test")
+	if err != nil {
+		t.Fatal(err)
 	}
+	differentAuthority := boot + 1000
+	cases := map[string]OperationInput{"actor": retry, "nil-authority": retry, "authority": retry, "command": retry, "effect": retry}
+	v := cases["actor"]
+	v.ActorID = other.ID
+	cases["actor"] = v
+	v = cases["nil-authority"]
+	v.AuthorityJournalID = nil
+	cases["nil-authority"] = v
+	v = cases["authority"]
+	v.AuthorityJournalID = &differentAuthority
+	cases["authority"] = v
+	v = cases["command"]
+	v.CommandDigest = []byte("different")
+	cases["command"] = v
+	v = cases["effect"]
+	v.Effects = []Effect{{Sort: EffectTaskEvent, TaskID: task, EventKind: EventKindTaskUpdated, Payload: []byte(`{"a":1,"b":3}`)}}
+	cases["effect"] = v
+	for name, candidate := range cases {
+		t.Run(name, func(t *testing.T) {
+			before := journalRowCount(t, env.tr)
+			if _, err := env.tr.Journal().Apply(candidate); !errors.Is(err, ErrOperationConflict) {
+				t.Fatalf("mismatch=%v, want conflict", err)
+			}
+			if after := journalRowCount(t, env.tr); after != before {
+				t.Fatalf("conflicting retry wrote journal rows: before=%d after=%d", before, after)
+			}
+		})
+	}
+}
+
+func journalRowCount(t *testing.T, tr Tracker) int64 {
+	t.Helper()
+	db := tr.(*sqliteTracker).db
+	db.Lock()
+	defer db.Unlock()
+	var count int64
+	if err := sqlitex.Execute(db.Conn(), `SELECT count(*) FROM journal`, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error {
+		count = stmt.ColumnInt64(0)
+		return nil
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	return count
 }
 
 func TestCanonicalRetryAcrossIndependentHandles(t *testing.T) {
@@ -82,8 +130,10 @@ func TestCanonicalRetryAcrossIndependentHandles(t *testing.T) {
 			t.Fatalf("independent handle %d: %v", i, err)
 		}
 	}
-	if results[0].AnchorJournalID != results[1].AnchorJournalID {
-		t.Fatalf("independent retries returned different anchors: %+v %+v", results[0], results[1])
+	results[0].ShortCircuited = false
+	results[1].ShortCircuited = false
+	if !reflect.DeepEqual(results[0], results[1]) {
+		t.Fatalf("independent retries returned different complete results: %+v %+v", results[0], results[1])
 	}
 	op.OperationID = "independent-conflict"
 	left, right := op, op
@@ -107,6 +157,101 @@ func TestCanonicalRetryAcrossIndependentHandles(t *testing.T) {
 	}
 	if successes != 1 || conflicts != 1 {
 		t.Fatalf("independent conflict race = %d successes/%d conflicts", successes, conflicts)
+	}
+}
+
+func TestCanonicalExactRetryAfterReopenReturnsCompleteResult(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "retry-reopen.sqlite")
+	tr, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actor, err := tr.RegisterSoftwareAgent("canonical", "reopen", "1", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	genesis, err := tr.Journal().Apply(OperationInput{OperationID: "retry-reopen-genesis", ActorID: actor.ID, CommandDigest: []byte("genesis"), Effects: []Effect{{Sort: EffectBootstrapAuthority, ResultSlot: "authority"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	boot, _ := slotJournalID(genesis, "authority")
+	task := newCorpusTaskID()
+	op := OperationInput{OperationID: "retry-reopen-create", ActorID: actor.ID, AuthorityJournalID: &boot, CommandDigest: []byte("create"), Effects: []Effect{{Sort: EffectTaskCreate, ResultSlot: "task", TaskID: task, Title: "title", Description: "description", Type: TaskTypeTask, Priority: PriorityMedium, Phase: PhaseUnscoped}}}
+	first, err := tr.Journal().Apply(op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	before := journalRowCount(t, reopened)
+	retry, err := reopened.Journal().Apply(op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !retry.ShortCircuited {
+		t.Fatal("reopened exact retry did not short circuit")
+	}
+	retry.ShortCircuited = false
+	if !reflect.DeepEqual(retry, first) {
+		t.Fatalf("reopened retry result = %+v, want %+v", retry, first)
+	}
+	if after := journalRowCount(t, reopened); after != before {
+		t.Fatalf("reopened exact retry wrote rows: before=%d after=%d", before, after)
+	}
+}
+
+func TestPinnedSessionCreateAcrossIndependentHandles(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pinned-create.sqlite")
+	first, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	actor, err := first.RegisterSoftwareAgent("canonical", "creator", "1", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	genesis, err := first.Journal().Apply(OperationInput{OperationID: "pinned-create-genesis", ActorID: actor.ID, CommandDigest: []byte("c"), Effects: []Effect{{Sort: EffectBootstrapAuthority, ResultSlot: "authority"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	boot, _ := slotJournalID(genesis, "authority")
+	second, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	var tasks [2]Task
+	var errs [2]error
+	var wg sync.WaitGroup
+	wg.Add(2)
+	call := func(i int, tr Tracker) {
+		defer wg.Done()
+		tasks[i], errs[i] = tr.As(actor.ID, boot).Create("canonical", "same", "same", TaskTypeTask, PriorityMedium, PhaseUnscoped, WithOperationID("pinned-create-request"))
+	}
+	go call(0, first)
+	go call(1, second)
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !reflect.DeepEqual(tasks[0], tasks[1]) {
+		t.Fatalf("concurrent pinned creates differ: %#v %#v", tasks[0], tasks[1])
+	}
+	listed, err := first.List(ListFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 {
+		t.Fatalf("created %d tasks, want one", len(listed))
 	}
 }
 
@@ -219,43 +364,56 @@ func TestCanonicalSchemaMigrationAndMixedLegacyRowsAreIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := tracker.(*sqliteTracker)
-	store.db.Lock()
-	for _, statement := range []string{`ALTER TABLE journal_operations DROP COLUMN canonical_mutation`, `ALTER TABLE journal_operations DROP COLUMN mutation_encoding_version`} {
-		if err = sqlitex.ExecuteTransient(store.db.Conn(), statement, nil); err != nil {
-			store.db.Unlock()
-			t.Fatal(err)
-		}
+	actor, err := tracker.RegisterSoftwareAgent("canonical", "actor", "1", "test")
+	if err != nil {
+		t.Fatal(err)
 	}
-	store.db.Unlock()
+	legacyInput := OperationInput{OperationID: "mixed-genesis", ActorID: actor.ID, CommandDigest: []byte("c"), MutationDigest: []byte("legacy-digest"), Effects: []Effect{{Sort: EffectBootstrapAuthority, ResultSlot: "authority"}}}
+	genesis, err := tracker.Journal().Apply(legacyInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boot, _ := slotJournalID(genesis, "authority")
+	makeOperationsSchemaLegacy(t, tracker)
 	if err = tracker.Close(); err != nil {
 		t.Fatal(err)
 	}
 	tracker, err = OpenSQLite(path)
 	if err != nil {
-		t.Fatalf("column migration: %v", err)
+		t.Fatalf("genuine pre-canonical migration: %v", err)
 	}
-	actor, err := tracker.RegisterSoftwareAgent("canonical", "actor", "1", "test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	genesis, err := tracker.Journal().Apply(OperationInput{OperationID: "mixed-genesis", ActorID: actor.ID, CommandDigest: []byte("c"), Effects: []Effect{{Sort: EffectBootstrapAuthority, ResultSlot: "authority"}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	boot, _ := slotJournalID(genesis, "authority")
-	store = tracker.(*sqliteTracker)
-	store.db.Lock()
-	err = sqlitex.Execute(store.db.Conn(), `UPDATE journal_operations SET mutation_encoding_version=NULL,canonical_mutation=NULL WHERE operation_id='mixed-genesis'`, nil)
-	store.db.Unlock()
-	if err != nil {
-		t.Fatal(err)
+	retried, err := tracker.Journal().Apply(legacyInput)
+	if err != nil || !retried.ShortCircuited || retried.AnchorJournalID != genesis.AnchorJournalID {
+		t.Fatalf("legacy identity/result not preserved: %+v %v", retried, err)
 	}
 	task := newCorpusTaskID()
 	if _, err = tracker.Journal().Apply(OperationInput{OperationID: "mixed-new", ActorID: actor.ID, AuthorityJournalID: &boot, CommandDigest: []byte("c"), Effects: []Effect{{Sort: EffectTaskCreate, TaskID: task, Title: "new", Type: TaskTypeTask, Priority: PriorityMedium, Phase: PhaseUnscoped}}}); err != nil {
 		t.Fatal(err)
 	}
+	store := tracker.(*sqliteTracker)
+	store.db.Lock()
+	legacyOK, canonicalOK := false, false
+	err = sqlitex.Execute(store.db.Conn(), `SELECT operation_id,mutation_encoding_version IS NULL,canonical_mutation IS NULL,hex(mutation_digest),length(canonical_mutation) FROM journal_operations ORDER BY journal_id`, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error {
+		switch stmt.ColumnText(0) {
+		case "mixed-genesis":
+			legacyOK = stmt.ColumnInt(1) == 1 && stmt.ColumnInt(2) == 1 && stmt.ColumnText(3) == "6C65676163792D646967657374"
+		case "mixed-new":
+			canonicalOK = stmt.ColumnInt(1) == 0 && stmt.ColumnInt(2) == 0 && stmt.ColumnInt(4) > 0
+		}
+		return nil
+	}})
+	store.db.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !legacyOK || !canonicalOK {
+		t.Fatalf("mixed rows not preserved: legacy=%v canonical=%v", legacyOK, canonicalOK)
+	}
 	if err = tracker.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stable, err := os.ReadFile(path)
+	if err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 2; i++ {
@@ -266,5 +424,134 @@ func TestCanonicalSchemaMigrationAndMixedLegacyRowsAreIdempotent(t *testing.T) {
 		if err = tracker.Close(); err != nil {
 			t.Fatal(err)
 		}
+		after, readErr := os.ReadFile(path)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if !bytes.Equal(stable, after) {
+			t.Fatalf("idempotent mixed reopen %d changed database bytes", i)
+		}
+	}
+}
+
+func makeOperationsSchemaLegacy(t *testing.T, tracker Tracker) {
+	t.Helper()
+	store := tracker.(*sqliteTracker)
+	store.db.Lock()
+	defer store.db.Unlock()
+	for _, statement := range []string{
+		`DROP TRIGGER journal_operations_canonical_insert`, `DROP TRIGGER journal_operations_canonical_update`,
+		`PRAGMA foreign_keys=OFF`, `PRAGMA legacy_alter_table=ON`,
+		`ALTER TABLE journal_operations RENAME TO journal_operations_canonical`,
+		`CREATE TABLE journal_operations (journal_id INTEGER PRIMARY KEY REFERENCES journal(journal_id),operation_id TEXT NOT NULL UNIQUE,authority_journal_id INTEGER REFERENCES journal_authorities(journal_id),command_digest BLOB NOT NULL,mutation_digest BLOB NOT NULL) STRICT`,
+		`INSERT INTO journal_operations SELECT journal_id,operation_id,authority_journal_id,command_digest,X'6c65676163792d646967657374' FROM journal_operations_canonical`,
+		`DROP TABLE journal_operations_canonical`, `PRAGMA foreign_keys=ON`,
+	} {
+		if err := sqlitex.ExecuteTransient(store.db.Conn(), statement, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestCorruptLegacySchemaStartupRollsBackWithoutByteDrift(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy-corrupt.sqlite")
+	tr, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actor, err := tr.RegisterSoftwareAgent("canonical", "legacy", "1", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := tr.Journal().Apply(OperationInput{OperationID: "legacy-corrupt-genesis", ActorID: actor.ID, CommandDigest: []byte("c"), Effects: []Effect{{Sort: EffectBootstrapAuthority, ResultSlot: "authority"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority, ok := slotJournalID(result, "authority")
+	if !ok {
+		t.Fatal("genesis result missing authority slot")
+	}
+	makeOperationsSchemaLegacy(t, tr)
+	corruptSQL(t, tr, `DELETE FROM journal_authority_bootstraps WHERE journal_id=?1`, int64(authority))
+	if err := tr.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, openErr := OpenSQLite(path)
+	if opened != nil {
+		_ = opened.Close()
+	}
+	if openErr == nil {
+		t.Fatal("corrupt pre-canonical schema opened")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("failed legacy-schema startup changed database bytes")
+	}
+}
+
+func TestMixedLegacyCanonicalMalformedPairsFailWithoutByteDrift(t *testing.T) {
+	for name, statement := range map[string]string{
+		"version-only":    `UPDATE journal_operations SET canonical_mutation=NULL WHERE operation_id='mixed-pair-new'`,
+		"bytes-only":      `UPDATE journal_operations SET mutation_encoding_version=NULL WHERE operation_id='mixed-pair-new'`,
+		"unknown-version": `UPDATE journal_operations SET mutation_encoding_version='unknown.v9' WHERE operation_id='mixed-pair-new'`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "mixed-malformed.sqlite")
+			tr, err := OpenSQLite(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			actor, err := tr.RegisterSoftwareAgent("canonical", "mixed-pair", "1", "test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			genesis, err := tr.Journal().Apply(OperationInput{OperationID: "mixed-pair-legacy", ActorID: actor.ID, CommandDigest: []byte("c"), Effects: []Effect{{Sort: EffectBootstrapAuthority, ResultSlot: "authority"}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			boot, _ := slotJournalID(genesis, "authority")
+			makeOperationsSchemaLegacy(t, tr)
+			if err := tr.Close(); err != nil {
+				t.Fatal(err)
+			}
+			tr, err = OpenSQLite(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			task := newCorpusTaskID()
+			if _, err = tr.Journal().Apply(OperationInput{OperationID: "mixed-pair-new", ActorID: actor.ID, AuthorityJournalID: &boot, CommandDigest: []byte("c"), Effects: []Effect{{Sort: EffectTaskCreate, TaskID: task, Title: "new", Type: TaskTypeTask, Priority: PriorityMedium, Phase: PhaseUnscoped}}}); err != nil {
+				t.Fatal(err)
+			}
+			corruptSQL(t, tr, `DROP TRIGGER journal_operations_canonical_update`)
+			corruptSQL(t, tr, statement)
+			if err := tr.Close(); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			opened, openErr := OpenSQLite(path)
+			if opened != nil {
+				_ = opened.Close()
+			}
+			if openErr == nil {
+				t.Fatal("malformed mixed canonical pair opened")
+			}
+			after, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(before, after) {
+				t.Fatal("failed mixed startup changed database bytes")
+			}
+		})
 	}
 }

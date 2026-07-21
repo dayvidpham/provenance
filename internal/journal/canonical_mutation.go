@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -16,14 +18,74 @@ import (
 // MutationEncodingV1 is the stable wire-version tag for canonical mutations.
 const MutationEncodingV1 = "provenance.mutation.v1"
 
+const (
+	MaxCanonicalEffects           = 256
+	MaxCanonicalContextsPerEffect = 64
+	MaxCanonicalFieldBytes        = 1 << 20
+	MaxCanonicalMutationBytes     = 8 << 20
+)
+
+var ErrCanonicalMutation = errors.New("provenance: invalid canonical mutation")
+
+type CanonicalMutationError struct{ Field, Reason, Fix string }
+
+func (e *CanonicalMutationError) Error() string {
+	return fmt.Sprintf("%v: field %s: %s — where: canonical mutation boundary; when: before allocation or write; impact: mutation is rejected without side effects; fix: %s", ErrCanonicalMutation, e.Field, e.Reason, e.Fix)
+}
+func (e *CanonicalMutationError) Is(target error) bool { return target == ErrCanonicalMutation }
+func canonicalMutationError(field, reason, fix string) error {
+	return &CanonicalMutationError{Field: field, Reason: reason, Fix: fix}
+}
+
 // CanonicalMutation is the prepared mutation consumed by persistence and execution.
 // Bytes are authoritative: Effects are decoded from Bytes rather than retained from
 // the caller, and Digest is SHA-256(Bytes).
 type CanonicalMutation struct {
-	Version string
-	Bytes   []byte
-	Digest  []byte
-	Effects []Effect
+	version string
+	bytes   []byte
+	digest  []byte
+	effects []Effect
+}
+
+func (m CanonicalMutation) EncodingVersion() string { return m.version }
+func (m CanonicalMutation) CanonicalBytes() []byte  { return append([]byte(nil), m.bytes...) }
+func (m CanonicalMutation) DerivedDigest() []byte   { return append([]byte(nil), m.digest...) }
+func (m CanonicalMutation) NormalizedEffects() []Effect {
+	out := make([]Effect, len(m.effects))
+	for i := range m.effects {
+		out[i] = cloneCanonicalEffect(m.effects[i])
+	}
+	return out
+}
+func cloneCanonicalEffect(e Effect) Effect {
+	e.Payload = append(json.RawMessage(nil), e.Payload...)
+	e.Contexts = append([]EventContext(nil), e.Contexts...)
+	e.ContentDigest = append([]byte(nil), e.ContentDigest...)
+	if e.RecordedAtOverride != nil {
+		v := *e.RecordedAtOverride
+		e.RecordedAtOverride = &v
+	}
+	if e.UpdateTitle != nil {
+		v := *e.UpdateTitle
+		e.UpdateTitle = &v
+	}
+	if e.UpdateDescription != nil {
+		v := *e.UpdateDescription
+		e.UpdateDescription = &v
+	}
+	if e.UpdatePriority != nil {
+		v := *e.UpdatePriority
+		e.UpdatePriority = &v
+	}
+	if e.UpdatePhase != nil {
+		v := *e.UpdatePhase
+		e.UpdatePhase = &v
+	}
+	if e.UpdateNotes != nil {
+		v := *e.UpdateNotes
+		e.UpdateNotes = &v
+	}
+	return e
 }
 
 var canonicalEffectSorts = []EffectSort{
@@ -37,17 +99,27 @@ var canonicalEffectSorts = []EffectSort{
 // then decodes those bytes once. The returned decoded effects are the only effects a
 // write path should execute.
 func PrepareMutationV1(effects []Effect) (CanonicalMutation, error) {
+	if len(effects) > MaxCanonicalEffects {
+		return CanonicalMutation{}, canonicalMutationError("effect-count", fmt.Sprintf("%d exceeds maximum %d", len(effects), MaxCanonicalEffects), "split the operation into bounded mutations")
+	}
 	var out bytes.Buffer
 	w := canonicalWriter{w: &out}
 	w.field("version", []byte(MutationEncodingV1))
 	w.field("effect-count", []byte(strconv.Itoa(len(effects))))
 	for i := range effects {
-		if err := encodeCanonicalEffect(&w, effects[i], i); err != nil {
+		normalized, err := normalizeCanonicalEffect(effects[i], i)
+		if err != nil {
+			return CanonicalMutation{}, err
+		}
+		if err := encodeCanonicalEffect(&w, normalized, i); err != nil {
 			return CanonicalMutation{}, err
 		}
 	}
 	if w.err != nil {
 		return CanonicalMutation{}, fmt.Errorf("provenance: encode canonical mutation: %w", w.err)
+	}
+	if out.Len() > MaxCanonicalMutationBytes {
+		return CanonicalMutation{}, canonicalMutationError("mutation", fmt.Sprintf("%d bytes exceeds maximum %d", out.Len(), MaxCanonicalMutationBytes), "reduce payloads or split the operation")
 	}
 	return DecodeCanonicalMutation(out.Bytes())
 }
@@ -55,6 +127,9 @@ func PrepareMutationV1(effects []Effect) (CanonicalMutation, error) {
 // DecodeCanonicalMutation strictly decodes one complete canonical mutation. Field
 // order is fixed, so unknown, missing, duplicate, and trailing fields all fail closed.
 func DecodeCanonicalMutation(data []byte) (CanonicalMutation, error) {
+	if len(data) > MaxCanonicalMutationBytes {
+		return CanonicalMutation{}, canonicalMutationError("mutation", fmt.Sprintf("%d bytes exceeds maximum %d", len(data), MaxCanonicalMutationBytes), "restore bounded canonical bytes")
+	}
 	r := canonicalReader{r: bufio.NewReader(bytes.NewReader(data))}
 	version, err := r.field("version")
 	if err != nil {
@@ -68,7 +143,7 @@ func DecodeCanonicalMutation(data []byte) (CanonicalMutation, error) {
 		return CanonicalMutation{}, err
 	}
 	count, err := strconv.Atoi(string(rawCount))
-	if err != nil || count < 0 {
+	if err != nil || count < 0 || count > MaxCanonicalEffects {
 		return CanonicalMutation{}, fmt.Errorf("provenance: decode canonical mutation: invalid effect-count %q", rawCount)
 	}
 	effects := make([]Effect, count)
@@ -86,10 +161,10 @@ func DecodeCanonicalMutation(data []byte) (CanonicalMutation, error) {
 	}
 	digest := sha256.Sum256(data)
 	return CanonicalMutation{
-		Version: MutationEncodingV1,
-		Bytes:   append([]byte(nil), data...),
-		Digest:  append([]byte(nil), digest[:]...),
-		Effects: effects,
+		version: MutationEncodingV1,
+		bytes:   append([]byte(nil), data...),
+		digest:  append([]byte(nil), digest[:]...),
+		effects: effects,
 	}, nil
 }
 
@@ -100,6 +175,10 @@ type canonicalWriter struct {
 
 func (w *canonicalWriter) field(name string, value []byte) {
 	if w.err != nil {
+		return
+	}
+	if len(value) > MaxCanonicalFieldBytes {
+		w.err = canonicalMutationError(name, fmt.Sprintf("%d bytes exceeds maximum %d", len(value), MaxCanonicalFieldBytes), "reduce this operand")
 		return
 	}
 	_, w.err = fmt.Fprintf(w.w, "%s:%d:", name, len(value))
@@ -127,7 +206,7 @@ func (r *canonicalReader) field(want string) ([]byte, error) {
 		return nil, fmt.Errorf("provenance: decode canonical mutation field %q length: %w", want, err)
 	}
 	n, err := strconv.Atoi(strings.TrimSuffix(rawLen, ":"))
-	if err != nil || n < 0 {
+	if err != nil || n < 0 || n > MaxCanonicalFieldBytes {
 		return nil, fmt.Errorf("provenance: decode canonical mutation field %q has invalid length %q", want, rawLen)
 	}
 	value := make([]byte, n)
@@ -141,63 +220,379 @@ func (r *canonicalReader) field(want string) ([]byte, error) {
 }
 
 func encodeCanonicalEffect(w *canonicalWriter, e Effect, index int) error {
-	if !validEffectSort(e.Sort) {
-		return fmt.Errorf("provenance: canonical mutation effect %d has unknown sort %d", index, int(e.Sort))
+	{
+		prefix := fmt.Sprintf("effect.%d.", index)
+		w.field(prefix+"family", []byte(e.Sort.String()))
+		w.field(prefix+"result-slot", []byte(e.ResultSlot))
+		w.field(prefix+"recorded-at-override", encodeOptionalInt64(e.RecordedAtOverride))
+		contexts := func() {
+			w.field(prefix+"context-count", []byte(strconv.Itoa(len(e.Contexts))))
+			for j, c := range e.Contexts {
+				k, id, _ := EncodeStoredEventContext(c)
+				w.field(fmt.Sprintf("%scontext.%d.kind", prefix, j), []byte(k))
+				w.field(fmt.Sprintf("%scontext.%d.identity", prefix, j), []byte(id))
+			}
+		}
+		payload := func() { p, _ := canonicalJSON(e.Payload); w.field(prefix+"payload", p) }
+		switch e.Sort {
+		case EffectTaskCreate:
+			w.field(prefix+"task", []byte(e.TaskID.String()))
+			payload()
+			contexts()
+			w.field(prefix+"title", []byte(e.Title))
+			w.field(prefix+"description", []byte(e.Description))
+			w.field(prefix+"type", []byte(e.Type.String()))
+			w.field(prefix+"priority", []byte(e.Priority.String()))
+			w.field(prefix+"phase", []byte(e.Phase.String()))
+		case EffectTaskEvent:
+			w.field(prefix+"task", []byte(e.TaskID.String()))
+			w.field(prefix+"event-kind", []byte(e.EventKind))
+			payload()
+			contexts()
+			if e.EventKind == EventKindTaskUpdated {
+				w.field(prefix+"update-title", encodeOptionalString(e.UpdateTitle))
+				w.field(prefix+"update-description", encodeOptionalString(e.UpdateDescription))
+				w.field(prefix+"update-priority", encodeOptionalText(e.UpdatePriority))
+				w.field(prefix+"update-phase", encodeOptionalText(e.UpdatePhase))
+				w.field(prefix+"update-notes", encodeOptionalString(e.UpdateNotes))
+			}
+			if IsTransitionLifecycleKind(e.EventKind) {
+				w.field(prefix+"forced", []byte(strconv.FormatBool(e.Forced)))
+				if e.EventKind == EventKindTaskClosed {
+					w.field(prefix+"close-reason", []byte(e.CloseReason))
+				}
+			}
+		case EffectBootstrapAuthority:
+			w.field(prefix+"bootstrap-label", []byte(e.BootstrapLabel))
+			w.field(prefix+"operation-authority", []byte(e.OperationAuthorityID))
+		case EffectAssignmentStart:
+			w.field(prefix+"task", []byte(e.TaskID.String()))
+			w.field(prefix+"assignment", []byte(e.AssignmentID))
+			w.field(prefix+"slot", []byte(e.SlotID))
+			w.field(prefix+"occupant", []byte(idString(e.Occupant)))
+			w.field(prefix+"predecessor", []byte(e.Predecessor))
+			w.field(prefix+"parent", []byte(e.Parent))
+		case EffectAssignmentEnd:
+			w.field(prefix+"task", []byte(idString(e.TaskID)))
+			w.field(prefix+"assignment", []byte(e.AssignmentID))
+			w.field(prefix+"slot", []byte(e.SlotID))
+		case EffectDecision:
+			w.field(prefix+"task", []byte(idString(e.TaskID)))
+			w.field(prefix+"decision-kind", []byte(e.DecisionKind))
+			payload()
+		case EffectEvidence:
+			w.field(prefix+"task", []byte(idString(e.TaskID)))
+			w.field(prefix+"evidence-kind", []byte(e.EvidenceKind))
+			w.field(prefix+"content-digest", e.ContentDigest)
+			payload()
+		case EffectEdgeAdd, EffectEdgeRemove:
+			w.field(prefix+"task", []byte(e.TaskID.String()))
+			w.field(prefix+"edge-target", []byte(e.EdgeTargetID))
+			w.field(prefix+"edge-kind", []byte(e.EdgeRelKind.String()))
+			contexts()
+		case EffectLabelAdd, EffectLabelRemove:
+			w.field(prefix+"task", []byte(e.TaskID.String()))
+			w.field(prefix+"label", []byte(e.Label))
+			contexts()
+		case EffectCommentAdd:
+			w.field(prefix+"task", []byte(e.TaskID.String()))
+			w.field(prefix+"comment", []byte(e.CommentIdentity.String()))
+			w.field(prefix+"comment-author", []byte(e.CommentAuthor.String()))
+			w.field(prefix+"comment-body", []byte(e.CommentBody))
+			contexts()
+		}
+		return w.err
 	}
-	contexts, err := CanonicalEventContexts(e.Contexts)
-	if err != nil {
-		return fmt.Errorf("provenance: canonical mutation effect %d contexts: %w", index, err)
-	}
-	payload, err := canonicalJSON(e.Payload)
-	if err != nil {
-		return fmt.Errorf("provenance: canonical mutation effect %d payload: %w", index, err)
-	}
-	prefix := fmt.Sprintf("effect.%d.", index)
-	w.field(prefix+"family", []byte(e.Sort.String()))
-	w.field(prefix+"result-slot", []byte(e.ResultSlot))
-	w.field(prefix+"actor", []byte(idString(e.ActorID)))
-	w.field(prefix+"recorded-at-override", encodeOptionalInt64(e.RecordedAtOverride))
-	w.field(prefix+"task", []byte(idString(e.TaskID)))
-	w.field(prefix+"event-kind", []byte(e.EventKind))
-	w.field(prefix+"payload", payload)
-	w.field(prefix+"context-count", []byte(strconv.Itoa(len(contexts))))
-	for j, context := range contexts {
-		kind, identity, _ := EncodeStoredEventContext(context)
-		w.field(fmt.Sprintf("%scontext.%d.kind", prefix, j), []byte(kind))
-		w.field(fmt.Sprintf("%scontext.%d.identity", prefix, j), []byte(identity))
-	}
-	w.field(prefix+"title", []byte(e.Title))
-	w.field(prefix+"description", []byte(e.Description))
-	w.field(prefix+"type", []byte(e.Type.String()))
-	w.field(prefix+"priority", []byte(e.Priority.String()))
-	w.field(prefix+"phase", []byte(e.Phase.String()))
-	w.field(prefix+"close-reason", []byte(e.CloseReason))
-	w.field(prefix+"update-title", encodeOptionalString(e.UpdateTitle))
-	w.field(prefix+"update-description", encodeOptionalString(e.UpdateDescription))
-	w.field(prefix+"update-priority", encodeOptionalText(e.UpdatePriority))
-	w.field(prefix+"update-phase", encodeOptionalText(e.UpdatePhase))
-	w.field(prefix+"update-notes", encodeOptionalString(e.UpdateNotes))
-	w.field(prefix+"forced", []byte(strconv.FormatBool(e.Forced)))
-	w.field(prefix+"bootstrap-label", []byte(e.BootstrapLabel))
-	w.field(prefix+"operation-authority", []byte(e.OperationAuthorityID))
-	w.field(prefix+"assignment", []byte(e.AssignmentID))
-	w.field(prefix+"slot", []byte(e.SlotID))
-	w.field(prefix+"occupant", []byte(idString(e.Occupant)))
-	w.field(prefix+"predecessor", []byte(e.Predecessor))
-	w.field(prefix+"parent", []byte(e.Parent))
-	w.field(prefix+"decision-kind", []byte(e.DecisionKind))
-	w.field(prefix+"evidence-kind", []byte(e.EvidenceKind))
-	w.field(prefix+"content-digest", e.ContentDigest)
-	w.field(prefix+"edge-target", []byte(e.EdgeTargetID))
-	w.field(prefix+"edge-kind", []byte(e.EdgeRelKind.String()))
-	w.field(prefix+"label", []byte(e.Label))
-	w.field(prefix+"comment", []byte(idString(e.CommentIdentity)))
-	w.field(prefix+"comment-author", []byte(idString(e.CommentAuthor)))
-	w.field(prefix+"comment-body", []byte(e.CommentBody))
-	return nil
 }
 
 func decodeCanonicalEffect(r *canonicalReader, index int) (Effect, error) {
+	{
+		p := fmt.Sprintf("effect.%d.", index)
+		read := func(name string) ([]byte, error) { return r.field(p + name) }
+		family, err := read("family")
+		if err != nil {
+			return Effect{}, err
+		}
+		sort, err := parseEffectSort(string(family))
+		if err != nil {
+			return Effect{}, err
+		}
+		e := Effect{Sort: sort}
+		b, err := read("result-slot")
+		if err != nil {
+			return e, err
+		}
+		e.ResultSlot = ResultSlotID(b)
+		b, err = read("recorded-at-override")
+		if err != nil {
+			return e, err
+		}
+		e.RecordedAtOverride, err = decodeOptionalInt64(b)
+		if err != nil {
+			return e, err
+		}
+		payload := func() error {
+			raw, x := read("payload")
+			if x == nil {
+				e.Payload = append(json.RawMessage(nil), raw...)
+			}
+			return x
+		}
+		contexts := func() error {
+			raw, x := read("context-count")
+			if x != nil {
+				return x
+			}
+			n, x := strconv.Atoi(string(raw))
+			if x != nil || n < 0 || n > MaxCanonicalContextsPerEffect {
+				return canonicalMutationError(p+"context-count", fmt.Sprintf("invalid bounded count %q", raw), "use a non-negative bounded count")
+			}
+			for j := 0; j < n; j++ {
+				k, x := r.field(fmt.Sprintf("%scontext.%d.kind", p, j))
+				if x != nil {
+					return x
+				}
+				id, x := r.field(fmt.Sprintf("%scontext.%d.identity", p, j))
+				if x != nil {
+					return x
+				}
+				c, x := DecodeStoredEventContext(EventContextKind(k), string(id))
+				if x != nil {
+					return x
+				}
+				e.Contexts = append(e.Contexts, c)
+			}
+			return nil
+		}
+		task := func() error {
+			raw, x := read("task")
+			if x != nil {
+				return x
+			}
+			e.TaskID, x = parseOptionalTask(string(raw))
+			return x
+		}
+		switch sort {
+		case EffectTaskCreate:
+			if err = task(); err != nil {
+				return e, err
+			}
+			if err = payload(); err != nil {
+				return e, err
+			}
+			if err = contexts(); err != nil {
+				return e, err
+			}
+			if b, err = read("title"); err == nil {
+				e.Title = string(b)
+			} else {
+				return e, err
+			}
+			if b, err = read("description"); err == nil {
+				e.Description = string(b)
+			} else {
+				return e, err
+			}
+			if b, err = read("type"); err == nil {
+				err = e.Type.UnmarshalText(b)
+			}
+			if err != nil {
+				return e, err
+			}
+			if b, err = read("priority"); err == nil {
+				err = e.Priority.UnmarshalText(b)
+			}
+			if err != nil {
+				return e, err
+			}
+			if b, err = read("phase"); err == nil {
+				err = e.Phase.UnmarshalText(b)
+			}
+		case EffectTaskEvent:
+			if err = task(); err != nil {
+				return e, err
+			}
+			if b, err = read("event-kind"); err == nil {
+				e.EventKind = EventKind(b)
+			} else {
+				return e, err
+			}
+			if err = payload(); err != nil {
+				return e, err
+			}
+			if err = contexts(); err != nil {
+				return e, err
+			}
+			if e.EventKind == EventKindTaskUpdated {
+				if b, err = read("update-title"); err == nil {
+					e.UpdateTitle, err = decodeOptionalString(b)
+				}
+				if err != nil {
+					return e, err
+				}
+				if b, err = read("update-description"); err == nil {
+					e.UpdateDescription, err = decodeOptionalString(b)
+				}
+				if err != nil {
+					return e, err
+				}
+				if b, err = read("update-priority"); err == nil {
+					e.UpdatePriority, err = decodeOptionalPriority(b)
+				}
+				if err != nil {
+					return e, err
+				}
+				if b, err = read("update-phase"); err == nil {
+					e.UpdatePhase, err = decodeOptionalPhase(b)
+				}
+				if err != nil {
+					return e, err
+				}
+				if b, err = read("update-notes"); err == nil {
+					e.UpdateNotes, err = decodeOptionalString(b)
+				}
+			}
+			if IsTransitionLifecycleKind(e.EventKind) {
+				if b, err = read("forced"); err == nil {
+					e.Forced, err = strconv.ParseBool(string(b))
+				}
+				if err != nil {
+					return e, err
+				}
+				if e.EventKind == EventKindTaskClosed {
+					if b, err = read("close-reason"); err == nil {
+						e.CloseReason = string(b)
+					}
+				}
+			}
+		case EffectBootstrapAuthority:
+			if b, err = read("bootstrap-label"); err == nil {
+				e.BootstrapLabel = string(b)
+			} else {
+				return e, err
+			}
+			if b, err = read("operation-authority"); err == nil {
+				e.OperationAuthorityID = OperationAuthorityID(b)
+			}
+		case EffectAssignmentStart:
+			if err = task(); err != nil {
+				return e, err
+			}
+			if b, err = read("assignment"); err == nil {
+				e.AssignmentID = AssignmentID(b)
+			} else {
+				return e, err
+			}
+			if b, err = read("slot"); err == nil {
+				e.SlotID = AssignmentSlotID(b)
+			} else {
+				return e, err
+			}
+			if b, err = read("occupant"); err == nil {
+				e.Occupant, err = parseOptionalActor(string(b))
+			}
+			if err != nil {
+				return e, err
+			}
+			if b, err = read("predecessor"); err == nil {
+				e.Predecessor = AssignmentID(b)
+			} else {
+				return e, err
+			}
+			if b, err = read("parent"); err == nil {
+				e.Parent = AssignmentID(b)
+			}
+		case EffectAssignmentEnd:
+			if err = task(); err != nil {
+				return e, err
+			}
+			if b, err = read("assignment"); err == nil {
+				e.AssignmentID = AssignmentID(b)
+			} else {
+				return e, err
+			}
+			if b, err = read("slot"); err == nil {
+				e.SlotID = AssignmentSlotID(b)
+			}
+		case EffectDecision:
+			if err = task(); err != nil {
+				return e, err
+			}
+			if b, err = read("decision-kind"); err == nil {
+				e.DecisionKind = DecisionKind(b)
+			} else {
+				return e, err
+			}
+			err = payload()
+		case EffectEvidence:
+			if err = task(); err != nil {
+				return e, err
+			}
+			if b, err = read("evidence-kind"); err == nil {
+				e.EvidenceKind = EvidenceKind(b)
+			} else {
+				return e, err
+			}
+			if b, err = read("content-digest"); err == nil {
+				e.ContentDigest = append([]byte(nil), b...)
+			} else {
+				return e, err
+			}
+			err = payload()
+		case EffectEdgeAdd, EffectEdgeRemove:
+			if err = task(); err != nil {
+				return e, err
+			}
+			if b, err = read("edge-target"); err == nil {
+				e.EdgeTargetID = string(b)
+			} else {
+				return e, err
+			}
+			if b, err = read("edge-kind"); err == nil {
+				err = e.EdgeRelKind.UnmarshalText(b)
+			}
+			if err == nil {
+				err = contexts()
+			}
+		case EffectLabelAdd, EffectLabelRemove:
+			if err = task(); err != nil {
+				return e, err
+			}
+			if b, err = read("label"); err == nil {
+				e.Label = string(b)
+			} else {
+				return e, err
+			}
+			err = contexts()
+		case EffectCommentAdd:
+			if err = task(); err != nil {
+				return e, err
+			}
+			if b, err = read("comment"); err == nil {
+				e.CommentIdentity, err = parseOptionalComment(string(b))
+			}
+			if err != nil {
+				return e, err
+			}
+			if b, err = read("comment-author"); err == nil {
+				e.CommentAuthor, err = parseOptionalActor(string(b))
+			}
+			if err != nil {
+				return e, err
+			}
+			if b, err = read("comment-body"); err == nil {
+				e.CommentBody = string(b)
+			} else {
+				return e, err
+			}
+			err = contexts()
+		}
+		if err != nil {
+			return e, err
+		}
+		return normalizeCanonicalEffect(e, index)
+	}
+	/* Legacy exhaustive layout retained below only as source history.
 	p := fmt.Sprintf("effect.%d.", index)
 	read := func(name string) ([]byte, error) { return r.field(p + name) }
 	family, err := read("family")
@@ -254,7 +649,7 @@ func decodeCanonicalEffect(r *canonicalReader, index int) (Effect, error) {
 		return e, err
 	}
 	count, err := strconv.Atoi(string(countRaw))
-	if err != nil || count < 0 {
+	if err != nil || count < 0 || count > MaxCanonicalContextsPerEffect {
 		return e, fmt.Errorf("provenance: canonical mutation effect %d invalid context-count %q", index, countRaw)
 	}
 	for j := 0; j < count; j++ {
@@ -451,7 +846,155 @@ func decodeCanonicalEffect(r *canonicalReader, index int) (Effect, error) {
 	} else {
 		return e, x
 	}
-	return e, nil
+	return e, nil */
+}
+
+func normalizeCanonicalEffect(e Effect, index int) (Effect, error) {
+	// Treat representational empty values as the zero value before shape checking.
+	if len(e.Payload) > 0 {
+		if payload, err := canonicalJSON(e.Payload); err == nil && string(payload) == "{}" {
+			e.Payload = nil
+		}
+	}
+	if len(e.Contexts) == 0 {
+		e.Contexts = nil
+	}
+	if len(e.ContentDigest) == 0 {
+		e.ContentDigest = nil
+	}
+	if !validEffectSort(e.Sort) {
+		return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.family", index), fmt.Sprintf("unknown family %d", e.Sort), "use a declared EffectSort")
+	}
+	if e.ActorID.Namespace != "" {
+		return Effect{}, fmt.Errorf("%w: %w", ErrActorPlacement, canonicalMutationError(fmt.Sprintf("effect.%d.actor", index), "per-effect ActorID is not behaviorally valid; actor comes from the operation anchor", "leave Effect.ActorID zero"))
+	}
+	n := Effect{Sort: e.Sort, ResultSlot: e.ResultSlot, RecordedAtOverride: e.RecordedAtOverride}
+	switch e.Sort {
+	case EffectTaskCreate:
+		if e.TaskID.Namespace == "" || !e.Type.IsValid() || !e.Priority.IsValid() || !e.Phase.IsValid() {
+			return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.task-create", index), "invalid task identity or classification enum", "supply a namespaced task and valid type/priority/phase")
+		}
+		n.TaskID = e.TaskID
+		n.Payload = e.Payload
+		n.Contexts = e.Contexts
+		n.Title = e.Title
+		n.Description = e.Description
+		n.Type = e.Type
+		n.Priority = e.Priority
+		n.Phase = e.Phase
+	case EffectTaskEvent:
+		if e.TaskID.Namespace == "" {
+			return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.task", index), "task event requires a task", "supply a namespaced TaskID")
+		}
+		if err := ValidateEventKind(e.EventKind); err != nil {
+			return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.event-kind", index), err.Error(), "use a valid namespaced event kind")
+		}
+		n.TaskID = e.TaskID
+		n.EventKind = e.EventKind
+		n.Payload = e.Payload
+		n.Contexts = e.Contexts
+		if e.EventKind == EventKindTaskUpdated {
+			n.UpdateTitle = e.UpdateTitle
+			n.UpdateDescription = e.UpdateDescription
+			n.UpdatePriority = e.UpdatePriority
+			n.UpdatePhase = e.UpdatePhase
+			n.UpdateNotes = e.UpdateNotes
+		}
+		if IsTransitionLifecycleKind(e.EventKind) {
+			n.Forced = e.Forced
+			if e.EventKind == EventKindTaskClosed {
+				n.CloseReason = e.CloseReason
+			}
+			if e.Forced && len(e.Payload) > 0 {
+				return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.payload", index), "forced lifecycle payload is reducer-generated", "leave payload empty when Forced is true")
+			}
+		}
+	case EffectBootstrapAuthority:
+		n.BootstrapLabel = e.BootstrapLabel
+		n.OperationAuthorityID = e.OperationAuthorityID
+	case EffectAssignmentStart:
+		if e.TaskID.Namespace == "" || e.AssignmentID == "" {
+			return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.assignment-start", index), "task and assignment are required", "supply both identities")
+		}
+		n.TaskID = e.TaskID
+		n.AssignmentID = e.AssignmentID
+		n.SlotID = e.SlotID
+		n.Occupant = e.Occupant
+		n.Predecessor = e.Predecessor
+		n.Parent = e.Parent
+	case EffectAssignmentEnd:
+		if e.AssignmentID == "" {
+			return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.assignment", index), "assignment is required", "supply the episode identity")
+		}
+		n.AssignmentID = e.AssignmentID
+		n.TaskID = e.TaskID
+		n.SlotID = e.SlotID
+	case EffectDecision:
+		if e.DecisionKind == "" {
+			return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.decision-kind", index), "decision kind is empty", "supply a namespaced decision kind")
+		}
+		n.TaskID = e.TaskID
+		n.DecisionKind = e.DecisionKind
+		n.Payload = e.Payload
+	case EffectEvidence:
+		if e.EvidenceKind == "" {
+			return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.evidence-kind", index), "evidence kind is empty", "supply a namespaced evidence kind")
+		}
+		n.TaskID = e.TaskID
+		n.EvidenceKind = e.EvidenceKind
+		n.ContentDigest = e.ContentDigest
+		n.Payload = e.Payload
+	case EffectEdgeAdd, EffectEdgeRemove:
+		if e.TaskID.Namespace == "" || e.EdgeTargetID == "" || !e.EdgeRelKind.IsValid() {
+			return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.edge", index), "invalid edge operands", "supply source, target, and valid edge kind")
+		}
+		n.TaskID = e.TaskID
+		n.EdgeTargetID = e.EdgeTargetID
+		n.EdgeRelKind = e.EdgeRelKind
+		n.Contexts = e.Contexts
+	case EffectLabelAdd, EffectLabelRemove:
+		if e.TaskID.Namespace == "" || e.Label == "" {
+			return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.label", index), "task and label are required", "supply both operands")
+		}
+		n.TaskID = e.TaskID
+		n.Label = e.Label
+		n.Contexts = e.Contexts
+	case EffectCommentAdd:
+		if e.TaskID.Namespace == "" || e.CommentIdentity.Namespace == "" || e.CommentAuthor.Namespace == "" {
+			return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.comment", index), "task, comment identity, and author are required", "supply all comment operands")
+		}
+		n.TaskID = e.TaskID
+		n.CommentIdentity = e.CommentIdentity
+		n.CommentAuthor = e.CommentAuthor
+		n.CommentBody = e.CommentBody
+		n.Contexts = e.Contexts
+	}
+	if !reflect.DeepEqual(e, n) {
+		v1, v2 := reflect.ValueOf(e), reflect.ValueOf(n)
+		for i := 0; i < v1.NumField(); i++ {
+			if !reflect.DeepEqual(v1.Field(i).Interface(), v2.Field(i).Interface()) {
+				return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.%s", index, reflect.TypeOf(e).Field(i).Name), "field is populated but not consumed by this effect family", "clear the irrelevant field")
+			}
+		}
+	}
+	contexts, err := CanonicalEventContexts(n.Contexts)
+	if err != nil {
+		return Effect{}, err
+	}
+	if len(contexts) > MaxCanonicalContextsPerEffect {
+		return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.context-count", index), fmt.Sprintf("%d exceeds maximum %d", len(contexts), MaxCanonicalContextsPerEffect), "reduce contexts")
+	}
+	if len(contexts) > 0 {
+		n.Contexts = contexts
+	} else {
+		n.Contexts = nil
+	}
+	if len(n.Payload) > 0 {
+		if _, err := canonicalJSON(n.Payload); err != nil {
+			return Effect{}, canonicalMutationError(fmt.Sprintf("effect.%d.payload", index), err.Error(), "supply one strict JSON value without duplicate fields")
+		}
+	}
+	return n, nil
 }
 
 func validEffectSort(sort EffectSort) bool {

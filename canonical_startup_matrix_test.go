@@ -1,0 +1,297 @@
+package provenance
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"zombiezen.com/go/sqlite"
+	"zombiezen.com/go/sqlite/sqlitex"
+)
+
+type startupFixture struct {
+	task, target           TaskID
+	comment                CommentID
+	anchor, event1, event2 JournalID
+}
+
+func buildStartupFixture(t *testing.T, path string) (Tracker, startupFixture) {
+	t.Helper()
+	tr, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actor, err := tr.RegisterSoftwareAgent("matrix", "actor", "1", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = tr.RegisterSoftwareAgent("matrix", "other", "1", "test"); err != nil {
+		t.Fatal(err)
+	}
+	gen, err := tr.Journal().Apply(OperationInput{OperationID: "matrix-genesis", ActorID: actor.ID, CommandDigest: []byte("c"), Effects: []Effect{{Sort: EffectBootstrapAuthority, ResultSlot: "authority"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	boot, _ := slotJournalID(gen, "authority")
+	s := tr.As(actor.ID, boot)
+	task, err := s.Create("matrix", "title", "description", TaskTypeTask, PriorityMedium, PhaseUnscoped, WithOperationID("matrix-task"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := s.Create("matrix", "target", "target", TaskTypeTask, PriorityMedium, PhaseUnscoped, WithOperationID("matrix-target"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	notes := "notes"
+	if _, err = s.Update(task.ID, UpdateFields{Notes: &notes}, WithOperationID("matrix-update")); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.AddEdge(task.ID, target.ID.String(), EdgeDerivedFrom); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.AddLabel(task.ID, "label"); err != nil {
+		t.Fatal(err)
+	}
+	comment, err := s.AddComment(task.ID, actor.ID, "body")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, _ := TaskContext(task.ID)
+	res, err := tr.Journal().Apply(OperationInput{OperationID: "matrix-events", ActorID: actor.ID, AuthorityJournalID: &boot, CommandDigest: []byte("c"), RecordedAt: 123, Effects: []Effect{{Sort: EffectTaskEvent, TaskID: task.ID, EventKind: "matrix.event", Contexts: []EventContext{ctx}, ResultSlot: "one"}, {Sort: EffectTaskEvent, TaskID: task.ID, EventKind: "matrix.other", ResultSlot: "two"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tr, startupFixture{task: task.ID, target: target.ID, comment: comment.ID, anchor: res.AnchorJournalID, event1: res.EmittedEvents[0], event2: res.EmittedEvents[1]}
+}
+
+func corruptSQL(t *testing.T, tr Tracker, statement string, args ...any) {
+	t.Helper()
+	db := tr.(*sqliteTracker).db
+	db.Lock()
+	defer db.Unlock()
+	if err := sqlitex.Execute(db.Conn(), `PRAGMA foreign_keys=OFF`, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := sqlitex.Execute(db.Conn(), `PRAGMA ignore_check_constraints=ON`, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := sqlitex.Execute(db.Conn(), statement, &sqlitex.ExecOptions{Args: args}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func corruptCanonicalWire(t *testing.T, tr Tracker, anchor JournalID, mutate func([]byte) []byte) {
+	t.Helper()
+	db := tr.(*sqliteTracker).db
+	db.Lock()
+	var wire []byte
+	err := sqlitex.Execute(db.Conn(), `SELECT canonical_mutation FROM journal_operations WHERE journal_id=?1`, &sqlitex.ExecOptions{Args: []any{int64(anchor)}, ResultFunc: func(stmt *sqlite.Stmt) error {
+		wire = make([]byte, stmt.ColumnLen(0))
+		stmt.ColumnBytes(0, wire)
+		return nil
+	}})
+	db.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	corruptSQL(t, tr, `DROP TRIGGER journal_operations_canonical_update`)
+	corruptSQL(t, tr, `UPDATE journal_operations SET canonical_mutation=?1 WHERE journal_id=?2`, mutate(wire), int64(anchor))
+}
+
+func TestStartupCorruptionMatrixLeavesBytesUnchanged(t *testing.T) {
+	cases := map[string]func(*testing.T, Tracker, startupFixture){
+		"task-namespace": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE tasks SET namespace='wrong' WHERE id=?1`, f.task.String())
+		},
+		"task-title": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE tasks SET title='wrong' WHERE id=?1`, f.task.String())
+		},
+		"task-description": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE tasks SET description='wrong' WHERE id=?1`, f.task.String())
+		},
+		"task-status": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE tasks SET status_id=2 WHERE id=?1`, f.task.String())
+		},
+		"task-priority": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE tasks SET priority_id=1 WHERE id=?1`, f.task.String())
+		},
+		"task-type": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE tasks SET type_id=1 WHERE id=?1`, f.task.String())
+		},
+		"task-phase": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE tasks SET phase_id=9 WHERE id=?1`, f.task.String())
+		},
+		"task-owner": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE tasks SET owner_id=(SELECT id FROM agents LIMIT 1) WHERE id=?1`, f.task.String())
+		},
+		"task-notes": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE tasks SET notes='wrong' WHERE id=?1`, f.task.String())
+		},
+		"task-created": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE tasks SET created_at=created_at+1 WHERE id=?1`, f.task.String())
+		},
+		"task-updated": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE tasks SET updated_at=updated_at+1 WHERE id=?1`, f.task.String())
+		},
+		"task-closed": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE tasks SET closed_at=1 WHERE id=?1`, f.task.String())
+		},
+		"task-reason": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE tasks SET close_reason='wrong' WHERE id=?1`, f.task.String())
+		},
+		"task-watermark": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE tasks SET last_journal_id=1 WHERE id=?1`, f.task.String())
+		},
+		"task-missing": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `DELETE FROM tasks WHERE id=?1`, f.task.String())
+		},
+		"task-spurious": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `INSERT INTO tasks SELECT 'matrix--018f0000-0000-7000-8000-000000000099',namespace,title,description,status_id,priority_id,type_id,phase_id,owner_id,notes,created_at,updated_at,closed_at,close_reason,last_journal_id FROM tasks WHERE id=?1`, f.task.String())
+		},
+		"attribution": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `DELETE FROM task_attributions WHERE task_id=?1`, f.task.String())
+		},
+		"attribution-actor": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE task_attributions SET actor_id=(SELECT id FROM agents WHERE id<>actor_id LIMIT 1) WHERE task_id=?1`, f.task.String())
+		},
+		"attribution-journal": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE task_attributions SET first_journal_id=?1 WHERE task_id=?2`, int64(f.event2), f.task.String())
+		},
+		"attribution-spurious": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `INSERT INTO task_attributions(task_id,actor_id,first_journal_id) SELECT ?1,agent_id,?2 FROM agents_software WHERE name='other' LIMIT 1`, f.target.String(), int64(f.anchor))
+		},
+		"edge-created": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE edges SET created_at=created_at+1 WHERE source_id=?1`, f.task.String())
+		},
+		"edge-source": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE edges SET source_id=?1 WHERE source_id=?2`, f.target.String(), f.task.String())
+		},
+		"edge-target": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE edges SET target_id='wrong-target' WHERE source_id=?1`, f.task.String())
+		},
+		"edge-kind": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE edges SET kind_id=2 WHERE source_id=?1`, f.task.String())
+		},
+		"edge-missing": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `DELETE FROM edges WHERE source_id=?1`, f.task.String())
+		},
+		"edge-spurious": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `INSERT INTO edges(source_id,target_id,kind_id,created_at) SELECT ?1,?2,kind_id,created_at FROM edges WHERE source_id=?2`, f.target.String(), f.task.String())
+		},
+		"label-name": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE labels SET name='wrong' WHERE task_id=?1`, f.task.String())
+		},
+		"label-task": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE labels SET task_id=?1 WHERE task_id=?2`, f.target.String(), f.task.String())
+		},
+		"label-missing": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `DELETE FROM labels WHERE task_id=?1`, f.task.String())
+		},
+		"label-spurious": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `INSERT INTO labels(task_id,name) VALUES(?1,'spurious')`, f.target.String())
+		},
+		"comment-id": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE comments SET id='matrix--018f0000-0000-7000-8000-000000000098' WHERE id=?1`, f.comment.String())
+		},
+		"comment-task": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE comments SET task_id=?1 WHERE id=?2`, f.target.String(), f.comment.String())
+		},
+		"comment-author": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE comments SET author_id=(SELECT id FROM agents WHERE id<>author_id LIMIT 1) WHERE id=?1`, f.comment.String())
+		},
+		"comment-body": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE comments SET body='wrong' WHERE id=?1`, f.comment.String())
+		},
+		"comment-created": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE comments SET created_at=created_at+1 WHERE id=?1`, f.comment.String())
+		},
+		"comment-missing": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `DELETE FROM comments WHERE id=?1`, f.comment.String())
+		},
+		"comment-spurious": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `INSERT INTO comments(id,task_id,author_id,body,created_at) SELECT 'matrix--018f0000-0000-7000-8000-000000000097',task_id,author_id,body,created_at FROM comments WHERE id=?1`, f.comment.String())
+		},
+		"result-slot-missing": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `DELETE FROM journal_operation_result_slots WHERE journal_id=?1 AND result_slot_id='one'`, int64(f.anchor))
+		},
+		"result-slot-redirected": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE journal_operation_result_slots SET produced_journal_id=?1 WHERE journal_id=?2 AND result_slot_id='one'`, int64(f.event2), int64(f.anchor))
+		},
+		"context-attached-by": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE journal_task_event_contexts SET attached_by_journal_id=?1 WHERE event_journal_id=?2`, int64(f.event2), int64(f.event1))
+		},
+		"effect-timestamp": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `UPDATE journal SET recorded_at=recorded_at+1 WHERE journal_id=?1`, int64(f.event1))
+		},
+		"missing-subtype": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `DELETE FROM journal_task_events WHERE journal_id=?1`, int64(f.event1))
+		},
+		"canonical-version-only": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `DROP TRIGGER journal_operations_canonical_update`)
+			corruptSQL(t, tr, `UPDATE journal_operations SET canonical_mutation=NULL WHERE journal_id=?1`, int64(f.anchor))
+		},
+		"canonical-bytes-only": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `DROP TRIGGER journal_operations_canonical_update`)
+			corruptSQL(t, tr, `UPDATE journal_operations SET mutation_encoding_version=NULL WHERE journal_id=?1`, int64(f.anchor))
+		},
+		"canonical-unknown-version": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptSQL(t, tr, `DROP TRIGGER journal_operations_canonical_update`)
+			corruptSQL(t, tr, `UPDATE journal_operations SET mutation_encoding_version='unknown.v9' WHERE journal_id=?1`, int64(f.anchor))
+		},
+		"canonical-effect-limit": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptCanonicalWire(t, tr, f.anchor, func(wire []byte) []byte {
+				return bytes.Replace(wire, []byte("effect-count:1:2\n"), []byte(fmt.Sprintf("effect-count:3:%d\n", MaxCanonicalEffects+1)), 1)
+			})
+		},
+		"canonical-context-limit": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptCanonicalWire(t, tr, f.anchor, func(wire []byte) []byte {
+				return bytes.Replace(wire, []byte("effect.0.context-count:1:1\n"), []byte(fmt.Sprintf("effect.0.context-count:2:%d\n", MaxCanonicalContextsPerEffect+1)), 1)
+			})
+		},
+		"canonical-field-limit": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptCanonicalWire(t, tr, f.anchor, func(wire []byte) []byte {
+				return bytes.Replace(wire, []byte("effect.0.family:10:task_event\n"), []byte(fmt.Sprintf("effect.0.family:%d:", MaxCanonicalFieldBytes+1)), 1)
+			})
+		},
+		"canonical-total-limit": func(t *testing.T, tr Tracker, f startupFixture) {
+			corruptCanonicalWire(t, tr, f.anchor, func([]byte) []byte { return bytes.Repeat([]byte{'x'}, MaxCanonicalMutationBytes+1) })
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "db.sqlite")
+			tr, f := buildStartupFixture(t, path)
+			mutate(t, tr, f)
+			if err := tr.Close(); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			opened, openErr := OpenSQLite(path)
+			if opened != nil {
+				_ = opened.Close()
+			}
+			if openErr == nil {
+				t.Fatal("corrupt database opened")
+			}
+			if name[:4] == "task" || name[:4] == "edge" || name[:5] == "label" || name[:7] == "comment" || name[:11] == "attribution" {
+				var divergence *ProjectionDivergenceError
+				if !errors.As(openErr, &divergence) {
+					t.Fatalf("projection corruption returned %T, want ProjectionDivergenceError: %v", openErr, openErr)
+				}
+			}
+			after, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(before, after) {
+				t.Fatal("failed Open changed corrupt database bytes")
+			}
+		})
+	}
+}

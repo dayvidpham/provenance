@@ -485,6 +485,12 @@ const (
 	authorityAssignmentMismatchQuery = `SELECT d.journal_id FROM journal_authority_assignment_transitions d
 			JOIN journal_authorities a ON a.journal_id = d.journal_id
 			WHERE a.authority_kind_id <> ?1 LIMIT 1`
+	authorityBootstrapMissingQuery = `SELECT a.journal_id FROM journal_authorities a
+			LEFT JOIN journal_authority_bootstraps d ON d.journal_id = a.journal_id
+			WHERE a.authority_kind_id = ?1 AND d.journal_id IS NULL LIMIT 1`
+	authorityAssignmentMissingQuery = `SELECT a.journal_id FROM journal_authorities a
+			LEFT JOIN journal_authority_assignment_transitions d ON d.journal_id = a.journal_id
+			WHERE a.authority_kind_id = ?1 AND d.journal_id IS NULL LIMIT 1`
 )
 
 // subtypeTablesPresent narrows the closed subtypeAllTables map to the tables that actually
@@ -619,6 +625,8 @@ func (db *DB) verifyAuthorityDetailIntegrityLocked() error {
 		want  int
 		label string
 	}{
+		{authorityBootstrapMissingQuery, 0, "bootstrap authority missing its bootstrap detail"},
+		{authorityAssignmentMissingQuery, 1, "assignment authority missing its assignment transition"},
 		{authorityBootstrapMismatchQuery, 0, "bootstrap detail on a non-bootstrap authority"},
 		{authorityAssignmentMismatchQuery, 1, "assignment transition on a non-assignment authority"},
 	}

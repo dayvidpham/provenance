@@ -404,8 +404,8 @@ func (db *DB) AdversarialResolveOperationIDInsertRace(in journal.OperationInput)
 		return journal.CommittedResult{}, err
 	}
 	callerMutationDigest := append([]byte(nil), in.MutationDigest...)
-	in.MutationDigest = prepared.Digest
-	in.Effects = prepared.Effects
+	in.MutationDigest = prepared.DerivedDigest()
+	in.Effects = prepared.NormalizedEffects()
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	return db.resolveOperationIDInsertRaceLocked(in, callerMutationDigest)

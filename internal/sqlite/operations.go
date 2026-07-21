@@ -70,8 +70,20 @@ func (db *DB) ensureOperationsSchema() error {
 			command_digest       BLOB NOT NULL,
 			mutation_digest      BLOB NOT NULL,
 			mutation_encoding_version TEXT,
-			canonical_mutation   BLOB
+			canonical_mutation   BLOB,
+			CHECK ((mutation_encoding_version IS NULL AND canonical_mutation IS NULL) OR
+			       (mutation_encoding_version = 'provenance.mutation.v1' AND length(canonical_mutation) > 0))
 		) STRICT`,
+		`CREATE TRIGGER IF NOT EXISTS journal_operations_canonical_insert
+		 BEFORE INSERT ON journal_operations
+		 WHEN NOT ((NEW.mutation_encoding_version IS NULL AND NEW.canonical_mutation IS NULL) OR
+		           (NEW.mutation_encoding_version = 'provenance.mutation.v1' AND length(NEW.canonical_mutation) > 0))
+		 BEGIN SELECT RAISE(ABORT, 'invalid canonical mutation version/bytes pair'); END`,
+		`CREATE TRIGGER IF NOT EXISTS journal_operations_canonical_update
+		 BEFORE UPDATE OF mutation_encoding_version, canonical_mutation ON journal_operations
+		 WHEN NOT ((NEW.mutation_encoding_version IS NULL AND NEW.canonical_mutation IS NULL) OR
+		           (NEW.mutation_encoding_version = 'provenance.mutation.v1' AND length(NEW.canonical_mutation) > 0))
+		 BEGIN SELECT RAISE(ABORT, 'invalid canonical mutation version/bytes pair'); END`,
 		// Slot-keyed committed-result mapping (§3.2). rule-9 own-operation
 		// integrity is reducer-enforced (the two FKs alone cannot express it).
 		`CREATE TABLE IF NOT EXISTS journal_operation_result_slots (
@@ -180,6 +192,48 @@ func (db *DB) ensureCanonicalMutationColumns() error {
 				return fmt.Errorf("ensure canonical mutation schema: add %s: %w", column.name, err)
 			}
 		}
+	}
+	return nil
+}
+
+func (db *DB) preflightCanonicalColumnsReadOnly() error {
+	columns, err := db.tableColumnsLocked("journal_operations")
+	if err != nil {
+		return err
+	}
+	_, hasVersion := columns["mutation_encoding_version"]
+	_, hasBytes := columns["canonical_mutation"]
+	if hasVersion != hasBytes {
+		return fmt.Errorf("journal_operations has only one canonical encoding column; restore both columns or neither for a genuine legacy schema")
+	}
+	if !hasVersion {
+		return nil
+	}
+	malformed := ""
+	if err := sqlitex.Execute(db.conn, `SELECT operation_id FROM journal_operations WHERE (mutation_encoding_version IS NULL) != (canonical_mutation IS NULL) OR (mutation_encoding_version IS NOT NULL AND (mutation_encoding_version != ?1 OR length(canonical_mutation)=0)) LIMIT 1`, &sqlitex.ExecOptions{Args: []any{journal.MutationEncodingV1}, ResultFunc: func(stmt *zs.Stmt) error { malformed = stmt.ColumnText(0); return nil }}); err != nil {
+		return err
+	}
+	if malformed != "" {
+		return fmt.Errorf("operation %q has malformed canonical version/bytes NULL pairing or unsupported version; startup stopped before schema writes", malformed)
+	}
+	oversized := ""
+	if err := sqlitex.Execute(db.conn, `SELECT operation_id FROM journal_operations WHERE canonical_mutation IS NOT NULL AND length(canonical_mutation)>?1 LIMIT 1`, &sqlitex.ExecOptions{Args: []any{journal.MaxCanonicalMutationBytes}, ResultFunc: func(stmt *zs.Stmt) error {
+		oversized = stmt.ColumnText(0)
+		return nil
+	}}); err != nil {
+		return err
+	}
+	if oversized != "" {
+		return fmt.Errorf("operation %q canonical mutation exceeds %d bytes; startup stopped before allocating or writing schema", oversized, journal.MaxCanonicalMutationBytes)
+	}
+	if err := sqlitex.Execute(db.conn, `SELECT operation_id,canonical_mutation FROM journal_operations WHERE canonical_mutation IS NOT NULL`, &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
+		opID := stmt.ColumnText(0)
+		if _, err := journal.DecodeCanonicalMutation(readBlob(stmt, 1)); err != nil {
+			return fmt.Errorf("operation %q canonical mutation is malformed; startup stopped before schema writes: %w", opID, err)
+		}
+		return nil
+	}}); err != nil {
+		return err
 	}
 	return nil
 }
@@ -329,8 +383,8 @@ func (db *DB) Apply(in journal.OperationInput) (journal.CommittedResult, error) 
 	}
 	// Canonical bytes, not a caller assertion, define mutation identity. Execute the
 	// decoded normalized effects so identity and behavior cannot drift.
-	in.Effects = prepared.Effects
-	in.MutationDigest = prepared.Digest
+	in.Effects = prepared.NormalizedEffects()
+	in.MutationDigest = prepared.DerivedDigest()
 	if err := validateApplyInput(in); err != nil {
 		return journal.CommittedResult{}, err
 	}
@@ -387,8 +441,8 @@ func (db *DB) applyLocked(in journal.OperationInput, faultHook func(effectIndex 
 	if err != nil {
 		return journal.CommittedResult{}, fmt.Errorf("Apply: prepare canonical mutation before any write: %w", err)
 	}
-	in.Effects = prepared.Effects
-	in.MutationDigest = prepared.Digest
+	in.Effects = prepared.NormalizedEffects()
+	in.MutationDigest = prepared.DerivedDigest()
 	return db.applyPreparedLocked(in, prepared, callerMutationDigest, faultHook)
 }
 
@@ -894,6 +948,12 @@ func (db *DB) foldAssignmentEndLocked(in journal.OperationInput, jid int64, eff 
 	}
 	task, err := db.episodeTaskLocked(eff.AssignmentID)
 	if err != nil {
+		return err
+	}
+	if eff.TaskID.Namespace != "" && eff.TaskID != task {
+		return fmt.Errorf("%w: assignment end %q names task %q but the episode belongs to %q — where: assignment-end fold; impact: nothing committed; fix: use the episode's task", journal.ErrAssignmentLifecycle, eff.AssignmentID, eff.TaskID, task)
+	}
+	if _, err := slotDBID(eff.SlotID); err != nil {
 		return err
 	}
 	if err := db.requireAuthorityGovernsLocked(in, jid, task); err != nil {

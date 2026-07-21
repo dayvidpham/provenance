@@ -112,6 +112,7 @@ type applyConfig struct {
 	commandDigest  []byte
 	mutationDigest []byte
 	forced         bool
+	pinned         bool
 }
 
 // WithForce marks a lifecycle transition verb (Start/Stop/CloseTask/Reopen) as a
@@ -130,7 +131,7 @@ func WithForce() ApplyOption {
 // same-identity replay short-circuits to the original result (§9.4); a reused id with
 // different arguments is a typed conflict (§11). See the package retry caveat.
 func WithOperationID(id OperationID) ApplyOption {
-	return func(c *applyConfig) { c.opID = id }
+	return func(c *applyConfig) { c.opID = id; c.pinned = true }
 }
 
 // WithCommandDigest overrides the operation's command digest (§3.1). By default the
@@ -242,15 +243,10 @@ func (s *Session) Create(namespace, title, description string, taskType TaskType
 	cfg := s.resolve(opts, "create", namespace, title, description,
 		fmt.Sprintf("%d/%d/%d", int(taskType), int(priority), int(phase)))
 	id := TaskID{Namespace: namespace, UUID: uuid.Must(uuid.NewV7())}
-	// A pinned Create retry must present the original allocated task identity as an
-	// actual canonical effect. Recover it from the committed result before preparing
-	// the mutation; changed arguments still conflict through CommandDigest.
-	if prior, err := s.tr.db.LookupCommitted(cfg.opID); err != nil {
-		return Task{}, fmt.Errorf("provenance.Session.Create: lookup pinned retry %q: %w", cfg.opID, err)
-	} else if prior.Kind == CommittedExact {
-		if committedID, ok := taskSlotID(prior, "task"); ok {
-			id = committedID
-		}
+	if cfg.pinned {
+		// The allocated result is a pure function of the logical pinned request, so
+		// concurrent callers prepare identical effects without a check-then-act race.
+		id.UUID = uuid.NewSHA1(uuid.NameSpaceURL, []byte("provenance.task.v1\x00"+namespace+"\x00"+string(cfg.opID)))
 	}
 	res, err := s.applyOne(cfg, []Effect{{
 		Sort:        EffectTaskCreate,

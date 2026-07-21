@@ -50,6 +50,7 @@ type (
 	CommittedResult         = journal.CommittedResult
 	OperationConflict       = journal.OperationConflict
 	CanonicalMutation       = journal.CanonicalMutation
+	CanonicalMutationError  = journal.CanonicalMutationError
 
 	// Shared-reducer replay, migration, and preflight surface (§9, §13, §15).
 	TaskStatus                    = journal.TaskStatus
@@ -81,8 +82,12 @@ const (
 	EventContextKindActor    = journal.EventContextKindActor
 	EventContextKindGit      = journal.EventContextKindGit
 
-	OrdinalV1CodecName = journal.OrdinalV1CodecName
-	MutationEncodingV1 = journal.MutationEncodingV1
+	OrdinalV1CodecName            = journal.OrdinalV1CodecName
+	MutationEncodingV1            = journal.MutationEncodingV1
+	MaxCanonicalEffects           = journal.MaxCanonicalEffects
+	MaxCanonicalContextsPerEffect = journal.MaxCanonicalContextsPerEffect
+	MaxCanonicalFieldBytes        = journal.MaxCanonicalFieldBytes
+	MaxCanonicalMutationBytes     = journal.MaxCanonicalMutationBytes
 
 	// Authority-kind and assignment-lifecycle closed enums (§4).
 	AuthorityKindBootstrap  = journal.AuthorityKindBootstrap
@@ -208,6 +213,7 @@ var (
 	ErrMigrationFault              = journal.ErrMigrationFault
 	ErrInjectedFault               = journal.ErrInjectedFault
 	ErrDishonestMigrationTimestamp = journal.ErrDishonestMigrationTimestamp
+	ErrCanonicalMutation           = journal.ErrCanonicalMutation
 )
 
 // JournalAPI is the ordered global-journal surface: commit operations (§9), query

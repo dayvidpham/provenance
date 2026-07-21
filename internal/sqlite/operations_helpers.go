@@ -49,7 +49,7 @@ func (db *DB) insertOperationRowLocked(anchor int64, in journal.OperationInput, 
 		`INSERT INTO journal_operations
 		 (journal_id, operation_id, authority_journal_id, command_digest, mutation_digest, mutation_encoding_version, canonical_mutation)
 		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
-		&sqlitex.ExecOptions{Args: []any{anchor, string(in.OperationID), authArg, in.CommandDigest, prepared.Digest, prepared.Version, prepared.Bytes}}); err != nil {
+		&sqlitex.ExecOptions{Args: []any{anchor, string(in.OperationID), authArg, in.CommandDigest, prepared.DerivedDigest(), prepared.EncodingVersion(), prepared.CanonicalBytes()}}); err != nil {
 		return fmt.Errorf("insert journal_operations for %q: %w", in.OperationID, err)
 	}
 	return nil
@@ -739,7 +739,7 @@ func (db *DB) committedOutcomeForExistingLocked(in journal.OperationInput, exist
 		if err != nil {
 			return journal.CommittedResult{}, err
 		}
-		if existing.encodingVersion != prepared.Version || !bytes.Equal(existing.canonicalMutation, prepared.Bytes) {
+		if existing.encodingVersion != prepared.EncodingVersion() || !bytes.Equal(existing.canonicalMutation, prepared.CanonicalBytes()) {
 			conflict := &journal.OperationConflict{OperationID: in.OperationID, Field: "canonical effects"}
 			return journal.CommittedResult{Kind: journal.CommittedConflict, Conflict: conflict},
 				fmt.Errorf("%w: %w", journal.ErrOperationConflict, conflict)
