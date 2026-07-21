@@ -2,10 +2,10 @@ package provenance
 
 // tracker.go contains the sqliteTracker implementation of the Tracker interface.
 //
-// Architecture: Types live in pkg/ptypes. As of v0.0.x post-FIX-V2-4, pkg/ptypes
-// imports bestiary for Provider.IsValid() catalog validation. No cyclic import risk:
-// bestiary does not import provenance or pkg/ptypes. The SQL persistence layer lives
-// in internal/sqlite. The graph store adapter lives in internal/graph. Graph traversal
+// Architecture: Types live in pkg/ptypes, which imports bestiary for
+// Provider.IsValid() catalog validation. No cyclic import exists because bestiary
+// imports neither provenance nor pkg/ptypes. SQL persistence lives in
+// internal/sqlite. The graph store adapter lives in internal/graph. Graph traversal
 // helpers live in internal/helpers. This root package imports all of them and wires
 // them together.
 
@@ -101,7 +101,7 @@ func (t *sqliteTracker) List(filter ListFilter) ([]Task, error) {
 // Edge MUTATIONS (AddEdge/RemoveEdge) are journaled and live on the Session SDK
 // (Tracker.As → Session.AddEdge/RemoveEdge): each commits one typed edge mutation-family
 // effect through Apply, and the shared reducer folds it into the edges projection the
-// graph store reads (§6, as amended by #5). Cycle detection for blocked_by edges is
+// graph store reads (§6). Cycle detection for blocked_by edges is
 // enforced in the reducer fold. There is no direct-write edge-mutation path on the
 // Tracker; the Edges read stays on the Tracker interface, backed by the same projection.
 
@@ -155,7 +155,7 @@ func (t *sqliteTracker) Descendants(id TaskID) ([]Task, error) {
 //
 // Label MUTATIONS (AddLabel/RemoveLabel) are journaled on the Session SDK (Tracker.As);
 // each commits one label mutation-family effect and the shared reducer folds it into the
-// labels projection (§6, as amended by #5). Labels reads stay on the Tracker interface.
+// labels projection (§6). Labels reads stay on the Tracker interface.
 
 func (t *sqliteTracker) Labels(id TaskID) ([]string, error) {
 	labels, err := t.db.GetLabels(id)
@@ -171,7 +171,7 @@ func (t *sqliteTracker) Labels(id TaskID) ([]string, error) {
 //
 // Comment MUTATION (AddComment) is journaled on the Session SDK (Tracker.As); it commits
 // one comment mutation-family effect and the shared reducer folds it into the comments
-// projection (§6, as amended by #5). Comments reads stay on the Tracker interface.
+// projection (§6). Comments reads stay on the Tracker interface.
 
 func (t *sqliteTracker) Comments(id TaskID) ([]Comment, error) {
 	comments, err := t.db.GetComments(id)

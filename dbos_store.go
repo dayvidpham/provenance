@@ -472,7 +472,7 @@ func AsStoreUnavailable(err error) (*StoreUnavailableError, bool) {
 }
 
 // ---------------------------------------------------------------------------
-// Shared-WAL transient-lock retry (borrowed-store write layer)
+// Shared-WAL transient-lock retry for borrowed-store writes.
 // ---------------------------------------------------------------------------
 
 // retryOnTransientLock runs a borrowed-store write, retrying ONLY a transient
@@ -480,7 +480,7 @@ func AsStoreUnavailable(err error) (*StoreUnavailableError, bool) {
 // borrowed bridge connection and the DBOS system connection share one WAL file, any
 // domain write can momentarily lose SQLite's single-writer lock while DBOS's own
 // background writers (queue runner, checkpointer) hold it; busy_timeout plus this
-// Go-level retry absorb it. This lives in the borrowed-store layer so EVERY public
+// Go-level retry absorb it. This lives at the borrowed-store boundary so every public
 // write surface on a borrowed tracker — the journal Apply, the gated Session's verbs,
 // and the direct agent/activity/registration writes — gets the same protection, not
 // just the one path the DBOS adapter step happens to drive.

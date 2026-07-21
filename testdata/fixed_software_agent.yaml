@@ -13,3 +13,9 @@ rollbackCases:
   - {name: base-agent-insert-fails, boundary: agent}
   - {name: software-agent-insert-fails, boundary: software}
   - {name: manifest-insert-fails, boundary: manifest}
+
+actionableErrorCases:
+  - {name: validation, mode: validation, wantError: invalid-id, wantWhere: FixedSoftwareAgentRegistration.Validate, wantWhen: before the activation transaction}
+  - {name: preflight, mode: preflight, wantError: agent-exists, wantWhere: actor preflight, wantWhen: before activation writes}
+  - {name: write, mode: write, wantError: "", wantWhere: namespace write, wantWhen: during the activation transaction}
+  - {name: transaction, mode: transaction, wantError: "", wantWhere: transaction setup, wantWhen: before preflight reads or writes}

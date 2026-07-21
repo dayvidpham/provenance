@@ -5,31 +5,31 @@ import (
 	"strings"
 )
 
-// Slice is the closed set of implementation leaves a corpus operator can belong
-// to. It is the executable-scope partition consumed by the corpus harness so
-// out-of-scope histories become recorded obligations rather than skipped tests.
-type Slice string
+// BehaviorArea is the stable behavior family a corpus operator exercises.
+// The corpus harness uses these areas to verify that every operator has exactly
+// one production handler.
+type BehaviorArea string
 
 const (
-	SliceS11 Slice = "s1.1" // journal base + task_event subtype + projections + actor namespace
-	SliceS12 Slice = "s1.2" // operations, effects, results, authority lifecycle
-	SliceS13 Slice = "s1.3" // shared reducer, replay, migration
+	AreaJournalFoundation    BehaviorArea = "journal-foundation"
+	AreaOperationLifecycle   BehaviorArea = "operation-lifecycle"
+	AreaRecoveryAndMigration BehaviorArea = "recovery-and-migration"
 )
 
-// IsValid reports whether s is a known slice.
-func (s Slice) IsValid() bool {
-	switch s {
-	case SliceS11, SliceS12, SliceS13:
+// IsValid reports whether a is a known behavior area.
+func (a BehaviorArea) IsValid() bool {
+	switch a {
+	case AreaJournalFoundation, AreaOperationLifecycle, AreaRecoveryAndMigration:
 		return true
 	default:
 		return false
 	}
 }
 
-// ScopeEntry assigns one operator to the slice that makes it executable.
+// ScopeEntry assigns one operator to its behavior area.
 type ScopeEntry struct {
 	Operator OperatorName `yaml:"operator"`
-	Slice    Slice        `yaml:"slice"`
+	Area     BehaviorArea `yaml:"area"`
 	Reason   string       `yaml:"reason,omitempty"`
 }
 
@@ -53,8 +53,8 @@ func (t ScopeTable) Validate() error {
 		if strings.TrimSpace(string(e.Operator)) == "" {
 			return fmt.Errorf("scope entry %d: operator is required", i)
 		}
-		if !e.Slice.IsValid() {
-			return fmt.Errorf("scope entry %q: slice %q is not one of s1.1/s1.2/s1.3", e.Operator, e.Slice)
+		if !e.Area.IsValid() {
+			return fmt.Errorf("scope entry %q: behavior area %q is not registered", e.Operator, e.Area)
 		}
 		if _, dup := seen[e.Operator]; dup {
 			return fmt.Errorf("scope entry %d duplicates operator %q", i, e.Operator)
@@ -64,21 +64,21 @@ func (t ScopeTable) Validate() error {
 	return nil
 }
 
-// SliceOf returns the slice an operator is partitioned to.
-func (t ScopeTable) SliceOf(op OperatorName) (Slice, bool) {
+// AreaOf returns the behavior area an operator is partitioned to.
+func (t ScopeTable) AreaOf(op OperatorName) (BehaviorArea, bool) {
 	for _, e := range t.Entries {
 		if e.Operator == op {
-			return e.Slice, true
+			return e.Area, true
 		}
 	}
 	return "", false
 }
 
-// Operators returns every operator partitioned to a given slice, in table order.
-func (t ScopeTable) Operators(slice Slice) []OperatorName {
+// Operators returns every operator in a behavior area, in table order.
+func (t ScopeTable) Operators(area BehaviorArea) []OperatorName {
 	var out []OperatorName
 	for _, e := range t.Entries {
-		if e.Slice == slice {
+		if e.Area == area {
 			out = append(out, e.Operator)
 		}
 	}
@@ -92,7 +92,7 @@ func (t ScopeTable) Operators(slice Slice) []OperatorName {
 // for a deleted operator, both fail.
 func (t ScopeTable) CheckPartition(used map[OperatorName]struct{}) error {
 	for op := range used {
-		if _, ok := t.SliceOf(op); !ok {
+		if _, ok := t.AreaOf(op); !ok {
 			return fmt.Errorf("corpus operator %q has no scope-table entry — add it to testdata/contract/scope.yaml", op)
 		}
 	}

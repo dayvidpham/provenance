@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -57,10 +58,9 @@ func seedActorAndTask(t *testing.T, db *DB) (journal.ActorID, journal.TaskID) {
 }
 
 // genesisBoot applies one genesis operation establishing the pasture-system bootstrap
-// authority — which governs every task (§14.1) — and returns its produced JournalID. In
-// #5 the operations-layer producer CHECK forbids bare (NULL-producer) task events, so
-// the query/ordering tests emit their events through operations under this authority
-// (the operation-anchored append), never the retired #4 AppendTaskEvent primitive. The
+// authority — which governs every task (§14.1) — and returns its produced JournalID.
+// The producer constraint forbids bare (NULL-producer) task events, so query and
+// ordering tests emit events through operations under this authority. The
 // genesis consumes two journal rows: the operation anchor (journal_id 1) and the
 // bootstrap authority it produces (journal_id 2, the returned value).
 func genesisBoot(t *testing.T, db *DB, actor journal.ActorID) journal.JournalID {
@@ -565,7 +565,7 @@ func TestVerifyIntegrityRejectsBareJournalRow(t *testing.T) {
 	db := newJournalDB(t)
 	actor, _ := seedActorAndTask(t, db)
 	// A bare decision row (kind with a subtype table, but no subtype row) violates
-	// subtype totality. It uses a non-task-event kind because the operations-layer
+	// subtype totality. It uses a non-task-event kind because the producer
 	// producer CHECK now forbids a NULL-producer task_event outright at insert time.
 	if _, err := db.AppendBareJournalRow(journal.JournalKindDecision, actor, time.Now()); err != nil {
 		t.Fatal(err)
@@ -847,6 +847,28 @@ func TestRegisterFixedSoftwareAgentRejectsOutOfRange(t *testing.T) {
 		Entry: journal.FixedActorEntry{ActorID: outOfRange, Namespace: outOfRange.Namespace, ActorKind: ptypes.AgentKindSoftware, Name: "x"}}
 	if _, err := db.RegisterFixedSoftwareAgent(reg); !errors.Is(err, journal.ErrEntryOutOfRange) {
 		t.Errorf("out-of-range ID: got %v, want ErrEntryOutOfRange", err)
+	}
+}
+
+func TestFixedAgentActivationCommitErrorIsActionable(t *testing.T) {
+	cause := ptypes.ErrAgentAlreadyExists
+	err := fixedAgentActivationError(cause,
+		"the activation transaction could not commit",
+		"SQLite rejected COMMIT",
+		"DB.RegisterFixedSoftwareAgent transaction finalization",
+		"after all activation writes completed",
+		"no agent is returned and the transaction was rolled back",
+		"retry the complete activation after verifying database health")
+	if !errors.Is(err, cause) {
+		t.Fatalf("commit error lost typed identity: %v", err)
+	}
+	for _, marker := range []string{
+		"fixed software agent activation failed:", "why:", "where:", "transaction finalization",
+		"when:", "after all activation writes completed", "impact:", "fix:",
+	} {
+		if !strings.Contains(err.Error(), marker) {
+			t.Errorf("commit error %q is missing %q", err, marker)
+		}
 	}
 }
 

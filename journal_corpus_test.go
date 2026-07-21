@@ -1,10 +1,8 @@
 package provenance
 
-// journal_corpus_test.go ports the salvage corpus harness onto the relational
-// contract and executes the S1.1-scoped adversarial histories against real
-// journal-base production code. Every contract operator that is not yet
-// implementable is a recorded s1.2/s1.3 obligation in testdata/contract/scope.yaml
-// — checked by the harness, never a skipped or disabled test.
+// journal_corpus_test.go executes the relational contract's adversarial
+// histories against production code. The checked behavior-area partition keeps
+// every corpus operator paired with exactly one handler.
 
 import (
 	"encoding/hex"
@@ -23,7 +21,7 @@ import (
 )
 
 // contractCorpusFiles is the explicit set of adversarial proof-corpus files
-// (scope.yaml is the partition table, not a corpus, and is excluded).
+// (scope.yaml is the behavior-area table, not a corpus, and is excluded).
 var contractCorpusFiles = []string{
 	"ordering.yaml",
 	"zero_event_operations.yaml",
@@ -78,10 +76,9 @@ func loadContractCorpus(t *testing.T, file string) testcorpus.Corpus[anyMap, any
 }
 
 // TestContractCorpusPartitionIsComplete proves the scope table exactly covers
-// every operator the corpus uses (both directions), and that the executable
-// S1.1 partition equals the registered S1.1 operator set — so a new corpus
-// operator, a stale scope entry, or an executable operator missing its handler
-// all fail loudly rather than silently skipping a history.
+// every operator the corpus uses (both directions), and that every behavior
+// area equals its registered operator set. New operators, stale entries, and
+// missing handlers therefore fail loudly instead of skipping a history.
 func TestContractCorpusPartitionIsComplete(t *testing.T) {
 	scope := loadScope(t)
 
@@ -101,103 +98,94 @@ func TestContractCorpusPartitionIsComplete(t *testing.T) {
 		t.Fatalf("scope partition: %v", err)
 	}
 
-	// The registered executable operators must be exactly the s1.1 partition.
-	registered := make([]testcorpus.OperatorName, 0, len(s11Operators))
-	for name := range s11Operators {
+	registered := make([]testcorpus.OperatorName, 0, len(journalFoundationOperators))
+	for name := range journalFoundationOperators {
 		registered = append(registered, name)
 	}
-	if err := testcorpus.CheckClosedSet(scope.Operators(testcorpus.SliceS11), registered); err != nil {
-		t.Fatalf("executable s1.1 registry does not match the s1.1 scope partition: %v", err)
+	if err := testcorpus.CheckClosedSet(scope.Operators(testcorpus.AreaJournalFoundation), registered); err != nil {
+		t.Fatalf("journal-foundation registry does not match its scope partition: %v", err)
 	}
 
-	// The S1.2 operations layer is now executable too: its registry must equal
-	// the s1.2 partition exactly (a new corpus operator or a stale handler fails).
-	registered12 := make([]testcorpus.OperatorName, 0, len(s12Operators))
-	for name := range s12Operators {
-		registered12 = append(registered12, name)
+	registeredOperations := make([]testcorpus.OperatorName, 0, len(operationLifecycleOperators))
+	for name := range operationLifecycleOperators {
+		registeredOperations = append(registeredOperations, name)
 	}
-	if err := testcorpus.CheckClosedSet(scope.Operators(testcorpus.SliceS12), registered12); err != nil {
-		t.Fatalf("executable s1.2 registry does not match the s1.2 scope partition: %v", err)
+	if err := testcorpus.CheckClosedSet(scope.Operators(testcorpus.AreaOperationLifecycle), registeredOperations); err != nil {
+		t.Fatalf("operation-lifecycle registry does not match its scope partition: %v", err)
 	}
 
-	// The S1.3 shared-reducer/replay/migration layer is now executable too: its
-	// registry must equal the s1.3 partition exactly (a new corpus operator or a
-	// stale handler fails).
-	registered13 := make([]testcorpus.OperatorName, 0, len(s13Operators))
-	for name := range s13Operators {
-		registered13 = append(registered13, name)
+	registeredRecovery := make([]testcorpus.OperatorName, 0, len(recoveryAndMigrationOperators))
+	for name := range recoveryAndMigrationOperators {
+		registeredRecovery = append(registeredRecovery, name)
 	}
-	if err := testcorpus.CheckClosedSet(scope.Operators(testcorpus.SliceS13), registered13); err != nil {
-		t.Fatalf("executable s1.3 registry does not match the s1.3 scope partition: %v", err)
+	if err := testcorpus.CheckClosedSet(scope.Operators(testcorpus.AreaRecoveryAndMigration), registeredRecovery); err != nil {
+		t.Fatalf("recovery-and-migration registry does not match its scope partition: %v", err)
 	}
 
-	t.Logf("contract corpus: %d cases across %d files; s1.1 executable=%d s1.2 executable=%d s1.3 executable=%d",
+	t.Logf("contract corpus: %d cases across %d files; journal=%d operations=%d recovery=%d",
 		total, len(contractCorpusFiles),
-		len(scope.Operators(testcorpus.SliceS11)),
-		len(scope.Operators(testcorpus.SliceS12)),
-		len(scope.Operators(testcorpus.SliceS13)))
+		len(scope.Operators(testcorpus.AreaJournalFoundation)),
+		len(scope.Operators(testcorpus.AreaOperationLifecycle)),
+		len(scope.Operators(testcorpus.AreaRecoveryAndMigration)))
 }
 
-// TestContractCorpusExecutesImplementedPartitions executes every S1.1- and
-// S1.2-scoped case against real production code and asserts each remaining s1.3
-// case is a recorded, not-yet-executable obligation (no handler registered for
-// it). The S1.2 operations layer moves from recorded obligation to executed here.
+// TestContractCorpusExecutesImplementedPartitions executes every behavior area
+// against real production code.
 func TestContractCorpusExecutesImplementedPartitions(t *testing.T) {
 	scope := loadScope(t)
 
-	executed11 := 0
-	executed12 := 0
-	executed13 := 0
+	executedJournal := 0
+	executedOperations := 0
+	executedRecovery := 0
 	for _, file := range contractCorpusFiles {
 		corpus := loadContractCorpus(t, file)
 		for _, c := range corpus.Cases {
-			slice, ok := scope.SliceOf(c.Mutation.Operator)
+			area, ok := scope.AreaOf(c.Mutation.Operator)
 			if !ok {
 				t.Fatalf("%s/%s: operator %q missing from scope table", file, c.Name, c.Mutation.Operator)
 			}
-			var registry map[testcorpus.OperatorName]s11Handler
-			switch slice {
-			case testcorpus.SliceS11:
-				registry = s11Operators
-			case testcorpus.SliceS12:
-				registry = s12Operators
-			case testcorpus.SliceS13:
-				registry = s13Operators
+			var registry map[testcorpus.OperatorName]corpusHandler
+			switch area {
+			case testcorpus.AreaJournalFoundation:
+				registry = journalFoundationOperators
+			case testcorpus.AreaOperationLifecycle:
+				registry = operationLifecycleOperators
+			case testcorpus.AreaRecoveryAndMigration:
+				registry = recoveryAndMigrationOperators
 			default:
-				t.Fatalf("%s/%s: operator %q has unknown slice %q", file, c.Name, c.Mutation.Operator, slice)
+				t.Fatalf("%s/%s: operator %q has unknown behavior area %q", file, c.Name, c.Mutation.Operator, area)
 			}
 			op, ok := registry[c.Mutation.Operator]
 			if !ok {
-				t.Fatalf("%s/%s: %s operator %q has no registered handler", file, c.Name, slice, c.Mutation.Operator)
+				t.Fatalf("%s/%s: %s operator %q has no registered handler", file, c.Name, area, c.Mutation.Operator)
 			}
 			t.Run(file+"/"+c.Name, func(t *testing.T) {
 				if err := op(t, c.Input, c.Expected, c.Classification); err != nil {
 					t.Fatalf("execute %q: %v", c.Mutation.Operator, err)
 				}
 			})
-			switch slice {
-			case testcorpus.SliceS11:
-				executed11++
-			case testcorpus.SliceS12:
-				executed12++
-			case testcorpus.SliceS13:
-				executed13++
+			switch area {
+			case testcorpus.AreaJournalFoundation:
+				executedJournal++
+			case testcorpus.AreaOperationLifecycle:
+				executedOperations++
+			case testcorpus.AreaRecoveryAndMigration:
+				executedRecovery++
 			}
 		}
 	}
-	if executed11 == 0 || executed12 == 0 || executed13 == 0 {
-		t.Fatalf("expected all partitions to execute; s1.1=%d s1.2=%d s1.3=%d — the harness would vacuously pass", executed11, executed12, executed13)
+	if executedJournal == 0 || executedOperations == 0 || executedRecovery == 0 {
+		t.Fatalf("expected all behavior areas to execute; journal=%d operations=%d recovery=%d", executedJournal, executedOperations, executedRecovery)
 	}
-	t.Logf("executed %d S1.1 + %d S1.2 + %d S1.3 cases against production code", executed11, executed12, executed13)
+	t.Logf("executed %d journal + %d operation + %d recovery cases against production code", executedJournal, executedOperations, executedRecovery)
 }
 
-// s11Handler drives one S1.1 case against production code. Returning nil means
+// corpusHandler drives one case against production code. Returning nil means
 // the case's classification (must-pass/must-fail) was honoured.
-type s11Handler func(t *testing.T, input, expected anyMap, class testcorpus.Classification) error
+type corpusHandler func(t *testing.T, input, expected anyMap, class testcorpus.Classification) error
 
-// s11Operators is the closed registry of executable S1.1 operators. Its key set
-// must equal the s1.1 partition of scope.yaml (asserted above).
-var s11Operators = map[testcorpus.OperatorName]s11Handler{
+// journalFoundationOperators is the closed registry for journal behavior.
+var journalFoundationOperators = map[testcorpus.OperatorName]corpusHandler{
 	"order-by-journalid":                   opOrderByJournalID,
 	"order-by-journalid-concurrent":        opOrderByJournalIDConcurrent,
 	"order-by-recordedat-timeline":         opOrderByRecordedAtTimeline,
@@ -229,7 +217,7 @@ func newJournalEnv(t *testing.T) *journalEnv {
 	if err != nil {
 		t.Fatalf("RegisterSoftwareAgent: %v", err)
 	}
-	// The base journal-query / #4-primitive operators need a real task row to append
+	// Journal-query operators need a real task row to append
 	// task-events onto (AppendTaskEvent projects onto an existing tasks row). Seed it
 	// as a pre-journal (legacy-shape) row via the raw seeding seam rather than through
 	// a journaled creation, so the shared env.task carries no creation operation that
@@ -251,9 +239,8 @@ func newCorpusTaskID() TaskID {
 
 // genesisBoot establishes the shared genesis bootstrap authority (which governs every
 // task, §14.1) and returns its produced JournalID, so the ordering operators can emit
-// operation-anchored task events on the base task. The #5 operations-layer producer
-// CHECK forbids the retired bare AppendTaskEvent (a NULL-producer task event), so every
-// task event flows through an operation.
+// operation-anchored task events on the base task. The producer constraint
+// forbids a NULL-producer task event, so every task event flows through an operation.
 func (e *journalEnv) genesisBoot(t *testing.T) JournalID {
 	t.Helper()
 	res, err := e.tr.Journal().Apply(OperationInput{
@@ -670,8 +657,8 @@ func opWriteJournalRowMissingSubtype(t *testing.T, input, expected anyMap, _ tes
 		return fmt.Errorf("expected *sqliteTracker, got %T", env.tr)
 	}
 	// A bare decision row (a kind with a subtype table but no subtype row) drives the
-	// totality violation; a task-event kind is no longer usable here because the #5
-	// operations-layer producer CHECK forbids a NULL-producer task event at insert time.
+	// totality violation; a task-event kind is no longer usable here because the
+	// producer constraint forbids a NULL-producer task event at insert time.
 	if _, err := st.db.AppendBareJournalRow(JournalKindDecision, env.actor, time.Now()); err != nil {
 		return fmt.Errorf("append bare journal row: %w", err)
 	}

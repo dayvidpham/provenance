@@ -16,7 +16,13 @@ import (
 // including an actor that predates its claim, fails before the first write.
 func (db *DB) RegisterFixedSoftwareAgent(reg journal.FixedSoftwareAgentRegistration) (agent ptypes.SoftwareAgent, err error) {
 	if err := reg.Validate(); err != nil {
-		return ptypes.SoftwareAgent{}, fmt.Errorf("RegisterFixedSoftwareAgent validation: %w", err)
+		return ptypes.SoftwareAgent{}, fixedAgentActivationError(err,
+			"registration validation rejected the requested identity",
+			"one or more claim, actor, manifest, or range invariants are invalid",
+			"FixedSoftwareAgentRegistration.Validate",
+			"before opening the activation transaction",
+			"no database rows were read or changed",
+			"correct the field named by the wrapped typed error and retry")
 	}
 	metadata := reg.Entry.Metadata
 	if metadata == "" {
@@ -31,23 +37,56 @@ func (db *DB) RegisterFixedSoftwareAgent(reg journal.FixedSoftwareAgentRegistrat
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if err = sqlitex.ExecuteTransient(db.conn, `BEGIN IMMEDIATE`, nil); err != nil {
-		return ptypes.SoftwareAgent{}, fmt.Errorf("RegisterFixedSoftwareAgent begin transaction: %w", err)
+		return ptypes.SoftwareAgent{}, fixedAgentActivationError(err,
+			"the activation transaction could not start",
+			"SQLite rejected BEGIN IMMEDIATE",
+			"DB.RegisterFixedSoftwareAgent transaction setup",
+			"before preflight reads or writes",
+			"no activation rows were changed",
+			"verify the database is open and writable, then retry")
 	}
 	defer func() {
 		if err != nil {
-			_ = sqlitex.ExecuteTransient(db.conn, `ROLLBACK`, nil)
+			if rollbackErr := sqlitex.ExecuteTransient(db.conn, `ROLLBACK`, nil); rollbackErr != nil {
+				err = fixedAgentActivationError(errors.Join(err, rollbackErr),
+					"the activation failed and its rollback also reported an error",
+					"SQLite rejected ROLLBACK after an earlier activation failure",
+					"DB.RegisterFixedSoftwareAgent transaction cleanup",
+					"while aborting the failed activation",
+					"the caller must treat the transaction outcome as unknown and no agent is returned",
+					"close and reopen the database, inspect all four activation tables, reconcile partial state, and retry")
+			}
 			return
 		}
 		if commitErr := sqlitex.ExecuteTransient(db.conn, `COMMIT`, nil); commitErr != nil {
-			_ = sqlitex.ExecuteTransient(db.conn, `ROLLBACK`, nil)
-			err = fmt.Errorf("RegisterFixedSoftwareAgent commit: %w", commitErr)
+			rollbackErr := sqlitex.ExecuteTransient(db.conn, `ROLLBACK`, nil)
+			cause := commitErr
+			impact := "no agent is returned; SQLite rejected the commit and the transaction was rolled back"
+			fix := "retry the complete activation; if it repeats, verify database health and available storage"
+			if rollbackErr != nil {
+				cause = errors.Join(commitErr, rollbackErr)
+				impact = "no agent is returned and the transaction outcome is unknown because rollback also failed"
+				fix = "close and reopen the database, inspect all four activation tables, reconcile partial state, and retry"
+			}
+			err = fixedAgentActivationError(cause,
+				"the activation transaction could not commit",
+				"SQLite rejected COMMIT",
+				"DB.RegisterFixedSoftwareAgent transaction finalization",
+				"after all activation writes completed",
+				impact, fix)
 			agent = ptypes.SoftwareAgent{}
 		}
 	}()
 
 	claims, err := db.loadNamespaceClaimsLocked()
 	if err != nil {
-		return ptypes.SoftwareAgent{}, err
+		return ptypes.SoftwareAgent{}, fixedAgentActivationError(err,
+			"existing namespace claims could not be loaded",
+			"the preflight query failed",
+			"DB.RegisterFixedSoftwareAgent namespace preflight",
+			"after the transaction began and before any writes",
+			"the activation is aborted and its transaction is rolled back",
+			"repair database access or schema integrity, then retry")
 	}
 	claimFound := false
 	for _, existing := range claims {
@@ -56,61 +95,122 @@ func (db *DB) RegisterFixedSoftwareAgent(reg journal.FixedSoftwareAgentRegistrat
 		}
 		claimFound = true
 		if !existing.Equal(reg.Claim) {
-			return ptypes.SoftwareAgent{}, fmt.Errorf(
-				"%w: namespace %q is already claimed differently; where: fixed software agent activation; when: preflight; impact: no rows changed; fix: use the exact stored claim or a distinct namespace",
-				journal.ErrNamespaceClaim, reg.Claim.Namespace)
+			return ptypes.SoftwareAgent{}, fixedAgentActivationError(journal.ErrNamespaceClaim,
+				fmt.Sprintf("namespace %q is already claimed differently", reg.Claim.Namespace),
+				"the stored claimant, range, or codec differs from the request",
+				"DB.RegisterFixedSoftwareAgent namespace preflight",
+				"before activation writes",
+				"the activation is rejected and no rows are changed",
+				"use the exact stored claim or choose a distinct namespace")
 		}
 	}
 	if err := journal.CheckNoOverlap(reg.Claim, claims); err != nil {
-		return ptypes.SoftwareAgent{}, err
+		return ptypes.SoftwareAgent{}, fixedAgentActivationError(err,
+			"the requested namespace range overlaps an existing claim",
+			"fixed actor ranges must remain disjoint",
+			"DB.RegisterFixedSoftwareAgent namespace preflight",
+			"before activation writes",
+			"the activation is rejected and no rows are changed",
+			"choose a disjoint range or reconcile the conflicting claim")
 	}
 
 	storedAgent, agentFound, err := db.fixedSoftwareAgentLocked(id)
 	if err != nil {
-		return ptypes.SoftwareAgent{}, err
+		return ptypes.SoftwareAgent{}, fixedAgentActivationError(err,
+			fmt.Sprintf("existing actor %q could not be validated", id.String()),
+			"the actor query failed or stored actor rows are inconsistent",
+			"DB.RegisterFixedSoftwareAgent actor preflight",
+			"before activation writes",
+			"the activation is rejected and no rows are changed",
+			"repair the actor and software-agent rows or database access, then retry")
 	}
 	if !claimFound && agentFound {
-		return ptypes.SoftwareAgent{}, fmt.Errorf(
-			"%w: actor %q exists before namespace %q is claimed; where: fixed software agent activation; when: preflight; impact: no claim is attached to ambiguous prior state; fix: reconcile or remove the pre-existing actor before activation",
-			ptypes.ErrAgentAlreadyExists, id.String(), reg.Claim.Namespace)
+		return ptypes.SoftwareAgent{}, fixedAgentActivationError(ptypes.ErrAgentAlreadyExists,
+			fmt.Sprintf("actor %q exists before namespace %q is claimed", id.String(), reg.Claim.Namespace),
+			"attaching a new claim to pre-existing actor state would be ambiguous",
+			"DB.RegisterFixedSoftwareAgent actor preflight",
+			"before activation writes",
+			"the activation is rejected and no claim is attached",
+			"reconcile or remove the pre-existing actor before activation")
 	}
 	if agentFound && storedAgent != agent {
-		return ptypes.SoftwareAgent{}, fmt.Errorf(
-			"%w: actor %q differs from the requested software identity; where: fixed software agent activation; when: preflight; impact: no rows changed; fix: retry with the exact stored name/version/source or choose a new actor ID",
-			ptypes.ErrAgentAlreadyExists, id.String())
+		return ptypes.SoftwareAgent{}, fixedAgentActivationError(ptypes.ErrAgentAlreadyExists,
+			fmt.Sprintf("actor %q differs from the requested software identity", id.String()),
+			"the stored name, version, or source differs from the request",
+			"DB.RegisterFixedSoftwareAgent actor preflight",
+			"before activation writes",
+			"the activation is rejected and no rows are changed",
+			"retry with the exact stored name, version, and source or choose a new actor ID")
 	}
 
 	entryFound, err := db.fixedActorEntryExactLocked(reg.Entry, metadata)
 	if err != nil {
-		return ptypes.SoftwareAgent{}, err
+		return ptypes.SoftwareAgent{}, fixedAgentActivationError(err,
+			fmt.Sprintf("manifest identity %q/%q could not be validated", reg.Entry.Namespace, reg.Entry.Name),
+			"the manifest query failed or an existing entry differs from the request",
+			"DB.RegisterFixedSoftwareAgent manifest preflight",
+			"before activation writes",
+			"the activation is rejected and no rows are changed",
+			"repair database access or use the exact stored manifest; otherwise choose an unallocated actor ID and name")
 	}
 
 	if !claimFound {
 		if err = sqlitex.Execute(db.conn,
 			`INSERT INTO actor_namespace_claims (namespace, claimant_id, range_min, range_max, codec) VALUES (?1, ?2, ?3, ?4, ?5)`,
 			&sqlitex.ExecOptions{Args: []any{reg.Claim.Namespace, reg.Claim.ClaimantID, reg.Claim.Range.Min[:], reg.Claim.Range.Max[:], reg.Claim.Codec}}); err != nil {
-			return ptypes.SoftwareAgent{}, fmt.Errorf("RegisterFixedSoftwareAgent insert namespace claim: %w", err)
+			return ptypes.SoftwareAgent{}, fixedAgentActivationError(err,
+				"the namespace claim could not be written",
+				"SQLite rejected the actor_namespace_claims insert",
+				"DB.RegisterFixedSoftwareAgent namespace write",
+				"during the activation transaction",
+				"the activation is aborted and all writes are rolled back",
+				"resolve the reported constraint, schema, storage, or lock error and retry the complete activation")
 		}
 	}
 	if !agentFound {
 		if err = sqlitex.Execute(db.conn, `INSERT INTO agents (id, kind_id) VALUES (?1, ?2)`,
 			&sqlitex.ExecOptions{Args: []any{id.String(), int(ptypes.AgentKindSoftware)}}); err != nil {
-			return ptypes.SoftwareAgent{}, fmt.Errorf("RegisterFixedSoftwareAgent insert agent: %w", err)
+			return ptypes.SoftwareAgent{}, fixedAgentActivationError(err,
+				"the base agent could not be written",
+				"SQLite rejected the agents insert",
+				"DB.RegisterFixedSoftwareAgent base-agent write",
+				"during the activation transaction",
+				"the activation is aborted and all writes are rolled back",
+				"resolve the reported constraint, schema, storage, or lock error and retry the complete activation")
 		}
 		if err = sqlitex.Execute(db.conn,
 			`INSERT INTO agents_software (agent_id, name, version, source) VALUES (?1, ?2, ?3, ?4)`,
 			&sqlitex.ExecOptions{Args: []any{id.String(), reg.AgentName, reg.Version, reg.Source}}); err != nil {
-			return ptypes.SoftwareAgent{}, fmt.Errorf("RegisterFixedSoftwareAgent insert software agent: %w", err)
+			return ptypes.SoftwareAgent{}, fixedAgentActivationError(err,
+				"the software-agent detail could not be written",
+				"SQLite rejected the agents_software insert",
+				"DB.RegisterFixedSoftwareAgent software-agent write",
+				"during the activation transaction",
+				"the activation is aborted and all writes are rolled back",
+				"resolve the reported constraint, schema, storage, or lock error and retry the complete activation")
 		}
 	}
 	if !entryFound {
 		if err = sqlitex.Execute(db.conn,
 			`INSERT INTO fixed_actor_manifest_entries (actor_id, namespace, kind_id, name, metadata) VALUES (?1, ?2, ?3, ?4, ?5)`,
 			&sqlitex.ExecOptions{Args: []any{id.String(), reg.Entry.Namespace, int(reg.Entry.ActorKind), reg.Entry.Name, metadata}}); err != nil {
-			return ptypes.SoftwareAgent{}, fmt.Errorf("RegisterFixedSoftwareAgent insert manifest entry: %w", err)
+			return ptypes.SoftwareAgent{}, fixedAgentActivationError(err,
+				"the fixed-actor manifest entry could not be written",
+				"SQLite rejected the fixed_actor_manifest_entries insert",
+				"DB.RegisterFixedSoftwareAgent manifest write",
+				"during the activation transaction",
+				"the activation is aborted and all writes are rolled back",
+				"resolve the reported constraint, schema, storage, or lock error and retry the complete activation")
 		}
 	}
 	return agent, nil
+}
+
+func fixedAgentActivationError(cause error, what, why, where, when, impact, fix string) error {
+	return fmt.Errorf(
+		"fixed software agent activation failed: %s; why: %s; where: %s; when: %s; impact: %s; fix: %s: %w",
+		what, why, where, when, impact, fix, cause,
+	)
 }
 
 func (db *DB) fixedSoftwareAgentLocked(id ptypes.AgentID) (ptypes.SoftwareAgent, bool, error) {
@@ -140,7 +240,7 @@ func (db *DB) fixedActorEntryExactLocked(entry journal.FixedActorEntry, metadata
 			found = true
 			if stmt.ColumnText(0) != entry.ActorID.String() || stmt.ColumnText(1) != entry.Namespace ||
 				ptypes.AgentKind(stmt.ColumnInt(2)) != entry.ActorKind || stmt.ColumnText(3) != entry.Name || stmt.ColumnText(4) != metadata {
-				return fmt.Errorf("%w: manifest identity %q/%q conflicts with an existing entry; where: fixed software agent activation; when: preflight; impact: no rows changed; fix: use the exact stored manifest or choose an unallocated actor ID and name",
+				return fmt.Errorf("%w: manifest identity %q/%q conflicts with an existing entry",
 					journal.ErrNamespaceClaim, entry.Namespace, entry.Name)
 			}
 			return nil

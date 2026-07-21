@@ -198,34 +198,59 @@ type FixedSoftwareAgentRegistration struct {
 // starts. Empty metadata is normalized to an empty JSON object by persistence.
 func (r FixedSoftwareAgentRegistration) Validate() error {
 	if err := r.Claim.Validate(); err != nil {
-		return err
+		return fixedAgentValidationError(err,
+			"the namespace claim is malformed",
+			"correct the claim field named by the wrapped typed error")
 	}
 	if r.Entry.ActorID.Namespace == "" {
-		return fmt.Errorf("%w: fixed software actor ID requires a namespace", ptypes.ErrInvalidID)
+		return fixedAgentValidationError(ptypes.ErrInvalidID,
+			"the fixed software actor ID has no namespace",
+			"set Entry.ActorID.Namespace to the claimed namespace")
 	}
 	if r.Entry.Namespace != r.Claim.Namespace || r.Entry.ActorID.Namespace != r.Claim.Namespace {
-		return fmt.Errorf("%w: claim namespace %q, entry namespace %q, and actor namespace %q must match",
-			ErrNamespaceClaim, r.Claim.Namespace, r.Entry.Namespace, r.Entry.ActorID.Namespace)
+		return fixedAgentValidationError(ErrNamespaceClaim,
+			fmt.Sprintf("claim namespace %q, entry namespace %q, and actor namespace %q do not match",
+				r.Claim.Namespace, r.Entry.Namespace, r.Entry.ActorID.Namespace),
+			"use the same namespace for Claim, Entry.Namespace, and Entry.ActorID.Namespace")
 	}
 	if r.Entry.ActorKind != ptypes.AgentKindSoftware {
-		return fmt.Errorf("%w: fixed software actor %q has kind %d; use software kind %d",
-			ptypes.ErrAgentKindMismatch, r.Entry.ActorID.String(), r.Entry.ActorKind, ptypes.AgentKindSoftware)
+		return fixedAgentValidationError(ptypes.ErrAgentKindMismatch,
+			fmt.Sprintf("fixed software actor %q has kind %d instead of software kind %d",
+				r.Entry.ActorID.String(), r.Entry.ActorKind, ptypes.AgentKindSoftware),
+			"set Entry.ActorKind to AgentKindSoftware")
 	}
 	if r.AgentName == "" {
-		return fmt.Errorf("%w: fixed software actor %q requires an agent name", ErrNamespaceClaim, r.Entry.ActorID.String())
+		return fixedAgentValidationError(ErrNamespaceClaim,
+			fmt.Sprintf("fixed software actor %q has no agent name", r.Entry.ActorID.String()),
+			"set AgentName to the durable software-agent name")
 	}
 	if r.Entry.Name == "" {
-		return fmt.Errorf("%w: fixed software actor %q requires a manifest name", ErrNamespaceClaim, r.Entry.ActorID.String())
+		return fixedAgentValidationError(ErrNamespaceClaim,
+			fmt.Sprintf("fixed software actor %q has no manifest name", r.Entry.ActorID.String()),
+			"set Entry.Name to the durable manifest identity")
 	}
 	metadata := r.Entry.Metadata
 	if metadata == "" {
 		metadata = "{}"
 	}
 	if !json.Valid([]byte(metadata)) {
-		return fmt.Errorf("%w: fixed software actor %q metadata is not valid JSON",
-			ErrNamespaceClaim, r.Entry.ActorID.String())
+		return fixedAgentValidationError(ErrNamespaceClaim,
+			fmt.Sprintf("fixed software actor %q metadata is not valid JSON", r.Entry.ActorID.String()),
+			"provide a valid JSON object or leave metadata empty to use {}")
 	}
-	return CheckEntryInRange(r.Claim, r.Entry.Namespace, [16]byte(r.Entry.ActorID.UUID))
+	if err := CheckEntryInRange(r.Claim, r.Entry.Namespace, [16]byte(r.Entry.ActorID.UUID)); err != nil {
+		return fixedAgentValidationError(err,
+			fmt.Sprintf("fixed software actor %q is not valid for the claimed range", r.Entry.ActorID.String()),
+			"choose an actor UUID inside the claim range and valid for its codec")
+	}
+	return nil
+}
+
+func fixedAgentValidationError(cause error, what, fix string) error {
+	return fmt.Errorf(
+		"fixed software agent registration is invalid: %s; why: the request violates an activation invariant; where: FixedSoftwareAgentRegistration.Validate; when: before the activation transaction; impact: activation is rejected and no database rows are read or changed; fix: %s: %w",
+		what, fix, cause,
+	)
 }
 
 // CheckEntryInRange rejects a fixed-actor entry whose 16-byte fixed UUID does

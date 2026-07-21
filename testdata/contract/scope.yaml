@@ -1,112 +1,100 @@
 # Executable-scope partition for the adversarial proof corpus.
 #
-# The relational contract's proof corpus (docs/journal-relational-contract.md,
-# the sibling *.yaml files) spans the whole journal architecture. Only the
-# journal-base capabilities exist at this layer (issue dayvidpham/provenance#4):
-# the global JournalID-ordered journal, the task_event subtype and its context
-# edges, the actor-namespace reservation registry, the current-state/attribution
-# projections, and subtype-integrity totality for the task_event kind.
+# The relational contract's proof corpus (docs/journal-relational-contract.md
+# and the sibling *.yaml files) spans the whole journal architecture.
 #
-# This table maps every corpus operator to the implementation leaf that makes it
-# executable. The corpus harness (journal_corpus_test.go) consumes it to:
-#   * execute every `s1.1` operator against real journal-base production code,
-#   * assert every remaining operator is a recorded `s1.2`/`s1.3` obligation and
-#     is NOT yet executable — a checked partition, never a skipped/disabled test,
-#   * fail if any corpus operator is missing from this table, or if any table
-#     entry names an operator no corpus case uses (freshness in both directions).
+# This table maps every corpus operator to its enduring behavior area. The
+# corpus harness executes every area against production code and fails if an
+# operator is missing, stale, or has no handler.
 #
-# Slice meanings:
-#   s1.1 — journal base + task_event subtype + projections + actor namespace
-#          + task_event subtype-totality (this leaf, issue #4).
-#   s1.2 — operations, effects, results, authority lifecycle, genesis,
-#          per-effect authorization, assignment lifecycle (issue #5).
-#   s1.3 — shared Apply/Open reducer, replay, retry/reopen/cancellation,
-#          projection repair, legacy baseline migration, schema preflight
-#          and fail-closed topology detection (issue #5).
+# Behavior areas:
+#   journal-foundation — ordered journal, task events, projections, namespaces
+#   operation-lifecycle — operations, effects, authority, results, assignments
+#   recovery-and-migration — replay, recovery, convergence, migration, preflight
 operators:
-  # --- s1.1: executable now against journal-base production code -------------
-  - {operator: order-by-journalid,                          slice: s1.1}
-  - {operator: order-by-journalid-concurrent,               slice: s1.1}
-  - {operator: order-by-recordedat-timeline,                slice: s1.1, reason: readable-timeline display order (§12)}
-  - {operator: reject-non-journalid-order-request,          slice: s1.1}
-  - {operator: claim-two-disjoint-namespaces,               slice: s1.1}
-  - {operator: claim-overlapping-namespace,                 slice: s1.1}
-  - {operator: register-manifest-entry-out-of-range,        slice: s1.1}
-  - {operator: write-journal-row-missing-subtype,           slice: s1.1}
+  # --- journal foundation ----------------------------------------------------
+  - {operator: order-by-journalid,                          area: journal-foundation}
+  - {operator: order-by-journalid-concurrent,               area: journal-foundation}
+  - {operator: order-by-recordedat-timeline,                area: journal-foundation, reason: readable-timeline display order (§12)}
+  - {operator: reject-non-journalid-order-request,          area: journal-foundation}
+  - {operator: claim-two-disjoint-namespaces,               area: journal-foundation}
+  - {operator: claim-overlapping-namespace,                 area: journal-foundation}
+  - {operator: register-manifest-entry-out-of-range,        area: journal-foundation}
+  - {operator: write-journal-row-missing-subtype,           area: journal-foundation}
 
-  # --- s1.2: operations, authority, results (issue #5) ----------------------
-  - {operator: authorize-using-recordedat-not-journalid,    slice: s1.2, reason: authority ordering}
-  - {operator: apply-empty-batch,                           slice: s1.2, reason: operation anchoring}
-  - {operator: apply-zero-task-event-operation,             slice: s1.2, reason: operation anchoring}
-  - {operator: authority-precedence-by-journalid,           slice: s1.2, reason: authority}
-  - {operator: lookup-committed,                            slice: s1.2, reason: operation result lookup}
-  - {operator: apply-genesis-operation,                     slice: s1.2, reason: genesis operation/authority}
-  - {operator: apply-genesis-retry-same-operationid,        slice: s1.2, reason: genesis idempotency}
-  - {operator: apply-genesis-with-extra-effect,             slice: s1.2, reason: genesis sole-effect rule}
-  - {operator: apply-null-authority-after-genesis,          slice: s1.2, reason: null-authority discipline}
-  - {operator: apply-second-genesis,                        slice: s1.2, reason: genesis first-operation-only}
-  - {operator: lookup-committed-emitted-events-from-closure, slice: s1.2, reason: produced-row closure}
-  - {operator: lookup-committed-reconstruct-result-slots,   slice: s1.2, reason: result-slot reconstruction}
-  - {operator: reject-result-slot-referencing-foreign-operation, slice: s1.2, reason: result-slot own-operation integrity (rule 9)}
-  - {operator: blocked-by-scheduling-edge-does-not-grant-authority, slice: s1.2, reason: authority}
-  - {operator: authority-unrelated,                         slice: s1.2, reason: authority}
-  - {operator: transitive-parent-citation-grants-authority, slice: s1.2, reason: parent-citation governance (§14.5)}
-  - {operator: parent-chain-middle-episode-ended-cuts-authority, slice: s1.2, reason: parent-citation whole-chain liveness (§14.5)}
-  - {operator: parent-chain-middle-ended-same-operation-cuts-authority, slice: s1.2, reason: "parent-citation whole-chain liveness within one operation's per-effect fold (§9.3.1 / §14.5)"}
-  - {operator: citation-of-inactive-parent-at-start-rejected, slice: s1.2, reason: parent-citation validity at start (§14.5)}
-  - {operator: corrupted-cyclic-parent-chain-fails-closed,  slice: s1.2, reason: parent-citation bounded fail-closed walk (§14.5)}
-  - {operator: batch-ended-before-started,                  slice: s1.2, reason: assignment lifecycle order}
-  - {operator: end-episode-never-started,                   slice: s1.2, reason: assignment lifecycle order}
-  - {operator: fold-sequentially-check-effect2-sees-effect1, slice: s1.2, reason: per-effect authorization}
-  - {operator: produce-subordinate-row-carrying-actor,      slice: s1.2, reason: anchor-only actor placement (§10 rule 5)}
-  - {operator: start-with-orphaned-predecessor,             slice: s1.2, reason: orphaned-evidence rejection}
-  - {operator: two-successors-same-predecessor,             slice: s1.2, reason: single-consumption evidence}
-  - {operator: attribute-episode-occupant-not-committer,    slice: s1.2, reason: assignment-episode attribution}
-  - {operator: close-task-omit-ended-transition,            slice: s1.2, reason: assignment lifecycle}
-  - {operator: close-task-with-active-assignment,           slice: s1.2, reason: assignment lifecycle}
-  - {operator: concurrent-transfer-cas,                     slice: s1.2, reason: transfer CAS}
-  - {operator: write-journal-row-two-subtypes,              slice: s1.2, reason: needs decision/evidence subtype tables}
-  - {operator: write-subtype-mismatching-journalkind,       slice: s1.2, reason: needs operations subtype table}
-  - {operator: write-authority-detail-mismatching-authoritykind, slice: s1.2, reason: needs authority subtype tables}
+  # --- operation lifecycle ---------------------------------------------------
+  - {operator: authorize-using-recordedat-not-journalid,    area: operation-lifecycle, reason: authority ordering}
+  - {operator: apply-empty-batch,                           area: operation-lifecycle, reason: operation anchoring}
+  - {operator: apply-zero-task-event-operation,             area: operation-lifecycle, reason: operation anchoring}
+  - {operator: authority-precedence-by-journalid,           area: operation-lifecycle, reason: authority}
+  - {operator: lookup-committed,                            area: operation-lifecycle, reason: operation result lookup}
+  - {operator: apply-genesis-operation,                     area: operation-lifecycle, reason: genesis operation/authority}
+  - {operator: apply-genesis-retry-same-operationid,        area: operation-lifecycle, reason: genesis idempotency}
+  - {operator: apply-genesis-with-extra-effect,             area: operation-lifecycle, reason: genesis sole-effect rule}
+  - {operator: apply-null-authority-after-genesis,          area: operation-lifecycle, reason: null-authority discipline}
+  - {operator: apply-second-genesis,                        area: operation-lifecycle, reason: genesis first-operation-only}
+  - {operator: lookup-committed-emitted-events-from-closure, area: operation-lifecycle, reason: produced-row closure}
+  - {operator: lookup-committed-reconstruct-result-slots,   area: operation-lifecycle, reason: result-slot reconstruction}
+  - {operator: reject-result-slot-referencing-foreign-operation, area: operation-lifecycle, reason: result-slot own-operation integrity (rule 9)}
+  - {operator: blocked-by-scheduling-edge-does-not-grant-authority, area: operation-lifecycle, reason: authority}
+  - {operator: authority-unrelated,                         area: operation-lifecycle, reason: authority}
+  - {operator: transitive-parent-citation-grants-authority, area: operation-lifecycle, reason: parent-citation governance (§14.5)}
+  - {operator: parent-chain-middle-episode-ended-cuts-authority, area: operation-lifecycle, reason: parent-citation whole-chain liveness (§14.5)}
+  - {operator: parent-chain-middle-ended-same-operation-cuts-authority, area: operation-lifecycle, reason: "parent-citation whole-chain liveness within one operation's per-effect fold (§9.3.1 / §14.5)"}
+  - {operator: citation-of-inactive-parent-at-start-rejected, area: operation-lifecycle, reason: parent-citation validity at start (§14.5)}
+  - {operator: corrupted-cyclic-parent-chain-fails-closed,  area: operation-lifecycle, reason: parent-citation bounded fail-closed walk (§14.5)}
+  - {operator: batch-ended-before-started,                  area: operation-lifecycle, reason: assignment lifecycle order}
+  - {operator: end-episode-never-started,                   area: operation-lifecycle, reason: assignment lifecycle order}
+  - {operator: fold-sequentially-check-effect2-sees-effect1, area: operation-lifecycle, reason: per-effect authorization}
+  - {operator: produce-subordinate-row-carrying-actor,      area: operation-lifecycle, reason: anchor-only actor placement (§10 rule 5)}
+  - {operator: start-with-orphaned-predecessor,             area: operation-lifecycle, reason: orphaned-evidence rejection}
+  - {operator: two-successors-same-predecessor,             area: operation-lifecycle, reason: single-consumption evidence}
+  - {operator: attribute-episode-occupant-not-committer,    area: operation-lifecycle, reason: assignment-episode attribution}
+  - {operator: close-task-omit-ended-transition,            area: operation-lifecycle, reason: assignment lifecycle}
+  - {operator: close-task-with-active-assignment,           area: operation-lifecycle, reason: assignment lifecycle}
+  - {operator: concurrent-transfer-cas,                     area: operation-lifecycle, reason: transfer CAS}
+  - {operator: write-journal-row-two-subtypes,              area: operation-lifecycle, reason: needs decision/evidence subtype tables}
+  - {operator: write-subtype-mismatching-journalkind,       area: operation-lifecycle, reason: needs operations subtype table}
+  - {operator: write-authority-detail-mismatching-authoritykind, area: operation-lifecycle, reason: needs authority subtype tables}
 
-  # --- s1.3: shared reducer, replay, migration (issue #5) -------------------
-  - {operator: replay-with-ended-authority,                 slice: s1.3, reason: Open-time replay}
-  - {operator: replay-zero-task-event-operation,            slice: s1.3, reason: Open-time replay}
-  - {operator: apply-then-close-then-reopen-compare-projection, slice: s1.3, reason: Apply/Open convergence}
-  - {operator: cancel-mid-batch,                            slice: s1.3, reason: cancellation recovery}
-  - {operator: concurrent-open-then-reopen-converge,        slice: s1.3, reason: replay convergence}
-  - {operator: fault-then-retry-same-operation,             slice: s1.3, reason: failure recovery}
-  - {operator: reuse-operationid-different-mutation-digest, slice: s1.3, reason: idempotent replay short-circuit}
-  - {operator: fault-between-transfer-ended-and-started,    slice: s1.3, reason: transfer-crash atomicity}
-  - {operator: reopen-task,                                 slice: s1.3, reason: reopen recovery}
-  - {operator: migrate-legacy-task,                         slice: s1.3, reason: legacy baseline migration}
-  - {operator: migrate-legacy-task-with-fabricated-timestamp, slice: s1.3, reason: honest-timestamp migration}
-  - {operator: migrate-batch-with-one-unmappable-owner,     slice: s1.3, reason: migration fail-closed}
-  - {operator: migrate-then-extend-compare-to-native-only,  slice: s1.3, reason: migrated/native equivalence}
-  - {operator: migrate-then-remigrate-same-legacy-set,      slice: s1.3, reason: idempotent re-migration}
-  - {operator: migrate-two-identical-createdat-tie-break,   slice: s1.3, reason: "deterministic created_at/id sort totality"}
-  - {operator: schema-preflight,                            slice: s1.3, reason: external-schema preflight}
-  - {operator: schema-preflight-extra-column,               slice: s1.3, reason: external-schema preflight}
-  - {operator: schema-preflight-extra-table,                slice: s1.3, reason: external-schema preflight extra-table direction}
-  - {operator: schema-preflight-missing-column,             slice: s1.3, reason: external-schema preflight}
-  - {operator: schema-preflight-missing-table,              slice: s1.3, reason: external-schema preflight}
-  - {operator: fault-mid-migration,                         slice: s1.3, reason: migration fail-closed}
-  - {operator: concurrent-open-during-corruption,           slice: s1.3, reason: fail-closed topology detection}
-  - {operator: replay-converges-clean,                      slice: s1.3, reason: §15 from-empty convergence}
-  - {operator: replay-converges-migrated-status,            slice: s1.3, reason: §15 migrated-status reproducibility}
-  - {operator: replay-detects-out-of-band-corruption,       slice: s1.3, reason: §15 fail-closed divergence detection}
-  - {operator: verify-clean-spine,                          slice: s1.3, reason: "UAT C8a corrupted-spine family — non-vacuous control"}
-  - {operator: corrupt-delete-subtype-row,                  slice: s1.3, reason: "UAT C8a corrupted-spine family — subtype-totality fail-closed"}
-  - {operator: corrupt-rewrite-discriminator,               slice: s1.3, reason: "UAT C8a corrupted-spine family — discriminator-agreement fail-closed"}
-  - {operator: corrupt-truncate-tail,                       slice: s1.3, reason: "UAT C8a corrupted-spine family — truncated-tail convergence fail-closed"}
-  - {operator: corrupt-noncontiguous-insert,                slice: s1.3, reason: "UAT C8a corrupted-spine family — bare-supertype-insert totality fail-closed"}
-  - {operator: revoke-then-pinned-retry-uncommitted,        slice: s1.3, reason: "UAT C8a authority-revocation family — pinned retry under revoked authority"}
-  - {operator: revoke-then-exact-replay-committed,          slice: s1.3, reason: "UAT C8a authority-revocation family — committed exact replay short-circuits"}
-  - {operator: fsm-rejects-closed-to-in-progress,          slice: s1.3, reason: "§8.1 status FSM — illegal closed→in_progress transition fails closed"}
-  - {operator: fsm-stopped-transition-converges,           slice: s1.3, reason: "§8.1 status FSM — in_progress→open stopped transition + from-empty convergence"}
-  - {operator: fsm-forced-coercion-converges,              slice: s1.3, reason: "§8.1/§16 forced FSM escape hatch — journal-reproducible, audit-visible coercion"}
-  - {operator: mutation-family-who-provenance,             slice: s1.3, reason: "§6 amendment — edge/label/comment journaled who-provenance (committer, authority, position, operands)"}
-  - {operator: mutation-family-unauthorized-rejected,      slice: s1.3, reason: "§6/§9.3 — edge/label/comment mutations obey per-effect authorization (must-fail per family)"}
-  - {operator: mutation-family-projections-replay,         slice: s1.3, reason: "§6/§15 — edge/label/comment domain projections re-derive from empty and converge"}
-  - {operator: journaled-edge-grants-no-authority,         slice: s1.3, reason: "§14.5 re-pin — journaled blocked_by edge still delegates no ownership authority"}
-  - {operator: mutation-family-comment-body-corruption-detected, slice: s1.3, reason: "§6.4/§15 — full-tuple domain-projection convergence detects out-of-band comment-body corruption a key-only check missed"}
+  # --- recovery and migration ------------------------------------------------
+  - {operator: replay-with-ended-authority,                 area: recovery-and-migration, reason: Open-time replay}
+  - {operator: replay-zero-task-event-operation,            area: recovery-and-migration, reason: Open-time replay}
+  - {operator: apply-then-close-then-reopen-compare-projection, area: recovery-and-migration, reason: Apply/Open convergence}
+  - {operator: cancel-mid-batch,                            area: recovery-and-migration, reason: cancellation recovery}
+  - {operator: concurrent-open-then-reopen-converge,        area: recovery-and-migration, reason: replay convergence}
+  - {operator: fault-then-retry-same-operation,             area: recovery-and-migration, reason: failure recovery}
+  - {operator: reuse-operationid-different-mutation-digest, area: recovery-and-migration, reason: idempotent replay short-circuit}
+  - {operator: fault-between-transfer-ended-and-started,    area: recovery-and-migration, reason: transfer-crash atomicity}
+  - {operator: reopen-task,                                 area: recovery-and-migration, reason: reopen recovery}
+  - {operator: migrate-legacy-task,                         area: recovery-and-migration, reason: legacy baseline migration}
+  - {operator: migrate-legacy-task-with-fabricated-timestamp, area: recovery-and-migration, reason: honest-timestamp migration}
+  - {operator: migrate-batch-with-one-unmappable-owner,     area: recovery-and-migration, reason: migration fail-closed}
+  - {operator: migrate-then-extend-compare-to-native-only,  area: recovery-and-migration, reason: migrated/native equivalence}
+  - {operator: migrate-then-remigrate-same-legacy-set,      area: recovery-and-migration, reason: idempotent re-migration}
+  - {operator: migrate-two-identical-createdat-tie-break,   area: recovery-and-migration, reason: "deterministic created_at/id sort totality"}
+  - {operator: schema-preflight,                            area: recovery-and-migration, reason: external-schema preflight}
+  - {operator: schema-preflight-extra-column,               area: recovery-and-migration, reason: external-schema preflight}
+  - {operator: schema-preflight-extra-table,                area: recovery-and-migration, reason: external-schema preflight extra-table direction}
+  - {operator: schema-preflight-missing-column,             area: recovery-and-migration, reason: external-schema preflight}
+  - {operator: schema-preflight-missing-table,              area: recovery-and-migration, reason: external-schema preflight}
+  - {operator: fault-mid-migration,                         area: recovery-and-migration, reason: migration fail-closed}
+  - {operator: concurrent-open-during-corruption,           area: recovery-and-migration, reason: fail-closed topology detection}
+  - {operator: replay-converges-clean,                      area: recovery-and-migration, reason: §15 from-empty convergence}
+  - {operator: replay-converges-migrated-status,            area: recovery-and-migration, reason: §15 migrated-status reproducibility}
+  - {operator: replay-detects-out-of-band-corruption,       area: recovery-and-migration, reason: §15 fail-closed divergence detection}
+  - {operator: verify-clean-spine,                          area: recovery-and-migration, reason: "corrupted-spine family — non-vacuous control"}
+  - {operator: corrupt-delete-subtype-row,                  area: recovery-and-migration, reason: "corrupted-spine family — subtype-totality fail-closed"}
+  - {operator: corrupt-rewrite-discriminator,               area: recovery-and-migration, reason: "corrupted-spine family — discriminator-agreement fail-closed"}
+  - {operator: corrupt-truncate-tail,                       area: recovery-and-migration, reason: "corrupted-spine family — truncated-tail convergence fail-closed"}
+  - {operator: corrupt-noncontiguous-insert,                area: recovery-and-migration, reason: "corrupted-spine family — bare-supertype-insert totality fail-closed"}
+  - {operator: revoke-then-pinned-retry-uncommitted,        area: recovery-and-migration, reason: "authority-revocation family — pinned retry under revoked authority"}
+  - {operator: revoke-then-exact-replay-committed,          area: recovery-and-migration, reason: "authority-revocation family — committed exact replay short-circuits"}
+  - {operator: fsm-rejects-closed-to-in-progress,          area: recovery-and-migration, reason: "§8.1 status FSM — illegal closed→in_progress transition fails closed"}
+  - {operator: fsm-stopped-transition-converges,           area: recovery-and-migration, reason: "§8.1 status FSM — in_progress→open stopped transition + from-empty convergence"}
+  - {operator: fsm-forced-coercion-converges,              area: recovery-and-migration, reason: "§8.1/§16 forced FSM escape hatch — journal-reproducible, audit-visible coercion"}
+  - {operator: mutation-family-who-provenance,             area: recovery-and-migration, reason: "§6 amendment — edge/label/comment journaled who-provenance (committer, authority, position, operands)"}
+  - {operator: mutation-family-unauthorized-rejected,      area: recovery-and-migration, reason: "§6/§9.3 — edge/label/comment mutations obey per-effect authorization (must-fail per family)"}
+  - {operator: mutation-family-projections-replay,         area: recovery-and-migration, reason: "§6/§15 — edge/label/comment domain projections re-derive from empty and converge"}
+  - {operator: journaled-edge-grants-no-authority,         area: recovery-and-migration, reason: "§14.5 re-pin — journaled blocked_by edge still delegates no ownership authority"}
+  - {operator: mutation-family-comment-body-corruption-detected, area: recovery-and-migration, reason: "§6.4/§15 — full-tuple domain-projection convergence detects out-of-band comment-body corruption a key-only check missed"}

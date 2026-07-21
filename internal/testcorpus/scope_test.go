@@ -11,7 +11,7 @@ import (
 // corresponding entry in the checked-in scope table.
 func TestCheckPartitionDetectsMissingScopeEntry(t *testing.T) {
 	table := ScopeTable{Entries: []ScopeEntry{
-		{Operator: "order-by-journalid", Slice: SliceS11},
+		{Operator: "order-by-journalid", Area: AreaJournalFoundation},
 	}}
 	used := map[OperatorName]struct{}{
 		"order-by-journalid":      {},
@@ -32,8 +32,8 @@ func TestCheckPartitionDetectsMissingScopeEntry(t *testing.T) {
 // renamed).
 func TestCheckPartitionDetectsStaleScopeEntry(t *testing.T) {
 	table := ScopeTable{Entries: []ScopeEntry{
-		{Operator: "order-by-journalid", Slice: SliceS11},
-		{Operator: "deleted-operator", Slice: SliceS12}, // stale: no case uses this anymore
+		{Operator: "order-by-journalid", Area: AreaJournalFoundation},
+		{Operator: "deleted-operator", Area: AreaOperationLifecycle}, // stale: no case uses this anymore
 	}}
 	used := map[OperatorName]struct{}{
 		"order-by-journalid": {},
@@ -53,8 +53,8 @@ func TestCheckPartitionDetectsStaleScopeEntry(t *testing.T) {
 // function.
 func TestCheckPartitionAcceptsExactCoverage(t *testing.T) {
 	table := ScopeTable{Entries: []ScopeEntry{
-		{Operator: "order-by-journalid", Slice: SliceS11},
-		{Operator: "apply-genesis-operation", Slice: SliceS12},
+		{Operator: "order-by-journalid", Area: AreaJournalFoundation},
+		{Operator: "apply-genesis-operation", Area: AreaOperationLifecycle},
 	}}
 	used := map[OperatorName]struct{}{
 		"order-by-journalid":      {},
@@ -65,16 +65,14 @@ func TestCheckPartitionAcceptsExactCoverage(t *testing.T) {
 	}
 }
 
-// TestScopeTableValidateRejectsUnregisteredHandlerSlice proves that an
-// scope-entry naming a slice outside the closed s1.1/s1.2/s1.3 set (which
-// would otherwise let a typo silently route an operator to no handler stage
-// at all) is rejected by Validate before CheckPartition ever runs.
-func TestScopeTableValidateRejectsUnregisteredHandlerSlice(t *testing.T) {
+// TestScopeTableValidateRejectsUnregisteredBehaviorArea proves a typo cannot
+// silently route an operator away from every production handler.
+func TestScopeTableValidateRejectsUnregisteredBehaviorArea(t *testing.T) {
 	table := ScopeTable{Entries: []ScopeEntry{
-		{Operator: "mystery-operator", Slice: Slice("s1.4")},
+		{Operator: "mystery-operator", Area: BehaviorArea("unknown")},
 	}}
 	if err := table.Validate(); err == nil {
-		t.Fatal("Validate accepted an out-of-range slice label; want an error")
+		t.Fatal("Validate accepted an unregistered behavior area; want an error")
 	}
 }
 

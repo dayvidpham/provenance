@@ -4,16 +4,16 @@ import "testing"
 
 // TestCheckClosedSetDetectsUnknownGotValue proves CheckClosedSet's
 // unknown-value branch fires: `got` contains a value `want` never declared.
-// This models the real harness's "an s1.2-scoped operator was accidentally
-// given an s1.1 handler" scenario — the registered-handler set (`got`) picks
-// up an operator that the s1.1 scope partition (`want`) does not name — which
+// This models an operation-lifecycle operator accidentally receiving a journal
+// foundation handler: the registered-handler set (`got`) picks up an operator
+// that the journal partition (`want`) does not name, which
 // TestContractCorpusPartitionIsComplete guards against on the production
 // scope.yaml.
 func TestCheckClosedSetDetectsUnknownGotValue(t *testing.T) {
-	want := []OperatorName{"order-by-journalid", "claim-two-disjoint-namespaces"} // the s1.1 partition
+	want := []OperatorName{"order-by-journalid", "claim-two-disjoint-namespaces"}
 	got := []OperatorName{
 		"order-by-journalid", "claim-two-disjoint-namespaces",
-		"apply-genesis-operation", // stray: this operator is scoped s1.2, not s1.1
+		"apply-genesis-operation", // stray: operation lifecycle, not journal foundation
 	}
 	err := CheckClosedSet(want, got)
 	if err == nil {
@@ -23,7 +23,7 @@ func TestCheckClosedSetDetectsUnknownGotValue(t *testing.T) {
 
 // TestCheckClosedSetDetectsMissingWantValue proves CheckClosedSet's
 // missing-value branch fires: `want` contains a value `got` never covers —
-// modeling an s1.1-scoped operator that has NO registered handler at all.
+// modeling a journal-foundation operator that has no registered handler.
 func TestCheckClosedSetDetectsMissingWantValue(t *testing.T) {
 	want := []OperatorName{"order-by-journalid", "claim-two-disjoint-namespaces"}
 	got := []OperatorName{"order-by-journalid"} // claim-two-disjoint-namespaces has no handler

@@ -1,14 +1,13 @@
 package provenance
 
-// journal_s13_corpus_test.go executes the S1.3 adversarial proof-corpus histories
+// journal_recovery_corpus_test.go executes recovery and migration proof-corpus histories
 // — the shared Apply/Open reducer, replay, retry/reopen/cancellation recovery,
 // legacy-baseline migration, external-schema preflight, and fail-closed topology
 // detection (docs/journal-relational-contract.md §9, §13, §15) — against the real
 // production path (Apply, ReplayProjections, MigrateLegacyBaseline, PreflightSchema).
 // Each operator translates the symbolic corpus data into concrete registered IDs
 // and drives the production reducer, honouring the case's must-pass/must-fail
-// classification. These operators are the executable half of the s1.3 partition
-// recorded in testdata/contract/scope.yaml.
+// classification.
 
 import (
 	"errors"
@@ -24,9 +23,8 @@ import (
 	"github.com/google/uuid"
 )
 
-// s13Operators is the closed registry of executable S1.3 operators. Its key set
-// must equal the s1.3 partition of scope.yaml (asserted by the partition test).
-var s13Operators = map[testcorpus.OperatorName]s11Handler{
+// recoveryAndMigrationOperators is the closed registry for recovery behavior.
+var recoveryAndMigrationOperators = map[testcorpus.OperatorName]corpusHandler{
 	// retry_reopen_cancellation.yaml (§9.2, §9.4, §9.5)
 	"fault-then-retry-same-operation":                 opFaultThenRetrySameOperation,
 	"apply-then-close-then-reopen-compare-projection": opApplyCloseReopenCompareProjection,
@@ -59,13 +57,13 @@ var s13Operators = map[testcorpus.OperatorName]s11Handler{
 	"replay-with-ended-authority": opReplayWithEndedAuthority,
 	// zero_event_operations.yaml (§9.4)
 	"replay-zero-task-event-operation": opReplayZeroTaskEventOperation,
-	// journal_spine_corruption.yaml (§10 rule 8, §15) — UAT C8a corrupted-journal-spine family
+	// journal_spine_corruption.yaml (§10 rule 8, §15)
 	"verify-clean-spine":            opVerifyCleanSpine,
 	"corrupt-delete-subtype-row":    opCorruptDeleteSubtypeRow,
 	"corrupt-rewrite-discriminator": opCorruptRewriteDiscriminator,
 	"corrupt-truncate-tail":         opCorruptTruncateTail,
 	"corrupt-noncontiguous-insert":  opCorruptNoncontiguousInsert,
-	// authority_revocation.yaml (§9.4, §14.1) — UAT C8a authority-revocation family
+	// authority_revocation.yaml (§9.4, §14.1)
 	"revoke-then-pinned-retry-uncommitted": opRevokeThenPinnedRetryUncommitted,
 	"revoke-then-exact-replay-committed":   opRevokeThenExactReplayCommitted,
 	// status_fsm.yaml (§8.1, §16) — static task-status FSM + forced escape hatch
@@ -1203,7 +1201,7 @@ func statusTokenToInt(token string) (int, bool) {
 }
 
 // ---------------------------------------------------------------------------
-// Shared helpers for the S1.3 operators
+// Shared helpers for recovery and migration operators.
 // ---------------------------------------------------------------------------
 
 // parseLegacyTask maps a symbolic corpus legacyTask into a concrete created task

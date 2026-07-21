@@ -7,13 +7,12 @@ package provenance
 // valid journaled history through Apply, damages the persisted spine via a disclosed
 // raw-SQL corruption seam (internal/sqlite/spine_corruption_adversarial.go), and asserts
 // the production guard fails closed with the case's typed expected error and repairs
-// nothing. These operators are the executable half of the family's s1.3 scope partition
+// nothing. These operators exercise the family's recovery behavior
 // recorded in testdata/contract/scope.yaml.
 //
-// This family is the corrupted-journal (not merely corrupted-projection) recovery
-// requirement of the Impl-UAT C8a ruling: the spine's own supertype/subtype rows are
-// damaged, so the guards must reject the whole database rather than silently proceeding
-// on a partial or renumbered history.
+// This family corrupts the journal itself, not merely a projection. Because the
+// spine's own supertype/subtype rows are damaged, guards must reject the whole
+// database rather than proceeding on a partial or renumbered history.
 
 import (
 	"errors"

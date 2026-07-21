@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -23,6 +24,13 @@ type fixedAgentFixture struct {
 		Name     string `yaml:"name"`
 		Boundary string `yaml:"boundary"`
 	} `yaml:"rollbackCases"`
+	ActionableErrorCases []struct {
+		Name      string `yaml:"name"`
+		Mode      string `yaml:"mode"`
+		WantError string `yaml:"wantError"`
+		WantWhere string `yaml:"wantWhere"`
+		WantWhen  string `yaml:"wantWhen"`
+	} `yaml:"actionableErrorCases"`
 }
 
 func loadFixedAgentFixture(t *testing.T) fixedAgentFixture {
@@ -35,8 +43,9 @@ func loadFixedAgentFixture(t *testing.T) fixedAgentFixture {
 	if err := yaml.Unmarshal(b, &fixture); err != nil {
 		t.Fatalf("decode fixed software-agent fixture: %v", err)
 	}
-	if len(fixture.ValidationCases) < 8 || len(fixture.RollbackCases) != 4 {
-		t.Fatalf("fixed software-agent fixture is incomplete: %d validation, %d rollback", len(fixture.ValidationCases), len(fixture.RollbackCases))
+	if len(fixture.ValidationCases) < 8 || len(fixture.RollbackCases) != 4 || len(fixture.ActionableErrorCases) != 4 {
+		t.Fatalf("fixed software-agent fixture is incomplete: %d validation, %d rollback, %d actionable errors",
+			len(fixture.ValidationCases), len(fixture.RollbackCases), len(fixture.ActionableErrorCases))
 	}
 	return fixture
 }
@@ -109,12 +118,61 @@ func fixedAgentSentinel(name string) error {
 		return ErrInvalidID
 	case "agent-kind":
 		return ErrAgentKindMismatch
+	case "agent-exists":
+		return ErrAgentAlreadyExists
 	case "entry-range":
 		return ErrEntryOutOfRange
 	case "namespace-range":
 		return ErrNamespaceRange
 	default:
 		panic("unknown fixed-agent sentinel: " + name)
+	}
+}
+
+func TestRegisterFixedSoftwareAgentErrorsAreActionable(t *testing.T) {
+	for _, tc := range loadFixedAgentFixture(t).ActionableErrorCases {
+		t.Run(tc.Name, func(t *testing.T) {
+			tr, err := OpenMemory()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tr.Close()
+			reg := testFixedSoftwareAgentRegistration()
+			switch tc.Mode {
+			case "validation":
+				reg.Entry.ActorID.Namespace = ""
+			case "preflight":
+				if _, err := tr.RegisterFixedSoftwareAgent(reg); err != nil {
+					t.Fatalf("seed activation: %v", err)
+				}
+				reg.AgentName = "different"
+			case "write":
+				installFixedAgentAbortTrigger(t, tr, "claim")
+			case "transaction":
+				if err := tr.Close(); err != nil {
+					t.Fatalf("close tracker before transaction test: %v", err)
+				}
+			default:
+				t.Fatalf("unknown actionable error mode %q", tc.Mode)
+			}
+
+			_, err = tr.RegisterFixedSoftwareAgent(reg)
+			if err == nil {
+				t.Fatal("RegisterFixedSoftwareAgent succeeded; want actionable error")
+			}
+			if want := fixedAgentSentinel(tc.WantError); want != nil && !errors.Is(err, want) {
+				t.Fatalf("error = %v, want errors.Is(%v)", err, want)
+			}
+			message := err.Error()
+			for _, marker := range []string{
+				"fixed software agent activation failed:", "why:", "where:", tc.WantWhere,
+				"when:", tc.WantWhen, "impact:", "fix:",
+			} {
+				if !strings.Contains(message, marker) {
+					t.Errorf("error %q is missing %q", message, marker)
+				}
+			}
+		})
 	}
 }
 

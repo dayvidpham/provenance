@@ -214,10 +214,10 @@ var (
 //
 // The bare AppendTaskEvent primitive is retired from this surface: every task event is
 // now produced by an operation (Session.Create/Update/CloseTask, an Atomic op, or a
-// migration baseline), which the operations-layer producer CHECK enforces
-// (produced_by_operation_journal_id NOT NULL for a task_event). The journal-base #4
-// layer keeps its NULL-producer append primitive at its own layer; it is not part of
-// this operations-layer public API.
+// migration baseline). The producer constraint enforces
+// produced_by_operation_journal_id NOT NULL for task events. A lower-level
+// append primitive exists only for controlled legacy migration and is not part
+// of this public API.
 type JournalAPI interface {
 	// QueryTaskEvents returns one page in the query's order: the readable-timeline
 	// (RecordedAt, JournalID) display order (the default) or the canonical JournalID

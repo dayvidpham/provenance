@@ -1,13 +1,12 @@
 package provenance
 
-// journal_operations_corpus_test.go executes the S1.2 adversarial proof-corpus
+// journal_operations_corpus_test.go executes operation-lifecycle proof-corpus
 // histories — operations, effects, results, and authority lifecycle
 // (docs/journal-relational-contract.md §2-§4, §9, §14) — against the real Apply
 // / LookupCommitted production path. Each operator translates the symbolic
 // corpus data (task/actor/assignment labels) into concrete registered IDs and
 // drives the production reducer, honouring the case's must-pass/must-fail
-// classification. These operators are the executable half of the s1.2 partition
-// recorded in testdata/contract/scope.yaml.
+// classification.
 
 import (
 	"errors"
@@ -19,9 +18,8 @@ import (
 	"github.com/dayvidpham/provenance/internal/testcorpus"
 )
 
-// s12Operators is the closed registry of executable S1.2 operators. Its key set
-// must equal the s1.2 partition of scope.yaml (asserted by the partition test).
-var s12Operators = map[testcorpus.OperatorName]s11Handler{
+// operationLifecycleOperators is the closed registry for operation behavior.
+var operationLifecycleOperators = map[testcorpus.OperatorName]corpusHandler{
 	// genesis_bootstrap.yaml (§4.6, §10 rules 6-7)
 	"apply-genesis-operation":              opApplyGenesisOperation,
 	"apply-null-authority-after-genesis":   opApplyNullAuthorityAfterGenesis,
@@ -1082,7 +1080,7 @@ func opAuthorizeUsingRecordedAtNotJournalID(t *testing.T, input, expected anyMap
 	boot := env.genesis(t, "op-genesis")
 	task := env.taskFor(t, "t1")
 	// ev1 is committed first (smaller JournalID) with a LATER RecordedAt, emitted as an
-	// operation-anchored append (the retired bare AppendTaskEvent is forbidden in #5).
+	// operation-anchored append because bare task events are forbidden.
 	ev1JID := appendEventViaOp(t, env.tr, boot, env.actor, task, "op-ev1", "provenance.task.updated",
 		time.Date(2026, 1, 5, 0, 0, 0, 0, time.UTC))
 	// auth1 (an assignment authority on t1) is committed AFTER ev1 (larger
@@ -1165,7 +1163,7 @@ func countSuccessorEpisodes(env *opsEnv, task TaskID) (int, error) {
 // conflict: reusing an OperationID with a different four-field replay identity is
 // a typed conflict that commits nothing, never a re-execution. The executed
 // corpus case for this (reuse-operationid-different-mutation-digest) is scoped to
-// S1.3, so this direct production test covers the S1.2 write-path requirement.
+// Recovery behavior has separate coverage, so this test targets the write path.
 func TestApplyRejectsOperationIDReuseWithDifferentIdentity(t *testing.T) {
 	env := newOpsEnv(t)
 	boot := env.genesis(t, "op-genesis")
