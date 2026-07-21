@@ -33,25 +33,25 @@ const (
 	tasksWatermarkColumnless
 )
 
-func (shape tasksWatermarkShape) createRebuildStatement() sqlStatement {
+func (shape tasksWatermarkShape) createRebuildStatement() sealedSQLStatement {
 	switch shape {
 	case tasksWatermarkNative:
-		return sqlStatement226
+		return migrationDDLCreateTasksWatermarkRebuilde9e2
 	case tasksWatermarkNullable:
-		return sqlStatement227
+		return migrationDDLCreateTasksWatermarkRebuild6df2
 	case tasksWatermarkColumnless:
-		return sqlStatement228
+		return migrationDDLCreateTasksWatermarkRebuild865e
 	default:
 		panic("unknown tasks watermark shape")
 	}
 }
 
-func (shape tasksWatermarkShape) copyStatement() sqlStatement {
+func (shape tasksWatermarkShape) copyStatement() sealedSQLStatement {
 	switch shape {
 	case tasksWatermarkNative, tasksWatermarkNullable:
-		return sqlStatement229
+		return migrationInsertTasksWatermarkRebuilddc9f
 	case tasksWatermarkColumnless:
-		return sqlStatement230
+		return migrationInsertTasksWatermarkRebuildd091
 	default:
 		panic("unknown tasks watermark shape")
 	}
@@ -60,14 +60,14 @@ func (shape tasksWatermarkShape) copyStatement() sqlStatement {
 // tasksIndexDDL returns the CREATE INDEX statements for the tasks table. They are
 // recreated after every watermark rebuild because the rebuild drops and renames the
 // table (the indexes go with the dropped table).
-func tasksIndexDDL() []sqlStatement {
-	return []sqlStatement{
-		sqlStatement231,
-		sqlStatement232,
-		sqlStatement233,
-		sqlStatement234,
-		sqlStatement235,
-		sqlStatement236,
+func tasksIndexDDL() []sealedSQLStatement {
+	return []sealedSQLStatement{
+		sharedDDLCreateIdxTasksNamespace7486,
+		migrationDDLCreateIdxTasksStatus0073,
+		migrationDDLCreateIdxTasksPriority4dc7,
+		migrationDDLCreateIdxTasksTyped2dc,
+		migrationDDLCreateIdxTasksPhase8793,
+		migrationDDLCreateIdxTasksOwner2af7,
 	}
 }
 
@@ -75,7 +75,7 @@ func tasksIndexDDL() []sqlStatement {
 // column and, if so, whether it is declared NOT NULL. Assumes db.mu is held.
 func (db *DB) tasksWatermarkColumnInfoLocked() (present bool, notNull bool, err error) {
 	if err := executeStatement(db.conn,
-		sqlStatement237,
+		migrationPragmaTableInfo6558,
 		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 			if stmt.ColumnText(1) == "last_journal_id" {
 				present = true
@@ -108,7 +108,7 @@ func (db *DB) countUnanchoredTasksLocked() (int, error) {
 	}
 	var n int
 	if err := executeStatement(db.conn,
-		sqlStatement238,
+		migrationSelectTasks0c06,
 		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
 		return 0, fmt.Errorf("countUnanchoredTasks: %w", err)
 	}
@@ -124,41 +124,41 @@ func (db *DB) countUnanchoredTasksLocked() (int, error) {
 // exactly as completeJournalOperationFK does; a detected violation rolls the whole
 // rebuild back. Assumes db.mu is held.
 func (db *DB) rebuildTasksWatermarkLocked(shape tasksWatermarkShape) error {
-	if err := executeStatement(db.conn, sqlStatement136, nil); err != nil {
+	if err := executeStatement(db.conn, sharedDDLPragmaForeignKeys1be4, nil); err != nil {
 		return fmt.Errorf("rebuildTasksWatermark: disable FK enforcement: %w", err)
 	}
-	defer func() { _ = executeStatement(db.conn, sqlStatement033, nil) }()
+	defer func() { _ = executeStatement(db.conn, sharedDDLPragmaForeignKeysde7c, nil) }()
 
-	steps := []sqlStatement{
-		sqlStatement006,
+	steps := []sealedSQLStatement{
+		sharedDDLBeginStatement4e51,
 		shape.createRebuildStatement(),
 		shape.copyStatement(),
-		sqlStatement239,
-		sqlStatement240,
+		migrationDDLDropTasks7ba0,
+		migrationDDLAlterTasksWatermarkRebuild6df4,
 	}
 	steps = append(steps, tasksIndexDDL()...)
 	for _, stmt := range steps {
 		if err := executeStatement(db.conn, stmt, nil); err != nil {
-			_ = executeStatement(db.conn, sqlStatement007, nil)
+			_ = executeStatement(db.conn, sharedDDLRollbackStatement4eec, nil)
 			return fmt.Errorf("rebuildTasksWatermark: static step failed: %w", err)
 		}
 	}
 	var violations int
-	if err := executeStatement(db.conn, sqlStatement124,
+	if err := executeStatement(db.conn, sharedDDLPragmaForeignKeyCheck6847,
 		&sqlitex.ExecOptions{ResultFunc: func(*zs.Stmt) error { violations++; return nil }}); err != nil {
-		_ = executeStatement(db.conn, sqlStatement007, nil)
+		_ = executeStatement(db.conn, sharedDDLRollbackStatement4eec, nil)
 		return fmt.Errorf("rebuildTasksWatermark: foreign_key_check: %w", err)
 	}
 	if violations > 0 {
-		_ = executeStatement(db.conn, sqlStatement007, nil)
+		_ = executeStatement(db.conn, sharedDDLRollbackStatement4eec, nil)
 		return fmt.Errorf(
 			"rebuildTasksWatermark: rebuild left %d foreign-key violations, rolled back — where: tasks "+
 				"watermark rebuild; impact: the rebuild was reverted and the database left unchanged; fix: "+
 				"this indicates a child row (edge/label/comment) references a task id that does not exist",
 			violations)
 	}
-	if err := executeStatement(db.conn, sqlStatement008, nil); err != nil {
-		_ = executeStatement(db.conn, sqlStatement007, nil)
+	if err := executeStatement(db.conn, sharedDDLCommitStatement696a, nil); err != nil {
+		_ = executeStatement(db.conn, sharedDDLRollbackStatement4eec, nil)
 		return fmt.Errorf("rebuildTasksWatermark: commit rebuild: %w", err)
 	}
 	return nil
@@ -214,7 +214,7 @@ func (db *DB) ensureTasksWatermarkColumnLocked() error {
 		return nil
 	}
 	if err := executeStatement(db.conn,
-		sqlStatement241, nil); err != nil {
+		migrationDDLAlterTasksed3d, nil); err != nil {
 		return fmt.Errorf(
 			"ensureTasksWatermarkColumn: add legacy last_journal_id column — where: migration column-add "+
 				"path (§13); when: before any legacy row is anchored; impact: nothing committed; fix: the "+

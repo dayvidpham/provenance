@@ -127,7 +127,7 @@ func isLegacyOperationsColumnSet(actual map[string]struct{}) bool {
 func (db *DB) preflightNoUnexpectedSpineTableLocked() error {
 	var unexpected string
 	if err := executeStatement(db.conn,
-		sqlStatement089,
+		migrationSelectSqliteMaster7370,
 		&sqlitex.ExecOptions{Args: []any{"table", "journal", `journal\_%`, `\`}, ResultFunc: func(stmt *zs.Stmt) error {
 			name := stmt.ColumnText(0)
 			if _, ok := recognizedJournalSpineTables[name]; !ok && unexpected == "" {
@@ -189,7 +189,7 @@ func checkColumns(want expectedTable, actual map[string]struct{}) error {
 func (db *DB) tableExistsLocked(table string) (bool, error) {
 	present := false
 	if err := executeStatement(db.conn,
-		sqlStatement081,
+		sharedSelectSqliteMasterc39e,
 		&sqlitex.ExecOptions{Args: []any{"table", table}, ResultFunc: func(*zs.Stmt) error { present = true; return nil }}); err != nil {
 		return false, fmt.Errorf("preflight: probe table %q: %w", table, err)
 	}
@@ -199,7 +199,7 @@ func (db *DB) tableExistsLocked(table string) (bool, error) {
 func (db *DB) tableColumnsLocked(table string) (map[string]struct{}, error) {
 	cols := map[string]struct{}{}
 	if err := executeStatement(db.conn,
-		sqlStatement090,
+		migrationSelectPragmaTableInfo94bb,
 		&sqlitex.ExecOptions{Args: []any{table}, ResultFunc: func(stmt *zs.Stmt) error {
 			cols[stmt.ColumnText(0)] = struct{}{}
 			return nil
@@ -466,7 +466,7 @@ func (db *DB) CountBaselineAnchors() (int, error) {
 	defer db.mu.Unlock()
 	var n int
 	if err := executeStatement(db.conn,
-		sqlStatement091,
+		migrationSelectJournalOperations1194,
 		&sqlitex.ExecOptions{Args: []any{"provenance.migration.baseline--%"}, ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
 		return 0, fmt.Errorf("CountBaselineAnchors: %w", err)
 	}
@@ -486,7 +486,7 @@ func (db *DB) EpisodeTransitionRecordedAt(assignment journal.AssignmentID, start
 	var recordedAt int64
 	found := false
 	if err := executeStatement(db.conn,
-		sqlStatement092,
+		migrationSelectJournalAuthorityAssignmentTransitions2a64,
 		&sqlitex.ExecOptions{Args: []any{string(assignment), transition}, ResultFunc: func(stmt *zs.Stmt) error {
 			found = true
 			recordedAt = stmt.ColumnInt64(0)
@@ -520,7 +520,7 @@ func (db *DB) CountEpisodesForTask(task journal.TaskID) (int, error) {
 	defer db.mu.Unlock()
 	var n int
 	if err := executeStatement(db.conn,
-		sqlStatement093,
+		migrationSelectJournalAuthorityAssignmentEpisodes1720,
 		&sqlitex.ExecOptions{Args: []any{task.String()}, ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
 		return 0, fmt.Errorf("CountEpisodesForTask %q: %w", task, err)
 	}

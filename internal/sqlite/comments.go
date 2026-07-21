@@ -25,7 +25,7 @@ func (db *DB) AddComment(id ptypes.TaskID, authorID ptypes.AgentID, body string)
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if err := executeStatement(db.conn,
-		sqlStatement029,
+		tasksInsertComments66d3,
 		&sqlitex.ExecOptions{Args: []any{
 			comment.ID.String(), comment.TaskID.String(),
 			comment.AuthorID.String(), comment.Body, comment.CreatedAt.UnixNano(),
@@ -49,7 +49,7 @@ func (db *DB) GetComment(id ptypes.CommentID) (ptypes.Comment, bool, error) {
 		found   bool
 	)
 	if err := executeStatement(db.conn,
-		sqlStatement030,
+		tasksSelectCommentsc91f,
 		&sqlitex.ExecOptions{
 			Args: []any{id.String()},
 			ResultFunc: func(stmt *zs.Stmt) error {
@@ -74,7 +74,7 @@ func (db *DB) GetComments(id ptypes.TaskID) ([]ptypes.Comment, error) {
 	defer db.mu.Unlock()
 	var comments []ptypes.Comment
 	err := executeStatement(db.conn,
-		sqlStatement031,
+		tasksSelectCommentsd80b,
 		&sqlitex.ExecOptions{
 			Args: []any{id.String()},
 			ResultFunc: func(stmt *zs.Stmt) error {

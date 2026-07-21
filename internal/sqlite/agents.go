@@ -17,14 +17,14 @@ func (db *DB) RegisterHumanAgent(namespace, name, contact string) (ptypes.HumanA
 	defer db.mu.Unlock()
 
 	if err := executeStatement(db.conn,
-		sqlStatement019,
-		&sqlitex.ExecOptions{Args: []any{id.String()}}); err != nil {
+		agentsInsertAgentse4db,
+		&sqlitex.ExecOptions{Args: []any{id.String(), int(ptypes.AgentKindHuman)}}); err != nil {
 		return ptypes.HumanAgent{}, fmt.Errorf(
 			"sqlite.RegisterHumanAgent: failed to insert agent row: %w", err,
 		)
 	}
 	if err := executeStatement(db.conn,
-		sqlStatement020,
+		agentsInsertAgentsHuman8029,
 		&sqlitex.ExecOptions{Args: []any{id.String(), name, contact}}); err != nil {
 		return ptypes.HumanAgent{}, fmt.Errorf(
 			"sqlite.RegisterHumanAgent: failed to insert human row: %w", err,
@@ -47,7 +47,7 @@ func (db *DB) RegisterMLAgent(namespace string, role ptypes.Role, provider ptype
 	var modelID int
 	var modelFound bool
 	if err := executeStatement(db.conn,
-		sqlStatement021,
+		agentsSelectMlModels2532,
 		&sqlitex.ExecOptions{
 			Args: []any{string(provider), string(modelName)},
 			ResultFunc: func(stmt *zs.Stmt) error {
@@ -71,14 +71,14 @@ func (db *DB) RegisterMLAgent(namespace string, role ptypes.Role, provider ptype
 
 	id := ptypes.AgentID{Namespace: namespace, UUID: uuid.Must(uuid.NewV7())}
 	if err := executeStatement(db.conn,
-		sqlStatement022,
-		&sqlitex.ExecOptions{Args: []any{id.String()}}); err != nil {
+		agentsInsertAgentse4db,
+		&sqlitex.ExecOptions{Args: []any{id.String(), int(ptypes.AgentKindMachineLearning)}}); err != nil {
 		return ptypes.MLAgent{}, fmt.Errorf(
 			"sqlite.RegisterMLAgent: failed to insert base agent row: %w", err,
 		)
 	}
 	if err := executeStatement(db.conn,
-		sqlStatement023,
+		agentsInsertAgentsMl1f20,
 		&sqlitex.ExecOptions{Args: []any{id.String(), int(role), modelID}}); err != nil {
 		return ptypes.MLAgent{}, fmt.Errorf(
 			"sqlite.RegisterMLAgent: failed to insert ml agent row: %w", err,
@@ -99,14 +99,14 @@ func (db *DB) RegisterSoftwareAgent(namespace, name, version, source string) (pt
 	defer db.mu.Unlock()
 
 	if err := executeStatement(db.conn,
-		sqlStatement024,
-		&sqlitex.ExecOptions{Args: []any{id.String()}}); err != nil {
+		agentsInsertAgentse4db,
+		&sqlitex.ExecOptions{Args: []any{id.String(), int(ptypes.AgentKindSoftware)}}); err != nil {
 		return ptypes.SoftwareAgent{}, fmt.Errorf(
 			"sqlite.RegisterSoftwareAgent: failed to insert base agent row: %w", err,
 		)
 	}
 	if err := executeStatement(db.conn,
-		sqlStatement011,
+		agentsInsertAgentsSoftwaref75f,
 		&sqlitex.ExecOptions{Args: []any{id.String(), name, version, source}}); err != nil {
 		return ptypes.SoftwareAgent{}, fmt.Errorf(
 			"sqlite.RegisterSoftwareAgent: failed to insert software agent row: %w", err,
@@ -128,7 +128,7 @@ func (db *DB) GetAgent(id ptypes.AgentID) (ptypes.Agent, error) {
 	var agent ptypes.Agent
 	var found bool
 	err := executeStatement(db.conn,
-		sqlStatement025,
+		agentsSelectAgents480a,
 		&sqlitex.ExecOptions{
 			Args: []any{id.String()},
 			ResultFunc: func(stmt *zs.Stmt) error {
@@ -159,7 +159,7 @@ func (db *DB) GetHumanAgent(id ptypes.AgentID) (ptypes.HumanAgent, error) {
 	var ha ptypes.HumanAgent
 	var found bool
 	err := executeStatement(db.conn,
-		sqlStatement026,
+		agentsSelectAgentsb65a,
 		&sqlitex.ExecOptions{
 			Args: []any{id.String()},
 			ResultFunc: func(stmt *zs.Stmt) error {
@@ -194,7 +194,7 @@ func (db *DB) GetMLAgent(id ptypes.AgentID) (ptypes.MLAgent, error) {
 	var mla ptypes.MLAgent
 	var found bool
 	err := executeStatement(db.conn,
-		sqlStatement027,
+		agentsSelectAgentsdb52,
 		&sqlitex.ExecOptions{
 			Args: []any{id.String()},
 			ResultFunc: func(stmt *zs.Stmt) error {
@@ -233,7 +233,7 @@ func (db *DB) GetSoftwareAgent(id ptypes.AgentID) (ptypes.SoftwareAgent, error) 
 	var sa ptypes.SoftwareAgent
 	var found bool
 	err := executeStatement(db.conn,
-		sqlStatement028,
+		agentsSelectAgentsc468,
 		&sqlitex.ExecOptions{
 			Args: []any{id.String()},
 			ResultFunc: func(stmt *zs.Stmt) error {

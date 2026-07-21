@@ -75,7 +75,7 @@ func (db *DB) foldMutationFamilyLocked(in journal.OperationInput, jid int64, eff
 		}
 	}
 	if err := executeStatement(db.conn,
-		sqlStatement094,
+		sharedInsertJournalTaskEventsf716,
 		&sqlitex.ExecOptions{Args: []any{jid, eff.TaskID.String(), string(kind), string(payload)}}); err != nil {
 		return fmt.Errorf("Apply: insert journal_task_events (%s): %w", kind, err)
 	}
@@ -89,7 +89,7 @@ func (db *DB) foldMutationFamilyLocked(in journal.OperationInput, jid int64, eff
 			return fmt.Errorf("Apply: encode context (%s): %w", kind, err)
 		}
 		if err := executeStatement(db.conn,
-			sqlStatement095,
+			operationsInsertJournalTaskEventContexts970f,
 			&sqlitex.ExecOptions{Args: []any{jid, string(contextKind), identity, jid}}); err != nil {
 			return fmt.Errorf("Apply: insert context (%s): %w", kind, err)
 		}
@@ -199,44 +199,44 @@ func (db *DB) projectMutationFamilyRowLocked(task journal.TaskID, kind journal.E
 	return db.advanceWatermarkLocked(task, jid)
 }
 
-func (target projectionTarget) edgeCycleStatement() sqlStatement {
+func (target projectionTarget) edgeCycleStatement() sealedSQLStatement {
 	if target == projectionTargetShadow {
-		return sqlStatement096
+		return operationsWithShadowEdgesde79
 	}
-	return sqlStatement097
+	return operationsWithEdgesb8dc
 }
 
-func (target projectionTarget) projectEdgeAddStatement() sqlStatement {
+func (target projectionTarget) projectEdgeAddStatement() sealedSQLStatement {
 	if target == projectionTargetShadow {
-		return sqlStatement098
+		return operationsInsertShadowEdges93a0
 	}
-	return sqlStatement099
+	return operationsInsertEdges0526
 }
 
-func (target projectionTarget) projectEdgeRemoveStatement() sqlStatement {
+func (target projectionTarget) projectEdgeRemoveStatement() sealedSQLStatement {
 	if target == projectionTargetShadow {
-		return sqlStatement100
+		return operationsDeleteShadowEdges592b
 	}
-	return sqlStatement101
+	return operationsDeleteEdges21cd
 }
 
-func (target projectionTarget) projectLabelAddStatement() sqlStatement {
+func (target projectionTarget) projectLabelAddStatement() sealedSQLStatement {
 	if target == projectionTargetShadow {
-		return sqlStatement102
+		return operationsInsertShadowLabelsc0c1
 	}
-	return sqlStatement103
+	return operationsInsertLabels502e
 }
 
-func (target projectionTarget) projectLabelRemoveStatement() sqlStatement {
+func (target projectionTarget) projectLabelRemoveStatement() sealedSQLStatement {
 	if target == projectionTargetShadow {
-		return sqlStatement104
+		return operationsDeleteShadowLabelsa2f4
 	}
-	return sqlStatement105
+	return operationsDeleteLabels0ffc
 }
 
-func (target projectionTarget) projectCommentAddStatement() sqlStatement {
+func (target projectionTarget) projectCommentAddStatement() sealedSQLStatement {
 	if target == projectionTargetShadow {
-		return sqlStatement106
+		return operationsInsertShadowComments3660
 	}
-	return sqlStatement107
+	return operationsInsertComments2a26
 }

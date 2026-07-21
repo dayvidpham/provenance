@@ -7,12 +7,12 @@ const (
 	taskEventQueryTimelineOrder
 )
 
-func (order taskEventQueryOrder) statement() sqlStatement {
+func (order taskEventQueryOrder) statement() sealedSQLStatement {
 	switch order {
 	case taskEventQueryJournalOrder:
-		return sqlStatement263
+		return journalSelectJournalAttributed1222
 	case taskEventQueryTimelineOrder:
-		return sqlStatement264
+		return journalSelectJournalAttributedfe94
 	default:
 		panic("unknown task-event query order")
 	}

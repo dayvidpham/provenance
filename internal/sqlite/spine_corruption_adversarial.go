@@ -45,18 +45,18 @@ const (
 	AdversarialSubtypeEvidence
 )
 
-func (table AdversarialSubtypeTable) deleteStatement() sqlStatement {
+func (table AdversarialSubtypeTable) deleteStatement() sealedSQLStatement {
 	switch table {
 	case AdversarialSubtypeOperations:
-		return sqlStatement242
+		return adversarialDeleteJournalOperations07ab
 	case AdversarialSubtypeTaskEvents:
-		return sqlStatement243
+		return adversarialDeleteJournalTaskEventsee69
 	case AdversarialSubtypeAuthorities:
-		return sqlStatement244
+		return adversarialDeleteJournalAuthoritiesc8ba
 	case AdversarialSubtypeDecisions:
-		return sqlStatement245
+		return adversarialDeleteJournalDecisionsd136
 	case AdversarialSubtypeEvidence:
-		return sqlStatement246
+		return adversarialDeleteJournalEvidence4f20
 	default:
 		panic("unknown adversarial subtype table")
 	}
@@ -65,10 +65,10 @@ func (table AdversarialSubtypeTable) deleteStatement() sqlStatement {
 func (db *DB) AdversarialDeleteSubtypeRow(jid journal.JournalID, table AdversarialSubtypeTable) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if err := executeStatement(db.conn, sqlStatement136, nil); err != nil {
+	if err := executeStatement(db.conn, sharedDDLPragmaForeignKeys1be4, nil); err != nil {
 		return fmt.Errorf("AdversarialDeleteSubtypeRow %q: disable FK: %w", table, err)
 	}
-	defer func() { _ = executeStatement(db.conn, sqlStatement033, nil) }()
+	defer func() { _ = executeStatement(db.conn, sharedDDLPragmaForeignKeysde7c, nil) }()
 	// The table is one of the closed subtype-table constants above, never caller
 	// input, so identifier interpolation is safe here.
 	if err := executeStatement(db.conn, table.deleteStatement(), &sqlitex.ExecOptions{Args: []any{int64(jid)}}); err != nil {
@@ -91,7 +91,7 @@ func (db *DB) AdversarialRewriteDiscriminator(jid journal.JournalID, newKind jou
 	defer db.mu.Unlock()
 	var current int = -1
 	if err := executeStatement(db.conn,
-		sqlStatement247,
+		adversarialSelectJournal3863,
 		&sqlitex.ExecOptions{Args: []any{int64(jid)}, ResultFunc: func(stmt *zs.Stmt) error { current = stmt.ColumnInt(0); return nil }}); err != nil {
 		return fmt.Errorf("AdversarialRewriteDiscriminator journal_id=%d: read current kind: %w", jid, err)
 	}
@@ -102,7 +102,7 @@ func (db *DB) AdversarialRewriteDiscriminator(jid journal.JournalID, newKind jou
 		return fmt.Errorf("AdversarialRewriteDiscriminator journal_id=%d: new kind %s equals the current kind, which is no corruption", jid, newKind)
 	}
 	if err := executeStatement(db.conn,
-		sqlStatement248,
+		adversarialUpdateJournal31e7,
 		&sqlitex.ExecOptions{Args: []any{int(newKind), int64(jid)}}); err != nil {
 		return fmt.Errorf("AdversarialRewriteDiscriminator journal_id=%d -> %s: %w", jid, newKind, err)
 	}
@@ -127,23 +127,23 @@ func (db *DB) AdversarialTruncateTail(n int) error {
 		return fmt.Errorf("AdversarialTruncateTail: n must be positive, got %d", n)
 	}
 	var total int
-	if err := executeStatement(db.conn, sqlStatement249,
+	if err := executeStatement(db.conn, adversarialSelectJournalc071,
 		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { total = stmt.ColumnInt(0); return nil }}); err != nil {
 		return fmt.Errorf("AdversarialTruncateTail: count journal: %w", err)
 	}
 	if n >= total {
 		return fmt.Errorf("AdversarialTruncateTail: n=%d must be smaller than the journal length %d (truncating the whole spine is a different case)", n, total)
 	}
-	if err := executeStatement(db.conn, sqlStatement136, nil); err != nil {
+	if err := executeStatement(db.conn, sharedDDLPragmaForeignKeys1be4, nil); err != nil {
 		return fmt.Errorf("AdversarialTruncateTail: disable FK: %w", err)
 	}
-	defer func() { _ = executeStatement(db.conn, sqlStatement033, nil) }()
+	defer func() { _ = executeStatement(db.conn, sharedDDLPragmaForeignKeysde7c, nil) }()
 	// The n highest JournalIDs are the tail. Delete their subtype/detail rows first,
 	// then the supertype rows, so no dangling subtype row is left behind (the tail is
 	// removed cleanly — only the projection, not the spine's own integrity, diverges).
 	var tail []int64
 	if err := executeStatement(db.conn,
-		sqlStatement250,
+		adversarialSelectJournalb2c5,
 		&sqlitex.ExecOptions{Args: []any{n}, ResultFunc: func(stmt *zs.Stmt) error {
 			tail = append(tail, stmt.ColumnInt64(0))
 			return nil
@@ -176,13 +176,13 @@ func (db *DB) AdversarialInsertNonContiguousSupertype(actor journal.ActorID, gap
 		return 0, fmt.Errorf("AdversarialInsertNonContiguousSupertype: gap must be positive, got %d", gap)
 	}
 	var maxJID int64
-	if err := executeStatement(db.conn, sqlStatement082,
+	if err := executeStatement(db.conn, sharedSelectJournalde83,
 		&sqlitex.ExecOptions{Args: []any{0}, ResultFunc: func(stmt *zs.Stmt) error { maxJID = stmt.ColumnInt64(0); return nil }}); err != nil {
 		return 0, fmt.Errorf("AdversarialInsertNonContiguousSupertype: read max journal_id: %w", err)
 	}
 	target := maxJID + int64(gap)
 	if err := executeStatement(db.conn,
-		sqlStatement251,
+		adversarialInsertJournald134,
 		&sqlitex.ExecOptions{Args: []any{target, int(journal.JournalKindDecision), actor.String()}}); err != nil {
 		return 0, fmt.Errorf("AdversarialInsertNonContiguousSupertype journal_id=%d: %w", target, err)
 	}
@@ -196,23 +196,23 @@ func (db *DB) AdversarialInsertNonContiguousSupertype(actor journal.ActorID, gap
 // class-table-inheritance and authority-detail tables the spine uses.
 func (db *DB) deleteSpineRowCascadeLocked(jid int64) error {
 	// Detail tables that reference the subtype rows (deepest first).
-	details := []sqlStatement{
-		sqlStatement252,
-		sqlStatement253,
-		sqlStatement254,
-		sqlStatement255,
-		sqlStatement256,
-		sqlStatement257,
-		sqlStatement258,
-		sqlStatement259,
-		sqlStatement260,
+	details := []sealedSQLStatement{
+		adversarialDeleteJournalOperationResultSlots436c,
+		adversarialDeleteJournalAuthorityBootstraps3ee3,
+		adversarialDeleteJournalAuthorityAssignmentTransitions22ab,
+		adversarialDeleteJournalAuthorities0a99,
+		adversarialDeleteJournalTaskEventContexts7d1d,
+		adversarialDeleteJournalTaskEvents1040,
+		adversarialDeleteJournalOperations1c0e,
+		adversarialDeleteJournalDecisionsa790,
+		adversarialDeleteJournalEvidence6f75,
 	}
 	for _, stmt := range details {
 		if err := executeStatement(db.conn, stmt, &sqlitex.ExecOptions{Args: []any{jid}}); err != nil {
 			return fmt.Errorf("cascade static subtype statement: %w", err)
 		}
 	}
-	if err := executeStatement(db.conn, sqlStatement261,
+	if err := executeStatement(db.conn, adversarialDeleteJournalb965,
 		&sqlitex.ExecOptions{Args: []any{jid}}); err != nil {
 		return fmt.Errorf("delete supertype row %d: %w", jid, err)
 	}
@@ -228,7 +228,7 @@ func (db *DB) AdversarialJournalRows() ([]journal.JournalID, []journal.JournalKi
 	var ids []journal.JournalID
 	var kinds []journal.JournalKind
 	if err := executeStatement(db.conn,
-		sqlStatement262,
+		adversarialSelectJournal4577,
 		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 			ids = append(ids, journal.JournalID(stmt.ColumnInt64(0)))
 			kinds = append(kinds, journal.JournalKind(stmt.ColumnInt(1)))

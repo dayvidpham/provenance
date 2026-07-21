@@ -26,7 +26,7 @@ func (db *DB) StartActivity(agentID ptypes.AgentID, phase ptypes.Phase, stage pt
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if err := executeStatement(db.conn,
-		sqlStatement001,
+		activitiesInsertActivities148f,
 		&sqlitex.ExecOptions{Args: []any{
 			activity.ID.String(), activity.AgentID.String(),
 			int(activity.Phase), int(activity.Stage),
@@ -55,7 +55,7 @@ func (db *DB) StartActivityWithID(id ptypes.ActivityID, agentID ptypes.AgentID, 
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if err := executeStatement(db.conn,
-		sqlStatement002,
+		activitiesInsertActivities10d4,
 		&sqlitex.ExecOptions{Args: []any{
 			id.String(), agentID.String(),
 			int(phase), int(stage),
@@ -73,7 +73,7 @@ func (db *DB) StartActivityWithID(id ptypes.ActivityID, agentID ptypes.AgentID, 
 	var act ptypes.Activity
 	var found bool
 	if err := executeStatement(db.conn,
-		sqlStatement003,
+		activitiesSelectActivitiesc7f6,
 		&sqlitex.ExecOptions{
 			Args: []any{id.String()},
 			ResultFunc: func(stmt *zs.Stmt) error {
@@ -103,7 +103,7 @@ func (db *DB) EndActivity(id ptypes.ActivityID) (ptypes.Activity, error) {
 	defer db.mu.Unlock()
 
 	if err := executeStatement(db.conn,
-		sqlStatement004,
+		activitiesUpdateActivities487b,
 		&sqlitex.ExecOptions{Args: []any{id.String(), endTime.UnixNano()}}); err != nil {
 		return ptypes.Activity{}, fmt.Errorf("sqlite.EndActivity: %w", err)
 	}
@@ -111,7 +111,7 @@ func (db *DB) EndActivity(id ptypes.ActivityID) (ptypes.Activity, error) {
 	var act ptypes.Activity
 	var found bool
 	if err := executeStatement(db.conn,
-		sqlStatement003,
+		activitiesSelectActivitiesc7f6,
 		&sqlitex.ExecOptions{
 			Args: []any{id.String()},
 			ResultFunc: func(stmt *zs.Stmt) error {
@@ -148,7 +148,7 @@ func (db *DB) GetActivities(agentID *ptypes.AgentID) ([]ptypes.Activity, error) 
 	}
 
 	var activities []ptypes.Activity
-	err := executeStatement(db.conn, sqlStatement005, &sqlitex.ExecOptions{
+	err := executeStatement(db.conn, activitiesSelectActivities629c, &sqlitex.ExecOptions{
 		Args: []any{agentID != nil, agent},
 		ResultFunc: func(stmt *zs.Stmt) error {
 			act, err := ScanActivity(stmt)

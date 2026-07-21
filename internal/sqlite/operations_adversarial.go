@@ -14,13 +14,13 @@ import (
 func (db *DB) AdversarialRemoveJournalOperationFK() (err error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if err = executeStatement(db.conn, sqlStatement136, nil); err != nil {
+	if err = executeStatement(db.conn, sharedDDLPragmaForeignKeys1be4, nil); err != nil {
 		return err
 	}
-	defer func() { _ = executeStatement(db.conn, sqlStatement033, nil) }()
+	defer func() { _ = executeStatement(db.conn, sharedDDLPragmaForeignKeysde7c, nil) }()
 	end := sqlitex.Transaction(db.conn)
 	defer end(&err)
-	steps := []sqlStatement{sqlStatement338, sqlStatement344, sqlStatement345, sqlStatement147, sqlStatement346, sqlStatement347, sqlStatement348, sqlStatement349, sqlStatement350, sqlStatement343}
+	steps := []sealedSQLStatement{sharedDDLDropJournalAttributed95ee, adversarialDDLCreateJournalLegacy3d98, adversarialInsertJournalLegacyd55f, sharedDDLDropJournal87b7, adversarialDDLAlterJournalLegacya8de, adversarialDDLCreateIdxJournalKind725e, adversarialDDLCreateIdxJournalActora6ef, adversarialDDLCreateIdxJournalPboj391f, adversarialDDLCreateIdxJournalRecordedAt69e6, sharedDDLCreateJournal4045}
 	for _, step := range steps {
 		if err = executeStatement(db.conn, step, nil); err != nil {
 			return fmt.Errorf("remove journal operation FK fixture: %w", err)
@@ -34,13 +34,13 @@ func (db *DB) AdversarialRemoveJournalOperationFK() (err error) {
 func (db *DB) AdversarialInstallV1OperationConstraint() (err error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if err = executeStatement(db.conn, sqlStatement136, nil); err != nil {
+	if err = executeStatement(db.conn, sharedDDLPragmaForeignKeys1be4, nil); err != nil {
 		return err
 	}
-	defer func() { _ = executeStatement(db.conn, sqlStatement033, nil) }()
+	defer func() { _ = executeStatement(db.conn, sharedDDLPragmaForeignKeysde7c, nil) }()
 	end := sqlitex.Transaction(db.conn)
 	defer end(&err)
-	steps := []sqlStatement{sqlStatement115, sqlStatement116, sqlStatement351, sqlStatement352, sqlStatement119, sqlStatement353, sqlStatement354, sqlStatement355}
+	steps := []sealedSQLStatement{sharedDDLDropJournalOperationsCanonicalInsertb583, sharedDDLDropJournalOperationsCanonicalUpdate213c, adversarialDDLCreateJournalOperationsV13987, adversarialInsertJournalOperationsV144cf, sharedDDLDropJournalOperations8369, adversarialDDLAlterJournalOperationsV15b33, adversarialDDLCreateJournalOperationsCanonicalInsertbb5e, adversarialDDLCreateOff2d8}
 	for _, step := range steps {
 		if err = executeStatement(db.conn, step, nil); err != nil {
 			return fmt.Errorf("install V1 operation constraint fixture: %w", err)
@@ -71,12 +71,12 @@ func (db *DB) AdversarialJournalRowTwoSubtypes(actor journal.ActorID) (journal.J
 		return 0, txErr
 	}
 	if txErr = executeStatement(db.conn,
-		sqlStatement137,
+		adversarialInsertJournalDecisions7778,
 		&sqlitex.ExecOptions{Args: []any{jid, "pasture.review.vote", "{}"}}); txErr != nil {
 		return 0, txErr
 	}
 	if txErr = executeStatement(db.conn,
-		sqlStatement138,
+		adversarialInsertJournalEvidenceb639,
 		&sqlitex.ExecOptions{Args: []any{jid, "pasture.git.commit", []byte("x"), "{}"}}); txErr != nil {
 		return 0, txErr
 	}
@@ -99,10 +99,10 @@ func (db *DB) AdversarialSubordinateRowCarryingActor(actor journal.ActorID, task
 	defer db.mu.Unlock()
 	// Bypass the structural CHECK so the reducer-level placement guard is what
 	// catches the row (the CHECK is exercised on the production write path instead).
-	if err := executeStatement(db.conn, sqlStatement139, nil); err != nil {
+	if err := executeStatement(db.conn, adversarialDDLPragmaIgnoreCheckConstraints8d56, nil); err != nil {
 		return 0, fmt.Errorf("AdversarialSubordinateRowCarryingActor: disable CHECK enforcement: %w", err)
 	}
-	defer func() { _ = executeStatement(db.conn, sqlStatement140, nil) }()
+	defer func() { _ = executeStatement(db.conn, adversarialDDLPragmaIgnoreCheckConstraintsb381, nil) }()
 
 	var txErr error
 	endTx := sqlitex.Transaction(db.conn)
@@ -116,20 +116,20 @@ func (db *DB) AdversarialSubordinateRowCarryingActor(actor journal.ActorID, task
 		return 0, txErr
 	}
 	if txErr = executeStatement(db.conn,
-		sqlStatement141,
+		adversarialInsertJournalOperationsd00f,
 		&sqlitex.ExecOptions{Args: []any{anchorJID, fmt.Sprintf("adversarial-subord-op-%d", anchorJID), []byte("c"), []byte("m")}}); txErr != nil {
 		return 0, txErr
 	}
 	// Subordinate task_event row carrying an actor it must not: PBOJID set AND
 	// actor_id set. insertJournalRowLocked would write NULL, so insert directly.
 	if txErr = executeStatement(db.conn,
-		sqlStatement142,
+		sharedInsertJournale268,
 		&sqlitex.ExecOptions{Args: []any{int(journal.JournalKindTaskEvent), actor.String(), int64(0), anchorJID}}); txErr != nil {
 		return 0, txErr
 	}
 	subordinateJID := db.conn.LastInsertRowID()
 	if txErr = executeStatement(db.conn,
-		sqlStatement094,
+		sharedInsertJournalTaskEventsf716,
 		&sqlitex.ExecOptions{Args: []any{subordinateJID, task.String(), string(journal.EventKindTaskUpdated), "{}"}}); txErr != nil {
 		return 0, txErr
 	}
@@ -151,12 +151,12 @@ func (db *DB) AdversarialSubtypeMismatchingKind(actor journal.ActorID) (journal.
 		return 0, txErr
 	}
 	if txErr = executeStatement(db.conn,
-		sqlStatement137,
+		adversarialInsertJournalDecisions7778,
 		&sqlitex.ExecOptions{Args: []any{jid, "pasture.review.vote", "{}"}}); txErr != nil {
 		return 0, txErr
 	}
 	if txErr = executeStatement(db.conn,
-		sqlStatement141,
+		adversarialInsertJournalOperationsd00f,
 		&sqlitex.ExecOptions{Args: []any{jid, fmt.Sprintf("adversarial-op-%d", jid), []byte("c"), []byte("m")}}); txErr != nil {
 		return 0, txErr
 	}
@@ -179,24 +179,24 @@ func (db *DB) AdversarialAuthorityDetailMismatch(actor journal.ActorID, task jou
 		return 0, txErr
 	}
 	if txErr = executeStatement(db.conn,
-		sqlStatement131,
+		sharedInsertJournalAuthoritiesd41a,
 		&sqlitex.ExecOptions{Args: []any{jid, authKindBootstrapID, fmt.Sprintf("adversarial-auth-%d", jid)}}); txErr != nil {
 		return 0, txErr
 	}
 	if txErr = executeStatement(db.conn,
-		sqlStatement132,
+		sharedInsertJournalAuthorityBootstrapsab65,
 		&sqlitex.ExecOptions{Args: []any{jid, "adversarial"}}); txErr != nil {
 		return 0, txErr
 	}
 	assignment := fmt.Sprintf("adversarial-episode-%d", jid)
 	if txErr = executeStatement(db.conn,
-		sqlStatement143,
+		adversarialInsertJournalAuthorityAssignmentEpisodesd5d6,
 		&sqlitex.ExecOptions{Args: []any{assignment, task.String(), slotOwnerResponsibilityID, actor.String()}}); txErr != nil {
 		return 0, txErr
 	}
 	// The transition points at the bootstrap authority above — the mismatch.
 	if txErr = executeStatement(db.conn,
-		sqlStatement144,
+		sharedInsertJournalAuthorityAssignmentTransitions6b1d,
 		&sqlitex.ExecOptions{Args: []any{jid, assignment, transitionStartedID}}); txErr != nil {
 		return 0, txErr
 	}
@@ -258,11 +258,11 @@ type AdversarialColumnAddition uint8
 
 const AdversarialAddUnreviewedTaskEventColumn AdversarialColumnAddition = 1
 
-func (addition AdversarialColumnAddition) statement() sqlStatement {
+func (addition AdversarialColumnAddition) statement() sealedSQLStatement {
 	if addition != AdversarialAddUnreviewedTaskEventColumn {
 		panic("unknown adversarial column addition")
 	}
-	return sqlStatement145
+	return adversarialDDLAlterJournalTaskEvents4d3f
 }
 
 func (db *DB) AdversarialAddColumn(addition AdversarialColumnAddition) error {
@@ -283,11 +283,11 @@ type AdversarialColumnDrop uint8
 
 const AdversarialDropTaskEventPayload AdversarialColumnDrop = 1
 
-func (drop AdversarialColumnDrop) statement() sqlStatement {
+func (drop AdversarialColumnDrop) statement() sealedSQLStatement {
 	if drop != AdversarialDropTaskEventPayload {
 		panic("unknown adversarial column drop")
 	}
-	return sqlStatement146
+	return adversarialDDLAlterJournalTaskEvents8346
 }
 
 func (db *DB) AdversarialDropColumn(drop AdversarialColumnDrop) error {
@@ -309,20 +309,20 @@ type AdversarialTableDrop uint8
 
 const AdversarialDropJournalTable AdversarialTableDrop = 1
 
-func (drop AdversarialTableDrop) statement() sqlStatement {
+func (drop AdversarialTableDrop) statement() sealedSQLStatement {
 	if drop != AdversarialDropJournalTable {
 		panic("unknown adversarial table drop")
 	}
-	return sqlStatement147
+	return sharedDDLDropJournal87b7
 }
 
 func (db *DB) AdversarialDropTable(drop AdversarialTableDrop) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if err := executeStatement(db.conn, sqlStatement136, nil); err != nil {
+	if err := executeStatement(db.conn, sharedDDLPragmaForeignKeys1be4, nil); err != nil {
 		return fmt.Errorf("AdversarialDropTable: disable FK: %w", err)
 	}
-	defer func() { _ = executeStatement(db.conn, sqlStatement033, nil) }()
+	defer func() { _ = executeStatement(db.conn, sharedDDLPragmaForeignKeysde7c, nil) }()
 	// DDL identifier cannot be bound; table comes from the closed corpus.
 	if err := executeStatement(db.conn, drop.statement(), nil); err != nil {
 		return fmt.Errorf("AdversarialDropTable: %w", err)
@@ -380,11 +380,11 @@ type AdversarialTableAddition uint8
 
 const AdversarialAddUnreviewedJournalTable AdversarialTableAddition = 1
 
-func (addition AdversarialTableAddition) statement() sqlStatement {
+func (addition AdversarialTableAddition) statement() sealedSQLStatement {
 	if addition != AdversarialAddUnreviewedJournalTable {
 		panic("unknown adversarial table addition")
 	}
-	return sqlStatement148
+	return adversarialDDLCreateJournalUnreviewed8b03
 }
 
 func (db *DB) AdversarialAddTable(addition AdversarialTableAddition) error {
@@ -432,14 +432,14 @@ func (db *DB) AdversarialCorruptTaskProjection(task journal.TaskID, field Advers
 	return nil
 }
 
-func (field AdversarialProjectionField) statement() sqlStatement {
+func (field AdversarialProjectionField) statement() sealedSQLStatement {
 	switch field {
 	case AdversarialFieldOwner:
-		return sqlStatement149
+		return adversarialUpdateTasksc047
 	case AdversarialFieldStatus:
-		return sqlStatement150
+		return adversarialUpdateTasks9d9f
 	case AdversarialFieldWatermark:
-		return sqlStatement151
+		return adversarialUpdateTasks4c22
 	default:
 		panic("unknown adversarial projection field")
 	}
@@ -457,7 +457,7 @@ func (db *DB) AdversarialCorruptCommentBody(commentID, body string) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if err := executeStatement(db.conn,
-		sqlStatement152,
+		adversarialUpdateComments6627,
 		&sqlitex.ExecOptions{Args: []any{body, commentID}}); err != nil {
 		return fmt.Errorf("AdversarialCorruptCommentBody %q: %w", commentID, err)
 	}
@@ -471,7 +471,7 @@ func (db *DB) AdversarialInsertSpuriousAttribution(task journal.TaskID, actor jo
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if err := executeStatement(db.conn,
-		sqlStatement153,
+		adversarialInsertTaskAttributions0464,
 		&sqlitex.ExecOptions{Args: []any{task.String(), actor.String(), int64(jid)}}); err != nil {
 		return fmt.Errorf("AdversarialInsertSpuriousAttribution %q/%q: %w", task, actor, err)
 	}
@@ -525,7 +525,7 @@ func (db *DB) AdversarialCyclicParentChain(actor journal.ActorID, taskX, taskY, 
 	// Close the cycle: X.parent = Y. A production start effect can never write this
 	// (its cycle guard rejects it); the direct UPDATE is the corruption under test.
 	if txErr = executeStatement(db.conn,
-		sqlStatement154,
+		adversarialUpdateJournalAuthorityAssignmentEpisodesf918,
 		&sqlitex.ExecOptions{Args: []any{"cyclic-parent-Y", "cyclic-parent-X"}}); txErr != nil {
 		return 0, journal.TaskID{}, 0, txErr
 	}
@@ -534,7 +534,7 @@ func (db *DB) AdversarialCyclicParentChain(actor journal.ActorID, taskX, taskY, 
 		return 0, journal.TaskID{}, 0, txErr
 	}
 	var maxJID int64
-	if txErr = executeStatement(db.conn, sqlStatement082,
+	if txErr = executeStatement(db.conn, sharedSelectJournalde83,
 		&sqlitex.ExecOptions{Args: []any{0}, ResultFunc: func(stmt *zs.Stmt) error { maxJID = stmt.ColumnInt64(0); return nil }}); txErr != nil {
 		return 0, journal.TaskID{}, 0, txErr
 	}
@@ -552,7 +552,7 @@ func (db *DB) seedActiveEpisodeLocked(actor journal.ActorID, task journal.TaskID
 		return 0, err
 	}
 	if err := executeStatement(db.conn,
-		sqlStatement155,
+		adversarialInsertJournalAuthorityAssignmentEpisodes2c6e,
 		&sqlitex.ExecOptions{Args: []any{string(assignment), task.String(), slotOwnerResponsibilityID, actor.String(), parent}}); err != nil {
 		return 0, fmt.Errorf("seed episode %q: %w", assignment, err)
 	}

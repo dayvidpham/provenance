@@ -14,7 +14,7 @@ func (db *DB) AddLabel(id ptypes.TaskID, label string) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	return executeStatement(db.conn,
-		sqlStatement085,
+		tasksInsertLabelscc95,
 		&sqlitex.ExecOptions{Args: []any{id.String(), label}})
 }
 
@@ -24,7 +24,7 @@ func (db *DB) RemoveLabel(id ptypes.TaskID, label string) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	return executeStatement(db.conn,
-		sqlStatement086,
+		tasksDeleteLabelsdf09,
 		&sqlitex.ExecOptions{Args: []any{id.String(), label}})
 }
 
@@ -35,7 +35,7 @@ func (db *DB) GetLabels(id ptypes.TaskID) ([]string, error) {
 	defer db.mu.Unlock()
 	var labels []string
 	err := executeStatement(db.conn,
-		sqlStatement087,
+		tasksSelectLabels9e23,
 		&sqlitex.ExecOptions{
 			Args: []any{id.String()},
 			ResultFunc: func(stmt *zs.Stmt) error {

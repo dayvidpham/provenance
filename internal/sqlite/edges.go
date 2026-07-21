@@ -14,7 +14,7 @@ func (db *DB) InsertEdge(sourceID ptypes.TaskID, targetID string, kind ptypes.Ed
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	return executeStatement(db.conn,
-		sqlStatement045,
+		tasksInsertEdges3b0d,
 		&sqlitex.ExecOptions{Args: []any{sourceID.String(), targetID, int(kind), now.UnixNano()}})
 }
 
@@ -23,7 +23,7 @@ func (db *DB) DeleteEdge(sourceID ptypes.TaskID, targetID string, kind ptypes.Ed
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	return executeStatement(db.conn,
-		sqlStatement046,
+		tasksDeleteEdges64b4,
 		&sqlitex.ExecOptions{Args: []any{sourceID.String(), targetID, int(kind)}})
 }
 
@@ -39,7 +39,7 @@ func (db *DB) GetEdges(sourceID ptypes.TaskID, kind *ptypes.EdgeKind) ([]ptypes.
 	}
 
 	var edges []ptypes.Edge
-	err := executeStatement(db.conn, sqlStatement047, &sqlitex.ExecOptions{
+	err := executeStatement(db.conn, tasksSelectEdges0685, &sqlitex.ExecOptions{
 		Args: []any{sourceID.String(), kind != nil, kindValue},
 		ResultFunc: func(stmt *zs.Stmt) error {
 			edges = append(edges, ptypes.Edge{
@@ -64,7 +64,7 @@ func (db *DB) GetBlockedByEdges() ([]ptypes.Edge, error) {
 
 	var edges []ptypes.Edge
 	err := executeStatement(db.conn,
-		sqlStatement048,
+		tasksSelectEdgesfb60,
 		&sqlitex.ExecOptions{Args: []any{int(ptypes.EdgeBlockedBy)},
 			ResultFunc: func(stmt *zs.Stmt) error {
 				edges = append(edges, ptypes.Edge{
@@ -89,7 +89,7 @@ func (db *DB) GetDepTree(rootID ptypes.TaskID) ([]ptypes.Edge, error) {
 
 	adj := make(map[string][]string)
 	if err := executeStatement(db.conn,
-		sqlStatement049,
+		tasksSelectEdges9d03,
 		&sqlitex.ExecOptions{Args: []any{int(ptypes.EdgeBlockedBy)},
 			ResultFunc: func(stmt *zs.Stmt) error {
 				src := stmt.ColumnText(0)

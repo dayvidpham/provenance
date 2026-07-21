@@ -37,13 +37,14 @@ func (v MutationEncodingVersion) String() string {
 type canonicalCodecDescriptor struct {
 	version MutationEncodingVersion
 	wireTag string
+	prepare canonicalMutationPreparer
 	decoder canonicalMutationDecoder
 }
 
 type canonicalCodecDescriptors []canonicalCodecDescriptor
 
 var canonicalCodecRegistry = canonicalCodecDescriptors{
-	canonicalCodecDescriptor{version: MutationEncodingV1, wireTag: "provenance.mutation.v1", decoder: decodeCanonicalMutationV1},
+	canonicalCodecDescriptor{version: MutationEncodingV1, wireTag: "provenance.mutation.v1", prepare: prepareMutationV1, decoder: decodeCanonicalMutationV1},
 }
 
 func canonicalCodecForVersion(version MutationEncodingVersion) (canonicalCodecDescriptor, bool) {
@@ -54,8 +55,8 @@ func (registry canonicalCodecDescriptors) validate() error {
 	versions := make(map[MutationEncodingVersion]struct{}, len(registry))
 	tags := make(map[string]struct{}, len(registry))
 	for _, descriptor := range registry {
-		if descriptor.version == 0 || descriptor.wireTag == "" || descriptor.decoder == nil {
-			return canonicalMutationError("codec-registry", "codec descriptor has an empty version, wire tag, or decoder", "register a complete codec descriptor")
+		if descriptor.version == 0 || descriptor.wireTag == "" || descriptor.prepare == nil || descriptor.decoder == nil {
+			return canonicalMutationError("codec-registry", "codec descriptor has an empty version, wire tag, preparer, or decoder", "register a complete codec descriptor")
 		}
 		if _, exists := versions[descriptor.version]; exists {
 			return canonicalMutationError("codec-registry", fmt.Sprintf("duplicate mutation encoding version %d", descriptor.version), "register each encoding version exactly once")
@@ -413,13 +414,25 @@ func (codec canonicalV1Codec) diagnosticField(ref canonicalV1FieldRef) string {
 // then decodes those bytes once. The returned decoded effects are the only effects a
 // write path should execute.
 func PrepareMutationV1(effects []Effect) (CanonicalMutation, error) {
+	return prepareCanonicalMutation(MutationEncodingV1, effects)
+}
+
+func prepareCanonicalMutation(version MutationEncodingVersion, effects []Effect) (CanonicalMutation, error) {
+	descriptor, ok := canonicalCodecRegistry.codecForVersion(version)
+	if !ok {
+		return CanonicalMutation{}, canonicalMutationError("codec-registry", fmt.Sprintf("mutation encoding version %d has no complete registered codec", version), "register exactly one complete codec descriptor before preparing mutations")
+	}
+	return descriptor.prepare(effects, descriptor)
+}
+
+func prepareMutationV1(effects []Effect, descriptor canonicalCodecDescriptor) (CanonicalMutation, error) {
 	if len(effects) > MaxCanonicalEffects {
 		return CanonicalMutation{}, canonicalMutationError("effect-count", fmt.Sprintf("%d exceeds maximum %d", len(effects), MaxCanonicalEffects), "split the operation into bounded mutations")
 	}
 	normalized := make([]Effect, len(effects))
 	counter := &canonicalSizeCounter{limit: MaxCanonicalMutationBytes}
 	w := canonicalWriter{codec: mutationV1Codec, w: counter}
-	writeCanonicalEnvelopeHeader(&w, len(effects))
+	writeCanonicalEnvelopeHeader(&w, len(effects), descriptor.wireTag)
 	for i := range effects {
 		if err := validateRawCanonicalEffectBounds(effects[i], i); err != nil {
 			return CanonicalMutation{}, err
@@ -439,7 +452,7 @@ func PrepareMutationV1(effects []Effect) (CanonicalMutation, error) {
 	var out bytes.Buffer
 	out.Grow(counter.size)
 	w = canonicalWriter{codec: mutationV1Codec, w: &out}
-	writeCanonicalEnvelopeHeader(&w, len(normalized))
+	writeCanonicalEnvelopeHeader(&w, len(normalized), descriptor.wireTag)
 	for i := range normalized {
 		if err := mutationV1Codec.encodeEffect(&w, normalized[i], i); err != nil {
 			return CanonicalMutation{}, err
@@ -448,11 +461,11 @@ func PrepareMutationV1(effects []Effect) (CanonicalMutation, error) {
 	if w.err != nil {
 		return CanonicalMutation{}, fmt.Errorf("provenance: encode bounded canonical mutation: %w", w.err)
 	}
-	return DecodeCanonicalMutation(out.Bytes())
+	return descriptor.decoder(out.Bytes(), descriptor.version, descriptor.wireTag)
 }
 
-func writeCanonicalEnvelopeHeader(w *canonicalWriter, effectCount int) {
-	w.field(envelopeField(envelopeVersion), []byte(MutationEncodingV1.String()))
+func writeCanonicalEnvelopeHeader(w *canonicalWriter, effectCount int, wireTag string) {
+	w.field(envelopeField(envelopeVersion), []byte(wireTag))
 	w.field(envelopeField(envelopeEffectCount), []byte(strconv.Itoa(effectCount)))
 }
 
@@ -484,6 +497,13 @@ func DecodeCanonicalMutation(data []byte) (CanonicalMutation, error) {
 // field. It does not require that this build support the version, allowing
 // startup to distinguish a column/wire mismatch from a matching unknown codec.
 func InspectCanonicalMutationEncodingVersion(data []byte) (inspectedMutationEncodingTag, error) {
+	return inspectCanonicalMutationEncodingVersionWithRegistry(data, canonicalCodecRegistry)
+}
+
+func inspectCanonicalMutationEncodingVersionWithRegistry(data []byte, registry canonicalCodecDescriptors) (inspectedMutationEncodingTag, error) {
+	if err := registry.validate(); err != nil {
+		return inspectedMutationEncodingTag{}, err
+	}
 	if len(data) > MaxCanonicalMutationBytes {
 		return inspectedMutationEncodingTag{}, canonicalMutationError("mutation", fmt.Sprintf("%d bytes exceeds maximum %d", len(data), MaxCanonicalMutationBytes), "restore bounded canonical bytes")
 	}
@@ -524,6 +544,7 @@ func decodeCanonicalMutationWithRegistry(data []byte, registry canonicalCodecDes
 }
 
 type canonicalMutationDecoder func([]byte, MutationEncodingVersion, string) (CanonicalMutation, error)
+type canonicalMutationPreparer func([]Effect, canonicalCodecDescriptor) (CanonicalMutation, error)
 
 func decodeCanonicalMutationV1(data []byte, versionID MutationEncodingVersion, wireTag string) (CanonicalMutation, error) {
 	r := canonicalReader{codec: mutationV1Codec, r: bufio.NewReader(bytes.NewReader(data))}

@@ -92,7 +92,7 @@ func (db *DB) insertLegacyTaskRowLocked(task ptypes.Task) error {
 		closedAt = task.ClosedAt.UTC().UnixNano()
 	}
 	if err := executeStatement(db.conn,
-		sqlStatement088,
+		migrationInsertTasks879a,
 		&sqlitex.ExecOptions{Args: []any{
 			task.ID.String(), task.ID.Namespace, task.Title, task.Description,
 			int(task.Status), int(task.Priority), int(task.Type), int(task.Phase),

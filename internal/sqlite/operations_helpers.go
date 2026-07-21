@@ -33,7 +33,7 @@ func (db *DB) insertJournalRowLocked(kind journal.JournalKind, actor journal.Act
 		actorArg = actor.String()
 	}
 	if err := executeStatement(db.conn,
-		sqlStatement142,
+		sharedInsertJournale268,
 		&sqlitex.ExecOptions{Args: []any{int(kind), actorArg, recordedAt, pbojArg}}); err != nil {
 		return 0, fmt.Errorf("insert journal row (kind %s): %w", kind, err)
 	}
@@ -46,7 +46,7 @@ func (db *DB) insertOperationRowLocked(anchor int64, in journal.OperationInput, 
 		authArg = int64(*in.AuthorityJournalID)
 	}
 	if err := executeStatement(db.conn,
-		sqlStatement156,
+		operationsInsertJournalOperations35a2,
 		&sqlitex.ExecOptions{Args: []any{anchor, string(in.OperationID), authArg, in.CommandDigest, prepared.DerivedDigest(), prepared.EncodingVersion().String(), prepared.CanonicalBytes()}}); err != nil {
 		return fmt.Errorf("insert journal_operations for %q: %w", in.OperationID, err)
 	}
@@ -56,12 +56,12 @@ func (db *DB) insertOperationRowLocked(anchor int64, in journal.OperationInput, 
 func (db *DB) insertAuthorityAssignmentTransitionLocked(jid int64, assignment journal.AssignmentID, transitionID int) error {
 	opAuthID := fmt.Sprintf("authority--assignment--%d", jid)
 	if err := executeStatement(db.conn,
-		sqlStatement131,
+		sharedInsertJournalAuthoritiesd41a,
 		&sqlitex.ExecOptions{Args: []any{jid, authKindAssignmentID, opAuthID}}); err != nil {
 		return fmt.Errorf("insert journal_authorities (assignment): %w", err)
 	}
 	if err := executeStatement(db.conn,
-		sqlStatement144,
+		sharedInsertJournalAuthorityAssignmentTransitions6b1d,
 		&sqlitex.ExecOptions{Args: []any{jid, string(assignment), transitionID}}); err != nil {
 		return fmt.Errorf("insert assignment transition (%s): %w", journal.AssignmentTransition(transitionID), err)
 	}
@@ -76,7 +76,7 @@ func (db *DB) insertResultSlotLocked(anchor int64, slot journal.ResultSlotID, pr
 		return err
 	}
 	if err := executeStatement(db.conn,
-		sqlStatement157,
+		operationsInsertJournalOperationResultSlots9f08,
 		&sqlitex.ExecOptions{Args: []any{anchor, string(slot), producedJID}}); err != nil {
 		return fmt.Errorf("insert result slot %q: %w", slot, err)
 	}
@@ -87,7 +87,7 @@ func (db *DB) requireResultSlotOwnOperationLocked(anchor, producedJID int64) err
 	var producer int64
 	var isNull = true
 	if err := executeStatement(db.conn,
-		sqlStatement158,
+		operationsSelectJournal5e6e,
 		&sqlitex.ExecOptions{Args: []any{producedJID}, ResultFunc: func(stmt *zs.Stmt) error {
 			if stmt.ColumnType(0) != zs.TypeNull {
 				producer = stmt.ColumnInt64(0)
@@ -137,7 +137,7 @@ func (db *DB) advanceWatermarkLocked(task journal.TaskID, jid int64) error {
 func (db *DB) recomputeTaskOwnerLocked(task journal.TaskID, jid int64) error {
 	var owner any
 	if err := executeStatement(db.conn,
-		sqlStatement159,
+		operationsSelectJournalAuthorityAssignmentEpisodes7d4e,
 		&sqlitex.ExecOptions{
 			Args:       []any{task.String(), transitionStartedID, slotOwnerResponsibilityID, transitionEndedID},
 			ResultFunc: func(stmt *zs.Stmt) error { owner = stmt.ColumnText(0); return nil },
@@ -152,25 +152,25 @@ func (db *DB) recomputeTaskOwnerLocked(task journal.TaskID, jid int64) error {
 	return nil
 }
 
-func (target projectionTarget) insertAttributionStatement() sqlStatement {
+func (target projectionTarget) insertAttributionStatement() sealedSQLStatement {
 	if target == projectionTargetShadow {
-		return sqlStatement160
+		return operationsInsertShadowTaskAttributions58d6
 	}
-	return sqlStatement161
+	return operationsInsertTaskAttributions0f2b
 }
 
-func (target projectionTarget) advanceWatermarkStatement() sqlStatement {
+func (target projectionTarget) advanceWatermarkStatement() sealedSQLStatement {
 	if target == projectionTargetShadow {
-		return sqlStatement162
+		return operationsUpdateShadowTasks2fcd
 	}
-	return sqlStatement055
+	return sharedUpdateTasksf343
 }
 
-func (target projectionTarget) updateOwnerStatement() sqlStatement {
+func (target projectionTarget) updateOwnerStatement() sealedSQLStatement {
 	if target == projectionTargetShadow {
-		return sqlStatement163
+		return operationsUpdateShadowTaskscb87
 	}
-	return sqlStatement164
+	return operationsUpdateTasks1ef4
 }
 
 // ---------------------------------------------------------------------------
@@ -196,7 +196,7 @@ func (db *DB) episodeEndedLocked(assignment journal.AssignmentID) (ended bool, e
 func (db *DB) episodeExistsLocked(assignment journal.AssignmentID) (bool, error) {
 	found := false
 	if err := executeStatement(db.conn,
-		sqlStatement165,
+		operationsSelectJournalAuthorityAssignmentEpisodesddfc,
 		&sqlitex.ExecOptions{Args: []any{string(assignment)}, ResultFunc: func(*zs.Stmt) error { found = true; return nil }}); err != nil {
 		return false, fmt.Errorf("episode exists %q: %w", assignment, err)
 	}
@@ -206,7 +206,7 @@ func (db *DB) episodeExistsLocked(assignment journal.AssignmentID) (bool, error)
 func (db *DB) transitionExistsLocked(assignment journal.AssignmentID, transitionID int) (bool, error) {
 	found := false
 	if err := executeStatement(db.conn,
-		sqlStatement166,
+		operationsSelectJournalAuthorityAssignmentTransitionse5c0,
 		&sqlitex.ExecOptions{Args: []any{string(assignment), transitionID}, ResultFunc: func(*zs.Stmt) error { found = true; return nil }}); err != nil {
 		return false, fmt.Errorf("transition exists %q/%d: %w", assignment, transitionID, err)
 	}
@@ -216,7 +216,7 @@ func (db *DB) transitionExistsLocked(assignment journal.AssignmentID, transition
 func (db *DB) episodeTaskLocked(assignment journal.AssignmentID) (journal.TaskID, error) {
 	var raw string
 	if err := executeStatement(db.conn,
-		sqlStatement167,
+		operationsSelectJournalAuthorityAssignmentEpisodesf2d6,
 		&sqlitex.ExecOptions{Args: []any{string(assignment)}, ResultFunc: func(stmt *zs.Stmt) error { raw = stmt.ColumnText(0); return nil }}); err != nil {
 		return journal.TaskID{}, fmt.Errorf("episode task %q: %w", assignment, err)
 	}
@@ -231,7 +231,7 @@ func (db *DB) episodeTaskLocked(assignment journal.AssignmentID) (journal.TaskID
 // parent_assignment_id) or does not exist.
 func (db *DB) episodeParentLocked(assignment journal.AssignmentID) (parent journal.AssignmentID, hasParent bool, err error) {
 	if execErr := executeStatement(db.conn,
-		sqlStatement168,
+		operationsSelectJournalAuthorityAssignmentEpisodes317f,
 		&sqlitex.ExecOptions{Args: []any{string(assignment)}, ResultFunc: func(stmt *zs.Stmt) error {
 			if stmt.ColumnType(0) != zs.TypeNull {
 				parent = journal.AssignmentID(stmt.ColumnText(0))
@@ -251,7 +251,7 @@ func (db *DB) episodeParentLocked(assignment journal.AssignmentID) (parent journ
 func (db *DB) transitionExistsBeforeLocked(assignment journal.AssignmentID, transitionID int, beforeJID int64) (bool, error) {
 	found := false
 	if err := executeStatement(db.conn,
-		sqlStatement169,
+		operationsSelectJournalAuthorityAssignmentTransitionsd830,
 		&sqlitex.ExecOptions{Args: []any{string(assignment), transitionID, beforeJID}, ResultFunc: func(*zs.Stmt) error { found = true; return nil }}); err != nil {
 		return false, fmt.Errorf("transition-before %q/%d < %d: %w", assignment, transitionID, beforeJID, err)
 	}
@@ -282,7 +282,7 @@ func (db *DB) episodeActiveAtLocked(assignment journal.AssignmentID, beforeJID i
 func (db *DB) taskHasActiveOwnerEpisodeLocked(task journal.TaskID) (bool, error) {
 	found := false
 	if err := executeStatement(db.conn,
-		sqlStatement170,
+		operationsSelectJournalAuthorityAssignmentEpisodes89e2,
 		&sqlitex.ExecOptions{
 			Args:       []any{task.String(), slotOwnerResponsibilityID, transitionStartedID, transitionEndedID},
 			ResultFunc: func(*zs.Stmt) error { found = true; return nil },
@@ -298,7 +298,7 @@ func (db *DB) taskHasActiveOwnerEpisodeLocked(task journal.TaskID) (bool, error)
 
 func (db *DB) operationCountLocked() (int, error) {
 	var n int
-	if err := executeStatement(db.conn, sqlStatement171,
+	if err := executeStatement(db.conn, operationsSelectJournalOperationsfa92,
 		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
 		return 0, fmt.Errorf("count operations: %w", err)
 	}
@@ -331,7 +331,7 @@ func (db *DB) validateGenesisLocked(in journal.OperationInput) error {
 func (db *DB) requireAuthorityExistsLocked(authJID journal.JournalID) error {
 	found := false
 	if err := executeStatement(db.conn,
-		sqlStatement172,
+		operationsSelectJournalAuthoritiesd4e5,
 		&sqlitex.ExecOptions{Args: []any{int64(authJID)}, ResultFunc: func(*zs.Stmt) error { found = true; return nil }}); err != nil {
 		return fmt.Errorf("require authority %d: %w", authJID, err)
 	}
@@ -385,7 +385,7 @@ func (db *DB) authorityGovernsTaskAtLocked(authJID journal.JournalID, targetTask
 	}
 	var kind = -1
 	if err := executeStatement(db.conn,
-		sqlStatement173,
+		operationsSelectJournalAuthorities0b4b,
 		&sqlitex.ExecOptions{Args: []any{int64(authJID)}, ResultFunc: func(stmt *zs.Stmt) error { kind = stmt.ColumnInt(0); return nil }}); err != nil {
 		return false, fmt.Errorf("authority kind %d: %w", authJID, err)
 	}
@@ -411,7 +411,7 @@ func (db *DB) assignmentAuthorityGovernsLocked(authJID journal.JournalID, target
 	// Resolve the assignment episode this authority (a transition row) belongs to.
 	var authEpisode string
 	if err := executeStatement(db.conn,
-		sqlStatement174,
+		operationsSelectJournalAuthorityAssignmentTransitions5f45,
 		&sqlitex.ExecOptions{Args: []any{int64(authJID)}, ResultFunc: func(stmt *zs.Stmt) error { authEpisode = stmt.ColumnText(0); return nil }}); err != nil {
 		return false, fmt.Errorf("authority assignment %d: %w", authJID, err)
 	}
@@ -466,7 +466,7 @@ func (db *DB) assignmentAuthorityGovernsLocked(authJID journal.JournalID, target
 func (db *DB) episodesOnTaskLocked(task journal.TaskID) ([]journal.AssignmentID, error) {
 	var out []journal.AssignmentID
 	if err := executeStatement(db.conn,
-		sqlStatement175,
+		operationsSelectJournalAuthorityAssignmentEpisodes036e,
 		&sqlitex.ExecOptions{Args: []any{task.String()}, ResultFunc: func(stmt *zs.Stmt) error {
 			out = append(out, journal.AssignmentID(stmt.ColumnText(0)))
 			return nil
@@ -526,7 +526,7 @@ func (db *DB) parentChainReachesLocked(start, target journal.AssignmentID, befor
 
 func (db *DB) countEpisodesLocked() (int, error) {
 	var n int
-	if err := executeStatement(db.conn, sqlStatement176,
+	if err := executeStatement(db.conn, operationsSelectJournalAuthorityAssignmentEpisodes77f5,
 		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
 		return 0, fmt.Errorf("count episodes: %w", err)
 	}
@@ -648,7 +648,7 @@ func (db *DB) lookupOperationLocked(op journal.OperationID) (storedOperation, bo
 	var out storedOperation
 	found := false
 	if err := executeStatement(db.conn,
-		sqlStatement177,
+		operationsSelectJournalOperations9050,
 		&sqlitex.ExecOptions{Args: []any{string(op)}, ResultFunc: func(stmt *zs.Stmt) error {
 			found = true
 			out.anchor = stmt.ColumnInt64(0)
@@ -673,7 +673,7 @@ func (db *DB) lookupOperationLocked(op journal.OperationID) (storedOperation, bo
 	}
 	// The committing actor lives on the anchor journal row.
 	if err := executeStatement(db.conn,
-		sqlStatement178,
+		operationsSelectJournala8d9,
 		&sqlitex.ExecOptions{Args: []any{out.anchor}, ResultFunc: func(stmt *zs.Stmt) error {
 			actor, err := journalParseActor(stmt.ColumnText(0))
 			if err != nil {
@@ -744,7 +744,7 @@ func (db *DB) reconcileAllocatedTaskCreatesLocked(in journal.OperationInput, exi
 		slots[binding.Slot] = binding
 	}
 	var produced []journal.JournalID
-	if err := executeStatement(db.conn, sqlStatement179, &sqlitex.ExecOptions{Args: []any{existing.anchor}, ResultFunc: func(stmt *zs.Stmt) error {
+	if err := executeStatement(db.conn, sharedSelectJournalef66, &sqlitex.ExecOptions{Args: []any{existing.anchor}, ResultFunc: func(stmt *zs.Stmt) error {
 		produced = append(produced, journal.JournalID(stmt.ColumnInt64(0)))
 		return nil
 	}}); err != nil {
@@ -858,7 +858,7 @@ func (db *DB) reconstructCommittedLocked(anchor int64) (journal.CommittedResult,
 	res := journal.CommittedResult{Kind: journal.CommittedExact, AnchorJournalID: journal.JournalID(anchor)}
 	// EmittedEvents: the flat task_event closure in JournalID order (§2.1, §3.2).
 	if err := executeStatement(db.conn,
-		sqlStatement180,
+		operationsSelectJournala2a6,
 		&sqlitex.ExecOptions{Args: []any{anchor, int(journal.JournalKindTaskEvent)}, ResultFunc: func(stmt *zs.Stmt) error {
 			res.EmittedEvents = append(res.EmittedEvents, journal.JournalID(stmt.ColumnInt64(0)))
 			return nil
@@ -867,7 +867,7 @@ func (db *DB) reconstructCommittedLocked(anchor int64) (journal.CommittedResult,
 	}
 	// Slot-keyed result map (§3.2), bucketed by JournalKind.
 	if err := executeStatement(db.conn,
-		sqlStatement181,
+		operationsSelectJournalOperationResultSlots31e2,
 		&sqlitex.ExecOptions{Args: []any{anchor}, ResultFunc: func(stmt *zs.Stmt) error {
 			binding := journal.ResultSlotBinding{
 				Slot:              journal.ResultSlotID(stmt.ColumnText(0)),
@@ -924,7 +924,7 @@ func (db *DB) CountAuthoritiesOfKind(kind int) (int, error) {
 	defer db.mu.Unlock()
 	var n int
 	if err := executeStatement(db.conn,
-		sqlStatement182,
+		operationsSelectJournalAuthoritiescf26,
 		&sqlitex.ExecOptions{Args: []any{kind}, ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
 		return 0, fmt.Errorf("CountAuthoritiesOfKind %d: %w", kind, err)
 	}
@@ -939,7 +939,7 @@ func (db *DB) CountSuccessorEpisodes(task journal.TaskID) (int, error) {
 	defer db.mu.Unlock()
 	var n int
 	if err := executeStatement(db.conn,
-		sqlStatement183,
+		operationsSelectJournalAuthorityAssignmentEpisodescfad,
 		&sqlitex.ExecOptions{Args: []any{task.String()}, ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
 		return 0, fmt.Errorf("CountSuccessorEpisodes %q: %w", task, err)
 	}

@@ -243,7 +243,7 @@ func (db *DB) Close() error {
 // ---------------------------------------------------------------------------
 
 func (db *DB) applyNonPersistentPragmas() error {
-	for _, p := range []sqlStatement{sqlStatement270, sqlStatement271} {
+	for _, p := range []sealedSQLStatement{schemaDDLPragmaBusyTimeout44ea, schemaDDLPragmaForeignKeyscc13} {
 		if err := executeStatement(db.conn, p, nil); err != nil {
 			return fmt.Errorf("pragma %q: %w", p, err)
 		}
@@ -252,11 +252,11 @@ func (db *DB) applyNonPersistentPragmas() error {
 }
 
 func (db *DB) enableWAL() error {
-	return executeStatement(db.conn, sqlStatement032, nil)
+	return executeStatement(db.conn, schemaDDLPragmaJournalMode606c, nil)
 }
 
 func (db *DB) enableForeignKeys() error {
-	return executeStatement(db.conn, sqlStatement033, nil)
+	return executeStatement(db.conn, sharedDDLPragmaForeignKeysde7c, nil)
 }
 
 // ---------------------------------------------------------------------------
@@ -264,7 +264,7 @@ func (db *DB) enableForeignKeys() error {
 // ---------------------------------------------------------------------------
 
 func (db *DB) ensureSchema(models []ptypes.ModelEntry) error {
-	ddl := []sqlStatement{sqlStatement272, sqlStatement273, sqlStatement274, sqlStatement275, sqlStatement276, sqlStatement277, sqlStatement278, sqlStatement279, sqlStatement280, sqlStatement281, sqlStatement282, sqlStatement283, sqlStatement284, sqlStatement285, sqlStatement286, sqlStatement231, sqlStatement287, sqlStatement288, sqlStatement289, sqlStatement290, sqlStatement291, sqlStatement292, sqlStatement293, sqlStatement294, sqlStatement295, sqlStatement296, sqlStatement297, sqlStatement298, sqlStatement299, sqlStatement300, sqlStatement301, sqlStatement302, sqlStatement303}
+	ddl := []sealedSQLStatement{schemaDDLCreateStatusesf4f1, schemaDDLCreatePriorities67d7, schemaDDLCreateTaskTypes4c16, schemaDDLCreateEdgeKinds7508, schemaDDLCreateAgentKindsde98, schemaDDLCreateProviders8ba5, schemaDDLCreateRoles0ada, schemaDDLCreatePhases6e89, schemaDDLCreateStagesdffc, schemaDDLCreateMlModelsb48d, schemaDDLCreateAgents8133, schemaDDLCreateAgentsHuman28d6, schemaDDLCreateAgentsMle8b0, schemaDDLCreateAgentsSoftware6c89, schemaDDLCreateTaskscc07, sharedDDLCreateIdxTasksNamespace7486, schemaDDLCreateIdxTasksStatusa4f0, schemaDDLCreateIdxTasksPriority3f16, schemaDDLCreateIdxTasksTypeae99, schemaDDLCreateIdxTasksPhase5aa3, schemaDDLCreateIdxTasksOwner7d8b, schemaDDLCreateEdges25c6, schemaDDLCreateIdxEdgesSource8c95, schemaDDLCreateIdxEdgesTargetd8ae, schemaDDLCreateIdxEdgesKindad6f, schemaDDLCreateActivitiesf3ac, schemaDDLCreateIdxActivitiesAgent206d, schemaDDLCreateIdxActivitiesPhase7b2e, schemaDDLCreateLabels4203, schemaDDLCreateIdxLabelsName2879, schemaDDLCreateComments320c, schemaDDLCreateIdxCommentsTaskbbf3, schemaDDLCreateIdxCommentsAuthor1138}
 
 	for _, stmt := range ddl {
 		if err := executeStatement(db.conn, stmt, nil); err != nil {
@@ -328,26 +328,26 @@ const (
 	seedStages
 )
 
-func (kind referenceSeedKind) statement() sqlStatement {
+func (kind referenceSeedKind) statement() sealedSQLStatement {
 	switch kind {
 	case seedStatuses:
-		return sqlStatement034
+		return schemaInsertStatusese359
 	case seedPriorities:
-		return sqlStatement035
+		return schemaInsertPriorities8039
 	case seedTaskTypes:
-		return sqlStatement036
+		return schemaInsertTaskTypes54b6
 	case seedEdgeKinds:
-		return sqlStatement037
+		return schemaInsertEdgeKinds6327
 	case seedAgentKinds:
-		return sqlStatement038
+		return schemaInsertAgentKinds1cc0
 	case seedProviders:
-		return sqlStatement039
+		return schemaInsertProviders3199
 	case seedRoles:
-		return sqlStatement040
+		return schemaInsertRolese069
 	case seedPhases:
-		return sqlStatement041
+		return schemaInsertPhasesea1e
 	case seedStages:
-		return sqlStatement042
+		return schemaInsertStagesa935
 	default:
 		panic("unknown reference seed kind")
 	}
@@ -359,7 +359,7 @@ func (kind referenceSeedKind) statement() sqlStatement {
 func (db *DB) seedMLModels(models []ptypes.ModelEntry) error {
 	var existing int
 	if err := executeStatement(db.conn,
-		sqlStatement043,
+		schemaSelectMlModels27ce,
 		&sqlitex.ExecOptions{
 			ResultFunc: func(stmt *zs.Stmt) error {
 				existing = stmt.ColumnInt(0)
@@ -378,7 +378,7 @@ func (db *DB) seedMLModels(models []ptypes.ModelEntry) error {
 	defer endTx(&err)
 	for _, m := range models {
 		if err = executeStatement(db.conn,
-			sqlStatement044,
+			schemaInsertMlModels20ed,
 			&sqlitex.ExecOptions{Args: []any{string(m.Provider), string(m.Name)}},
 		); err != nil {
 			return fmt.Errorf("seedMLModels: inserting model (%s, %q): %w",

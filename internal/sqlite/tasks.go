@@ -32,7 +32,7 @@ func (db *DB) GetTask(id ptypes.TaskID) (ptypes.Task, bool, error) {
 	var task ptypes.Task
 	var found bool
 	err := executeStatement(db.conn,
-		sqlStatement265,
+		tasksSelectTasksce15,
 		&sqlitex.ExecOptions{
 			Args: []any{id.String()},
 			ResultFunc: func(stmt *zs.Stmt) error {
@@ -78,7 +78,7 @@ func (db *DB) ListTasks(filter ptypes.ListFilter) ([]ptypes.Task, error) {
 	}
 
 	var tasks []ptypes.Task
-	err := executeStatement(db.conn, sqlStatement266, &sqlitex.ExecOptions{
+	err := executeStatement(db.conn, tasksSelectTasks5ced, &sqlitex.ExecOptions{
 		Args: []any{
 			flag(filter.Status != nil), status,
 			flag(filter.Priority != nil), priority,
@@ -110,7 +110,7 @@ func (db *DB) TaskCount() (int, error) {
 
 	var count int
 	err := executeStatement(db.conn,
-		sqlStatement267,
+		tasksSelectTasksf73a,
 		&sqlitex.ExecOptions{
 			ResultFunc: func(stmt *zs.Stmt) error {
 				count = stmt.ColumnInt(0)
@@ -130,7 +130,7 @@ func (db *DB) ReadyTasks() ([]ptypes.Task, error) {
 	defer db.mu.Unlock()
 
 	var tasks []ptypes.Task
-	err := executeStatement(db.conn, sqlStatement268, &sqlitex.ExecOptions{
+	err := executeStatement(db.conn, tasksSelectTaskse1a0, &sqlitex.ExecOptions{
 		Args: []any{int(ptypes.StatusClosed), int(ptypes.EdgeBlockedBy)},
 		ResultFunc: func(stmt *zs.Stmt) error {
 			task, err := ScanTask(stmt)
@@ -154,7 +154,7 @@ func (db *DB) BlockedTasks() ([]ptypes.Task, error) {
 	defer db.mu.Unlock()
 
 	var tasks []ptypes.Task
-	err := executeStatement(db.conn, sqlStatement269, &sqlitex.ExecOptions{
+	err := executeStatement(db.conn, tasksSelectTasks4bcc, &sqlitex.ExecOptions{
 		Args: []any{int(ptypes.StatusClosed), int(ptypes.EdgeBlockedBy)},
 		ResultFunc: func(stmt *zs.Stmt) error {
 			task, err := ScanTask(stmt)

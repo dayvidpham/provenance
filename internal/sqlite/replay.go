@@ -49,7 +49,7 @@ func (db *DB) projectJournalRowLocked(jid int64) error {
 	// attributes the same committing actor whether Apply folds a just-produced
 	// subordinate row or Open replays it (§9.2).
 	if err := executeStatement(db.conn,
-		sqlStatement184,
+		replaySelectJournalAttributed70dd,
 		&sqlitex.ExecOptions{Args: []any{jid}, ResultFunc: func(stmt *zs.Stmt) error {
 			found = true
 			kind = stmt.ColumnInt(0)
@@ -93,7 +93,7 @@ func (db *DB) projectTaskEventRowLocked(jid int64, committing journal.ActorID, r
 		payload []byte
 	)
 	if err := executeStatement(db.conn,
-		sqlStatement185,
+		replaySelectJournalTaskEvents520f,
 		&sqlitex.ExecOptions{Args: []any{jid}, ResultFunc: func(stmt *zs.Stmt) error {
 			taskRaw = stmt.ColumnText(0)
 			kindStr = stmt.ColumnText(1)
@@ -219,7 +219,7 @@ func (db *DB) projectAuthorityRowLocked(jid int64) error {
 		hasTrans   bool
 	)
 	if err := executeStatement(db.conn,
-		sqlStatement186,
+		replaySelectJournalAuthorityAssignmentTransitions70c5,
 		&sqlitex.ExecOptions{Args: []any{jid}, ResultFunc: func(stmt *zs.Stmt) error {
 			hasTrans = true
 			assignment = stmt.ColumnText(0)
@@ -237,7 +237,7 @@ func (db *DB) projectAuthorityRowLocked(jid int64) error {
 		slot        = -1
 	)
 	if err := executeStatement(db.conn,
-		sqlStatement187,
+		replaySelectJournalAuthorityAssignmentEpisodes3c0a,
 		&sqlitex.ExecOptions{Args: []any{assignment}, ResultFunc: func(stmt *zs.Stmt) error {
 			taskRaw = stmt.ColumnText(0)
 			occupantRaw = stmt.ColumnText(1)
@@ -328,25 +328,25 @@ func (db *DB) projectTaskStatusLocked(task journal.TaskID, status journal.TaskSt
 	return nil
 }
 
-func (target projectionTarget) readTaskStatusStatement() sqlStatement {
+func (target projectionTarget) readTaskStatusStatement() sealedSQLStatement {
 	if target == projectionTargetShadow {
-		return sqlStatement188
+		return replaySelectShadowTasks1015
 	}
-	return sqlStatement189
+	return replaySelectTasks9c6c
 }
 
-func (table taskScopedTable) statement() sqlStatement {
+func (table taskScopedTable) statement() sealedSQLStatement {
 	if table == taskScopedEvidence {
-		return sqlStatement190
+		return replaySelectJournalEvidenceccc4
 	}
-	return sqlStatement191
+	return replaySelectJournalDecisionscad7
 }
 
-func (target projectionTarget) projectTaskStatusStatement() sqlStatement {
+func (target projectionTarget) projectTaskStatusStatement() sealedSQLStatement {
 	if target == projectionTargetShadow {
-		return sqlStatement192
+		return replayUpdateShadowTasks76f4
 	}
-	return sqlStatement193
+	return replayUpdateTaskse066
 }
 
 // ---------------------------------------------------------------------------
@@ -482,25 +482,25 @@ const (
 	canonicalColumnsLegacy
 )
 
-func (shape canonicalColumnShape) operationsStatement() sqlStatement {
+func (shape canonicalColumnShape) operationsStatement() sealedSQLStatement {
 	if shape == canonicalColumnsLegacy {
-		return sqlStatement194
+		return replaySelectJournalOperations571e
 	}
-	return sqlStatement195
+	return replaySelectJournalOperations19b2
 }
 
-func (shape canonicalColumnShape) effectForRowStatement() sqlStatement {
+func (shape canonicalColumnShape) effectForRowStatement() sealedSQLStatement {
 	if shape == canonicalColumnsLegacy {
-		return sqlStatement196
+		return replaySelectJournal7295
 	}
-	return sqlStatement197
+	return replaySelectJournal4f1e
 }
 
-func (shape canonicalColumnShape) seedLegacyTasksStatement() sqlStatement {
+func (shape canonicalColumnShape) seedLegacyTasksStatement() sealedSQLStatement {
 	if shape == canonicalColumnsLegacy {
-		return sqlStatement198
+		return replayInsertShadowTasksdbeb
 	}
-	return sqlStatement199
+	return replayInsertShadowTasks659b
 }
 
 func (db *DB) validateCanonicalOperationsLocked() error {
@@ -561,7 +561,7 @@ func (db *DB) validateCanonicalOperationsLocked() error {
 		}
 		effects := prepared.NormalizedEffects()
 		var rows []int64
-		if err := executeStatement(db.conn, sqlStatement179, &sqlitex.ExecOptions{Args: []any{op.anchor}, ResultFunc: func(stmt *zs.Stmt) error { rows = append(rows, stmt.ColumnInt64(0)); return nil }}); err != nil {
+		if err := executeStatement(db.conn, sharedSelectJournalef66, &sqlitex.ExecOptions{Args: []any{op.anchor}, ResultFunc: func(stmt *zs.Stmt) error { rows = append(rows, stmt.ColumnInt64(0)); return nil }}); err != nil {
 			return err
 		}
 		if len(rows) != len(effects) {
@@ -618,7 +618,7 @@ func (db *DB) validateCanonicalResultSlotsLocked(anchor int64, rows []int64, eff
 		}
 	}
 	actual := map[string]int64{}
-	if err := executeStatement(db.conn, sqlStatement200, &sqlitex.ExecOptions{Args: []any{anchor}, ResultFunc: func(stmt *zs.Stmt) error { slot := stmt.ColumnText(0); actual[slot] = stmt.ColumnInt64(1); return nil }}); err != nil {
+	if err := executeStatement(db.conn, replaySelectJournalOperationResultSlotsa304, &sqlitex.ExecOptions{Args: []any{anchor}, ResultFunc: func(stmt *zs.Stmt) error { slot := stmt.ColumnText(0); actual[slot] = stmt.ColumnInt64(1); return nil }}); err != nil {
 		return err
 	}
 	for slot, want := range expected {
@@ -649,7 +649,7 @@ func (db *DB) validateCanonicalEffectRowLocked(op canonicalStoredOperation, jid 
 	}
 	var kind int
 	var recordedAt int64
-	if err := executeStatement(db.conn, sqlStatement201, &sqlitex.ExecOptions{Args: []any{jid}, ResultFunc: func(stmt *zs.Stmt) error { kind = stmt.ColumnInt(0); recordedAt = stmt.ColumnInt64(1); return nil }}); err != nil {
+	if err := executeStatement(db.conn, replaySelectJournal4f3e, &sqlitex.ExecOptions{Args: []any{jid}, ResultFunc: func(stmt *zs.Stmt) error { kind = stmt.ColumnInt(0); recordedAt = stmt.ColumnInt64(1); return nil }}); err != nil {
 		return err
 	}
 	if kind != int(expectedKind) {
@@ -674,20 +674,20 @@ func (db *DB) validateCanonicalEffectRowLocked(op canonicalStoredOperation, jid 
 		if auth == "" {
 			auth = fmt.Sprintf("authority--bootstrap--%d", jid)
 		}
-		return db.compareSingleRowLocked(op.anchor, jid, sqlStatement202, []string{auth, label})
+		return db.compareSingleRowLocked(op.anchor, jid, replaySelectJournalAuthorities174f, []string{auth, label})
 	case journal.EffectAssignmentStart:
 		occupant := effect.Occupant
 		if occupant.Namespace == "" {
 			occupant = op.actor
 		}
 		slot, _ := slotDBID(effect.SlotID)
-		return db.compareSingleRowLocked(op.anchor, jid, sqlStatement203, []string{string(effect.AssignmentID), effect.TaskID.String(), strconv.Itoa(slot), occupant.String(), string(effect.Predecessor), string(effect.Parent), strconv.Itoa(transitionStartedID)})
+		return db.compareSingleRowLocked(op.anchor, jid, replaySelectJournalAuthorityAssignmentTransitions79ed, []string{string(effect.AssignmentID), effect.TaskID.String(), strconv.Itoa(slot), occupant.String(), string(effect.Predecessor), string(effect.Parent), strconv.Itoa(transitionStartedID)})
 	case journal.EffectAssignmentEnd:
-		return db.compareSingleRowLocked(op.anchor, jid, sqlStatement204, []string{string(effect.AssignmentID), strconv.Itoa(transitionEndedID)})
+		return db.compareSingleRowLocked(op.anchor, jid, replaySelectJournalAuthorityAssignmentTransitionse07b, []string{string(effect.AssignmentID), strconv.Itoa(transitionEndedID)})
 	case journal.EffectDecision:
-		return db.compareSingleRowLocked(op.anchor, jid, sqlStatement205, []string{string(effect.DecisionKind), optionalTaskString(effect.TaskID), string(effect.Payload)})
+		return db.compareSingleRowLocked(op.anchor, jid, replaySelectJournalDecisions2490, []string{string(effect.DecisionKind), optionalTaskString(effect.TaskID), string(effect.Payload)})
 	case journal.EffectEvidence:
-		return db.compareSingleRowLocked(op.anchor, jid, sqlStatement206, []string{string(effect.EvidenceKind), optionalTaskString(effect.TaskID), strings.ToUpper(fmt.Sprintf("%x", effect.ContentDigest)), string(effect.Payload)})
+		return db.compareSingleRowLocked(op.anchor, jid, replaySelectJournalEvidence13bb, []string{string(effect.EvidenceKind), optionalTaskString(effect.TaskID), strings.ToUpper(fmt.Sprintf("%x", effect.ContentDigest)), string(effect.Payload)})
 	}
 	return nil
 }
@@ -719,7 +719,7 @@ func (db *DB) validateCanonicalTaskEventLocked(anchor, jid int64, effect journal
 	if len(payload) == 0 {
 		payload = []byte(`{}`)
 	}
-	if err := db.compareSingleRowLocked(anchor, jid, sqlStatement207, []string{effect.TaskID.String(), string(kind), string(payload)}); err != nil {
+	if err := db.compareSingleRowLocked(anchor, jid, replaySelectJournalTaskEvents4a71, []string{effect.TaskID.String(), string(kind), string(payload)}); err != nil {
 		return err
 	}
 	expected, err := journal.CanonicalEventContexts(effect.Contexts)
@@ -741,7 +741,7 @@ func (db *DB) validateCanonicalTaskEventLocked(anchor, jid int64, effect journal
 		}
 	}
 	attached := []int64{}
-	if err := executeStatement(db.conn, sqlStatement208, &sqlitex.ExecOptions{Args: []any{jid}, ResultFunc: func(stmt *zs.Stmt) error { attached = append(attached, stmt.ColumnInt64(0)); return nil }}); err != nil {
+	if err := executeStatement(db.conn, replaySelectJournalTaskEventContexts0a57, &sqlitex.ExecOptions{Args: []any{jid}, ResultFunc: func(stmt *zs.Stmt) error { attached = append(attached, stmt.ColumnInt64(0)); return nil }}); err != nil {
 		return err
 	}
 	for i, got := range attached {
@@ -752,7 +752,7 @@ func (db *DB) validateCanonicalTaskEventLocked(anchor, jid int64, effect journal
 	return nil
 }
 
-func (db *DB) compareSingleRowLocked(anchor, jid int64, query sqlStatement, expected []string) error {
+func (db *DB) compareSingleRowLocked(anchor, jid int64, query sealedSQLStatement, expected []string) error {
 	found := false
 	var actual []string
 	if err := executeStatement(db.conn, query, &sqlitex.ExecOptions{Args: []any{jid}, ResultFunc: func(stmt *zs.Stmt) error {
@@ -813,7 +813,7 @@ func (db *DB) rederiveProjectionsShadowLocked() (
 
 	var order []int64
 	if err = executeStatement(db.conn,
-		sqlStatement209,
+		replaySelectJournalf459,
 		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 			order = append(order, stmt.ColumnInt64(0))
 			return nil
@@ -859,7 +859,7 @@ func (db *DB) createProjectionShadowLocked() error {
 	if err := db.dropProjectionShadowLocked(); err != nil {
 		return err
 	}
-	ddl := []sqlStatement{sqlStatement356, sqlStatement357, sqlStatement358, sqlStatement359, sqlStatement360}
+	ddl := []sealedSQLStatement{replayDDLCreateShadowTasks2548, replayDDLCreateShadowTaskAttributionsdb81, replayDDLCreateShadowEdges8e48, replayDDLCreateShadowLabels0541, replayDDLCreateShadowComments42a6}
 	for _, stmt := range ddl {
 		if err := executeStatement(db.conn, stmt, nil); err != nil {
 			return fmt.Errorf("create shadow projection table: %w", err)
@@ -928,7 +928,7 @@ func (db *DB) canonicalEffectForJournalRowLocked(jid int64) (journal.Effect, boo
 	}
 	ordinal := 0
 	if err := executeStatement(db.conn,
-		sqlStatement210,
+		replaySelectJournal17ea,
 		&sqlitex.ExecOptions{Args: []any{anchor, jid}, ResultFunc: func(stmt *zs.Stmt) error { ordinal = stmt.ColumnInt(0) - 1; return nil }}); err != nil {
 		return journal.Effect{}, false, fmt.Errorf("resolve canonical effect ordinal for row %d: %w", jid, err)
 	}
@@ -941,7 +941,7 @@ func (db *DB) canonicalEffectForJournalRowLocked(jid int64) (journal.Effect, boo
 
 func (db *DB) insertCanonicalShadowTaskLocked(e journal.Effect, recordedAt, jid int64) error {
 	if err := executeStatement(db.conn,
-		sqlStatement211,
+		replayInsertShadowTasks93b3,
 		&sqlitex.ExecOptions{Args: []any{e.TaskID.String(), e.TaskID.Namespace, e.Title, e.Description,
 			statusOpenID, int(e.Priority), int(e.Type), int(e.Phase), "", recordedAt, jid}}); err != nil {
 		return fmt.Errorf("replay canonical task create %q: %w", e.TaskID, err)
@@ -973,7 +973,7 @@ func (db *DB) materializeCanonicalShadowTaskEventLocked(e journal.Effect, record
 	if e.UpdatePhase != nil {
 		phase = int(*e.UpdatePhase)
 	}
-	if err := executeStatement(db.conn, sqlStatement212, &sqlitex.ExecOptions{Args: []any{
+	if err := executeStatement(db.conn, replayUpdateShadowTasks7195, &sqlitex.ExecOptions{Args: []any{
 		recordedAt,
 		flag(e.UpdateTitle != nil), value(e.UpdateTitle),
 		flag(e.UpdateDescription != nil), value(e.UpdateDescription),
@@ -990,7 +990,7 @@ func (db *DB) materializeCanonicalShadowTaskEventLocked(e journal.Effect, record
 
 // dropProjectionShadowLocked removes the connection-scoped shadow projection tables.
 func (db *DB) dropProjectionShadowLocked() error {
-	for _, stmt := range []sqlStatement{sqlStatement361, sqlStatement362, sqlStatement363, sqlStatement364, sqlStatement365} {
+	for _, stmt := range []sealedSQLStatement{replayDDLDropShadowTasks814c, replayDDLDropShadowTaskAttributionse1b1, replayDDLDropShadowEdges42d9, replayDDLDropShadowLabels076c, replayDDLDropShadowComments22a4} {
 		if err := executeStatement(db.conn, stmt, nil); err != nil {
 			return fmt.Errorf("drop shadow projection table: %w", err)
 		}
@@ -1005,7 +1005,7 @@ func (db *DB) dropProjectionShadowLocked() error {
 func (db *DB) journalAnchoredTasksLocked() (map[string]struct{}, error) {
 	out := map[string]struct{}{}
 	if err := executeStatement(db.conn,
-		sqlStatement213,
+		replaySelectJournalTaskEventsd7aa,
 		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 			if stmt.ColumnType(0) != zs.TypeNull {
 				out[stmt.ColumnText(0)] = struct{}{}
@@ -1050,46 +1050,46 @@ func (db *DB) snapshotTaskProjectionsLocked(target projectionTarget) (map[string
 	return out, nil
 }
 
-func (target projectionTarget) snapshotTaskProjectionsStatement() sqlStatement {
+func (target projectionTarget) snapshotTaskProjectionsStatement() sealedSQLStatement {
 	if target == projectionTargetShadow {
-		return sqlStatement214
+		return replaySelectShadowTasks7408
 	}
-	return sqlStatement215
+	return replaySelectTasksddad
 }
 
-func (target projectionTarget) snapshotAttributionsStatement() sqlStatement {
+func (target projectionTarget) snapshotAttributionsStatement() sealedSQLStatement {
 	if target == projectionTargetShadow {
-		return sqlStatement216
+		return replaySelectShadowTaskAttributions836a
 	}
-	return sqlStatement217
+	return replaySelectTaskAttributionsfd41
 }
 
-func (target projectionTarget) snapshotCompleteTaskStateStatement() sqlStatement {
+func (target projectionTarget) snapshotCompleteTaskStateStatement() sealedSQLStatement {
 	if target == projectionTargetShadow {
-		return sqlStatement218
+		return replaySelectShadowTasks21a5
 	}
-	return sqlStatement219
+	return replaySelectTasksd8ec
 }
 
-func (target projectionTarget) snapshotEdgesStatement() sqlStatement {
+func (target projectionTarget) snapshotEdgesStatement() sealedSQLStatement {
 	if target == projectionTargetShadow {
-		return sqlStatement220
+		return replaySelectShadowEdges38a7
 	}
-	return sqlStatement221
+	return replaySelectEdges707e
 }
 
-func (target projectionTarget) snapshotLabelsStatement() sqlStatement {
+func (target projectionTarget) snapshotLabelsStatement() sealedSQLStatement {
 	if target == projectionTargetShadow {
-		return sqlStatement222
+		return replaySelectShadowLabels47d0
 	}
-	return sqlStatement223
+	return replaySelectLabelsa071
 }
 
-func (target projectionTarget) snapshotCommentsStatement() sqlStatement {
+func (target projectionTarget) snapshotCommentsStatement() sealedSQLStatement {
 	if target == projectionTargetShadow {
-		return sqlStatement224
+		return replaySelectShadowComments2e53
 	}
-	return sqlStatement225
+	return replaySelectCommentscd77
 }
 
 // snapshotAttributionsLocked reads the attribution projection from the named table
