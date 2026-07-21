@@ -239,9 +239,7 @@ func (r FixedSoftwareAgentRegistration) Validate() error {
 			"provide a valid JSON object or leave metadata empty to use {}")
 	}
 	if err := CheckEntryInRange(r.Claim, r.Entry.Namespace, [16]byte(r.Entry.ActorID.UUID)); err != nil {
-		return fixedAgentValidationError(err,
-			fmt.Sprintf("fixed software actor %q is not valid for the claimed range", r.Entry.ActorID.String()),
-			"choose an actor UUID inside the claim range and valid for its codec")
+		return err
 	}
 	return nil
 }
@@ -258,17 +256,22 @@ func fixedAgentValidationError(cause error, what, fix string) error {
 // (§7.3 rule 2). actorUUID is derived from the entry's ActorID.
 func CheckEntryInRange(claim ActorNamespaceClaim, entryNamespace string, actorUUID [16]byte) error {
 	if entryNamespace != claim.Namespace {
-		return fmt.Errorf("%w: entry namespace %q does not match claim namespace %q",
-			ErrEntryOutOfRange, entryNamespace, claim.Namespace)
+		return fmt.Errorf(
+			"%w: entry namespace %q does not match claim namespace %q; why: range membership is defined by the registered claim for one namespace; where: CheckEntryInRange namespace validation; when: before decoding or persistence; impact: the entry is rejected and no rows are changed; fix: use the claim namespace for the entry or validate against the correct claim",
+			ErrEntryOutOfRange, entryNamespace, claim.Namespace,
+		)
 	}
 	codec, err := LookupCodec(claim.Codec)
 	if err != nil {
-		return fmt.Errorf("namespace %q: %w", claim.Namespace, err)
+		return fmt.Errorf(
+			"namespace %q range validation failed: the codec %q could not be loaded; why: the claim names an unregistered codec; where: CheckEntryInRange codec lookup; when: before UUID decoding or persistence; impact: the entry is rejected and no rows are changed; fix: register the claim with a supported codec and retry: %w",
+			claim.Namespace, claim.Codec, err,
+		)
 	}
 	if !claim.Range.Contains(actorUUID) {
 		return fmt.Errorf(
 			"%w: fixed actor %x is outside namespace %q's claimed range "+
-				"[%x, %x] — where: fixed-actor manifest registration; when: before "+
+				"[%x, %x]; why: the actor UUID is not a member of the claimed range; where: fixed-actor manifest registration; when: before "+
 				"commit; impact: the entry is rejected so it cannot collide with an "+
 				"actor from a neighbouring range; fix: register the entry within "+
 				"[RangeMin, RangeMax] or widen the namespace claim",
@@ -276,7 +279,10 @@ func CheckEntryInRange(claim ActorNamespaceClaim, entryNamespace string, actorUU
 		)
 	}
 	if _, err := codec.Decode(claim.Range, actorUUID); err != nil {
-		return fmt.Errorf("namespace %q entry-in-range: %w", claim.Namespace, err)
+		return fmt.Errorf(
+			"namespace %q entry %x could not be decoded; why: the UUID is not a valid ordinal under codec %q; where: CheckEntryInRange codec decoding; when: after range containment and before persistence; impact: the entry is rejected and no rows are changed; fix: choose a UUID representable by the claim codec or correct the claim range: %w",
+			claim.Namespace, actorUUID, claim.Codec, err,
+		)
 	}
 	return nil
 }

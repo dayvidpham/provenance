@@ -16,6 +16,7 @@ rollbackCases:
 
 actionableErrorCases:
   - {name: validation, mode: validation, wantError: invalid-id, wantWhere: FixedSoftwareAgentRegistration.Validate, wantWhen: before the activation transaction}
+  - {name: range-validation, mode: range, wantError: entry-range, wantWhere: fixed-actor manifest registration, wantWhen: before commit}
   - {name: preflight, mode: preflight, wantError: agent-exists, wantWhere: actor preflight, wantWhen: before activation writes}
   - {name: write, mode: write, wantError: "", wantWhere: namespace write, wantWhen: during the activation transaction}
   - {name: transaction, mode: transaction, wantError: "", wantWhere: transaction setup, wantWhen: before preflight reads or writes}

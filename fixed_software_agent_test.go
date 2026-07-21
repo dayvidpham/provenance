@@ -43,7 +43,7 @@ func loadFixedAgentFixture(t *testing.T) fixedAgentFixture {
 	if err := yaml.Unmarshal(b, &fixture); err != nil {
 		t.Fatalf("decode fixed software-agent fixture: %v", err)
 	}
-	if len(fixture.ValidationCases) < 8 || len(fixture.RollbackCases) != 4 || len(fixture.ActionableErrorCases) != 4 {
+	if len(fixture.ValidationCases) < 8 || len(fixture.RollbackCases) != 4 || len(fixture.ActionableErrorCases) != 5 {
 		t.Fatalf("fixed software-agent fixture is incomplete: %d validation, %d rollback, %d actionable errors",
 			len(fixture.ValidationCases), len(fixture.RollbackCases), len(fixture.ActionableErrorCases))
 	}
@@ -141,6 +141,8 @@ func TestRegisterFixedSoftwareAgentErrorsAreActionable(t *testing.T) {
 			switch tc.Mode {
 			case "validation":
 				reg.Entry.ActorID.Namespace = ""
+			case "range":
+				reg.Entry.ActorID.UUID = uuid.UUID(BigEndianUUID(4096))
 			case "preflight":
 				if _, err := tr.RegisterFixedSoftwareAgent(reg); err != nil {
 					t.Fatalf("seed activation: %v", err)
@@ -170,6 +172,11 @@ func TestRegisterFixedSoftwareAgentErrorsAreActionable(t *testing.T) {
 			} {
 				if !strings.Contains(message, marker) {
 					t.Errorf("error %q is missing %q", message, marker)
+				}
+			}
+			for _, marker := range []string{"why:", "where:", "when:", "impact:", "fix:"} {
+				if count := strings.Count(message, marker); count != 1 {
+					t.Errorf("error has %d %q sections, want one authoritative section: %q", count, marker, message)
 				}
 			}
 		})
