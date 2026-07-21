@@ -2,6 +2,7 @@ package journal
 
 import (
 	"bytes"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"reflect"
@@ -30,6 +31,13 @@ func TestCanonicalMutationV1IndependentGoldenBytes(t *testing.T) {
 	want := []byte("version:22:provenance.mutation.v1\neffect-count:1:1\neffect.0.family:19:bootstrap_authority\neffect.0.result-slot:4:root\neffect.0.recorded-at-override:1:0\neffect.0.bootstrap-label:4:root\neffect.0.operation-authority:6:auth-1\n")
 	if !bytes.Equal(got.CanonicalBytes(), want) {
 		t.Fatalf("canonical bytes drifted\n got %q\nwant %q", got.CanonicalBytes(), want)
+	}
+	wantDigest, err := hex.DecodeString("2a044cf580d36ae527513e4a520febd935ac34cb514ff91636b17984b555b727")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got.DerivedDigest(), wantDigest) {
+		t.Fatalf("canonical digest drifted: got %x want %x", got.DerivedDigest(), wantDigest)
 	}
 	decoded, err := DecodeCanonicalMutation(want)
 	if err != nil {

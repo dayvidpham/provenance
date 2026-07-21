@@ -3,7 +3,6 @@ package sqlite
 import (
 	"encoding/json"
 	"fmt"
-	"sort"
 	"time"
 
 	"github.com/dayvidpham/provenance/internal/journal"
@@ -442,42 +441,56 @@ func (db *DB) verifyActorPlacementLocked() error {
 // a new subtype kind is added in exactly one place. Statically defined (over the former
 // per-call literal) per the statically-defined-over-runtime preference; identifiers are
 // compile-time literals, never caller input.
-var subtypeAllTables = map[journal.JournalKind]string{
-	journal.JournalKindOperation: "journal_operations",
-	journal.JournalKindTaskEvent: "journal_task_events",
-	journal.JournalKindAuthority: "journal_authorities",
-	journal.JournalKindDecision:  "journal_decisions",
-	journal.JournalKindEvidence:  "journal_evidence",
+type subtypeTable uint8
+
+const (
+	subtypeOperations subtypeTable = iota + 1
+	subtypeTaskEvents
+	subtypeAuthorities
+	subtypeDecisions
+	subtypeEvidence
+)
+
+var subtypeAllTables = map[journal.JournalKind]subtypeTable{
+	journal.JournalKindOperation: subtypeOperations,
+	journal.JournalKindTaskEvent: subtypeTaskEvents,
+	journal.JournalKindAuthority: subtypeAuthorities,
+	journal.JournalKindDecision:  subtypeDecisions,
+	journal.JournalKindEvidence:  subtypeEvidence,
 }
 
-// subtypeIntegrityQuery holds the two per-table subtype-integrity probes (§10 rule 8)
-// pre-built ONCE at package init from subtypeAllTables, so verifySubtypeIntegrityLocked
-// constructs no SQL text per check. Table identifiers come from the closed map, never
-// caller input, so their interpolation is safe.
-type subtypeIntegrityQuery struct {
-	// totality: a journal row of this kind with no subtype row.
-	totality string
-	// discriminator: a subtype row whose journal row carries a different kind_id.
-	discriminator string
-}
-
-// subtypeIntegrityQueries maps each closed JournalKind to its pre-built totality and
-// discriminator probes (built once at package init).
-var subtypeIntegrityQueries = buildSubtypeIntegrityQueries()
-
-func buildSubtypeIntegrityQueries() map[journal.JournalKind]subtypeIntegrityQuery {
-	out := make(map[journal.JournalKind]subtypeIntegrityQuery, len(subtypeAllTables))
-	for kind, table := range subtypeAllTables {
-		out[kind] = subtypeIntegrityQuery{
-			totality: fmt.Sprintf(`SELECT j.journal_id FROM journal j
-					LEFT JOIN %s s ON s.journal_id = j.journal_id
-					WHERE j.kind_id = ?1 AND s.journal_id IS NULL LIMIT 1`, table),
-			discriminator: fmt.Sprintf(`SELECT s.journal_id FROM %s s
-					JOIN journal j ON j.journal_id = s.journal_id
-					WHERE j.kind_id <> ?1 LIMIT 1`, table),
-		}
+func (table subtypeTable) label() string {
+	switch table {
+	case subtypeOperations:
+		return "journal_operations"
+	case subtypeTaskEvents:
+		return "journal_task_events"
+	case subtypeAuthorities:
+		return "journal_authorities"
+	case subtypeDecisions:
+		return "journal_decisions"
+	case subtypeEvidence:
+		return "journal_evidence"
+	default:
+		return "unknown_subtype"
 	}
-	return out
+}
+
+func subtypeIntegrityQueries(table subtypeTable) (totality, discriminator string) {
+	switch table {
+	case subtypeOperations:
+		return `SELECT j.journal_id FROM journal j LEFT JOIN journal_operations s ON s.journal_id=j.journal_id WHERE j.kind_id=?1 AND s.journal_id IS NULL LIMIT 1`, `SELECT s.journal_id FROM journal_operations s JOIN journal j ON j.journal_id=s.journal_id WHERE j.kind_id<>?1 LIMIT 1`
+	case subtypeTaskEvents:
+		return `SELECT j.journal_id FROM journal j LEFT JOIN journal_task_events s ON s.journal_id=j.journal_id WHERE j.kind_id=?1 AND s.journal_id IS NULL LIMIT 1`, `SELECT s.journal_id FROM journal_task_events s JOIN journal j ON j.journal_id=s.journal_id WHERE j.kind_id<>?1 LIMIT 1`
+	case subtypeAuthorities:
+		return `SELECT j.journal_id FROM journal j LEFT JOIN journal_authorities s ON s.journal_id=j.journal_id WHERE j.kind_id=?1 AND s.journal_id IS NULL LIMIT 1`, `SELECT s.journal_id FROM journal_authorities s JOIN journal j ON j.journal_id=s.journal_id WHERE j.kind_id<>?1 LIMIT 1`
+	case subtypeDecisions:
+		return `SELECT j.journal_id FROM journal j LEFT JOIN journal_decisions s ON s.journal_id=j.journal_id WHERE j.kind_id=?1 AND s.journal_id IS NULL LIMIT 1`, `SELECT s.journal_id FROM journal_decisions s JOIN journal j ON j.journal_id=s.journal_id WHERE j.kind_id<>?1 LIMIT 1`
+	case subtypeEvidence:
+		return `SELECT j.journal_id FROM journal j LEFT JOIN journal_evidence s ON s.journal_id=j.journal_id WHERE j.kind_id=?1 AND s.journal_id IS NULL LIMIT 1`, `SELECT s.journal_id FROM journal_evidence s JOIN journal j ON j.journal_id=s.journal_id WHERE j.kind_id<>?1 LIMIT 1`
+	default:
+		panic("unknown subtype table")
+	}
 }
 
 // subtypeExclusivityPair is one pre-built cross-subtype exclusivity probe (§10 rule 8):
@@ -485,28 +498,62 @@ func buildSubtypeIntegrityQueries() map[journal.JournalKind]subtypeIntegrityQuer
 // subtypeAllTables set are built once at package init, in deterministic kind order.
 type subtypeExclusivityPair struct {
 	a, b  journal.JournalKind
-	query string
+	query subtypeExclusivityQuery
 }
 
-var subtypeExclusivityPairs = buildSubtypeExclusivityPairs()
+type subtypeExclusivityQuery uint8
 
-func buildSubtypeExclusivityPairs() []subtypeExclusivityPair {
-	kinds := make([]journal.JournalKind, 0, len(subtypeAllTables))
-	for k := range subtypeAllTables {
-		kinds = append(kinds, k)
+const (
+	exclusivityOperationTaskEvent subtypeExclusivityQuery = iota + 1
+	exclusivityOperationAuthority
+	exclusivityOperationDecision
+	exclusivityOperationEvidence
+	exclusivityTaskEventAuthority
+	exclusivityTaskEventDecision
+	exclusivityTaskEventEvidence
+	exclusivityAuthorityDecision
+	exclusivityAuthorityEvidence
+	exclusivityDecisionEvidence
+)
+
+func (query subtypeExclusivityQuery) sql() string {
+	switch query {
+	case exclusivityOperationTaskEvent:
+		return `SELECT a.journal_id FROM journal_operations a JOIN journal_task_events b ON a.journal_id=b.journal_id LIMIT 1`
+	case exclusivityOperationAuthority:
+		return `SELECT a.journal_id FROM journal_operations a JOIN journal_authorities b ON a.journal_id=b.journal_id LIMIT 1`
+	case exclusivityOperationDecision:
+		return `SELECT a.journal_id FROM journal_operations a JOIN journal_decisions b ON a.journal_id=b.journal_id LIMIT 1`
+	case exclusivityOperationEvidence:
+		return `SELECT a.journal_id FROM journal_operations a JOIN journal_evidence b ON a.journal_id=b.journal_id LIMIT 1`
+	case exclusivityTaskEventAuthority:
+		return `SELECT a.journal_id FROM journal_task_events a JOIN journal_authorities b ON a.journal_id=b.journal_id LIMIT 1`
+	case exclusivityTaskEventDecision:
+		return `SELECT a.journal_id FROM journal_task_events a JOIN journal_decisions b ON a.journal_id=b.journal_id LIMIT 1`
+	case exclusivityTaskEventEvidence:
+		return `SELECT a.journal_id FROM journal_task_events a JOIN journal_evidence b ON a.journal_id=b.journal_id LIMIT 1`
+	case exclusivityAuthorityDecision:
+		return `SELECT a.journal_id FROM journal_authorities a JOIN journal_decisions b ON a.journal_id=b.journal_id LIMIT 1`
+	case exclusivityAuthorityEvidence:
+		return `SELECT a.journal_id FROM journal_authorities a JOIN journal_evidence b ON a.journal_id=b.journal_id LIMIT 1`
+	case exclusivityDecisionEvidence:
+		return `SELECT a.journal_id FROM journal_decisions a JOIN journal_evidence b ON a.journal_id=b.journal_id LIMIT 1`
+	default:
+		panic("unknown subtype exclusivity query")
 	}
-	sort.Slice(kinds, func(i, j int) bool { return kinds[i] < kinds[j] })
-	pairs := make([]subtypeExclusivityPair, 0, len(kinds)*(len(kinds)-1)/2)
-	for i := 0; i < len(kinds); i++ {
-		for j := i + 1; j < len(kinds); j++ {
-			pairs = append(pairs, subtypeExclusivityPair{
-				a: kinds[i], b: kinds[j],
-				query: fmt.Sprintf(`SELECT a.journal_id FROM %s a JOIN %s b ON a.journal_id = b.journal_id LIMIT 1`,
-					subtypeAllTables[kinds[i]], subtypeAllTables[kinds[j]]),
-			})
-		}
-	}
-	return pairs
+}
+
+var subtypeExclusivityPairs = []subtypeExclusivityPair{
+	{journal.JournalKindOperation, journal.JournalKindTaskEvent, exclusivityOperationTaskEvent},
+	{journal.JournalKindOperation, journal.JournalKindAuthority, exclusivityOperationAuthority},
+	{journal.JournalKindOperation, journal.JournalKindDecision, exclusivityOperationDecision},
+	{journal.JournalKindOperation, journal.JournalKindEvidence, exclusivityOperationEvidence},
+	{journal.JournalKindTaskEvent, journal.JournalKindAuthority, exclusivityTaskEventAuthority},
+	{journal.JournalKindTaskEvent, journal.JournalKindDecision, exclusivityTaskEventDecision},
+	{journal.JournalKindTaskEvent, journal.JournalKindEvidence, exclusivityTaskEventEvidence},
+	{journal.JournalKindAuthority, journal.JournalKindDecision, exclusivityAuthorityDecision},
+	{journal.JournalKindAuthority, journal.JournalKindEvidence, exclusivityAuthorityEvidence},
+	{journal.JournalKindDecision, journal.JournalKindEvidence, exclusivityDecisionEvidence},
 }
 
 // Authority-level discriminator-agreement probes (§10 rule 8, second inheritance level),
@@ -531,18 +578,18 @@ const (
 // exist in the live schema, so this guard extends automatically as later slices add
 // operation/authority/decision/evidence tables without weakening the check for the kinds
 // present today.
-func (db *DB) subtypeTablesPresent() (map[journal.JournalKind]string, error) {
-	present := make(map[journal.JournalKind]string, len(subtypeAllTables))
+func (db *DB) subtypeTablesPresent() (map[journal.JournalKind]subtypeTable, error) {
+	present := make(map[journal.JournalKind]subtypeTable, len(subtypeAllTables))
 	for kind, table := range subtypeAllTables {
 		var exists bool
 		if err := sqlitex.Execute(db.conn,
-			`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1`,
+			`SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2`,
 			&sqlitex.ExecOptions{
-				Args:       []any{table},
+				Args:       []any{"table", table.label()},
 				ResultFunc: func(*zs.Stmt) error { exists = true; return nil },
 			},
 		); err != nil {
-			return nil, fmt.Errorf("subtypeTablesPresent: probe %q: %w", table, err)
+			return nil, fmt.Errorf("subtypeTablesPresent: probe %q: %w", table.label(), err)
 		}
 		if exists {
 			present[kind] = table
@@ -557,16 +604,16 @@ func (db *DB) verifySubtypeIntegrityLocked() error {
 		return err
 	}
 	for kind, table := range tables {
-		probes := subtypeIntegrityQueries[kind]
+		totalityQuery, discriminatorQuery := subtypeIntegrityQueries(table)
 		// Totality: a journal row of this kind with no subtype row.
 		var missing int64
-		if err := sqlitex.Execute(db.conn, probes.totality,
+		if err := sqlitex.Execute(db.conn, totalityQuery,
 			&sqlitex.ExecOptions{
 				Args:       []any{int(kind)},
 				ResultFunc: func(stmt *zs.Stmt) error { missing = stmt.ColumnInt64(0); return nil },
 			},
 		); err != nil {
-			return fmt.Errorf("verifySubtypeIntegrity totality %s: %w", table, err)
+			return fmt.Errorf("verifySubtypeIntegrity totality %s: %w", table.label(), err)
 		}
 		if missing != 0 {
 			return fmt.Errorf(
@@ -575,19 +622,19 @@ func (db *DB) verifySubtypeIntegrityLocked() error {
 					"write is rolled back because class-table inheritance requires "+
 					"exactly one subtype row per journal row; fix: write the %s row in "+
 					"the same transaction as its journal row",
-				journal.ErrSubtypeIntegrity, missing, kind, table, table)
+				journal.ErrSubtypeIntegrity, missing, kind, table.label(), table.label())
 		}
 		// Discriminator agreement + exclusivity: a subtype row whose journal row
 		// carries a different kind_id (or a JournalID present in a foreign
 		// subtype table).
 		var mismatch int64
-		if err := sqlitex.Execute(db.conn, probes.discriminator,
+		if err := sqlitex.Execute(db.conn, discriminatorQuery,
 			&sqlitex.ExecOptions{
 				Args:       []any{int(kind)},
 				ResultFunc: func(stmt *zs.Stmt) error { mismatch = stmt.ColumnInt64(0); return nil },
 			},
 		); err != nil {
-			return fmt.Errorf("verifySubtypeIntegrity agreement %s: %w", table, err)
+			return fmt.Errorf("verifySubtypeIntegrity agreement %s: %w", table.label(), err)
 		}
 		if mismatch != 0 {
 			return fmt.Errorf(
@@ -595,7 +642,7 @@ func (db *DB) verifySubtypeIntegrityLocked() error {
 					"not %s — where: subtype-integrity gate; when: before commit; "+
 					"impact: the write is rolled back; fix: the subtype table must "+
 					"agree with journal.kind_id",
-				journal.ErrSubtypeIntegrity, table, mismatch, kind)
+				journal.ErrSubtypeIntegrity, table.label(), mismatch, kind)
 		}
 	}
 	// Exclusivity across subtype tables (§10 rule 8): a JournalID may appear in at
@@ -613,7 +660,7 @@ func (db *DB) verifySubtypeIntegrityLocked() error {
 // verifySubtypeExclusivityLocked rejects a JournalID present in two subtype
 // tables at once (§10 rule 8 exclusivity). The subtype PKs are all JournalID, so
 // a pairwise existence probe over the present tables is exact.
-func (db *DB) verifySubtypeExclusivityLocked(tables map[journal.JournalKind]string) error {
+func (db *DB) verifySubtypeExclusivityLocked(tables map[journal.JournalKind]subtypeTable) error {
 	// Walk the pre-built closed pair set, probing only pairs whose BOTH tables are present
 	// in the live schema — so the check is the exact subset of pairs the former dynamic
 	// double loop covered, with no per-call SQL construction.
@@ -624,17 +671,17 @@ func (db *DB) verifySubtypeExclusivityLocked(tables map[journal.JournalKind]stri
 			continue
 		}
 		var dup int64
-		if err := sqlitex.Execute(db.conn, p.query,
+		if err := sqlitex.Execute(db.conn, p.query.sql(),
 			&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { dup = stmt.ColumnInt64(0); return nil }},
 		); err != nil {
-			return fmt.Errorf("verifySubtypeExclusivity %s/%s: %w", ta, tb, err)
+			return fmt.Errorf("verifySubtypeExclusivity %s/%s: %w", ta.label(), tb.label(), err)
 		}
 		if dup != 0 {
 			return fmt.Errorf(
 				"%w: journal %d appears in both %s and %s subtype tables — where: subtype-integrity "+
 					"gate; when: before commit; impact: the write is rolled back; fix: a journal row "+
 					"must have exactly one subtype row selected by its JournalKind",
-				journal.ErrSubtypeIntegrity, dup, ta, tb)
+				journal.ErrSubtypeIntegrity, dup, ta.label(), tb.label())
 		}
 	}
 	return nil
@@ -647,8 +694,8 @@ func (db *DB) verifySubtypeExclusivityLocked(tables map[journal.JournalKind]stri
 func (db *DB) verifyAuthorityDetailIntegrityLocked() error {
 	var present bool
 	if err := sqlitex.Execute(db.conn,
-		`SELECT 1 FROM sqlite_master WHERE type='table' AND name='journal_authorities'`,
-		&sqlitex.ExecOptions{ResultFunc: func(*zs.Stmt) error { present = true; return nil }}); err != nil {
+		`SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2`,
+		&sqlitex.ExecOptions{Args: []any{"table", "journal_authorities"}, ResultFunc: func(*zs.Stmt) error { present = true; return nil }}); err != nil {
 		return fmt.Errorf("verifyAuthorityDetailIntegrity: probe journal_authorities: %w", err)
 	}
 	if !present {

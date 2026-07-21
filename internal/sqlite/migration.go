@@ -127,10 +127,10 @@ func isLegacyOperationsColumnSet(actual map[string]struct{}) bool {
 func (db *DB) preflightNoUnexpectedSpineTableLocked() error {
 	var unexpected string
 	if err := sqlitex.Execute(db.conn,
-		`SELECT name FROM sqlite_master WHERE type='table'
-		   AND (name = 'journal' OR name LIKE 'journal\_%' ESCAPE '\')
+		`SELECT name FROM sqlite_master WHERE type=?1
+		   AND (name = ?2 OR name LIKE ?3 ESCAPE ?4)
 		 ORDER BY name ASC`,
-		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
+		&sqlitex.ExecOptions{Args: []any{"table", "journal", `journal\_%`, `\`}, ResultFunc: func(stmt *zs.Stmt) error {
 			name := stmt.ColumnText(0)
 			if _, ok := recognizedJournalSpineTables[name]; !ok && unexpected == "" {
 				unexpected = name
@@ -191,8 +191,8 @@ func checkColumns(want expectedTable, actual map[string]struct{}) error {
 func (db *DB) tableExistsLocked(table string) (bool, error) {
 	present := false
 	if err := sqlitex.Execute(db.conn,
-		`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1`,
-		&sqlitex.ExecOptions{Args: []any{table}, ResultFunc: func(*zs.Stmt) error { present = true; return nil }}); err != nil {
+		`SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2`,
+		&sqlitex.ExecOptions{Args: []any{"table", table}, ResultFunc: func(*zs.Stmt) error { present = true; return nil }}); err != nil {
 		return false, fmt.Errorf("preflight: probe table %q: %w", table, err)
 	}
 	return present, nil
@@ -200,12 +200,10 @@ func (db *DB) tableExistsLocked(table string) (bool, error) {
 
 func (db *DB) tableColumnsLocked(table string) (map[string]struct{}, error) {
 	cols := map[string]struct{}{}
-	// PRAGMA table_info cannot be parameterized; the table name comes from the
-	// closed expectedJournalShape set, never from caller input.
 	if err := sqlitex.Execute(db.conn,
-		fmt.Sprintf(`PRAGMA table_info(%q)`, table),
-		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
-			cols[stmt.ColumnText(1)] = struct{}{} // column 1 is the column name
+		`SELECT name FROM pragma_table_info(?1)`,
+		&sqlitex.ExecOptions{Args: []any{table}, ResultFunc: func(stmt *zs.Stmt) error {
+			cols[stmt.ColumnText(0)] = struct{}{}
 			return nil
 		}}); err != nil {
 		return nil, fmt.Errorf("preflight: read columns of %q: %w", table, err)
@@ -470,8 +468,8 @@ func (db *DB) CountBaselineAnchors() (int, error) {
 	defer db.mu.Unlock()
 	var n int
 	if err := sqlitex.Execute(db.conn,
-		`SELECT COUNT(*) FROM journal_operations WHERE operation_id LIKE 'provenance.migration.baseline--%'`,
-		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
+		`SELECT COUNT(*) FROM journal_operations WHERE operation_id LIKE ?1`,
+		&sqlitex.ExecOptions{Args: []any{"provenance.migration.baseline--%"}, ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
 		return 0, fmt.Errorf("CountBaselineAnchors: %w", err)
 	}
 	return n, nil

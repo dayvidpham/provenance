@@ -75,9 +75,9 @@ func (db *DB) projectJournalRowLocked(jid int64) error {
 	case journal.JournalKindAuthority:
 		return db.projectAuthorityRowLocked(jid)
 	case journal.JournalKindDecision:
-		return db.projectTaskScopedRowLocked(jid, committing, "journal_decisions")
+		return db.projectTaskScopedRowLocked(jid, committing, taskScopedDecision)
 	case journal.JournalKindEvidence:
-		return db.projectTaskScopedRowLocked(jid, committing, "journal_evidence")
+		return db.projectTaskScopedRowLocked(jid, committing, taskScopedEvidence)
 	default:
 		return fmt.Errorf("project journal row %d: unknown journal kind %d", jid, kind)
 	}
@@ -117,7 +117,7 @@ func (db *DB) projectTaskEventRowLocked(jid int64, committing journal.ActorID, r
 		if canonicalEffect.TaskID != task || canonicalEffect.EventKind != "" && canonicalEffect.EventKind != journal.EventKind(kindStr) {
 			return fmt.Errorf("provenance: canonical mutation row %d disagrees with journal_task_events task/event facts — where: startup canonical validation; impact: database open fails without projection writes; fix: restore the journal row and canonical bytes from the same committed operation", jid)
 		}
-		if db.projTasks() == shadowTasksTable {
+		if db.projectionTarget == projectionTargetShadow {
 			switch canonicalEffect.Sort {
 			case journal.EffectTaskCreate, journal.EffectTaskCreateAllocated:
 				if err := db.insertCanonicalShadowTaskLocked(canonicalEffect, recordedAt, jid); err != nil {
@@ -189,7 +189,7 @@ func (db *DB) readProjTaskStatusLocked(task journal.TaskID) (journal.TaskStatus,
 	var status journal.TaskStatus
 	found := false
 	if err := sqlitex.Execute(db.conn,
-		fmt.Sprintf(`SELECT status_id FROM %s WHERE id = ?1`, db.projTasks()),
+		readTaskStatusQuery(db.projectionTarget),
 		&sqlitex.ExecOptions{Args: []any{task.String()}, ResultFunc: func(stmt *zs.Stmt) error {
 			found = true
 			status = journal.TaskStatus(stmt.ColumnInt(0))
@@ -268,11 +268,25 @@ func (db *DB) projectAuthorityRowLocked(jid int64) error {
 // projectTaskScopedRowLocked attributes the committing actor for a task-scoped
 // decision/evidence row and advances the watermark (§8.2). An untasked row
 // attributes nothing.
-func (db *DB) projectTaskScopedRowLocked(jid int64, committing journal.ActorID, table string) error {
+type taskScopedTable uint8
+
+const (
+	taskScopedDecision taskScopedTable = iota + 1
+	taskScopedEvidence
+)
+
+func (table taskScopedTable) label() string {
+	if table == taskScopedEvidence {
+		return "journal_evidence"
+	}
+	return "journal_decisions"
+}
+
+func (db *DB) projectTaskScopedRowLocked(jid int64, committing journal.ActorID, table taskScopedTable) error {
 	var taskRaw string
 	hasTask := false
 	if err := sqlitex.Execute(db.conn,
-		fmt.Sprintf(`SELECT task_id FROM %s WHERE journal_id = ?1`, table),
+		taskScopedQuery(table),
 		&sqlitex.ExecOptions{Args: []any{jid}, ResultFunc: func(stmt *zs.Stmt) error {
 			if stmt.ColumnType(0) != zs.TypeNull {
 				taskRaw = stmt.ColumnText(0)
@@ -280,7 +294,7 @@ func (db *DB) projectTaskScopedRowLocked(jid int64, committing journal.ActorID, 
 			}
 			return nil
 		}}); err != nil {
-		return fmt.Errorf("project %s %d: %w", table, jid, err)
+		return fmt.Errorf("project %s %d: %w", table.label(), jid, err)
 	}
 	if !hasTask {
 		return nil
@@ -307,11 +321,32 @@ func (db *DB) projectTaskStatusLocked(task journal.TaskID, status journal.TaskSt
 	// Targets the real tasks table during a live Apply and the shadow tasks table
 	// during a from-empty replay derivation (§8.1, §15).
 	if err := sqlitex.Execute(db.conn,
-		fmt.Sprintf(`UPDATE %s SET status_id = ?1, closed_at = ?2, last_journal_id = ?3 WHERE id = ?4`, db.projTasks()),
+		projectTaskStatusQuery(db.projectionTarget),
 		&sqlitex.ExecOptions{Args: []any{int(status), closedAt, jid, task.String()}}); err != nil {
 		return fmt.Errorf("project task status for %q: %w", task, err)
 	}
 	return nil
+}
+
+func readTaskStatusQuery(target projectionTarget) string {
+	if target == projectionTargetShadow {
+		return `SELECT status_id FROM shadow_tasks WHERE id=?1`
+	}
+	return `SELECT status_id FROM tasks WHERE id=?1`
+}
+
+func taskScopedQuery(table taskScopedTable) string {
+	if table == taskScopedEvidence {
+		return `SELECT task_id FROM journal_evidence WHERE journal_id=?1`
+	}
+	return `SELECT task_id FROM journal_decisions WHERE journal_id=?1`
+}
+
+func projectTaskStatusQuery(target projectionTarget) string {
+	if target == projectionTargetShadow {
+		return `UPDATE shadow_tasks SET status_id=?1,closed_at=?2,last_journal_id=?3 WHERE id=?4`
+	}
+	return `UPDATE tasks SET status_id=?1,closed_at=?2,last_journal_id=?3 WHERE id=?4`
 }
 
 // ---------------------------------------------------------------------------
@@ -374,15 +409,15 @@ func (db *DB) ReplayProjections() (journal.ReplayResult, error) {
 	}
 
 	// Snapshot the STORED projection before any change, keyed by task id.
-	storedTasks, err := db.snapshotTaskProjectionsLocked("tasks")
+	storedTasks, err := db.snapshotTaskProjectionsLocked(projectionTargetLive)
 	if err != nil {
 		return journal.ReplayResult{}, err
 	}
-	storedTaskState, err := db.snapshotCompleteTaskStateLocked("tasks")
+	storedTaskState, err := db.snapshotCompleteTaskStateLocked(projectionTargetLive)
 	if err != nil {
 		return journal.ReplayResult{}, err
 	}
-	storedAttribs, err := db.snapshotAttributionsLocked("task_attributions")
+	storedAttribs, err := db.snapshotAttributionsLocked(projectionTargetLive)
 	if err != nil {
 		return journal.ReplayResult{}, err
 	}
@@ -393,7 +428,7 @@ func (db *DB) ReplayProjections() (journal.ReplayResult, error) {
 	// The relationship/annotation domain projections are journaled in full (§6 amendment),
 	// so every edge/label/comment is journal-reproducible; the stored sets are snapshotted
 	// whole (not scoped to anchored tasks) and diffed against the from-empty re-derivation.
-	storedDomain, err := db.snapshotDomainProjectionsLocked("edges", "labels", "comments")
+	storedDomain, err := db.snapshotDomainProjectionsLocked(projectionTargetLive)
 	if err != nil {
 		return journal.ReplayResult{}, err
 	}
@@ -440,20 +475,23 @@ type canonicalStoredOperation struct {
 	wireSet      bool
 }
 
+const canonicalOperationsQuery = `SELECT o.journal_id,o.authority_journal_id,o.mutation_encoding_version,o.canonical_mutation,o.mutation_digest,j.actor_id,j.recorded_at FROM journal_operations o JOIN journal j ON j.journal_id=o.journal_id ORDER BY o.journal_id`
+const legacyOperationsQuery = `SELECT o.journal_id,o.authority_journal_id,NULL,NULL,o.mutation_digest,j.actor_id,j.recorded_at FROM journal_operations o JOIN journal j ON j.journal_id=o.journal_id ORDER BY o.journal_id`
+const canonicalEffectForRowQuery = `SELECT o.journal_id,o.mutation_encoding_version,o.canonical_mutation FROM journal j JOIN journal_operations o ON o.journal_id=j.produced_by_operation_journal_id WHERE j.journal_id=?1`
+const legacyEffectForRowQuery = `SELECT o.journal_id,NULL,NULL FROM journal j JOIN journal_operations o ON o.journal_id=j.produced_by_operation_journal_id WHERE j.journal_id=?1`
+const seedMixedLegacyTasksQuery = `INSERT INTO shadow_tasks (id,namespace,title,description,owner_id,status_id,priority_id,type_id,phase_id,notes,created_at,updated_at,closed_at,close_reason,last_journal_id) SELECT t.id,t.namespace,t.title,t.description,NULL,?1,t.priority_id,t.type_id,t.phase_id,t.notes,t.created_at,t.updated_at,NULL,t.close_reason,NULL FROM tasks t WHERE EXISTS (SELECT 1 FROM journal_task_events e JOIN journal j ON j.journal_id=e.journal_id JOIN journal_operations o ON o.journal_id=j.produced_by_operation_journal_id WHERE e.task_id=t.id AND ((e.event_kind=?2 AND o.canonical_mutation IS NULL) OR e.event_kind=?3))`
+const seedLegacyOnlyTasksQuery = `INSERT INTO shadow_tasks (id,namespace,title,description,owner_id,status_id,priority_id,type_id,phase_id,notes,created_at,updated_at,closed_at,close_reason,last_journal_id) SELECT t.id,t.namespace,t.title,t.description,NULL,?1,t.priority_id,t.type_id,t.phase_id,t.notes,t.created_at,t.updated_at,NULL,t.close_reason,NULL FROM tasks t WHERE EXISTS (SELECT 1 FROM journal_task_events e JOIN journal j ON j.journal_id=e.journal_id JOIN journal_operations o ON o.journal_id=j.produced_by_operation_journal_id WHERE e.task_id=t.id AND (e.event_kind=?2 OR e.event_kind=?3))`
+
 func (db *DB) validateCanonicalOperationsLocked() error {
 	var operations []canonicalStoredOperation
 	columns, err := db.tableColumnsLocked("journal_operations")
 	if err != nil {
 		return err
 	}
-	versionExpr, wireExpr := "o.mutation_encoding_version", "o.canonical_mutation"
+	query := canonicalOperationsQuery
 	if isLegacyOperationsColumnSet(columns) {
-		versionExpr, wireExpr = "NULL", "NULL"
+		query = legacyOperationsQuery
 	}
-	query := fmt.Sprintf(`SELECT o.journal_id, o.authority_journal_id, %s, %s,
-		        o.mutation_digest, j.actor_id, j.recorded_at
-		 FROM journal_operations o JOIN journal j ON j.journal_id=o.journal_id
-		 ORDER BY o.journal_id`, versionExpr, wireExpr)
 	if err := sqlitex.Execute(db.conn,
 		query,
 		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
@@ -494,8 +532,8 @@ func (db *DB) validateCanonicalOperationsLocked() error {
 		if err != nil {
 			return fmt.Errorf("startup canonical validation operation %d: %w", op.anchor, err)
 		}
-		if op.version != prepared.EncodingVersion() {
-			return canonicalCorruption(op.anchor, "encoding version", op.version, prepared.EncodingVersion())
+		if op.version != prepared.EncodingVersion().String() {
+			return canonicalCorruption(op.anchor, "encoding version", op.version, prepared.EncodingVersion().String())
 		}
 		if !bytes.Equal(op.digest, prepared.DerivedDigest()) {
 			return canonicalCorruption(op.anchor, "mutation digest", fmt.Sprintf("%x", op.digest), fmt.Sprintf("%x", prepared.DerivedDigest()))
@@ -622,13 +660,13 @@ func (db *DB) validateCanonicalEffectRowLocked(op canonicalStoredOperation, jid 
 			occupant = op.actor
 		}
 		slot, _ := slotDBID(effect.SlotID)
-		return db.compareSingleRowLocked(op.anchor, jid, `SELECT e.assignment_id,e.task_id,e.slot_id,e.actor_id,COALESCE(e.predecessor_assignment_id,''),COALESCE(e.parent_assignment_id,''),t.transition_id FROM journal_authority_assignment_transitions t JOIN journal_authority_assignment_episodes e ON e.assignment_id=t.assignment_id WHERE t.journal_id=?1`, []string{string(effect.AssignmentID), effect.TaskID.String(), strconv.Itoa(slot), occupant.String(), string(effect.Predecessor), string(effect.Parent), strconv.Itoa(transitionStartedID)})
+		return db.compareSingleRowLocked(op.anchor, jid, `SELECT e.assignment_id,e.task_id,e.slot_id,e.actor_id,e.predecessor_assignment_id,e.parent_assignment_id,t.transition_id FROM journal_authority_assignment_transitions t JOIN journal_authority_assignment_episodes e ON e.assignment_id=t.assignment_id WHERE t.journal_id=?1`, []string{string(effect.AssignmentID), effect.TaskID.String(), strconv.Itoa(slot), occupant.String(), string(effect.Predecessor), string(effect.Parent), strconv.Itoa(transitionStartedID)})
 	case journal.EffectAssignmentEnd:
 		return db.compareSingleRowLocked(op.anchor, jid, `SELECT assignment_id,transition_id FROM journal_authority_assignment_transitions WHERE journal_id=?1`, []string{string(effect.AssignmentID), strconv.Itoa(transitionEndedID)})
 	case journal.EffectDecision:
-		return db.compareSingleRowLocked(op.anchor, jid, `SELECT decision_kind,COALESCE(task_id,''),payload FROM journal_decisions WHERE journal_id=?1`, []string{string(effect.DecisionKind), optionalTaskString(effect.TaskID), string(effect.Payload)})
+		return db.compareSingleRowLocked(op.anchor, jid, `SELECT decision_kind,task_id,payload FROM journal_decisions WHERE journal_id=?1`, []string{string(effect.DecisionKind), optionalTaskString(effect.TaskID), string(effect.Payload)})
 	case journal.EffectEvidence:
-		return db.compareSingleRowLocked(op.anchor, jid, `SELECT evidence_kind,COALESCE(task_id,''),hex(content_digest),payload FROM journal_evidence WHERE journal_id=?1`, []string{string(effect.EvidenceKind), optionalTaskString(effect.TaskID), strings.ToUpper(fmt.Sprintf("%x", effect.ContentDigest)), string(effect.Payload)})
+		return db.compareSingleRowLocked(op.anchor, jid, `SELECT evidence_kind,task_id,hex(content_digest),payload FROM journal_evidence WHERE journal_id=?1`, []string{string(effect.EvidenceKind), optionalTaskString(effect.TaskID), strings.ToUpper(fmt.Sprintf("%x", effect.ContentDigest)), string(effect.Payload)})
 	}
 	return nil
 }
@@ -744,17 +782,9 @@ func (db *DB) rederiveProjectionsShadowLocked() (
 	// relationship/annotation domain projections (§6 amendment) are repointed alongside
 	// the task/attribution projections so their from-empty refold lands in the shadow
 	// tables too.
-	db.projTasksTable = shadowTasksTable
-	db.projAttribTable = shadowAttribTable
-	db.projEdgesTable = shadowEdgesTable
-	db.projLabelsTable = shadowLabelsTable
-	db.projCommentsTable = shadowCommentsTable
+	db.projectionTarget = projectionTargetShadow
 	defer func() {
-		db.projTasksTable = ""
-		db.projAttribTable = ""
-		db.projEdgesTable = ""
-		db.projLabelsTable = ""
-		db.projCommentsTable = ""
+		db.projectionTarget = projectionTargetLive
 		if derr := db.dropProjectionShadowLocked(); derr != nil && err == nil {
 			err = fmt.Errorf("ReplayProjections: drop shadow projection tables: %w", derr)
 		}
@@ -776,19 +806,19 @@ func (db *DB) rederiveProjectionsShadowLocked() (
 		folded++
 	}
 
-	tasks, err = db.snapshotTaskProjectionsLocked(shadowTasksTable)
+	tasks, err = db.snapshotTaskProjectionsLocked(projectionTargetShadow)
 	if err != nil {
 		return nil, nil, nil, domainProjection{}, 0, err
 	}
-	taskState, err = db.snapshotCompleteTaskStateLocked(shadowTasksTable)
+	taskState, err = db.snapshotCompleteTaskStateLocked(projectionTargetShadow)
 	if err != nil {
 		return nil, nil, nil, domainProjection{}, 0, err
 	}
-	attribs, err = db.snapshotAttributionsLocked(shadowAttribTable)
+	attribs, err = db.snapshotAttributionsLocked(projectionTargetShadow)
 	if err != nil {
 		return nil, nil, nil, domainProjection{}, 0, err
 	}
-	domain, err = db.snapshotDomainProjectionsLocked(shadowEdgesTable, shadowLabelsTable, shadowCommentsTable)
+	domain, err = db.snapshotDomainProjectionsLocked(projectionTargetShadow)
 	if err != nil {
 		return nil, nil, nil, domainProjection{}, 0, err
 	}
@@ -868,24 +898,10 @@ func (db *DB) createProjectionShadowLocked() error {
 	if err != nil {
 		return err
 	}
-	legacyBirth := "o.canonical_mutation IS NULL"
+	seedLegacy := seedMixedLegacyTasksQuery
 	if isLegacyOperationsColumnSet(columns) {
-		legacyBirth = "1"
+		seedLegacy = seedLegacyOnlyTasksQuery
 	}
-	seedLegacy := fmt.Sprintf(`INSERT INTO shadow_tasks
-		 (id, namespace, title, description, owner_id, status_id, priority_id, type_id,
-		  phase_id, notes, created_at, updated_at, closed_at, close_reason, last_journal_id)
-		 SELECT t.id, t.namespace, t.title, t.description, NULL, ?1, t.priority_id, t.type_id,
-		        t.phase_id, t.notes, t.created_at, t.updated_at, NULL, t.close_reason, NULL
-		 FROM tasks t
-		 WHERE EXISTS (
-		   SELECT 1 FROM journal_task_events e
-		   JOIN journal j ON j.journal_id=e.journal_id
-		   JOIN journal_operations o ON o.journal_id=j.produced_by_operation_journal_id
-		   WHERE e.task_id=t.id AND (
-		     (e.event_kind=?2 AND %s) OR e.event_kind=?3
-		   )
-		 )`, legacyBirth)
 	if err := sqlitex.Execute(db.conn, seedLegacy,
 		&sqlitex.ExecOptions{Args: []any{statusOpenID, string(journal.EventKindTaskCreated), string(journal.EventKindTaskMigrated)}}); err != nil {
 		return fmt.Errorf("seed shadow_tasks legacy slate: %w", err)
@@ -902,13 +918,10 @@ func (db *DB) canonicalEffectForJournalRowLocked(jid int64) (journal.Effect, boo
 	if err != nil {
 		return journal.Effect{}, false, err
 	}
-	versionExpr, wireExpr := "o.mutation_encoding_version", "o.canonical_mutation"
+	query := canonicalEffectForRowQuery
 	if isLegacyOperationsColumnSet(columns) {
-		versionExpr, wireExpr = "NULL", "NULL"
+		query = legacyEffectForRowQuery
 	}
-	query := fmt.Sprintf(`SELECT o.journal_id, %s, %s
-		 FROM journal j JOIN journal_operations o ON o.journal_id=j.produced_by_operation_journal_id
-		 WHERE j.journal_id=?1`, versionExpr, wireExpr)
 	if err := sqlitex.Execute(db.conn, query,
 		&sqlitex.ExecOptions{Args: []any{jid}, ResultFunc: func(stmt *zs.Stmt) error {
 			found = true
@@ -936,7 +949,7 @@ func (db *DB) canonicalEffectForJournalRowLocked(jid int64) (journal.Effect, boo
 	if err != nil {
 		return journal.Effect{}, false, fmt.Errorf("operation %d canonical mutation: %w", anchor, err)
 	}
-	if prepared.EncodingVersion() != version {
+	if prepared.EncodingVersion().String() != version {
 		return journal.Effect{}, false, fmt.Errorf("operation %d canonical column version %q differs from registered wire version %q", anchor, version, prepared.EncodingVersion())
 	}
 	ordinal := 0
@@ -966,36 +979,47 @@ func (db *DB) insertCanonicalShadowTaskLocked(e journal.Effect, recordedAt, jid 
 }
 
 func (db *DB) materializeCanonicalShadowTaskEventLocked(e journal.Effect, recordedAt int64) error {
-	set := []string{"updated_at=?1"}
-	args := []any{recordedAt}
-	add := func(column string, value any) {
-		args = append(args, value)
-		set = append(set, column+"=?"+strconv.Itoa(len(args)))
-	}
-	if e.UpdateTitle != nil {
-		add("title", *e.UpdateTitle)
-	}
-	if e.UpdateDescription != nil {
-		add("description", *e.UpdateDescription)
-	}
-	if e.UpdatePriority != nil {
-		add("priority_id", int(*e.UpdatePriority))
-	}
-	if e.UpdatePhase != nil {
-		add("phase_id", int(*e.UpdatePhase))
-	}
-	if e.UpdateNotes != nil {
-		add("notes", *e.UpdateNotes)
-	}
-	if e.EventKind == journal.EventKindTaskClosed && e.CloseReason != "" {
-		add("close_reason", e.CloseReason)
-	}
-	if len(set) == 1 {
+	closeReasonSet := e.EventKind == journal.EventKindTaskClosed && e.CloseReason != ""
+	if e.UpdateTitle == nil && e.UpdateDescription == nil && e.UpdatePriority == nil && e.UpdatePhase == nil && e.UpdateNotes == nil && !closeReasonSet {
 		return nil
 	}
-	args = append(args, e.TaskID.String())
-	query := fmt.Sprintf("UPDATE shadow_tasks SET %s WHERE id=?%d", strings.Join(set, ","), len(args))
-	if err := sqlitex.Execute(db.conn, query, &sqlitex.ExecOptions{Args: args}); err != nil {
+	value := func(p *string) any {
+		if p == nil {
+			return nil
+		}
+		return *p
+	}
+	flag := func(set bool) int {
+		if set {
+			return 1
+		}
+		return 0
+	}
+	var priority, phase any
+	if e.UpdatePriority != nil {
+		priority = int(*e.UpdatePriority)
+	}
+	if e.UpdatePhase != nil {
+		phase = int(*e.UpdatePhase)
+	}
+	if err := sqlitex.Execute(db.conn, `UPDATE shadow_tasks SET
+		updated_at=?1,
+		title=CASE WHEN ?2 THEN ?3 ELSE title END,
+		description=CASE WHEN ?4 THEN ?5 ELSE description END,
+		priority_id=CASE WHEN ?6 THEN ?7 ELSE priority_id END,
+		phase_id=CASE WHEN ?8 THEN ?9 ELSE phase_id END,
+		notes=CASE WHEN ?10 THEN ?11 ELSE notes END,
+		close_reason=CASE WHEN ?12 THEN ?13 ELSE close_reason END
+		WHERE id=?14`, &sqlitex.ExecOptions{Args: []any{
+		recordedAt,
+		flag(e.UpdateTitle != nil), value(e.UpdateTitle),
+		flag(e.UpdateDescription != nil), value(e.UpdateDescription),
+		flag(e.UpdatePriority != nil), priority,
+		flag(e.UpdatePhase != nil), phase,
+		flag(e.UpdateNotes != nil), value(e.UpdateNotes),
+		flag(closeReasonSet), e.CloseReason,
+		e.TaskID.String(),
+	}}); err != nil {
 		return fmt.Errorf("replay canonical task event %q: %w", e.TaskID, err)
 	}
 	return nil
@@ -1041,10 +1065,10 @@ func (db *DB) journalAnchoredTasksLocked() (map[string]struct{}, error) {
 // status, watermark) keyed by task id from the named table, so a replay can compare
 // the stored projection ("tasks") against the from-empty re-derivation
 // ("shadow_tasks") (§15).
-func (db *DB) snapshotTaskProjectionsLocked(table string) (map[string]journal.TaskProjection, error) {
+func (db *DB) snapshotTaskProjectionsLocked(target projectionTarget) (map[string]journal.TaskProjection, error) {
 	out := map[string]journal.TaskProjection{}
 	if err := sqlitex.Execute(db.conn,
-		fmt.Sprintf(`SELECT id, owner_id, status_id, last_journal_id FROM %s`, table),
+		snapshotTaskProjectionsQuery(target),
 		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 			taskRaw := stmt.ColumnText(0)
 			task, err := journalParseTask(taskRaw)
@@ -1070,14 +1094,56 @@ func (db *DB) snapshotTaskProjectionsLocked(table string) (map[string]journal.Ta
 	return out, nil
 }
 
+func snapshotTaskProjectionsQuery(target projectionTarget) string {
+	if target == projectionTargetShadow {
+		return `SELECT id,owner_id,status_id,last_journal_id FROM shadow_tasks`
+	}
+	return `SELECT id,owner_id,status_id,last_journal_id FROM tasks`
+}
+
+func snapshotAttributionsQuery(target projectionTarget) string {
+	if target == projectionTargetShadow {
+		return `SELECT task_id,actor_id,first_journal_id FROM shadow_task_attributions`
+	}
+	return `SELECT task_id,actor_id,first_journal_id FROM task_attributions`
+}
+
+func snapshotCompleteTaskStateQuery(target projectionTarget) string {
+	if target == projectionTargetShadow {
+		return `SELECT id,namespace,title,description,status_id,priority_id,type_id,phase_id,owner_id,notes,created_at,updated_at,closed_at,close_reason,last_journal_id FROM shadow_tasks`
+	}
+	return `SELECT id,namespace,title,description,status_id,priority_id,type_id,phase_id,owner_id,notes,created_at,updated_at,closed_at,close_reason,last_journal_id FROM tasks`
+}
+
+func snapshotEdgesQuery(target projectionTarget) string {
+	if target == projectionTargetShadow {
+		return `SELECT source_id,target_id,kind_id,created_at FROM shadow_edges`
+	}
+	return `SELECT source_id,target_id,kind_id,created_at FROM edges`
+}
+
+func snapshotLabelsQuery(target projectionTarget) string {
+	if target == projectionTargetShadow {
+		return `SELECT task_id,name FROM shadow_labels`
+	}
+	return `SELECT task_id,name FROM labels`
+}
+
+func snapshotCommentsQuery(target projectionTarget) string {
+	if target == projectionTargetShadow {
+		return `SELECT id,task_id,author_id,body,created_at FROM shadow_comments`
+	}
+	return `SELECT id,task_id,author_id,body,created_at FROM comments`
+}
+
 // snapshotAttributionsLocked reads the attribution projection from the named table
 // as a nested map task_id → (actor_id → first_journal_id), so a replay can compare
 // the stored edges ("task_attributions") against the from-empty re-derivation
 // ("shadow_task_attributions") (§8.2, §15).
-func (db *DB) snapshotAttributionsLocked(table string) (map[string]map[string]int64, error) {
+func (db *DB) snapshotAttributionsLocked(target projectionTarget) (map[string]map[string]int64, error) {
 	out := map[string]map[string]int64{}
 	if err := sqlitex.Execute(db.conn,
-		fmt.Sprintf(`SELECT task_id, actor_id, first_journal_id FROM %s`, table),
+		snapshotAttributionsQuery(target),
 		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 			task := stmt.ColumnText(0)
 			if out[task] == nil {
@@ -1176,11 +1242,9 @@ type completeTaskState struct {
 	fields map[string]string
 }
 
-func (db *DB) snapshotCompleteTaskStateLocked(table string) (map[string]completeTaskState, error) {
+func (db *DB) snapshotCompleteTaskStateLocked(target projectionTarget) (map[string]completeTaskState, error) {
 	out := map[string]completeTaskState{}
-	query := fmt.Sprintf(`SELECT id, namespace, title, description, status_id, priority_id,
-		type_id, phase_id, owner_id, notes, created_at, updated_at, closed_at,
-		close_reason, last_journal_id FROM %s`, table)
+	query := snapshotCompleteTaskStateQuery(target)
 	if err := sqlitex.Execute(db.conn, query, &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 		id, err := journalParseTask(stmt.ColumnText(0))
 		if err != nil {
@@ -1207,7 +1271,7 @@ func (db *DB) snapshotCompleteTaskStateLocked(table string) (map[string]complete
 		}}
 		return nil
 	}}); err != nil {
-		return nil, fmt.Errorf("snapshot complete task state from %s: %w", table, err)
+		return nil, fmt.Errorf("snapshot complete task state from %s: %w", target.label(), err)
 	}
 	return out, nil
 }
@@ -1297,14 +1361,14 @@ type domainComment struct {
 // column, not merely the keys (§15). It selects the non-key content columns
 // (edges.created_at; comments.author_id/body/created_at) alongside the keys; labels have no
 // non-key column.
-func (db *DB) snapshotDomainProjectionsLocked(edgesT, labelsT, commentsT string) (domainProjection, error) {
+func (db *DB) snapshotDomainProjectionsLocked(target projectionTarget) (domainProjection, error) {
 	dp := domainProjection{
 		edges:    map[string]domainEdge{},
 		labels:   map[string]domainLabel{},
 		comments: map[string]domainComment{},
 	}
 	if err := sqlitex.Execute(db.conn,
-		fmt.Sprintf(`SELECT source_id, target_id, kind_id, created_at FROM %s`, edgesT),
+		snapshotEdgesQuery(target),
 		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 			src, tgt, kind := stmt.ColumnText(0), stmt.ColumnText(1), stmt.ColumnInt(2)
 			task, err := journalParseTask(src)
@@ -1314,10 +1378,10 @@ func (db *DB) snapshotDomainProjectionsLocked(edgesT, labelsT, commentsT string)
 			dp.edges[fmt.Sprintf("%s\x00%s\x00%d", src, tgt, kind)] = domainEdge{task: task, createdAt: stmt.ColumnInt64(3)}
 			return nil
 		}}); err != nil {
-		return domainProjection{}, fmt.Errorf("snapshot edges %s: %w", edgesT, err)
+		return domainProjection{}, fmt.Errorf("snapshot %s edges: %w", target.label(), err)
 	}
 	if err := sqlitex.Execute(db.conn,
-		fmt.Sprintf(`SELECT task_id, name FROM %s`, labelsT),
+		snapshotLabelsQuery(target),
 		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 			taskRaw, name := stmt.ColumnText(0), stmt.ColumnText(1)
 			task, err := journalParseTask(taskRaw)
@@ -1327,10 +1391,10 @@ func (db *DB) snapshotDomainProjectionsLocked(edgesT, labelsT, commentsT string)
 			dp.labels[fmt.Sprintf("%s\x00%s", taskRaw, name)] = domainLabel{task: task}
 			return nil
 		}}); err != nil {
-		return domainProjection{}, fmt.Errorf("snapshot labels %s: %w", labelsT, err)
+		return domainProjection{}, fmt.Errorf("snapshot %s labels: %w", target.label(), err)
 	}
 	if err := sqlitex.Execute(db.conn,
-		fmt.Sprintf(`SELECT id, task_id, author_id, body, created_at FROM %s`, commentsT),
+		snapshotCommentsQuery(target),
 		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 			id, taskRaw := stmt.ColumnText(0), stmt.ColumnText(1)
 			task, err := journalParseTask(taskRaw)
@@ -1345,7 +1409,7 @@ func (db *DB) snapshotDomainProjectionsLocked(edgesT, labelsT, commentsT string)
 			}
 			return nil
 		}}); err != nil {
-		return domainProjection{}, fmt.Errorf("snapshot comments %s: %w", commentsT, err)
+		return domainProjection{}, fmt.Errorf("snapshot %s comments: %w", target.label(), err)
 	}
 	return dp, nil
 }

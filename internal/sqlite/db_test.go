@@ -190,8 +190,8 @@ func TestFoldUpdateMaterializesMetadata(t *testing.T) {
 	id := journalCreate(t, db, actor, boot, "ns", "Original Title", "original description",
 		ptypes.TaskTypeTask, ptypes.PriorityMedium, ptypes.PhaseUnscoped)
 
-	newTitle := "Updated Title"
-	newNotes := "Updated notes"
+	newTitle := "Updated 'Title'; -- not SQL\x00control"
+	newNotes := "notes /* remain data */ \"quoted\""
 	journalApply(t, db, actor, boot, "op-update--"+id.String(), []journal.Effect{{
 		Sort:        journal.EffectTaskEvent,
 		TaskID:      id,
@@ -204,11 +204,11 @@ func TestFoldUpdateMaterializesMetadata(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("GetTask(found=%v): %v", found, err)
 	}
-	if got.Title != "Updated Title" {
-		t.Errorf("Title = %q, want %q", got.Title, "Updated Title")
+	if got.Title != newTitle {
+		t.Errorf("Title = %q, want %q", got.Title, newTitle)
 	}
-	if got.Notes != "Updated notes" {
-		t.Errorf("Notes = %q, want %q", got.Notes, "Updated notes")
+	if got.Notes != newNotes {
+		t.Errorf("Notes = %q, want %q", got.Notes, newNotes)
 	}
 	// status is a reducer-exclusive projection: a metadata update never touches it.
 	if got.Status != ptypes.StatusOpen {

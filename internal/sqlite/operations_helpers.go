@@ -49,7 +49,7 @@ func (db *DB) insertOperationRowLocked(anchor int64, in journal.OperationInput, 
 		`INSERT INTO journal_operations
 		 (journal_id, operation_id, authority_journal_id, command_digest, mutation_digest, mutation_encoding_version, canonical_mutation)
 		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
-		&sqlitex.ExecOptions{Args: []any{anchor, string(in.OperationID), authArg, in.CommandDigest, prepared.DerivedDigest(), prepared.EncodingVersion(), prepared.CanonicalBytes()}}); err != nil {
+		&sqlitex.ExecOptions{Args: []any{anchor, string(in.OperationID), authArg, in.CommandDigest, prepared.DerivedDigest(), prepared.EncodingVersion().String(), prepared.CanonicalBytes()}}); err != nil {
 		return fmt.Errorf("insert journal_operations for %q: %w", in.OperationID, err)
 	}
 	return nil
@@ -113,9 +113,9 @@ func (db *DB) insertAttributionLocked(task journal.TaskID, actor journal.ActorID
 	// Targets the real task_attributions during a live Apply and the shadow
 	// attribution table during a from-empty replay derivation (§8.2, §15).
 	if err := sqlitex.Execute(db.conn,
-		fmt.Sprintf(`INSERT OR IGNORE INTO %s (task_id, actor_id, first_journal_id) VALUES (?1, ?2, ?3)`, db.projAttribs()),
+		insertAttributionQuery(db.projectionTarget),
 		&sqlitex.ExecOptions{Args: []any{task.String(), actor.String(), jid}}); err != nil {
-		return fmt.Errorf("update %s: %w", db.projAttribs(), err)
+		return fmt.Errorf("update %s attribution: %w", db.projectionTarget.label(), err)
 	}
 	return nil
 }
@@ -124,9 +124,9 @@ func (db *DB) advanceWatermarkLocked(task journal.TaskID, jid int64) error {
 	// Targets the real tasks table during a live Apply and the shadow tasks table
 	// during a from-empty replay derivation (§8.1, §15).
 	if err := sqlitex.Execute(db.conn,
-		fmt.Sprintf(`UPDATE %s SET last_journal_id = ?1 WHERE id = ?2`, db.projTasks()),
+		advanceWatermarkQuery(db.projectionTarget),
 		&sqlitex.ExecOptions{Args: []any{jid, task.String()}}); err != nil {
-		return fmt.Errorf("advance %s.last_journal_id: %w", db.projTasks(), err)
+		return fmt.Errorf("advance %s task watermark: %w", db.projectionTarget.label(), err)
 	}
 	return nil
 }
@@ -153,11 +153,32 @@ func (db *DB) recomputeTaskOwnerLocked(task journal.TaskID, jid int64) error {
 		return fmt.Errorf("recompute task owner: %w", err)
 	}
 	if err := sqlitex.Execute(db.conn,
-		fmt.Sprintf(`UPDATE %s SET owner_id = ?1, last_journal_id = ?2 WHERE id = ?3`, db.projTasks()),
+		updateOwnerQuery(db.projectionTarget),
 		&sqlitex.ExecOptions{Args: []any{owner, jid, task.String()}}); err != nil {
-		return fmt.Errorf("update %s owner projection: %w", db.projTasks(), err)
+		return fmt.Errorf("update %s owner: %w", db.projectionTarget.label(), err)
 	}
 	return nil
+}
+
+func insertAttributionQuery(target projectionTarget) string {
+	if target == projectionTargetShadow {
+		return `INSERT OR IGNORE INTO shadow_task_attributions (task_id, actor_id, first_journal_id) VALUES (?1, ?2, ?3)`
+	}
+	return `INSERT OR IGNORE INTO task_attributions (task_id, actor_id, first_journal_id) VALUES (?1, ?2, ?3)`
+}
+
+func advanceWatermarkQuery(target projectionTarget) string {
+	if target == projectionTargetShadow {
+		return `UPDATE shadow_tasks SET last_journal_id = ?1 WHERE id = ?2`
+	}
+	return `UPDATE tasks SET last_journal_id = ?1 WHERE id = ?2`
+}
+
+func updateOwnerQuery(target projectionTarget) string {
+	if target == projectionTargetShadow {
+		return `UPDATE shadow_tasks SET owner_id = ?1, last_journal_id = ?2 WHERE id = ?3`
+	}
+	return `UPDATE tasks SET owner_id = ?1, last_journal_id = ?2 WHERE id = ?3`
 }
 
 // ---------------------------------------------------------------------------
@@ -808,7 +829,7 @@ func (db *DB) committedOutcomeForExistingLocked(in journal.OperationInput, exist
 			fmt.Errorf("%w: %w", journal.ErrOperationConflict, conflict)
 	}
 	if existing.encodingVersion != "" {
-		if existing.encodingVersion != prepared.EncodingVersion() || !bytes.Equal(existing.canonicalMutation, prepared.CanonicalBytes()) {
+		if existing.encodingVersion != prepared.EncodingVersion().String() || !bytes.Equal(existing.canonicalMutation, prepared.CanonicalBytes()) {
 			conflict := &journal.OperationConflict{OperationID: in.OperationID, Field: "canonical effects"}
 			return journal.CommittedResult{Kind: journal.CommittedConflict, Conflict: conflict},
 				fmt.Errorf("%w: %w", journal.ErrOperationConflict, conflict)

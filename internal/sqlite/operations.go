@@ -202,11 +202,11 @@ func (db *DB) ensureCanonicalMutationColumns() error {
 
 func (db *DB) ensureGenericCanonicalConstraints() error {
 	var tableSQL string
-	if err := sqlitex.Execute(db.conn, `SELECT sql FROM sqlite_master WHERE type='table' AND name='journal_operations'`, &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { tableSQL = stmt.ColumnText(0); return nil }}); err != nil {
+	if err := sqlitex.Execute(db.conn, `SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2`, &sqlitex.ExecOptions{Args: []any{"table", "journal_operations"}, ResultFunc: func(stmt *zs.Stmt) error { tableSQL = stmt.ColumnText(0); return nil }}); err != nil {
 		return fmt.Errorf("inspect journal_operations constraint: %w", err)
 	}
 	needsTriggers := false
-	if strings.Contains(tableSQL, journal.MutationEncodingV1) {
+	if strings.Contains(tableSQL, journal.MutationEncodingV1.String()) {
 		needsTriggers = true
 		steps := []string{
 			`DROP TRIGGER IF EXISTS journal_operations_canonical_insert`, `DROP TRIGGER IF EXISTS journal_operations_canonical_update`,
@@ -222,10 +222,10 @@ func (db *DB) ensureGenericCanonicalConstraints() error {
 	if !needsTriggers {
 		for _, name := range []string{"journal_operations_canonical_insert", "journal_operations_canonical_update"} {
 			sql := ""
-			if err := sqlitex.Execute(db.conn, `SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1`, &sqlitex.ExecOptions{Args: []any{name}, ResultFunc: func(stmt *zs.Stmt) error { sql = stmt.ColumnText(0); return nil }}); err != nil {
+			if err := sqlitex.Execute(db.conn, `SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2`, &sqlitex.ExecOptions{Args: []any{"trigger", name}, ResultFunc: func(stmt *zs.Stmt) error { sql = stmt.ColumnText(0); return nil }}); err != nil {
 				return err
 			}
-			if sql == "" || strings.Contains(sql, journal.MutationEncodingV1) {
+			if sql == "" || strings.Contains(sql, journal.MutationEncodingV1.String()) {
 				needsTriggers = true
 				break
 			}
@@ -294,10 +294,11 @@ func (db *DB) preflightCanonicalColumnsReadOnly() error {
 		if err != nil {
 			return canonicalStartupPreflightError(err, fmt.Sprintf("operation %q has a malformed canonical wire-version frame", opID), "the canonical bytes do not begin with one valid framed version field", "restore canonical bytes and mutation digest from the same committed backup")
 		}
-		if wireVersion != version {
-			return canonicalStartupPreflightError(journal.ErrProjectionDivergence, fmt.Sprintf("operation %q column version %q differs from wire version %q", opID, version, wireVersion), "the redundant column and framed wire version identify different codecs", "restore mutation_encoding_version, canonical_mutation, and mutation_digest from the same committed operation")
+		if !wireVersion.MatchesStoredText(version) {
+			return canonicalStartupPreflightError(journal.ErrProjectionDivergence, fmt.Sprintf("operation %q column version %q differs from wire version (opaque inspected tag)", opID, version), "the redundant column and framed wire version identify different codecs", "restore mutation_encoding_version, canonical_mutation, and mutation_digest from the same committed operation")
 		}
-		if !journal.IsSupportedMutationEncoding(version) {
+		registeredVersion, supported := wireVersion.RegisteredVersion()
+		if !supported || !journal.IsSupportedMutationEncoding(registeredVersion) {
 			cause := &journal.CanonicalMutationError{Field: "version", Reason: fmt.Sprintf("unsupported canonical codec version %q for operation %q", version, opID), Fix: "open with a build that supports this codec or restore bytes written by a supported codec"}
 			return canonicalStartupPreflightError(cause, fmt.Sprintf("operation %q uses unsupported canonical codec version %q", opID, version), "the column and wire agree, but this build has no registered decoder for that version", "upgrade to a codec-capable build, or restore the operation's version, bytes, and digest from a supported backup")
 		}
@@ -852,48 +853,50 @@ func (db *DB) materializeTaskEventColumnsLocked(in journal.OperationInput, jid i
 	if eff.RecordedAtOverride != nil {
 		recordedAt = *eff.RecordedAtOverride
 	}
-	setClauses := []string{"updated_at = ?1"}
-	args := []any{recordedAt}
-	idx := 2
-	if eff.UpdateTitle != nil {
-		setClauses = append(setClauses, fmt.Sprintf("title = ?%d", idx))
-		args = append(args, *eff.UpdateTitle)
-		idx++
+	value := func(p *string) any {
+		if p == nil {
+			return nil
+		}
+		return *p
 	}
-	if eff.UpdateDescription != nil {
-		setClauses = append(setClauses, fmt.Sprintf("description = ?%d", idx))
-		args = append(args, *eff.UpdateDescription)
-		idx++
+	flag := func(set bool) int {
+		if set {
+			return 1
+		}
+		return 0
 	}
-	if eff.UpdatePriority != nil {
-		setClauses = append(setClauses, fmt.Sprintf("priority_id = ?%d", idx))
-		args = append(args, int(*eff.UpdatePriority))
-		idx++
-	}
-	if eff.UpdatePhase != nil {
-		setClauses = append(setClauses, fmt.Sprintf("phase_id = ?%d", idx))
-		args = append(args, int(*eff.UpdatePhase))
-		idx++
-	}
-	if eff.UpdateNotes != nil {
-		setClauses = append(setClauses, fmt.Sprintf("notes = ?%d", idx))
-		args = append(args, *eff.UpdateNotes)
-		idx++
-	}
-	if journal.EventKind(eff.EventKind) == journal.EventKindTaskClosed && eff.CloseReason != "" {
-		setClauses = append(setClauses, fmt.Sprintf("close_reason = ?%d", idx))
-		args = append(args, eff.CloseReason)
-		idx++
-	}
+	closeReasonSet := journal.EventKind(eff.EventKind) == journal.EventKindTaskClosed && eff.CloseReason != ""
 	// Only updated_at would change (no metadata/close column): nothing material to
 	// write, so skip the UPDATE entirely (a bare updated_at bump on an unrelated event
 	// would be noise).
-	if len(setClauses) == 1 {
+	if eff.UpdateTitle == nil && eff.UpdateDescription == nil && eff.UpdatePriority == nil && eff.UpdatePhase == nil && eff.UpdateNotes == nil && !closeReasonSet {
 		return nil
 	}
-	args = append(args, eff.TaskID.String())
-	query := fmt.Sprintf(`UPDATE tasks SET %s WHERE id = ?%d`, strings.Join(setClauses, ", "), idx)
-	if err := sqlitex.Execute(db.conn, query, &sqlitex.ExecOptions{Args: args}); err != nil {
+	var priority, phase any
+	if eff.UpdatePriority != nil {
+		priority = int(*eff.UpdatePriority)
+	}
+	if eff.UpdatePhase != nil {
+		phase = int(*eff.UpdatePhase)
+	}
+	if err := sqlitex.Execute(db.conn, `UPDATE tasks SET
+		updated_at=?1,
+		title=CASE WHEN ?2 THEN ?3 ELSE title END,
+		description=CASE WHEN ?4 THEN ?5 ELSE description END,
+		priority_id=CASE WHEN ?6 THEN ?7 ELSE priority_id END,
+		phase_id=CASE WHEN ?8 THEN ?9 ELSE phase_id END,
+		notes=CASE WHEN ?10 THEN ?11 ELSE notes END,
+		close_reason=CASE WHEN ?12 THEN ?13 ELSE close_reason END
+		WHERE id=?14`, &sqlitex.ExecOptions{Args: []any{
+		recordedAt,
+		flag(eff.UpdateTitle != nil), value(eff.UpdateTitle),
+		flag(eff.UpdateDescription != nil), value(eff.UpdateDescription),
+		flag(eff.UpdatePriority != nil), priority,
+		flag(eff.UpdatePhase != nil), phase,
+		flag(eff.UpdateNotes != nil), value(eff.UpdateNotes),
+		flag(closeReasonSet), eff.CloseReason,
+		eff.TaskID.String(),
+	}}); err != nil {
 		return fmt.Errorf(
 			"Apply: operation %q materialize task-event columns for %q: %w",
 			in.OperationID, eff.TaskID, err)

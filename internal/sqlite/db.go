@@ -27,71 +27,23 @@ import (
 type DB struct {
 	mu   sync.Mutex
 	conn *zs.Conn
-
-	// projTasksTable / projAttribTable name the tables the shared reducer's
-	// projection-WRITE steps target (docs/journal-relational-contract.md §8, §15).
-	// They are the real projection tables ("tasks", "task_attributions") during a
-	// live Apply, and are temporarily repointed at connection-scoped shadow tables
-	// during ReplayProjections' from-empty convergence check so the real rows are
-	// never mutated while the check runs (SHADOW DERIVATION — the real tables stay
-	// read-only during the check, so the check is constraint-independent and the
-	// NOT NULL tasks.last_journal_id tightening cannot be tripped by a clear-in-place
-	// scratch UPDATE). Both are always held under db.mu; the swap+restore is bracketed
-	// inside one locked ReplayProjections call so a live Apply never observes the
-	// shadow target. Empty is treated as the real default by projTasks/projAttribs.
-	projTasksTable  string
-	projAttribTable string
-	// projEdgesTable / projLabelsTable / projCommentsTable name the domain-projection
-	// WRITE targets for the journaled relationship/annotation mutation families (§6
-	// amendment, §15). Real ("edges"/"labels"/"comments") during a live Apply; repointed
-	// at connection-scoped shadow tables during ReplayProjections' from-empty convergence
-	// check so the real rows stay read-only. Empty is treated as the real default.
-	projEdgesTable    string
-	projLabelsTable   string
-	projCommentsTable string
+	// projectionTarget is a closed selector for complete static SQL variants.
+	// SQLite cannot bind identifiers, so arbitrary table names are never stored.
+	projectionTarget projectionTarget
 }
 
-// projTasks returns the projection-write target table for tasks: the shadow table
-// during a from-empty replay derivation, else the real "tasks" table (§8, §15).
-func (db *DB) projTasks() string {
-	if db.projTasksTable == "" {
-		return "tasks"
-	}
-	return db.projTasksTable
-}
+type projectionTarget uint8
 
-// projAttribs returns the projection-write target table for task attributions:
-// the shadow table during a from-empty replay derivation, else the real
-// "task_attributions" table (§8.2, §15).
-func (db *DB) projAttribs() string {
-	if db.projAttribTable == "" {
-		return "task_attributions"
-	}
-	return db.projAttribTable
-}
+const (
+	projectionTargetLive projectionTarget = iota
+	projectionTargetShadow
+)
 
-// projEdges / projLabels / projComments return the domain-projection write target for
-// the journaled edge/label/comment mutation families: the shadow table during a
-// from-empty replay derivation, else the real base table (§6 amendment, §15).
-func (db *DB) projEdges() string {
-	if db.projEdgesTable == "" {
-		return "edges"
+func (target projectionTarget) label() string {
+	if target == projectionTargetShadow {
+		return "shadow projection"
 	}
-	return db.projEdgesTable
-}
-
-func (db *DB) projLabels() string {
-	if db.projLabelsTable == "" {
-		return "labels"
-	}
-	return db.projLabelsTable
-}
-
-func (db *DB) projComments() string {
-	if db.projCommentsTable == "" {
-		return "comments"
-	}
-	return db.projCommentsTable
+	return "live projection"
 }
 
 // Open opens (or creates) a SQLite database at dbPath and returns an
