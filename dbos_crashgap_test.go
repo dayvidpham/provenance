@@ -22,6 +22,7 @@ import (
 	"database/sql"
 	"os"
 	"os/exec"
+	"reflect"
 	"strconv"
 	"testing"
 	"time"
@@ -37,6 +38,7 @@ import (
 const (
 	crashAppName      = "provenance-crashgap"
 	crashAppVersion   = "crash-v1"
+	crashExitBefore   = 41
 	crashExitDomain   = 42
 	crashExitStep     = 43
 	crashExitFinished = 7 // child returned without crashing (a failure)
@@ -109,6 +111,8 @@ func runCrashChild(gap, dbpath, actorStr, authStr, taskStr string) {
 		os.Exit(23)
 	}
 	switch gap {
+	case "before":
+		adapter.testHooks.beforeDomainCommit = func() { os.Exit(crashExitBefore) }
 	case "domain":
 		adapter.testHooks.afterDomainCommit = func() { os.Exit(crashExitDomain) }
 	case "step":
@@ -202,6 +206,16 @@ func runCrashGap(t *testing.T, gap string, wantExit int) {
 	if looked.Kind != journal.CommittedExact {
 		t.Fatalf("LookupCommitted Kind = %v, want CommittedExact", looked.Kind)
 	}
+	if !reflect.DeepEqual(res, looked) {
+		t.Fatalf("recovered complete result=%#v want journal result=%#v", res, looked)
+	}
+	task, err := tracker.Show(taskID)
+	if err != nil {
+		t.Fatalf("Show recovered task: %v", err)
+	}
+	if task.ID != taskID || task.Title != "crash-task" || task.Description != "" || task.Type != TaskTypeTask || task.Priority != PriorityMedium || task.Phase != PhaseWorkerSlices || task.Status != StatusOpen || task.Owner != nil || task.Notes != "" || task.CreatedAt.UnixNano() != 1 || !task.UpdatedAt.Equal(task.CreatedAt) || task.ClosedAt != nil || task.CloseReason != "" {
+		t.Fatalf("recovered complete task tuple drifted: %#v", task)
+	}
 	tasks, err := tracker.List(ListFilter{})
 	if err != nil {
 		t.Fatalf("List: %v", err)
@@ -291,6 +305,13 @@ func TestCrashGap1_DomainCommitBeforeCheckpoint(t *testing.T) {
 		t.Skip("subprocess crash-recovery test")
 	}
 	runCrashGap(t, "domain", crashExitDomain)
+}
+
+func TestCrashGap0_BeforeDomainCommit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("subprocess crash-recovery test")
+	}
+	runCrashGap(t, "before", crashExitBefore)
 }
 
 func TestCrashGap2_StepCheckpointBeforeCompletion(t *testing.T) {

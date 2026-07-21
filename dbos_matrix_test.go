@@ -9,9 +9,11 @@ package provenance_test
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/dayvidpham/provenance"
+	"github.com/google/uuid"
 )
 
 // fakeJournal wraps a real JournalAPI, counting fold ATTEMPTS (every Apply call,
@@ -222,6 +224,24 @@ func TestMatrix_AllocatedCreateChangedProvisionalUUIDReturnsOriginal(t *testing.
 		t.Fatalf("first Apply: %v", err)
 	}
 	wantTask := *first.ResultSlots[0].TaskID
+	if wantTask.UUID.Version() != uuid.Version(7) {
+		t.Fatalf("allocated task UUID version = %d, want genuine UUIDv7", wantTask.UUID.Version())
+	}
+	tasksBefore, err := s.tracker.List(provenance.ListFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventsBefore, err := s.tracker.Journal().QueryTaskEvents(provenance.JournalQueryV1{OrderBy: provenance.OrderByJournalID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workflowsBefore, outputsBefore int
+	if err := s.db.QueryRow(`SELECT count(*) FROM workflow_status`).Scan(&workflowsBefore); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow(`SELECT count(*) FROM operation_outputs`).Scan(&outputsBefore); err != nil {
+		t.Fatal(err)
+	}
 	retry := op
 	retry.Effects = append([]provenance.Effect(nil), op.Effects...)
 	retry.Effects[0].TaskID = newTaskID("aura")
@@ -235,6 +255,66 @@ func TestMatrix_AllocatedCreateChangedProvisionalUUIDReturnsOriginal(t *testing.
 	}
 	if len(got.ResultSlots) != 1 || got.ResultSlots[0].TaskID == nil || *got.ResultSlots[0].TaskID != wantTask {
 		t.Fatalf("allocated retry result = %+v, want original task %s", got, wantTask)
+	}
+	if !reflect.DeepEqual(got, first) {
+		t.Fatalf("allocated retry complete result=%#v want original=%#v", got, first)
+	}
+	tasksAfter, _ := s.tracker.List(provenance.ListFilter{})
+	eventsAfter, _ := s.tracker.Journal().QueryTaskEvents(provenance.JournalQueryV1{OrderBy: provenance.OrderByJournalID})
+	var workflowsAfter, outputsAfter int
+	_ = s.db.QueryRow(`SELECT count(*) FROM workflow_status`).Scan(&workflowsAfter)
+	_ = s.db.QueryRow(`SELECT count(*) FROM operation_outputs`).Scan(&outputsAfter)
+	if !reflect.DeepEqual(tasksAfter, tasksBefore) || !reflect.DeepEqual(eventsAfter, eventsBefore) || workflowsAfter != workflowsBefore || outputsAfter != outputsBefore {
+		t.Fatalf("allocation-only retry changed durable tuples: tasks=%v events=%v workflows=%d->%d outputs=%d->%d", !reflect.DeepEqual(tasksAfter, tasksBefore), !reflect.DeepEqual(eventsAfter, eventsBefore), workflowsBefore, workflowsAfter, outputsBefore, outputsAfter)
+	}
+
+	ctx, err := provenance.TaskContext(wantTask)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*provenance.OperationInput){
+		"namespace": func(v *provenance.OperationInput) { v.Effects[0].TaskID = newTaskID("other") },
+		"metadata":  func(v *provenance.OperationInput) { v.Effects[0].Description = "changed" },
+		"contexts":  func(v *provenance.OperationInput) { v.Effects[0].Contexts = []provenance.EventContext{ctx} },
+		"slot":      func(v *provenance.OperationInput) { v.Effects[0].ResultSlot = "other" },
+		"family":    func(v *provenance.OperationInput) { v.Effects[0].Sort = provenance.EffectTaskCreate },
+	} {
+		t.Run("forbidden-"+name, func(t *testing.T) {
+			changed := op
+			changed.Effects = append([]provenance.Effect(nil), op.Effects...)
+			mutate(&changed)
+			beforeAttempts := c.attempts
+			_, err := s.adapter.Apply(context.Background(), changed)
+			if !errors.Is(err, provenance.ErrOperationConflict) {
+				t.Fatalf("error=%v want ErrOperationConflict", err)
+			}
+			if c.attempts-beforeAttempts != 1 {
+				t.Fatalf("forbidden allocation retry attempts=%d, want preflight only", c.attempts-beforeAttempts)
+			}
+		})
+	}
+}
+
+func TestMatrix_TimestampOnlyRetryAttachesCompletedWorkflow(t *testing.T) {
+	var c counters
+	s := stackWithJournal(t, &c, nil)
+	op := s.createTaskOp("op-timestamp-retry", "aura", "timestamp")
+	want, err := s.adapter.Apply(context.Background(), op)
+	if err != nil {
+		t.Fatalf("first Apply: %v", err)
+	}
+	retry := op
+	retry.RecordedAt += 987654321
+	attemptsBefore := c.attempts
+	got, err := s.adapter.Apply(context.Background(), retry)
+	if err != nil {
+		t.Fatalf("timestamp-only retry: %v", err)
+	}
+	if c.attempts-attemptsBefore != 1 {
+		t.Fatalf("timestamp retry attempts = %d, want one read-only preflight and zero workflow callbacks", c.attempts-attemptsBefore)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("timestamp retry result = %#v, want complete original %#v", got, want)
 	}
 }
 

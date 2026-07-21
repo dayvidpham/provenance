@@ -322,9 +322,14 @@ func fingerprintV1(applicationVersion string, in journal.OperationInput) string 
 	return fmt.Sprintf("%x", sum)
 }
 
-// fingerprintV2 binds the runtime contract and the complete closed V2 input.
-// Mutation is the reviewed canonical byte stream, never the caller's digest.
-func fingerprintV2(applicationVersion string, input DBOSApplyInputV2) string {
+// fingerprintV2 binds the runtime contract and canonical replay identity.
+// Mutation is the reviewed canonical byte stream, never the caller's digest;
+// audit-only RecordedAt remains transported but deliberately is not hashed.
+func fingerprintV2(applicationVersion string, input DBOSApplyInputV2) (string, error) {
+	identity, err := decodeDBOSContextV2(input.Context)
+	if err != nil {
+		return "", err
+	}
 	h := sha256.New()
 	write := func(value []byte) {
 		var size [8]byte
@@ -332,14 +337,23 @@ func fingerprintV2(applicationVersion string, input DBOSApplyInputV2) string {
 		_, _ = h.Write(size[:])
 		_, _ = h.Write(value)
 	}
-	for _, value := range [][]byte{
+	values := [][]byte{
 		[]byte(DBOSApplyInputSchemaV2), []byte(ApplyWorkflowSchemaV2),
 		[]byte(DBOSStepOutcomeSchemaV1), []byte(PinnedDBOSContractVersion),
-		[]byte(applicationVersion), input.Context, input.Mutation,
-	} {
+		[]byte(applicationVersion), []byte(identity.OperationID), []byte(actorToWire(identity.ActorID)),
+	}
+	if identity.AuthorityJournalID == nil {
+		values = append(values, []byte("authority:genesis"))
+	} else {
+		var authority [8]byte
+		binary.BigEndian.PutUint64(authority[:], uint64(*identity.AuthorityJournalID))
+		values = append(values, authority[:])
+	}
+	values = append(values, identity.CommandDigest, input.Mutation)
+	for _, value := range values {
 		write(value)
 	}
-	return fmt.Sprintf("%x", h.Sum(nil))
+	return fmt.Sprintf("%x", h.Sum(nil)), nil
 }
 
 // journalValidateTaskID mirrors the journal package's task-ID validity check for a

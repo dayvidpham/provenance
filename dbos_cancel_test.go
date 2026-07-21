@@ -8,6 +8,7 @@ package provenance_test
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -118,6 +119,20 @@ func TestCancel_WhileGated_DurableWorkContinues(t *testing.T) {
 	}
 	if replayed.Kind != provenance.CommittedExact {
 		t.Errorf("replay Kind = %v, want CommittedExact", replayed.Kind)
+	}
+	looked, err := s.tracker.Journal().LookupCommitted(op.OperationID)
+	if err != nil {
+		t.Fatalf("LookupCommitted: %v", err)
+	}
+	if !reflect.DeepEqual(replayed, looked) {
+		t.Fatalf("cancellation replay complete result=%#v want=%#v", replayed, looked)
+	}
+	task, err := s.tracker.Show(op.Effects[0].TaskID)
+	if err != nil {
+		t.Fatalf("Show after cancellation recovery: %v", err)
+	}
+	if task.ID != op.Effects[0].TaskID || task.Title != op.Effects[0].Title || task.Description != op.Effects[0].Description || task.Type != op.Effects[0].Type || task.Priority != op.Effects[0].Priority || task.Phase != op.Effects[0].Phase || task.Status != provenance.StatusOpen || task.Owner != nil || task.Notes != "" || task.CreatedAt.UnixNano() != op.RecordedAt || !task.UpdatedAt.Equal(task.CreatedAt) || task.ClosedAt != nil || task.CloseReason != "" {
+		t.Fatalf("cancellation recovery complete task tuple drifted: %#v", task)
 	}
 	assertNoLeak()
 }

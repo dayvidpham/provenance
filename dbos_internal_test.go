@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/dayvidpham/provenance/internal/journal"
@@ -24,6 +25,15 @@ func testTaskID(t *testing.T) ptypes.TaskID {
 func testActorID(t *testing.T) ptypes.ActorID {
 	t.Helper()
 	return ptypes.ActorID{Namespace: "provenance-test", UUID: uuid.Must(uuid.NewV7())}
+}
+
+func mustFingerprintV2(t *testing.T, version string, input DBOSApplyInputV2) string {
+	t.Helper()
+	fingerprint, err := fingerprintV2(version, input)
+	if err != nil {
+		t.Fatalf("fingerprintV2: %v", err)
+	}
+	return fingerprint
 }
 
 // richOperationInput builds an input touching every wire field family: a task
@@ -157,8 +167,23 @@ func TestWireV2_TransportsCanonicalBytesAndRejectsMalformedFrames(t *testing.T) 
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
-			if _, err := decodeApplyInputV2(mutate(encoded)); err == nil {
+			_, err := decodeApplyInputV2(mutate(encoded))
+			if err == nil {
 				t.Fatal("malformed V2 input decoded successfully")
+			}
+			if name != "unknown input version" && name != "malformed canonical mutation" && name != "oversized canonical mutation" {
+				if !errors.Is(err, ErrDBOSContextFrame) {
+					t.Fatalf("context error %v does not wrap ErrDBOSContextFrame", err)
+				}
+				var frame *DBOSContextFrameError
+				if !errors.As(err, &frame) || frame.Field == "" || frame.Reason == "" || frame.Fix == "" {
+					t.Fatalf("context error is not complete typed diagnostic: %#v", err)
+				}
+				for _, token := range []string{"what:", "why:", "where:", "when:", "impact:", "fix:"} {
+					if !strings.Contains(err.Error(), token) {
+						t.Fatalf("context error lacks %s: %v", token, err)
+					}
+				}
 			}
 		})
 	}
@@ -170,7 +195,7 @@ func TestWireV2_TransportsCanonicalBytesAndRejectsMalformedFrames(t *testing.T) 
 	if _, err := decodeApplyInput(legacy); err != nil {
 		t.Fatalf("historical V1 no longer decodes: %v", err)
 	}
-	if applyWorkflowIDPrefix+fingerprintV1("v1", in) == applyWorkflowIDPrefixV2+fingerprintV2("v1", encoded) {
+	if applyWorkflowIDPrefix+fingerprintV1("v1", in) == applyWorkflowIDPrefixV2+mustFingerprintV2(t, "v1", encoded) {
 		t.Fatal("V1 and V2 workflow identities collided")
 	}
 }
@@ -220,14 +245,14 @@ func TestFingerprint_StableAndSensitive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode V2: %v", err)
 	}
-	base := fingerprintV2("v1", input)
+	base := mustFingerprintV2(t, "v1", input)
 	changedDigest := in
 	changedDigest.MutationDigest = []byte("caller-controlled")
 	inputChangedDigest, _, err := encodeApplyInputV2(changedDigest)
 	if err != nil {
 		t.Fatalf("encode V2 changed caller digest: %v", err)
 	}
-	if fingerprintV2("v1", inputChangedDigest) != base {
+	if mustFingerprintV2(t, "v1", inputChangedDigest) != base {
 		t.Error("V2 fingerprint depends on caller MutationDigest")
 	}
 	changedEffect := in
@@ -237,8 +262,20 @@ func TestFingerprint_StableAndSensitive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode V2 changed effect: %v", err)
 	}
-	if fingerprintV2("v1", inputChangedEffect) == base {
+	if mustFingerprintV2(t, "v1", inputChangedEffect) == base {
 		t.Error("V2 fingerprint is insensitive to canonical effect bytes")
+	}
+	changedRecordedAt := in
+	changedRecordedAt.RecordedAt++
+	inputChangedRecordedAt, _, err := encodeApplyInputV2(changedRecordedAt)
+	if err != nil {
+		t.Fatalf("encode V2 changed RecordedAt: %v", err)
+	}
+	if bytes.Equal(inputChangedRecordedAt.Context, input.Context) {
+		t.Error("V2 transport omitted changed audit RecordedAt")
+	}
+	if mustFingerprintV2(t, "v1", inputChangedRecordedAt) != base {
+		t.Error("V2 logical identity includes audit-only RecordedAt")
 	}
 }
 

@@ -118,6 +118,12 @@ func retryMismatchCandidates(t *testing.T, f retryMatrixFixture) map[string]Oper
 	altCtx, _ := TaskContext(altTask)
 	altComment, _ := ParseCommentID("retry--018f0000-0000-7000-8000-000000000012")
 	at := int64(701)
+	add("bootstrap-family-operands", func(v *OperationInput) {
+		v.Effects[2] = Effect{Sort: EffectBootstrapAuthority, ResultSlot: "bootstrap-changed", RecordedAtOverride: &at, BootstrapLabel: "changed-root", OperationAuthorityID: "changed-authority"}
+	})
+	add("allocated-create-family-operands", func(v *OperationInput) {
+		v.Effects[2] = Effect{Sort: EffectTaskCreateAllocated, ResultSlot: "allocated-changed", RecordedAtOverride: &at, TaskID: altTask, Payload: []byte(`{"allocated":true}`), Contexts: []EventContext{altCtx}, Title: "allocated", Description: "changed", Type: TaskTypeTask, Priority: PriorityHigh, Phase: PhaseCodeReview}
+	})
 	title, description, notes := "changed", "changed description", "changed notes"
 	priority, phase := PriorityCritical, PhaseImplPlan
 	for i := range f.input.Effects {

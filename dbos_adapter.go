@@ -30,25 +30,27 @@ type DBOSAdapterConfig struct {
 }
 
 // applyTestHooks are unexported, no-op-by-default seams the crash-gap subprocess
-// tests replace to os.Exit at the two durable boundaries: afterDomainCommit fires
-// after the reducer commits the domain mutation but before the step outcome is
-// checkpointed; afterStepCheckpoint fires after the step outcome is durably
-// recorded but before the workflow completes. Production leaves both as no-ops.
+// tests replace to os.Exit around the durable boundaries: beforeDomainCommit fires
+// before any domain fold, afterDomainCommit fires after commit but before the step
+// outcome checkpoint, and afterStepCheckpoint fires after the checkpoint but before
+// workflow completion. Production leaves all hooks as no-ops.
 type applyTestHooks struct {
+	beforeDomainCommit  func()
 	afterDomainCommit   func()
 	afterStepCheckpoint func()
 }
 
 func defaultApplyTestHooks() applyTestHooks {
 	return applyTestHooks{
+		beforeDomainCommit:  func() {},
 		afterDomainCommit:   func() {},
 		afterStepCheckpoint: func() {},
 	}
 }
 
 // DBOSAdapter runs Provenance operations as durable DBOS workflows over a shared
-// journal contract. It owns exactly one registered provenance.apply/v1 workflow on
-// the adapter root.
+// journal contract. It owns one workflow per durable schema version: V1 remains
+// registered only to recover persisted history; new Apply calls use V2.
 type DBOSAdapter struct {
 	root               dbos.DBOSContext
 	tracker            Tracker
@@ -58,8 +60,8 @@ type DBOSAdapter struct {
 
 // NewDBOSAdapter validates the root and tracker, derives the actual application
 // version from the DBOS root, rejects a non-empty mismatched expectation, and
-// registers the single stable provenance.apply/v1 workflow on the not-yet-launched
-// root (so it is recovery-visible after Launch).
+// registers the historical V1 and current V2 workflows on the not-yet-launched root
+// so both are recovery-visible after Launch.
 func NewDBOSAdapter(root dbos.DBOSContext, tracker Tracker, config DBOSAdapterConfig) (*DBOSAdapter, error) {
 	if root == nil {
 		return nil, fmt.Errorf(
@@ -143,7 +145,10 @@ func (a *DBOSAdapter) Apply(ctx context.Context, in journal.OperationInput) (Com
 			return CommittedResult{}, fmt.Errorf("provenance.DBOSAdapter.Apply: canonicalize reconciled operation %q: %w", in.OperationID, err)
 		}
 	}
-	fp := fingerprintV2(a.applicationVersion, input)
+	fp, err := fingerprintV2(a.applicationVersion, input)
+	if err != nil {
+		return CommittedResult{}, fmt.Errorf("provenance.DBOSAdapter.Apply: derive V2 workflow identity for operation %q: %w", in.OperationID, err)
+	}
 	workflowID := applyWorkflowIDPrefixV2 + fp
 
 	// Start (or attach to) the durable workflow on the UN-CANCELLED adapter root, so
@@ -189,8 +194,8 @@ func reconcileDBOSAllocatedCreates(in journal.OperationInput, result journal.Com
 	return in, nil
 }
 
-// applyWorkflow is the single registered durable workflow: decode/validate/
-// fingerprint the input, then run ONE step wrapping the atomic journal fold. A
+// applyWorkflow is the historical V1 durable workflow retained for persisted
+// recovery. It decodes and runs one atomic fold step. A
 // domain failure is checkpointed as a closed outcome (nil Go error); only DBOS
 // infrastructure failures use the Go-error channel.
 func (a *DBOSAdapter) applyWorkflow(wfCtx dbos.DBOSContext, input DBOSApplyInputV1) (DBOSStepOutcomeV1, error) {
@@ -203,6 +208,7 @@ func (a *DBOSAdapter) applyWorkflow(wfCtx dbos.DBOSContext, input DBOSApplyInput
 	outcome, err := dbos.RunAsStep(
 		wfCtx,
 		func(stepCtx context.Context) (DBOSStepOutcomeV1, error) {
+			a.testHooks.beforeDomainCommit()
 			result, applyErr := a.foldDomainMutation(in)
 			if applyErr != nil {
 				// INFRASTRUCTURE failures (a shut-down store, or a transient WAL lock
@@ -234,8 +240,12 @@ func (a *DBOSAdapter) applyWorkflowV2(wfCtx dbos.DBOSContext, input DBOSApplyInp
 	if err != nil {
 		return DBOSStepOutcomeV1{}, fmt.Errorf("provenance.applyWorkflowV2: %w", err)
 	}
-	fp := fingerprintV2(a.applicationVersion, input)
+	fp, err := fingerprintV2(a.applicationVersion, input)
+	if err != nil {
+		return DBOSStepOutcomeV1{}, fmt.Errorf("provenance.applyWorkflowV2: derive step identity: %w", err)
+	}
 	outcome, err := dbos.RunAsStep(wfCtx, func(stepCtx context.Context) (DBOSStepOutcomeV1, error) {
+		a.testHooks.beforeDomainCommit()
 		result, applyErr := a.foldDomainMutation(in)
 		if applyErr != nil {
 			if isInfrastructureError(applyErr) {
