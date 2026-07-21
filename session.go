@@ -20,7 +20,7 @@ package provenance
 // reproducible from history.
 //
 // Relationship / annotation verbs — AddEdge, RemoveEdge, AddLabel, RemoveLabel,
-// AddComment — are ALSO journaled (§6, as amended by #5): each commits one typed
+// AddComment — are ALSO journaled (§6): each commits one typed
 // mutation-family effect (provenance.edge.added/removed, provenance.label.added/removed,
 // provenance.comment.added) under the same per-effect authorization discipline as task
 // events, so who added/removed an edge/label/comment, under which authority, at which
@@ -141,8 +141,10 @@ func WithCommandDigest(d []byte) ApplyOption {
 	return func(c *applyConfig) { c.commandDigest = append([]byte(nil), d...) }
 }
 
-// WithMutationDigest overrides the operation's mutation digest (§3.1). See
-// WithCommandDigest.
+// WithMutationDigest preserves the legacy opaque-digest option for source compatibility
+// and retries of explicit legacy operation rows. Canonical new writes always derive the
+// persisted mutation digest from their canonical effects; this value cannot override or
+// forge that identity.
 func WithMutationDigest(d []byte) ApplyOption {
 	return func(c *applyConfig) { c.mutationDigest = append([]byte(nil), d...) }
 }
@@ -237,12 +239,19 @@ func (s *Session) Create(namespace, title, description string, taskType TaskType
 	if err := s.requireInitialized("Create"); err != nil {
 		return Task{}, err
 	}
-	id := TaskID{Namespace: namespace, UUID: uuid.Must(uuid.NewV7())}
-	// The digest canonical deliberately excludes the freshly minted id so a pinned
-	// same-argument retry matches through the §9.4 short-circuit (which returns the
-	// original task, discarding this call's minted id).
 	cfg := s.resolve(opts, "create", namespace, title, description,
 		fmt.Sprintf("%d/%d/%d", int(taskType), int(priority), int(phase)))
+	id := TaskID{Namespace: namespace, UUID: uuid.Must(uuid.NewV7())}
+	// A pinned Create retry must present the original allocated task identity as an
+	// actual canonical effect. Recover it from the committed result before preparing
+	// the mutation; changed arguments still conflict through CommandDigest.
+	if prior, err := s.tr.db.LookupCommitted(cfg.opID); err != nil {
+		return Task{}, fmt.Errorf("provenance.Session.Create: lookup pinned retry %q: %w", cfg.opID, err)
+	} else if prior.Kind == CommittedExact {
+		if committedID, ok := taskSlotID(prior, "task"); ok {
+			id = committedID
+		}
+	}
 	res, err := s.applyOne(cfg, []Effect{{
 		Sort:        EffectTaskCreate,
 		TaskID:      id,
@@ -467,7 +476,7 @@ func taskSlotID(res CommittedResult, slot string) (TaskID, bool) {
 }
 
 // ---------------------------------------------------------------------------
-// Journaled relationship / annotation verbs (contract §6, as amended by #5)
+// Journaled relationship / annotation verbs (contract §6)
 // ---------------------------------------------------------------------------
 //
 // These five verbs are journaled single-effect wrappers over Apply: each commits one
@@ -475,7 +484,7 @@ func taskSlotID(res CommittedResult, slot string) (TaskID, bool) {
 // removed, provenance.comment.added) under this Session's actor and authority, so who
 // added/removed the relationship, under which authority, at which journal position is
 // queryable from the journal (who-provenance). The signatures are UNCHANGED from the
-// pre-#5 un-journaled forms. The edges/labels/comments domain tables are shared-reducer
+// pre-journal forms. The edges/labels/comments domain tables are shared-reducer
 // projections re-derivable from journal history (§6, §15). Authorization is the same
 // per-effect discipline as a task event (§9.3): the source/subject task must be governed.
 // A journaled edge's CREATION being recorded does NOT make the edge grant authority —

@@ -306,9 +306,10 @@ func opReuseOperationIDDifferentMutationDigest(t *testing.T, input, expected any
 	}
 	conflicting := base
 	conflicting.MutationDigest = env.digest("digest-b")
+	conflicting.Effects = []Effect{{Sort: EffectTaskEvent, TaskID: task, EventKind: "provenance.task.updated", Payload: []byte(`{"changed":true}`)}}
 	res, err := env.tr.Journal().Apply(conflicting)
 	if err == nil {
-		return fmt.Errorf("OperationID reuse with a different mutation digest was accepted; expected a typed conflict")
+		return fmt.Errorf("OperationID reuse with different canonical effects was accepted; expected a typed conflict")
 	}
 	if res.Kind != CommittedConflict {
 		return fmt.Errorf("reuse variant = %s, want CommittedConflict", res.Kind)

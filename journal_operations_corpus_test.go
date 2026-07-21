@@ -1179,9 +1179,9 @@ func TestApplyRejectsOperationIDReuseWithDifferentIdentity(t *testing.T) {
 	if _, err := env.tr.Journal().Apply(base); err != nil {
 		t.Fatalf("first apply: %v", err)
 	}
-	// Same OperationID, different MutationDigest → typed conflict, no write.
+	// Same OperationID, different canonical effects → typed conflict, no write.
 	conflicting := base
-	conflicting.MutationDigest = env.digest("different-m")
+	conflicting.Effects = []Effect{{Sort: EffectTaskEvent, TaskID: task, EventKind: "provenance.task.updated", Payload: []byte(`{"changed":true}`)}}
 	_, err := env.tr.Journal().Apply(conflicting)
 	if !errors.Is(err, ErrOperationConflict) {
 		t.Fatalf("reused OperationID with a different identity = %v, want ErrOperationConflict", err)
@@ -1215,7 +1215,7 @@ func TestApplyConflictProducesTypedClosedSumAndErrorsAs(t *testing.T) {
 		t.Fatalf("first apply: %v", err)
 	}
 	conflicting := base
-	conflicting.MutationDigest = env.digest("different-m")
+	conflicting.Effects = []Effect{{Sort: EffectTaskEvent, TaskID: task, EventKind: "provenance.task.updated", Payload: []byte(`{"changed":true}`)}}
 	res, err := env.tr.Journal().Apply(conflicting)
 	if err == nil {
 		t.Fatal("reused OperationID with a different identity was accepted; want a conflict error")
@@ -1228,7 +1228,7 @@ func TestApplyConflictProducesTypedClosedSumAndErrorsAs(t *testing.T) {
 		t.Fatal("CommittedConflict result carried a nil Conflict payload")
 	}
 	if res.Conflict.OperationID != "op-x" || res.Conflict.Field != "mutation digest" {
-		t.Fatalf("res.Conflict = {%q,%q}, want {op-x, mutation digest}", res.Conflict.OperationID, res.Conflict.Field)
+		t.Fatalf("res.Conflict = {%q,%q}, want {op-x, mutation digest derived from canonical effects}", res.Conflict.OperationID, res.Conflict.Field)
 	}
 	// errors.Is recovers the sentinel; errors.As recovers the typed *OperationConflict.
 	if !errors.Is(err, ErrOperationConflict) {
@@ -1348,7 +1348,7 @@ func TestFoldEvidenceEnforcesAuthorityGovernance(t *testing.T) {
 }
 
 // TestResolveOperationIDInsertRaceTranslatesToTypedOutcome exercises §9.6's
-// bullet-2 race-translation path directly (MINOR 2xizh, absorbing yvgcn): when the
+// bullet-2 race-translation path directly: when the
 // anchor insert loses a concurrent same-new-OperationID UNIQUE race, the reducer
 // re-reads the winner's committed row and returns the typed idempotent result (on
 // an exact identity match) or the typed CommittedConflict (on a mismatch), never a
@@ -1382,6 +1382,7 @@ func TestResolveOperationIDInsertRaceTranslatesToTypedOutcome(t *testing.T) {
 	// Conflicting loser: same OperationID, different identity → typed conflict.
 	conflicting := winner
 	conflicting.MutationDigest = env.digest("different-m")
+	conflicting.Effects = []Effect{{Sort: EffectTaskEvent, TaskID: task, EventKind: "provenance.task.updated", Payload: []byte(`{"changed":true}`)}}
 	res2, err2 := st.db.AdversarialResolveOperationIDInsertRace(conflicting)
 	if err2 == nil {
 		t.Fatal("conflicting race translation returned no error")

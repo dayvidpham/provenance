@@ -12,7 +12,7 @@ import (
 // typed shapes the Apply write path and LookupCommitted read path consume; the
 // concrete SQLite reducer that folds them lives in internal/sqlite. The write
 // path validation is structured as reusable reducer steps so the Open/replay
-// reducer of a later slice folds onto them rather than duplicating a second
+// reducer folds onto them rather than duplicating a second
 // switch (§9.2).
 
 // ---------------------------------------------------------------------------
@@ -132,8 +132,8 @@ const (
 	// It must be ordered before any effect (or FK) that references the new task.
 	EffectTaskCreate // JournalKindTaskEvent (provenance.task.created), also inserts the tasks row
 
-	// Journaled relationship / annotation mutation-family effect sorts (§6, as amended
-	// by #5). Each produces one journal_task_events row carrying its fixed per-family
+	// Journaled relationship / annotation mutation-family effect sorts (§6). Each
+	// produces one journal_task_events row carrying its fixed per-family
 	// EventKind (provenance.edge.added/removed, provenance.label.added/removed,
 	// provenance.comment.added) plus the operands in the payload; the shared reducer
 	// folds the row into the edges/labels/comments domain projection. They authorize
@@ -333,9 +333,11 @@ type OperationInput struct {
 	// (§4.6, §10 rule 6).
 	AuthorityJournalID *JournalID
 	CommandDigest      []byte
-	MutationDigest     []byte
-	RecordedAt         RecordedTime // audit/display only (§12)
-	Effects            []Effect
+	// MutationDigest is retained for source compatibility and explicit legacy-row
+	// retries. New writes derive and persist this value from canonical Effects.
+	MutationDigest []byte
+	RecordedAt     RecordedTime // audit/display only (§12)
+	Effects        []Effect
 }
 
 // RecordedTime is the caller-supplied wall-clock stamp copied into
@@ -343,10 +345,10 @@ type OperationInput struct {
 // surface does not import time here; the sqlite layer converts to UnixNano.
 type RecordedTime = int64
 
-// StoredOperationIdentity is the four-field exact replay identity compared at
-// §9.4 short-circuit time: a same-OperationID retry whose identity matches
-// exactly returns the original result; any mismatch is a typed conflict (§11).
-// It is deliberately NOT a schema uniqueness constraint (§3.1).
+// StoredOperationIdentity contains the scalar replay identity. Canonical new rows
+// additionally compare their persisted canonical mutation bytes; MutationDigest is
+// derived from those bytes rather than trusted from the caller. Explicit legacy rows
+// retain their opaque digest comparison.
 type StoredOperationIdentity struct {
 	ActorID            ActorID
 	AuthorityJournalID *JournalID
@@ -424,7 +426,7 @@ func (c OperationConflict) Error() string {
 		"provenance: OperationID %q reused with a different %s than the committed "+
 			"operation — where: Apply replay short-circuit (§9.4/§11); when: before "+
 			"any write; impact: nothing was committed; fix: retry with the identical "+
-			"actor, authority, command digest, and mutation digest, or issue a new "+
+			"actor, authority, command digest, and canonical effects, or issue a new "+
 			"OperationID for a genuinely different operation",
 		string(c.OperationID), c.Field)
 }

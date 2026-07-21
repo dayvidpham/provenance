@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/dayvidpham/provenance/internal/journal"
 	zs "zombiezen.com/go/sqlite"
@@ -18,7 +19,7 @@ import (
 // list order (§9.3.1), authorizing each against the state produced by all
 // earlier effects of the same operation (§9.3), and short-circuits an exact
 // same-OperationID replay (§9.4). The per-effect validation is written as
-// reusable *Locked reducer steps so the Open/replay reducer of a later slice
+// reusable *Locked reducer steps so the Open/replay reducer
 // folds onto them rather than duplicating a second switch (§9.2).
 
 // Closed-lookup integer ids, matching the Go enum iota values so the SQL lookup
@@ -67,7 +68,9 @@ func (db *DB) ensureOperationsSchema() error {
 			operation_id         TEXT NOT NULL UNIQUE,
 			authority_journal_id INTEGER REFERENCES journal_authorities(journal_id),
 			command_digest       BLOB NOT NULL,
-			mutation_digest      BLOB NOT NULL
+			mutation_digest      BLOB NOT NULL,
+			mutation_encoding_version TEXT,
+			canonical_mutation   BLOB
 		) STRICT`,
 		// Slot-keyed committed-result mapping (§3.2). rule-9 own-operation
 		// integrity is reducer-enforced (the two FKs alone cannot express it).
@@ -151,7 +154,34 @@ func (db *DB) ensureOperationsSchema() error {
 			return fmt.Errorf("ensureOperationsSchema: seed assignment_transitions: %w", err)
 		}
 	}
+	if err := db.ensureCanonicalMutationColumns(); err != nil {
+		return err
+	}
 	return db.completeJournalOperationFK()
+}
+
+// ensureCanonicalMutationColumns upgrades operation rows without rewriting them.
+// Existing operations remain explicit legacy opaque records (both columns NULL);
+// every operation committed after this migration stores both columns.
+func (db *DB) ensureCanonicalMutationColumns() error {
+	for _, column := range []struct{ name, ddl string }{
+		{"mutation_encoding_version", `ALTER TABLE journal_operations ADD COLUMN mutation_encoding_version TEXT`},
+		{"canonical_mutation", `ALTER TABLE journal_operations ADD COLUMN canonical_mutation BLOB`},
+	} {
+		present := false
+		if err := sqlitex.ExecuteTransient(db.conn, `PRAGMA table_info(journal_operations)`, &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
+			present = present || stmt.ColumnText(1) == column.name
+			return nil
+		}}); err != nil {
+			return fmt.Errorf("ensure canonical mutation schema: inspect %s: %w", column.name, err)
+		}
+		if !present {
+			if err := sqlitex.ExecuteTransient(db.conn, column.ddl, nil); err != nil {
+				return fmt.Errorf("ensure canonical mutation schema: add %s: %w", column.name, err)
+			}
+		}
+	}
+	return nil
 }
 
 // completeJournalOperationFK completes the journal.produced_by_operation_journal_id
@@ -195,8 +225,8 @@ func (db *DB) completeJournalOperationFK() error {
 		// must be produced by an operation (produced_by_operation_journal_id NOT NULL). In
 		// the journaled model every task_event is emitted by an operation — a native
 		// create, an update/lifecycle event, or a migration baseline marker — so the only
-		// thing this rejects is a bare NULL-producer append (the retired #4 AppendTaskEvent
-		// path). The journal-base #4 layer keeps NULL-producer task_events (no FK, no this
+		// thing this rejects is a bare NULL-producer append (the retired AppendTaskEvent
+		// path). The journal-base layer keeps NULL-producer task_events (no FK, no this
 		// CHECK); the constraint is introduced only here in the operations-layer rebuild.
 		fmt.Sprintf(`CREATE TABLE journal_new (
 			journal_id   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -292,12 +322,37 @@ func (db *DB) JournalIsEmpty() (bool, error) {
 // per-effect authorization (§9.3), persists result slots (§3.2), and runs the
 // subtype-integrity and close-ends-assignment gates before commit.
 func (db *DB) Apply(in journal.OperationInput) (journal.CommittedResult, error) {
+	callerMutationDigest := append([]byte(nil), in.MutationDigest...)
+	prepared, err := journal.PrepareMutationV1(in.Effects)
+	if err != nil {
+		return journal.CommittedResult{}, fmt.Errorf("Apply: prepare canonical mutation before any write: %w", err)
+	}
+	// Canonical bytes, not a caller assertion, define mutation identity. Execute the
+	// decoded normalized effects so identity and behavior cannot drift.
+	in.Effects = prepared.Effects
+	in.MutationDigest = prepared.Digest
 	if err := validateApplyInput(in); err != nil {
 		return journal.CommittedResult{}, err
 	}
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	return db.applyLocked(in, nil)
+	var res journal.CommittedResult
+	for attempt := 0; attempt < 5; attempt++ {
+		res, err = db.applyPreparedLocked(in, prepared, callerMutationDigest, nil)
+		if !isTransientSQLiteContention(err) {
+			return res, err
+		}
+		time.Sleep(time.Duration(attempt+1) * 10 * time.Millisecond)
+	}
+	return res, fmt.Errorf("Apply: independent-handle contention did not clear after 5 bounded retries: %w", err)
+}
+
+func isTransientSQLiteContention(err error) bool {
+	if err == nil {
+		return false
+	}
+	primary := zs.ErrCode(err) & 0xff
+	return primary == zs.ResultBusy || primary == zs.ResultLocked
 }
 
 // validateApplyInput runs the pre-transaction input checks shared by the public
@@ -309,10 +364,10 @@ func validateApplyInput(in journal.OperationInput) error {
 	if in.ActorID.Namespace == "" {
 		return fmt.Errorf("Apply: operation %q: committing actor is required", in.OperationID)
 	}
-	if len(in.CommandDigest) == 0 || len(in.MutationDigest) == 0 {
+	if len(in.CommandDigest) == 0 {
 		return fmt.Errorf(
-			"Apply: operation %q: CommandDigest and MutationDigest are both required (§3.1) — "+
-				"where: Apply input validation; impact: nothing committed; fix: supply both opaque digests",
+			"Apply: operation %q: CommandDigest is required — where: Apply input validation; "+
+				"impact: nothing committed; fix: supply the command provenance digest; the mutation digest is derived from canonical effects",
 			in.OperationID)
 	}
 	return nil
@@ -327,6 +382,17 @@ func validateApplyInput(in journal.OperationInput) error {
 // effect index is folded; a non-nil return aborts and rolls back the whole
 // operation, committing nothing.
 func (db *DB) applyLocked(in journal.OperationInput, faultHook func(effectIndex int) error) (journal.CommittedResult, error) {
+	callerMutationDigest := append([]byte(nil), in.MutationDigest...)
+	prepared, err := journal.PrepareMutationV1(in.Effects)
+	if err != nil {
+		return journal.CommittedResult{}, fmt.Errorf("Apply: prepare canonical mutation before any write: %w", err)
+	}
+	in.Effects = prepared.Effects
+	in.MutationDigest = prepared.Digest
+	return db.applyPreparedLocked(in, prepared, callerMutationDigest, faultHook)
+}
+
+func (db *DB) applyPreparedLocked(in journal.OperationInput, prepared journal.CanonicalMutation, callerMutationDigest []byte, faultHook func(effectIndex int) error) (journal.CommittedResult, error) {
 	// SAVEPOINT (not BEGIN) so applyLocked composes as a nested transaction when
 	// migration folds many per-task operations inside one outer savepoint (§9.5,
 	// §13 whole-batch atomicity); standalone it behaves as an ordinary atomic
@@ -347,7 +413,7 @@ func (db *DB) applyLocked(in journal.OperationInput, faultHook func(effectIndex 
 		// identity match short-circuits (§9.4), any mismatch is the typed
 		// CommittedConflict (§11). Either way no effect is folded and nothing is
 		// written; on a conflict txErr is set so the transaction rolls back.
-		res, err := db.committedOutcomeForExistingLocked(in, existing)
+		res, err := db.committedOutcomeForExistingLocked(in, existing, callerMutationDigest)
 		if err != nil {
 			txErr = err
 		}
@@ -372,7 +438,7 @@ func (db *DB) applyLocked(in journal.OperationInput, faultHook func(effectIndex 
 		txErr = err
 		return journal.CommittedResult{}, txErr
 	}
-	if err := db.insertOperationRowLocked(anchorJID, in); err != nil {
+	if err := db.insertOperationRowLocked(anchorJID, in, prepared); err != nil {
 		if isUniqueViolation(err) {
 			// §9.6 bullet 2 (defense-in-depth): a concurrent writer committed this
 			// new OperationID first, so the anchor insert violates
@@ -382,7 +448,7 @@ func (db *DB) applyLocked(in journal.OperationInput, faultHook func(effectIndex 
 			// db.mu (which serializes Apply end-to-end so the §9.4 lookup above
 			// always observes a concurrent writer's committed row first), but
 			// honoured for a future multi-connection/multi-process writer.
-			res, rErr := db.resolveOperationIDInsertRaceLocked(in)
+			res, rErr := db.resolveOperationIDInsertRaceLocked(in, callerMutationDigest)
 			txErr = rErr
 			return res, rErr
 		}

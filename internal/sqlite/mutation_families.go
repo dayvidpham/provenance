@@ -10,8 +10,8 @@ import (
 )
 
 // mutation_families.go implements the reducer half of the journaled
-// relationship/annotation mutation families (docs/journal-relational-contract.md §6, as
-// amended by #5): edge-add/edge-remove/label-add/label-remove/comment-add. Each family is
+// relationship/annotation mutation families (docs/journal-relational-contract.md §6):
+// edge-add/edge-remove/label-add/label-remove/comment-add. Each family is
 // journaled ON a journal_task_events row carrying its fixed per-family EventKind and the
 // operands in its payload, so who added/removed the relationship, under which authority,
 // at which journal position is derivable from the journal (who-provenance).
@@ -78,6 +78,21 @@ func (db *DB) foldMutationFamilyLocked(in journal.OperationInput, jid int64, eff
 		`INSERT INTO journal_task_events (journal_id, task_id, event_kind, payload) VALUES (?1, ?2, ?3, ?4)`,
 		&sqlitex.ExecOptions{Args: []any{jid, eff.TaskID.String(), string(kind), string(payload)}}); err != nil {
 		return fmt.Errorf("Apply: insert journal_task_events (%s): %w", kind, err)
+	}
+	contexts, err := journal.CanonicalEventContexts(eff.Contexts)
+	if err != nil {
+		return fmt.Errorf("Apply: canonical contexts (%s): %w", kind, err)
+	}
+	for _, context := range contexts {
+		contextKind, identity, err := journal.EncodeStoredEventContext(context)
+		if err != nil {
+			return fmt.Errorf("Apply: encode context (%s): %w", kind, err)
+		}
+		if err := sqlitex.Execute(db.conn,
+			`INSERT INTO journal_task_event_contexts (event_journal_id, context_kind, context_identity, attached_by_journal_id) VALUES (?1, ?2, ?3, ?4)`,
+			&sqlitex.ExecOptions{Args: []any{jid, string(contextKind), identity, jid}}); err != nil {
+			return fmt.Errorf("Apply: insert context (%s): %w", kind, err)
+		}
 	}
 	return nil
 }

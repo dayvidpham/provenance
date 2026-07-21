@@ -49,6 +49,7 @@ type (
 	ResultSlotBinding       = journal.ResultSlotBinding
 	CommittedResult         = journal.CommittedResult
 	OperationConflict       = journal.OperationConflict
+	CanonicalMutation       = journal.CanonicalMutation
 
 	// Shared-reducer replay, migration, and preflight surface (§9, §13, §15).
 	TaskStatus                    = journal.TaskStatus
@@ -81,6 +82,7 @@ const (
 	EventContextKindGit      = journal.EventContextKindGit
 
 	OrdinalV1CodecName = journal.OrdinalV1CodecName
+	MutationEncodingV1 = journal.MutationEncodingV1
 
 	// Authority-kind and assignment-lifecycle closed enums (§4).
 	AuthorityKindBootstrap  = journal.AuthorityKindBootstrap
@@ -170,6 +172,8 @@ var (
 	DecodeEdgeMutationPayload    = journal.DecodeEdgeMutationPayload
 	DecodeLabelMutationPayload   = journal.DecodeLabelMutationPayload
 	DecodeCommentMutationPayload = journal.DecodeCommentMutationPayload
+	PrepareMutationV1            = journal.PrepareMutationV1
+	DecodeCanonicalMutation      = journal.DecodeCanonicalMutation
 )
 
 // Status-FSM typed error + sentinel (§8.1).

@@ -120,6 +120,13 @@ func Open(dbPath string, models []ptypes.ModelEntry) (*DB, error) {
 		_ = conn.Close()
 		return nil, fmt.Errorf("sqlite.Open: failed to apply schema on %q: %w", dbPath, err)
 	}
+	// Activation accepts the database only after integrity and complete projection
+	// convergence have been checked against canonical history. Replay derives into
+	// TEMP tables, so corruption is reported without repairing or mutating it.
+	if _, err := db.ReplayProjections(); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("sqlite.Open: startup journal validation failed on %q: %w", dbPath, err)
+	}
 
 	return db, nil
 }

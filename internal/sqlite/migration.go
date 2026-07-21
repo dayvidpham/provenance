@@ -35,7 +35,7 @@ type expectedTable struct {
 var expectedJournalShape = []expectedTable{
 	{"journal", []string{"journal_id", "kind_id", "actor_id", "recorded_at", "produced_by_operation_journal_id"}},
 	{"journal_task_events", []string{"journal_id", "task_id", "event_kind", "payload"}},
-	{"journal_operations", []string{"journal_id", "operation_id", "authority_journal_id", "command_digest", "mutation_digest"}},
+	{"journal_operations", []string{"journal_id", "operation_id", "authority_journal_id", "command_digest", "mutation_digest", "mutation_encoding_version", "canonical_mutation"}},
 	{"journal_authorities", []string{"journal_id", "authority_kind_id", "operation_authority_id"}},
 }
 

@@ -1,8 +1,7 @@
 package provenance
 
-// journal_concurrent_writers_test.go is the concurrent-writer-interleavings
-// negative-path family required by the Impl-UAT C8a ruling. Concurrency is
-// process-shaped, so per the C8b split it lives in Go (not the YAML corpus): two
+// journal_concurrent_writers_test.go covers concurrent writer interleavings.
+// Concurrency is process-shaped, so it lives in Go (not the YAML corpus): two
 // live Sessions on one Tracker race real mutations through the production Apply path
 // under the race detector, and the tests assert the single-winner, typed-loser, and
 // no-partial-fold properties the journal write path promises (§9.4 idempotent replay,
@@ -187,6 +186,7 @@ func TestConcurrentSameOperationIDConflictingIdentityLoserGetsTypedConflict(t *t
 	opA.MutationDigest = []byte("mutation-a")
 	opB := base
 	opB.MutationDigest = []byte("mutation-b")
+	opB.Effects = []Effect{{Sort: EffectTaskEvent, TaskID: task, EventKind: EventKindTaskUpdated, UpdateTitle: strPtr("different canonical effect")}}
 
 	type outcome struct {
 		res CommittedResult

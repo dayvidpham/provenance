@@ -40,15 +40,16 @@ func (db *DB) insertJournalRowLocked(kind journal.JournalKind, actor journal.Act
 	return db.conn.LastInsertRowID(), nil
 }
 
-func (db *DB) insertOperationRowLocked(anchor int64, in journal.OperationInput) error {
+func (db *DB) insertOperationRowLocked(anchor int64, in journal.OperationInput, prepared journal.CanonicalMutation) error {
 	var authArg any
 	if in.AuthorityJournalID != nil {
 		authArg = int64(*in.AuthorityJournalID)
 	}
 	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO journal_operations (journal_id, operation_id, authority_journal_id, command_digest, mutation_digest)
-		 VALUES (?1, ?2, ?3, ?4, ?5)`,
-		&sqlitex.ExecOptions{Args: []any{anchor, string(in.OperationID), authArg, in.CommandDigest, in.MutationDigest}}); err != nil {
+		`INSERT INTO journal_operations
+		 (journal_id, operation_id, authority_journal_id, command_digest, mutation_digest, mutation_encoding_version, canonical_mutation)
+		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
+		&sqlitex.ExecOptions{Args: []any{anchor, string(in.OperationID), authArg, in.CommandDigest, prepared.Digest, prepared.Version, prepared.Bytes}}); err != nil {
 		return fmt.Errorf("insert journal_operations for %q: %w", in.OperationID, err)
 	}
 	return nil
@@ -629,15 +630,19 @@ func (db *DB) validateClosesEndAssignmentsLocked(anchor int64, effects []journal
 // ---------------------------------------------------------------------------
 
 type storedOperation struct {
-	anchor   int64
-	identity journal.StoredOperationIdentity
+	anchor            int64
+	identity          journal.StoredOperationIdentity
+	encodingVersion   string
+	canonicalMutation []byte
 }
 
 func (db *DB) lookupOperationLocked(op journal.OperationID) (storedOperation, bool, error) {
 	var out storedOperation
 	found := false
 	if err := sqlitex.Execute(db.conn,
-		`SELECT journal_id, authority_journal_id, command_digest, mutation_digest FROM journal_operations WHERE operation_id = ?1`,
+		`SELECT journal_id, authority_journal_id, command_digest, mutation_digest,
+		        mutation_encoding_version, canonical_mutation
+		 FROM journal_operations WHERE operation_id = ?1`,
 		&sqlitex.ExecOptions{Args: []any{string(op)}, ResultFunc: func(stmt *zs.Stmt) error {
 			found = true
 			out.anchor = stmt.ColumnInt64(0)
@@ -647,6 +652,12 @@ func (db *DB) lookupOperationLocked(op journal.OperationID) (storedOperation, bo
 			}
 			out.identity.CommandDigest = readBlob(stmt, 2)
 			out.identity.MutationDigest = readBlob(stmt, 3)
+			if stmt.ColumnType(4) != zs.TypeNull {
+				out.encodingVersion = stmt.ColumnText(4)
+			}
+			if stmt.ColumnType(5) != zs.TypeNull {
+				out.canonicalMutation = readBlob(stmt, 5)
+			}
 			return nil
 		}}); err != nil {
 		return storedOperation{}, false, fmt.Errorf("lookup operation %q: %w", op, err)
@@ -705,16 +716,34 @@ func journalIDPtrEqual(a, b *journal.JournalID) bool {
 // errors.As(err, &*OperationConflict), and a caller switching on res.Kind sees
 // CommittedConflict (§11, §9.6). Shared by the Apply short-circuit and the
 // concurrent-insert race translation so both surface the identical typed shape.
-func (db *DB) committedOutcomeForExistingLocked(in journal.OperationInput, existing storedOperation) (journal.CommittedResult, error) {
+func (db *DB) committedOutcomeForExistingLocked(in journal.OperationInput, existing storedOperation, callerMutationDigest []byte) (journal.CommittedResult, error) {
+	proposedMutationDigest := in.MutationDigest
+	if existing.encodingVersion == "" {
+		proposedMutationDigest = callerMutationDigest
+		if len(proposedMutationDigest) == 0 {
+			proposedMutationDigest = in.MutationDigest
+		}
+	}
 	if field, ok := identityMismatch(existing.identity, journal.StoredOperationIdentity{
 		ActorID:            in.ActorID,
 		AuthorityJournalID: in.AuthorityJournalID,
 		CommandDigest:      in.CommandDigest,
-		MutationDigest:     in.MutationDigest,
+		MutationDigest:     proposedMutationDigest,
 	}); !ok {
 		conflict := &journal.OperationConflict{OperationID: in.OperationID, Field: field}
 		return journal.CommittedResult{Kind: journal.CommittedConflict, Conflict: conflict},
 			fmt.Errorf("%w: %w", journal.ErrOperationConflict, conflict)
+	}
+	if existing.encodingVersion != "" {
+		prepared, err := journal.PrepareMutationV1(in.Effects)
+		if err != nil {
+			return journal.CommittedResult{}, err
+		}
+		if existing.encodingVersion != prepared.Version || !bytes.Equal(existing.canonicalMutation, prepared.Bytes) {
+			conflict := &journal.OperationConflict{OperationID: in.OperationID, Field: "canonical effects"}
+			return journal.CommittedResult{Kind: journal.CommittedConflict, Conflict: conflict},
+				fmt.Errorf("%w: %w", journal.ErrOperationConflict, conflict)
+		}
 	}
 	res, err := db.reconstructCommittedLocked(existing.anchor)
 	if err != nil {
@@ -733,7 +762,7 @@ func (db *DB) committedOutcomeForExistingLocked(in journal.OperationInput, exist
 // db.mu this is unreachable (Apply's §9.4 lookup observes the committed row before
 // ever reaching the insert); it is the defense-in-depth path for a future
 // multi-connection/multi-process writer.
-func (db *DB) resolveOperationIDInsertRaceLocked(in journal.OperationInput) (journal.CommittedResult, error) {
+func (db *DB) resolveOperationIDInsertRaceLocked(in journal.OperationInput, callerMutationDigest []byte) (journal.CommittedResult, error) {
 	existing, found, err := db.lookupOperationLocked(in.OperationID)
 	if err != nil {
 		return journal.CommittedResult{}, err
@@ -747,7 +776,7 @@ func (db *DB) resolveOperationIDInsertRaceLocked(in journal.OperationInput) (jou
 		return journal.CommittedResult{Kind: journal.CommittedConflict, Conflict: conflict},
 			fmt.Errorf("%w: %w", journal.ErrOperationConflict, conflict)
 	}
-	return db.committedOutcomeForExistingLocked(in, existing)
+	return db.committedOutcomeForExistingLocked(in, existing, callerMutationDigest)
 }
 
 func (db *DB) reconstructCommittedLocked(anchor int64) (journal.CommittedResult, error) {
