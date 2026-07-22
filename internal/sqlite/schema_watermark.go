@@ -33,56 +33,40 @@ const (
 	tasksWatermarkColumnless
 )
 
-func (shape tasksWatermarkShape) createRebuildStatement() sealedSQLStatement {
+func (shape tasksWatermarkShape) createRebuildQuery() string {
 	switch shape {
 	case tasksWatermarkNative:
-		return migrationDDLCreateTasksWatermarkRebuilde9e2
+		return "CREATE TABLE tasks_watermark_rebuild (id TEXT PRIMARY KEY,namespace TEXT NOT NULL,title TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',status_id INTEGER NOT NULL DEFAULT 0 REFERENCES statuses(id),priority_id INTEGER NOT NULL DEFAULT 2 REFERENCES priorities(id),type_id INTEGER NOT NULL DEFAULT 2 REFERENCES task_types(id),phase_id INTEGER NOT NULL REFERENCES phases(id),owner_id TEXT REFERENCES agents(id),notes TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,closed_at INTEGER,close_reason TEXT NOT NULL DEFAULT '',last_journal_id INTEGER NOT NULL REFERENCES journal(journal_id)) STRICT"
 	case tasksWatermarkNullable:
-		return migrationDDLCreateTasksWatermarkRebuild6df2
+		return "CREATE TABLE tasks_watermark_rebuild (id TEXT PRIMARY KEY,namespace TEXT NOT NULL,title TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',status_id INTEGER NOT NULL DEFAULT 0 REFERENCES statuses(id),priority_id INTEGER NOT NULL DEFAULT 2 REFERENCES priorities(id),type_id INTEGER NOT NULL DEFAULT 2 REFERENCES task_types(id),phase_id INTEGER NOT NULL REFERENCES phases(id),owner_id TEXT REFERENCES agents(id),notes TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,closed_at INTEGER,close_reason TEXT NOT NULL DEFAULT '',last_journal_id INTEGER REFERENCES journal(journal_id)) STRICT"
 	case tasksWatermarkColumnless:
-		return migrationDDLCreateTasksWatermarkRebuild865e
+		return "CREATE TABLE tasks_watermark_rebuild (id TEXT PRIMARY KEY,namespace TEXT NOT NULL,title TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',status_id INTEGER NOT NULL DEFAULT 0 REFERENCES statuses(id),priority_id INTEGER NOT NULL DEFAULT 2 REFERENCES priorities(id),type_id INTEGER NOT NULL DEFAULT 2 REFERENCES task_types(id),phase_id INTEGER NOT NULL REFERENCES phases(id),owner_id TEXT REFERENCES agents(id),notes TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,closed_at INTEGER,close_reason TEXT NOT NULL DEFAULT '') STRICT"
 	default:
 		panic("unknown tasks watermark shape")
 	}
 }
 
-func (shape tasksWatermarkShape) copyStatement() sealedSQLStatement {
+func (shape tasksWatermarkShape) copyQuery() string {
 	switch shape {
 	case tasksWatermarkNative, tasksWatermarkNullable:
-		return migrationInsertTasksWatermarkRebuilddc9f
+		return "INSERT INTO tasks_watermark_rebuild (id,namespace,title,description,status_id,priority_id,type_id,phase_id,owner_id,notes,created_at,updated_at,closed_at,close_reason,last_journal_id) SELECT id,namespace,title,description,status_id,priority_id,type_id,phase_id,owner_id,notes,created_at,updated_at,closed_at,close_reason,last_journal_id FROM tasks"
 	case tasksWatermarkColumnless:
-		return migrationInsertTasksWatermarkRebuildd091
+		return "INSERT INTO tasks_watermark_rebuild (id,namespace,title,description,status_id,priority_id,type_id,phase_id,owner_id,notes,created_at,updated_at,closed_at,close_reason) SELECT id,namespace,title,description,status_id,priority_id,type_id,phase_id,owner_id,notes,created_at,updated_at,closed_at,close_reason FROM tasks"
 	default:
 		panic("unknown tasks watermark shape")
-	}
-}
-
-// tasksIndexDDL returns the CREATE INDEX statements for the tasks table. They are
-// recreated after every watermark rebuild because the rebuild drops and renames the
-// table (the indexes go with the dropped table).
-func tasksIndexDDL() []sealedSQLStatement {
-	return []sealedSQLStatement{
-		sharedDDLCreateIdxTasksNamespace7486,
-		migrationDDLCreateIdxTasksStatus0073,
-		migrationDDLCreateIdxTasksPriority4dc7,
-		migrationDDLCreateIdxTasksTyped2dc,
-		migrationDDLCreateIdxTasksPhase8793,
-		migrationDDLCreateIdxTasksOwner2af7,
 	}
 }
 
 // tasksWatermarkColumnInfoLocked reports whether the tasks table has a last_journal_id
 // column and, if so, whether it is declared NOT NULL. Assumes db.mu is held.
 func (db *DB) tasksWatermarkColumnInfoLocked() (present bool, notNull bool, err error) {
-	if err := executeStatement(db.conn,
-		migrationPragmaTableInfo6558,
-		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
-			if stmt.ColumnText(1) == "last_journal_id" {
-				present = true
-				notNull = stmt.ColumnInt(3) == 1 // column 3 of table_info is "notnull"
-			}
-			return nil
-		}}); err != nil {
+	if err := sqlitex.Execute(db.conn, "PRAGMA table_info(tasks)", &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
+		if stmt.ColumnText(1) == "last_journal_id" {
+			present = true
+			notNull = stmt.ColumnInt(3) == 1 // column 3 of table_info is "notnull"
+		}
+		return nil
+	}}); err != nil {
 		return false, false, fmt.Errorf("tasksWatermarkColumnInfo: %w", err)
 	}
 	return present, notNull, nil
@@ -107,9 +91,7 @@ func (db *DB) countUnanchoredTasksLocked() (int, error) {
 				"nothing re-tightened; fix: this indicates the column-add path was skipped, which is a bug")
 	}
 	var n int
-	if err := executeStatement(db.conn,
-		migrationSelectTasks0c06,
-		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
+	if err := sqlitex.Execute(db.conn, "SELECT COUNT(*) FROM tasks WHERE last_journal_id IS ?1", &sqlitex.ExecOptions{Args: []any{nil}, ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
 		return 0, fmt.Errorf("countUnanchoredTasks: %w", err)
 	}
 	return n, nil
@@ -124,41 +106,60 @@ func (db *DB) countUnanchoredTasksLocked() (int, error) {
 // exactly as completeJournalOperationFK does; a detected violation rolls the whole
 // rebuild back. Assumes db.mu is held.
 func (db *DB) rebuildTasksWatermarkLocked(shape tasksWatermarkShape) error {
-	if err := executeStatement(db.conn, sharedDDLPragmaForeignKeys1be4, nil); err != nil {
+	if err := sqlitex.ExecuteTransient(db.conn, "PRAGMA foreign_keys=OFF", nil); err != nil {
 		return fmt.Errorf("rebuildTasksWatermark: disable FK enforcement: %w", err)
 	}
-	defer func() { _ = executeStatement(db.conn, sharedDDLPragmaForeignKeysde7c, nil) }()
+	defer func() { _ = sqlitex.ExecuteTransient(db.conn, "PRAGMA foreign_keys=ON", nil) }()
 
-	steps := []sealedSQLStatement{
-		sharedDDLBeginStatement4e51,
-		shape.createRebuildStatement(),
-		shape.copyStatement(),
-		migrationDDLDropTasks7ba0,
-		migrationDDLAlterTasksWatermarkRebuild6df4,
+	if err := sqlitex.ExecuteTransient(db.conn, "BEGIN IMMEDIATE", nil); err != nil {
+		return fmt.Errorf("rebuildTasksWatermark: begin: %w", err)
 	}
-	steps = append(steps, tasksIndexDDL()...)
-	for _, stmt := range steps {
-		if err := executeStatement(db.conn, stmt, nil); err != nil {
-			_ = executeStatement(db.conn, sharedDDLRollbackStatement4eec, nil)
-			return fmt.Errorf("rebuildTasksWatermark: static step failed: %w", err)
+	if err := sqlitex.ExecuteTransient(db.conn, shape.createRebuildQuery(), nil); err != nil {
+		_ = sqlitex.ExecuteTransient(db.conn, "ROLLBACK", nil)
+		return fmt.Errorf("rebuildTasksWatermark: create rebuild table: %w", err)
+	}
+	if err := sqlitex.Execute(db.conn, shape.copyQuery(), nil); err != nil {
+		_ = sqlitex.ExecuteTransient(db.conn, "ROLLBACK", nil)
+		return fmt.Errorf("rebuildTasksWatermark: copy rows: %w", err)
+	}
+	if err := sqlitex.ExecuteTransient(db.conn, "DROP TABLE tasks", nil); err != nil {
+		_ = sqlitex.ExecuteTransient(db.conn, "ROLLBACK", nil)
+		return fmt.Errorf("rebuildTasksWatermark: drop old table: %w", err)
+	}
+	if err := sqlitex.ExecuteTransient(db.conn, "ALTER TABLE tasks_watermark_rebuild RENAME TO tasks", nil); err != nil {
+		_ = sqlitex.ExecuteTransient(db.conn, "ROLLBACK", nil)
+		return fmt.Errorf("rebuildTasksWatermark: rename rebuilt table: %w", err)
+	}
+	// Recreate the indexes dropped with the old tasks table.
+	for _, ddl := range []string{
+		"CREATE INDEX IF NOT EXISTS idx_tasks_namespace ON tasks (namespace)",
+		"CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks (status_id)",
+		"CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks (priority_id)",
+		"CREATE INDEX IF NOT EXISTS idx_tasks_type ON tasks (type_id)",
+		"CREATE INDEX IF NOT EXISTS idx_tasks_phase ON tasks (phase_id)",
+		"CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks (owner_id)",
+	} {
+		if err := sqlitex.ExecuteTransient(db.conn, ddl, nil); err != nil {
+			_ = sqlitex.ExecuteTransient(db.conn, "ROLLBACK", nil)
+			return fmt.Errorf("rebuildTasksWatermark: recreate index: %w", err)
 		}
 	}
 	var violations int
-	if err := executeStatement(db.conn, sharedDDLPragmaForeignKeyCheck6847,
+	if err := sqlitex.ExecuteTransient(db.conn, "PRAGMA foreign_key_check",
 		&sqlitex.ExecOptions{ResultFunc: func(*zs.Stmt) error { violations++; return nil }}); err != nil {
-		_ = executeStatement(db.conn, sharedDDLRollbackStatement4eec, nil)
+		_ = sqlitex.ExecuteTransient(db.conn, "ROLLBACK", nil)
 		return fmt.Errorf("rebuildTasksWatermark: foreign_key_check: %w", err)
 	}
 	if violations > 0 {
-		_ = executeStatement(db.conn, sharedDDLRollbackStatement4eec, nil)
+		_ = sqlitex.ExecuteTransient(db.conn, "ROLLBACK", nil)
 		return fmt.Errorf(
 			"rebuildTasksWatermark: rebuild left %d foreign-key violations, rolled back — where: tasks "+
 				"watermark rebuild; impact: the rebuild was reverted and the database left unchanged; fix: "+
 				"this indicates a child row (edge/label/comment) references a task id that does not exist",
 			violations)
 	}
-	if err := executeStatement(db.conn, sharedDDLCommitStatement696a, nil); err != nil {
-		_ = executeStatement(db.conn, sharedDDLRollbackStatement4eec, nil)
+	if err := sqlitex.ExecuteTransient(db.conn, "COMMIT", nil); err != nil {
+		_ = sqlitex.ExecuteTransient(db.conn, "ROLLBACK", nil)
 		return fmt.Errorf("rebuildTasksWatermark: commit rebuild: %w", err)
 	}
 	return nil
@@ -213,8 +214,8 @@ func (db *DB) ensureTasksWatermarkColumnLocked() error {
 	if present {
 		return nil
 	}
-	if err := executeStatement(db.conn,
-		migrationDDLAlterTasksed3d, nil); err != nil {
+	if err := sqlitex.ExecuteTransient(db.conn,
+		"ALTER TABLE tasks ADD COLUMN last_journal_id INTEGER REFERENCES journal(journal_id)", nil); err != nil {
 		return fmt.Errorf(
 			"ensureTasksWatermarkColumn: add legacy last_journal_id column — where: migration column-add "+
 				"path (§13); when: before any legacy row is anchored; impact: nothing committed; fix: the "+

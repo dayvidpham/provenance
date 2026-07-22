@@ -40,10 +40,14 @@ const (
 )
 
 func (target projectionTarget) label() string {
-	if target == projectionTargetShadow {
+	switch target {
+	case projectionTargetLive:
+		return "live projection"
+	case projectionTargetShadow:
 		return "shadow projection"
+	default:
+		panic("unknown projection target")
 	}
-	return "live projection"
 }
 
 // Open opens (or creates) a SQLite database at dbPath and returns an
@@ -246,20 +250,20 @@ func (db *DB) Close() error {
 // ---------------------------------------------------------------------------
 
 func (db *DB) applyActivationPragmas() error {
-	for _, p := range []sealedSQLStatement{schemaDDLPragmaBusyTimeout44ea, schemaDDLPragmaForeignKeysOffcc13} {
-		if err := executeStatement(db.conn, p, nil); err != nil {
-			return fmt.Errorf("pragma %q: %w", p, err)
+	for _, pragma := range []string{"PRAGMA busy_timeout=5000;", "PRAGMA foreign_keys=OFF;"} {
+		if err := sqlitex.ExecuteTransient(db.conn, pragma, nil); err != nil {
+			return fmt.Errorf("pragma %q: %w", pragma, err)
 		}
 	}
 	return nil
 }
 
 func (db *DB) enableWAL() error {
-	return executeStatement(db.conn, schemaDDLPragmaJournalMode606c, nil)
+	return sqlitex.ExecuteTransient(db.conn, "PRAGMA journal_mode=WAL", nil)
 }
 
 func (db *DB) enableForeignKeys() error {
-	return executeStatement(db.conn, sharedDDLPragmaForeignKeysde7c, nil)
+	return sqlitex.ExecuteTransient(db.conn, "PRAGMA foreign_keys=ON", nil)
 }
 
 // ---------------------------------------------------------------------------
@@ -267,11 +271,53 @@ func (db *DB) enableForeignKeys() error {
 // ---------------------------------------------------------------------------
 
 func (db *DB) ensureSchema(models []ptypes.ModelEntry) error {
-	ddl := []sealedSQLStatement{schemaDDLCreateStatusesf4f1, schemaDDLCreatePriorities67d7, schemaDDLCreateTaskTypes4c16, schemaDDLCreateEdgeKinds7508, schemaDDLCreateAgentKindsde98, schemaDDLCreateProviders8ba5, schemaDDLCreateRoles0ada, schemaDDLCreatePhases6e89, schemaDDLCreateStagesdffc, schemaDDLCreateMlModelsb48d, schemaDDLCreateAgents8133, schemaDDLCreateAgentsHuman28d6, schemaDDLCreateAgentsMle8b0, schemaDDLCreateAgentsSoftware6c89, schemaDDLCreateTaskscc07, sharedDDLCreateIdxTasksNamespace7486, schemaDDLCreateIdxTasksStatusa4f0, schemaDDLCreateIdxTasksPriority3f16, schemaDDLCreateIdxTasksTypeae99, schemaDDLCreateIdxTasksPhase5aa3, schemaDDLCreateIdxTasksOwner7d8b, schemaDDLCreateEdges25c6, schemaDDLCreateIdxEdgesSource8c95, schemaDDLCreateIdxEdgesTargetd8ae, schemaDDLCreateIdxEdgesKindad6f, schemaDDLCreateActivitiesf3ac, schemaDDLCreateIdxActivitiesAgent206d, schemaDDLCreateIdxActivitiesPhase7b2e, schemaDDLCreateLabels4203, schemaDDLCreateIdxLabelsName2879, schemaDDLCreateComments320c, schemaDDLCreateIdxCommentsTaskbbf3, schemaDDLCreateIdxCommentsAuthor1138}
+	ddl := []string{
+		"CREATE TABLE IF NOT EXISTS statuses (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT",
+		"CREATE TABLE IF NOT EXISTS priorities (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT",
+		"CREATE TABLE IF NOT EXISTS task_types (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT",
+		"CREATE TABLE IF NOT EXISTS edge_kinds (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT",
+		"CREATE TABLE IF NOT EXISTS agent_kinds (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT",
+		"CREATE TABLE IF NOT EXISTS providers (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT",
+		"CREATE TABLE IF NOT EXISTS roles (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT",
+		"CREATE TABLE IF NOT EXISTS phases (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT",
+		"CREATE TABLE IF NOT EXISTS stages (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT",
+		`CREATE TABLE IF NOT EXISTS ml_models (
+			id INTEGER PRIMARY KEY, provider_id INTEGER NOT NULL REFERENCES providers(id), name TEXT NOT NULL,
+			UNIQUE (provider_id, name)) STRICT`,
+		"CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, kind_id INTEGER NOT NULL REFERENCES agent_kinds(id)) STRICT",
+		"CREATE TABLE IF NOT EXISTS agents_human (agent_id TEXT PRIMARY KEY REFERENCES agents(id), name TEXT NOT NULL, contact TEXT NOT NULL DEFAULT '') STRICT, WITHOUT ROWID",
+		"CREATE TABLE IF NOT EXISTS agents_ml (agent_id TEXT PRIMARY KEY REFERENCES agents(id), role_id INTEGER NOT NULL REFERENCES roles(id), model_id INTEGER NOT NULL REFERENCES ml_models(id)) STRICT, WITHOUT ROWID",
+		"CREATE TABLE IF NOT EXISTS agents_software (agent_id TEXT PRIMARY KEY REFERENCES agents(id), name TEXT NOT NULL, version TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT '') STRICT, WITHOUT ROWID",
+		`CREATE TABLE IF NOT EXISTS tasks (
+			id TEXT PRIMARY KEY, namespace TEXT NOT NULL, title TEXT NOT NULL,
+			description TEXT NOT NULL DEFAULT '', status_id INTEGER NOT NULL DEFAULT 0 REFERENCES statuses(id),
+			priority_id INTEGER NOT NULL DEFAULT 2 REFERENCES priorities(id), type_id INTEGER NOT NULL DEFAULT 2 REFERENCES task_types(id),
+			phase_id INTEGER NOT NULL REFERENCES phases(id), owner_id TEXT REFERENCES agents(id), notes TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, closed_at INTEGER, close_reason TEXT NOT NULL DEFAULT '',
+			last_journal_id INTEGER NOT NULL REFERENCES journal(journal_id)) STRICT`,
+		"CREATE INDEX IF NOT EXISTS idx_tasks_namespace ON tasks (namespace)",
+		"CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks (status_id)",
+		"CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks (priority_id)",
+		"CREATE INDEX IF NOT EXISTS idx_tasks_type ON tasks (type_id)",
+		"CREATE INDEX IF NOT EXISTS idx_tasks_phase ON tasks (phase_id)",
+		"CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks (owner_id)",
+		"CREATE TABLE IF NOT EXISTS edges (source_id TEXT NOT NULL REFERENCES tasks(id), target_id TEXT NOT NULL, kind_id INTEGER NOT NULL REFERENCES edge_kinds(id), created_at INTEGER NOT NULL, PRIMARY KEY (source_id, target_id, kind_id)) STRICT, WITHOUT ROWID",
+		"CREATE INDEX IF NOT EXISTS idx_edges_source ON edges (source_id)",
+		"CREATE INDEX IF NOT EXISTS idx_edges_target ON edges (target_id)",
+		"CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges (kind_id)",
+		"CREATE TABLE IF NOT EXISTS activities (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL REFERENCES agents(id), phase_id INTEGER NOT NULL REFERENCES phases(id), stage_id INTEGER NOT NULL REFERENCES stages(id), started_at INTEGER NOT NULL, ended_at INTEGER, notes TEXT NOT NULL DEFAULT '') STRICT",
+		"CREATE INDEX IF NOT EXISTS idx_activities_agent ON activities (agent_id)",
+		"CREATE INDEX IF NOT EXISTS idx_activities_phase ON activities (phase_id)",
+		"CREATE TABLE IF NOT EXISTS labels (task_id TEXT NOT NULL REFERENCES tasks(id), name TEXT NOT NULL, PRIMARY KEY (task_id, name)) STRICT, WITHOUT ROWID",
+		"CREATE INDEX IF NOT EXISTS idx_labels_name ON labels (name)",
+		"CREATE TABLE IF NOT EXISTS comments (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), author_id TEXT NOT NULL REFERENCES agents(id), body TEXT NOT NULL, created_at INTEGER NOT NULL) STRICT",
+		"CREATE INDEX IF NOT EXISTS idx_comments_task ON comments (task_id)",
+		"CREATE INDEX IF NOT EXISTS idx_comments_author ON comments (author_id)",
+	}
 
 	for _, stmt := range ddl {
-		if err := executeStatement(db.conn, stmt, nil); err != nil {
-			return fmt.Errorf("ensureSchema: statement %d: %w", stmt, err)
+		if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
+			return fmt.Errorf("ensureSchema: statement %q: %w", stmt, err)
 		}
 	}
 	if err := db.seedReferenceData(models); err != nil {
@@ -304,7 +350,7 @@ func (db *DB) seedReferenceData(models []ptypes.ModelEntry) error {
 	}
 	for _, seed := range seeds {
 		for id, name := range seed.names {
-			if err := executeStatement(db.conn, seed.kind.statement(), &sqlitex.ExecOptions{Args: []any{id, name}}); err != nil {
+			if err := sqlitex.Execute(db.conn, seed.kind.query(), &sqlitex.ExecOptions{Args: []any{id, name}}); err != nil {
 				return fmt.Errorf("seedReferenceData: kind %d id %d: %w", seed.kind, id, err)
 			}
 		}
@@ -331,26 +377,26 @@ const (
 	seedStages
 )
 
-func (kind referenceSeedKind) statement() sealedSQLStatement {
+func (kind referenceSeedKind) query() string {
 	switch kind {
 	case seedStatuses:
-		return schemaInsertStatusese359
+		return "INSERT OR IGNORE INTO statuses (id,name) VALUES (?1,?2)"
 	case seedPriorities:
-		return schemaInsertPriorities8039
+		return "INSERT OR IGNORE INTO priorities (id,name) VALUES (?1,?2)"
 	case seedTaskTypes:
-		return schemaInsertTaskTypes54b6
+		return "INSERT OR IGNORE INTO task_types (id,name) VALUES (?1,?2)"
 	case seedEdgeKinds:
-		return schemaInsertEdgeKinds6327
+		return "INSERT OR IGNORE INTO edge_kinds (id,name) VALUES (?1,?2)"
 	case seedAgentKinds:
-		return schemaInsertAgentKinds1cc0
+		return "INSERT OR IGNORE INTO agent_kinds (id,name) VALUES (?1,?2)"
 	case seedProviders:
-		return schemaInsertProviders3199
+		return "INSERT OR IGNORE INTO providers (id,name) VALUES (?1,?2)"
 	case seedRoles:
-		return schemaInsertRolese069
+		return "INSERT OR IGNORE INTO roles (id,name) VALUES (?1,?2)"
 	case seedPhases:
-		return schemaInsertPhasesea1e
+		return "INSERT OR IGNORE INTO phases (id,name) VALUES (?1,?2)"
 	case seedStages:
-		return schemaInsertStagesa935
+		return "INSERT OR IGNORE INTO stages (id,name) VALUES (?1,?2)"
 	default:
 		panic("unknown reference seed kind")
 	}
@@ -361,15 +407,12 @@ func (kind referenceSeedKind) statement() sealedSQLStatement {
 // Each model is inserted with parameterized queries to prevent SQL injection.
 func (db *DB) seedMLModels(models []ptypes.ModelEntry) error {
 	var existing int
-	if err := executeStatement(db.conn,
-		schemaSelectMlModels27ce,
-		&sqlitex.ExecOptions{
-			ResultFunc: func(stmt *zs.Stmt) error {
-				existing = stmt.ColumnInt(0)
-				return nil
-			},
+	if err := sqlitex.Execute(db.conn, "SELECT COUNT(*) FROM ml_models", &sqlitex.ExecOptions{
+		ResultFunc: func(stmt *zs.Stmt) error {
+			existing = stmt.ColumnInt(0)
+			return nil
 		},
-	); err != nil {
+	}); err != nil {
 		return fmt.Errorf("seedMLModels: count existing models: %w", err)
 	}
 	if existing >= len(models) {
@@ -380,10 +423,7 @@ func (db *DB) seedMLModels(models []ptypes.ModelEntry) error {
 	endTx := sqlitex.Save(db.conn)
 	defer endTx(&err)
 	for _, m := range models {
-		if err = executeStatement(db.conn,
-			schemaInsertMlModels20ed,
-			&sqlitex.ExecOptions{Args: []any{string(m.Provider), string(m.Name)}},
-		); err != nil {
+		if err = sqlitex.Execute(db.conn, "INSERT OR IGNORE INTO ml_models (provider_id, name) VALUES ((SELECT id FROM providers WHERE name = ?1), ?2)", &sqlitex.ExecOptions{Args: []any{string(m.Provider), string(m.Name)}}); err != nil {
 			return fmt.Errorf("seedMLModels: inserting model (%s, %q): %w",
 				m.Provider.String(), m.Name, err)
 		}

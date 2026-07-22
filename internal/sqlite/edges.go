@@ -13,18 +13,14 @@ import (
 func (db *DB) InsertEdge(sourceID ptypes.TaskID, targetID string, kind ptypes.EdgeKind, now time.Time) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	return executeStatement(db.conn,
-		tasksInsertEdges3b0d,
-		&sqlitex.ExecOptions{Args: []any{sourceID.String(), targetID, int(kind), now.UnixNano()}})
+	return sqlitex.Execute(db.conn, "INSERT OR IGNORE INTO edges (source_id, target_id, kind_id, created_at) VALUES (?1, ?2, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{sourceID.String(), targetID, int(kind), now.UnixNano()}})
 }
 
 // DeleteEdge deletes an edge. Acquires the DB mutex.
 func (db *DB) DeleteEdge(sourceID ptypes.TaskID, targetID string, kind ptypes.EdgeKind) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	return executeStatement(db.conn,
-		tasksDeleteEdges64b4,
-		&sqlitex.ExecOptions{Args: []any{sourceID.String(), targetID, int(kind)}})
+	return sqlitex.Execute(db.conn, "DELETE FROM edges WHERE source_id = ?1 AND target_id = ?2 AND kind_id = ?3", &sqlitex.ExecOptions{Args: []any{sourceID.String(), targetID, int(kind)}})
 }
 
 // GetEdges returns edges originating from sourceID, optionally filtered by kind.
@@ -39,7 +35,7 @@ func (db *DB) GetEdges(sourceID ptypes.TaskID, kind *ptypes.EdgeKind) ([]ptypes.
 	}
 
 	var edges []ptypes.Edge
-	err := executeStatement(db.conn, tasksSelectEdges0685, &sqlitex.ExecOptions{
+	err := sqlitex.Execute(db.conn, "SELECT source_id,target_id,kind_id FROM edges WHERE source_id=?1 AND (NOT ?2 OR kind_id=?3) ORDER BY created_at ASC", &sqlitex.ExecOptions{
 		Args: []any{sourceID.String(), kind != nil, kindValue},
 		ResultFunc: func(stmt *zs.Stmt) error {
 			edges = append(edges, ptypes.Edge{
@@ -63,18 +59,16 @@ func (db *DB) GetBlockedByEdges() ([]ptypes.Edge, error) {
 	defer db.mu.Unlock()
 
 	var edges []ptypes.Edge
-	err := executeStatement(db.conn,
-		tasksSelectEdgesfb60,
-		&sqlitex.ExecOptions{Args: []any{int(ptypes.EdgeBlockedBy)},
-			ResultFunc: func(stmt *zs.Stmt) error {
-				edges = append(edges, ptypes.Edge{
-					SourceID: stmt.ColumnText(0),
-					TargetID: stmt.ColumnText(1),
-					Kind:     ptypes.EdgeBlockedBy,
-				})
-				return nil
-			},
-		})
+	err := sqlitex.Execute(db.conn, "SELECT source_id, target_id, kind_id FROM edges WHERE kind_id = ?1 ORDER BY created_at ASC", &sqlitex.ExecOptions{Args: []any{int(ptypes.EdgeBlockedBy)},
+		ResultFunc: func(stmt *zs.Stmt) error {
+			edges = append(edges, ptypes.Edge{
+				SourceID: stmt.ColumnText(0),
+				TargetID: stmt.ColumnText(1),
+				Kind:     ptypes.EdgeBlockedBy,
+			})
+			return nil
+		},
+	})
 	if err != nil {
 		return nil, fmt.Errorf("sqlite.GetBlockedByEdges: %w", err)
 	}
@@ -88,16 +82,14 @@ func (db *DB) GetDepTree(rootID ptypes.TaskID) ([]ptypes.Edge, error) {
 	defer db.mu.Unlock()
 
 	adj := make(map[string][]string)
-	if err := executeStatement(db.conn,
-		tasksSelectEdges9d03,
-		&sqlitex.ExecOptions{Args: []any{int(ptypes.EdgeBlockedBy)},
-			ResultFunc: func(stmt *zs.Stmt) error {
-				src := stmt.ColumnText(0)
-				tgt := stmt.ColumnText(1)
-				adj[src] = append(adj[src], tgt)
-				return nil
-			},
-		}); err != nil {
+	if err := sqlitex.Execute(db.conn, "SELECT source_id, target_id FROM edges WHERE kind_id = ?1", &sqlitex.ExecOptions{Args: []any{int(ptypes.EdgeBlockedBy)},
+		ResultFunc: func(stmt *zs.Stmt) error {
+			src := stmt.ColumnText(0)
+			tgt := stmt.ColumnText(1)
+			adj[src] = append(adj[src], tgt)
+			return nil
+		},
+	}); err != nil {
 		return nil, fmt.Errorf("sqlite.GetDepTree: %w", err)
 	}
 

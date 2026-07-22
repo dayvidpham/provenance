@@ -14,15 +14,23 @@ import (
 func (db *DB) AdversarialRemoveJournalOperationFK() (err error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if err = executeStatement(db.conn, sharedDDLPragmaForeignKeys1be4, nil); err != nil {
+	if err = sqlitex.ExecuteTransient(db.conn, "PRAGMA foreign_keys=OFF", nil); err != nil {
 		return err
 	}
-	defer func() { _ = executeStatement(db.conn, sharedDDLPragmaForeignKeysde7c, nil) }()
+	defer func() { _ = sqlitex.ExecuteTransient(db.conn, "PRAGMA foreign_keys=ON", nil) }()
 	end := sqlitex.Transaction(db.conn)
 	defer end(&err)
-	steps := []sealedSQLStatement{sharedDDLDropJournalAttributed95ee, adversarialDDLCreateJournalLegacy3d98, adversarialInsertJournalLegacyd55f, sharedDDLDropJournal87b7, adversarialDDLAlterJournalLegacya8de, adversarialDDLCreateIdxJournalKind725e, adversarialDDLCreateIdxJournalActora6ef, adversarialDDLCreateIdxJournalPboj391f, adversarialDDLCreateIdxJournalRecordedAt69e6, sharedDDLCreateJournal4045}
-	for _, step := range steps {
-		if err = executeStatement(db.conn, step, nil); err != nil {
+	if err = sqlitex.ExecuteTransient(db.conn, "DROP VIEW IF EXISTS journal_attributed", nil); err != nil {
+		return fmt.Errorf("remove journal operation FK fixture: drop view: %w", err)
+	}
+	if err = sqlitex.ExecuteTransient(db.conn, "CREATE TABLE journal_legacy (journal_id INTEGER PRIMARY KEY AUTOINCREMENT,kind_id INTEGER NOT NULL REFERENCES journal_kinds(id),actor_id TEXT REFERENCES agents(id),recorded_at INTEGER NOT NULL,produced_by_operation_journal_id INTEGER,CHECK ((actor_id IS NULL) = (produced_by_operation_journal_id IS NOT NULL)),CHECK (kind_id <> 1 OR produced_by_operation_journal_id IS NOT NULL)) STRICT", nil); err != nil {
+		return fmt.Errorf("remove journal operation FK fixture: create legacy table: %w", err)
+	}
+	if err = sqlitex.Execute(db.conn, "INSERT INTO journal_legacy SELECT * FROM journal", nil); err != nil {
+		return fmt.Errorf("remove journal operation FK fixture: copy rows: %w", err)
+	}
+	for _, ddl := range []string{"DROP TABLE journal", "ALTER TABLE journal_legacy RENAME TO journal", "CREATE INDEX idx_journal_kind ON journal(kind_id)", "CREATE INDEX idx_journal_actor ON journal(actor_id)", "CREATE INDEX idx_journal_pboj ON journal(produced_by_operation_journal_id)", "CREATE INDEX idx_journal_recorded_at ON journal(recorded_at,journal_id)", journalAttributedViewDDL} {
+		if err = sqlitex.ExecuteTransient(db.conn, ddl, nil); err != nil {
 			return fmt.Errorf("remove journal operation FK fixture: %w", err)
 		}
 	}
@@ -34,15 +42,22 @@ func (db *DB) AdversarialRemoveJournalOperationFK() (err error) {
 func (db *DB) AdversarialInstallV1OperationConstraint() (err error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if err = executeStatement(db.conn, sharedDDLPragmaForeignKeys1be4, nil); err != nil {
+	if err = sqlitex.ExecuteTransient(db.conn, "PRAGMA foreign_keys=OFF", nil); err != nil {
 		return err
 	}
-	defer func() { _ = executeStatement(db.conn, sharedDDLPragmaForeignKeysde7c, nil) }()
+	defer func() { _ = sqlitex.ExecuteTransient(db.conn, "PRAGMA foreign_keys=ON", nil) }()
 	end := sqlitex.Transaction(db.conn)
 	defer end(&err)
-	steps := []sealedSQLStatement{sharedDDLDropJournalOperationsCanonicalInsertb583, sharedDDLDropJournalOperationsCanonicalUpdate213c, adversarialDDLCreateJournalOperationsV13987, adversarialInsertJournalOperationsV144cf, sharedDDLDropJournalOperations8369, adversarialDDLAlterJournalOperationsV15b33, adversarialDDLCreateJournalOperationsCanonicalInsertbb5e, adversarialDDLCreateOff2d8}
-	for _, step := range steps {
-		if err = executeStatement(db.conn, step, nil); err != nil {
+	for _, ddl := range []string{"DROP TRIGGER IF EXISTS journal_operations_canonical_insert", "DROP TRIGGER IF EXISTS journal_operations_canonical_update", "CREATE TABLE journal_operations_v1 (journal_id INTEGER PRIMARY KEY REFERENCES journal(journal_id),operation_id TEXT NOT NULL UNIQUE,authority_journal_id INTEGER REFERENCES journal_authorities(journal_id),command_digest BLOB NOT NULL,mutation_digest BLOB NOT NULL,mutation_encoding_version TEXT,canonical_mutation BLOB,CHECK ((mutation_encoding_version IS NULL AND canonical_mutation IS NULL) OR (mutation_encoding_version='provenance.mutation.v1' AND length(canonical_mutation)>0))) STRICT"} {
+		if err = sqlitex.ExecuteTransient(db.conn, ddl, nil); err != nil {
+			return fmt.Errorf("install V1 operation constraint fixture: %w", err)
+		}
+	}
+	if err = sqlitex.Execute(db.conn, "INSERT INTO journal_operations_v1 SELECT * FROM journal_operations", nil); err != nil {
+		return fmt.Errorf("install V1 operation constraint fixture: copy rows: %w", err)
+	}
+	for _, ddl := range []string{"DROP TABLE journal_operations", "ALTER TABLE journal_operations_v1 RENAME TO journal_operations", "CREATE TRIGGER journal_operations_canonical_insert BEFORE INSERT ON journal_operations WHEN NEW.mutation_encoding_version IS NOT NULL AND NEW.mutation_encoding_version!='provenance.mutation.v1' BEGIN SELECT RAISE(ABORT,'V1 only'); END", "CREATE TRIGGER journal_operations_canonical_update BEFORE UPDATE OF mutation_encoding_version ON journal_operations WHEN NEW.mutation_encoding_version IS NOT NULL AND NEW.mutation_encoding_version!='provenance.mutation.v1' BEGIN SELECT RAISE(ABORT,'V1 only'); END"} {
+		if err = sqlitex.ExecuteTransient(db.conn, ddl, nil); err != nil {
 			return fmt.Errorf("install V1 operation constraint fixture: %w", err)
 		}
 	}
@@ -70,14 +85,10 @@ func (db *DB) AdversarialJournalRowTwoSubtypes(actor journal.ActorID) (journal.J
 		txErr = err
 		return 0, txErr
 	}
-	if txErr = executeStatement(db.conn,
-		adversarialInsertJournalDecisions7778,
-		&sqlitex.ExecOptions{Args: []any{jid, "pasture.review.vote", "{}"}}); txErr != nil {
+	if txErr = sqlitex.Execute(db.conn, "INSERT INTO journal_decisions (journal_id, decision_kind, task_id, payload) VALUES (?1, ?2, ?4, ?3)", &sqlitex.ExecOptions{Args: []any{jid, "pasture.review.vote", "{}", nil}}); txErr != nil {
 		return 0, txErr
 	}
-	if txErr = executeStatement(db.conn,
-		adversarialInsertJournalEvidenceb639,
-		&sqlitex.ExecOptions{Args: []any{jid, "pasture.git.commit", []byte("x"), "{}"}}); txErr != nil {
+	if txErr = sqlitex.Execute(db.conn, "INSERT INTO journal_evidence (journal_id, evidence_kind, task_id, content_digest, payload) VALUES (?1, ?2, ?5, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{jid, "pasture.git.commit", []byte("x"), "{}", nil}}); txErr != nil {
 		return 0, txErr
 	}
 	return journal.JournalID(jid), nil
@@ -99,10 +110,10 @@ func (db *DB) AdversarialSubordinateRowCarryingActor(actor journal.ActorID, task
 	defer db.mu.Unlock()
 	// Bypass the structural CHECK so the reducer-level placement guard is what
 	// catches the row (the CHECK is exercised on the production write path instead).
-	if err := executeStatement(db.conn, adversarialDDLPragmaIgnoreCheckConstraints8d56, nil); err != nil {
+	if err := sqlitex.ExecuteTransient(db.conn, "PRAGMA ignore_check_constraints=ON", nil); err != nil {
 		return 0, fmt.Errorf("AdversarialSubordinateRowCarryingActor: disable CHECK enforcement: %w", err)
 	}
-	defer func() { _ = executeStatement(db.conn, adversarialDDLPragmaIgnoreCheckConstraintsb381, nil) }()
+	defer func() { _ = sqlitex.ExecuteTransient(db.conn, "PRAGMA ignore_check_constraints=OFF", nil) }()
 
 	var txErr error
 	endTx := sqlitex.Transaction(db.conn)
@@ -115,21 +126,17 @@ func (db *DB) AdversarialSubordinateRowCarryingActor(actor journal.ActorID, task
 		txErr = err
 		return 0, txErr
 	}
-	if txErr = executeStatement(db.conn,
-		adversarialInsertJournalOperationsd00f,
-		&sqlitex.ExecOptions{Args: []any{anchorJID, fmt.Sprintf("adversarial-subord-op-%d", anchorJID), []byte("c"), []byte("m")}}); txErr != nil {
+	if txErr = sqlitex.Execute(db.conn, "INSERT INTO journal_operations (journal_id, operation_id, authority_journal_id, command_digest, mutation_digest)\n\t\t VALUES (?1, ?2, ?5, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{anchorJID, fmt.Sprintf("adversarial-subord-op-%d", anchorJID), []byte("c"), []byte("m"), nil}}); txErr != nil {
 		return 0, txErr
 	}
 	// Subordinate task_event row carrying an actor it must not: PBOJID set AND
 	// actor_id set. insertJournalRowLocked would write NULL, so insert directly.
-	if txErr = executeStatement(db.conn,
-		sharedInsertJournale268,
-		&sqlitex.ExecOptions{Args: []any{int(journal.JournalKindTaskEvent), actor.String(), int64(0), anchorJID}}); txErr != nil {
+	if txErr = sqlitex.Execute(db.conn, "INSERT INTO journal (kind_id, actor_id, recorded_at, produced_by_operation_journal_id) VALUES (?1, ?2, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{int(journal.JournalKindTaskEvent), actor.String(), int64(0), anchorJID}}); txErr != nil {
 		return 0, txErr
 	}
 	subordinateJID := db.conn.LastInsertRowID()
-	if txErr = executeStatement(db.conn,
-		sharedInsertJournalTaskEventsf716,
+	if txErr = sqlitex.Execute(db.conn,
+		insertJournalTaskEventSQL,
 		&sqlitex.ExecOptions{Args: []any{subordinateJID, task.String(), string(journal.EventKindTaskUpdated), "{}"}}); txErr != nil {
 		return 0, txErr
 	}
@@ -150,14 +157,10 @@ func (db *DB) AdversarialSubtypeMismatchingKind(actor journal.ActorID) (journal.
 		txErr = err
 		return 0, txErr
 	}
-	if txErr = executeStatement(db.conn,
-		adversarialInsertJournalDecisions7778,
-		&sqlitex.ExecOptions{Args: []any{jid, "pasture.review.vote", "{}"}}); txErr != nil {
+	if txErr = sqlitex.Execute(db.conn, "INSERT INTO journal_decisions (journal_id, decision_kind, task_id, payload) VALUES (?1, ?2, ?4, ?3)", &sqlitex.ExecOptions{Args: []any{jid, "pasture.review.vote", "{}", nil}}); txErr != nil {
 		return 0, txErr
 	}
-	if txErr = executeStatement(db.conn,
-		adversarialInsertJournalOperationsd00f,
-		&sqlitex.ExecOptions{Args: []any{jid, fmt.Sprintf("adversarial-op-%d", jid), []byte("c"), []byte("m")}}); txErr != nil {
+	if txErr = sqlitex.Execute(db.conn, "INSERT INTO journal_operations (journal_id, operation_id, authority_journal_id, command_digest, mutation_digest)\n\t\t VALUES (?1, ?2, ?5, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{jid, fmt.Sprintf("adversarial-op-%d", jid), []byte("c"), []byte("m"), nil}}); txErr != nil {
 		return 0, txErr
 	}
 	return journal.JournalID(jid), nil
@@ -178,26 +181,20 @@ func (db *DB) AdversarialAuthorityDetailMismatch(actor journal.ActorID, task jou
 		txErr = err
 		return 0, txErr
 	}
-	if txErr = executeStatement(db.conn,
-		sharedInsertJournalAuthoritiesd41a,
+	if txErr = sqlitex.Execute(db.conn,
+		insertJournalAuthoritySQL,
 		&sqlitex.ExecOptions{Args: []any{jid, authKindBootstrapID, fmt.Sprintf("adversarial-auth-%d", jid)}}); txErr != nil {
 		return 0, txErr
 	}
-	if txErr = executeStatement(db.conn,
-		sharedInsertJournalAuthorityBootstrapsab65,
-		&sqlitex.ExecOptions{Args: []any{jid, "adversarial"}}); txErr != nil {
+	if txErr = sqlitex.Execute(db.conn, "INSERT INTO journal_authority_bootstraps (journal_id, label) VALUES (?1, ?2)", &sqlitex.ExecOptions{Args: []any{jid, "adversarial"}}); txErr != nil {
 		return 0, txErr
 	}
 	assignment := fmt.Sprintf("adversarial-episode-%d", jid)
-	if txErr = executeStatement(db.conn,
-		adversarialInsertJournalAuthorityAssignmentEpisodesd5d6,
-		&sqlitex.ExecOptions{Args: []any{assignment, task.String(), slotOwnerResponsibilityID, actor.String()}}); txErr != nil {
+	if txErr = sqlitex.Execute(db.conn, "INSERT INTO journal_authority_assignment_episodes (assignment_id, task_id, slot_id, actor_id, predecessor_assignment_id)\n\t\t VALUES (?1, ?2, ?3, ?4, ?5)", &sqlitex.ExecOptions{Args: []any{assignment, task.String(), slotOwnerResponsibilityID, actor.String(), nil}}); txErr != nil {
 		return 0, txErr
 	}
 	// The transition points at the bootstrap authority above — the mismatch.
-	if txErr = executeStatement(db.conn,
-		sharedInsertJournalAuthorityAssignmentTransitions6b1d,
-		&sqlitex.ExecOptions{Args: []any{jid, assignment, transitionStartedID}}); txErr != nil {
+	if txErr = sqlitex.Execute(db.conn, "INSERT INTO journal_authority_assignment_transitions (journal_id, assignment_id, transition_id) VALUES (?1, ?2, ?3)", &sqlitex.ExecOptions{Args: []any{jid, assignment, transitionStartedID}}); txErr != nil {
 		return 0, txErr
 	}
 	return journal.JournalID(jid), nil
@@ -258,11 +255,13 @@ type AdversarialColumnAddition uint8
 
 const AdversarialAddUnreviewedTaskEventColumn AdversarialColumnAddition = 1
 
-func (addition AdversarialColumnAddition) statement() sealedSQLStatement {
-	if addition != AdversarialAddUnreviewedTaskEventColumn {
+func (addition AdversarialColumnAddition) query() string {
+	switch addition {
+	case AdversarialAddUnreviewedTaskEventColumn:
+		return "ALTER TABLE journal_task_events ADD COLUMN unreviewed TEXT"
+	default:
 		panic("unknown adversarial column addition")
 	}
-	return adversarialDDLAlterJournalTaskEvents4d3f
 }
 
 func (db *DB) AdversarialAddColumn(addition AdversarialColumnAddition) error {
@@ -270,7 +269,7 @@ func (db *DB) AdversarialAddColumn(addition AdversarialColumnAddition) error {
 	defer db.mu.Unlock()
 	// DDL identifiers cannot be bound as parameters; table/column come from the
 	// closed corpus, never caller input, so identifier interpolation is safe here.
-	if err := executeStatement(db.conn, addition.statement(), nil); err != nil {
+	if err := sqlitex.ExecuteTransient(db.conn, addition.query(), nil); err != nil {
 		return fmt.Errorf("AdversarialAddColumn: %w", err)
 	}
 	return nil
@@ -283,18 +282,20 @@ type AdversarialColumnDrop uint8
 
 const AdversarialDropTaskEventPayload AdversarialColumnDrop = 1
 
-func (drop AdversarialColumnDrop) statement() sealedSQLStatement {
-	if drop != AdversarialDropTaskEventPayload {
+func (drop AdversarialColumnDrop) query() string {
+	switch drop {
+	case AdversarialDropTaskEventPayload:
+		return "ALTER TABLE journal_task_events DROP COLUMN payload"
+	default:
 		panic("unknown adversarial column drop")
 	}
-	return adversarialDDLAlterJournalTaskEvents8346
 }
 
 func (db *DB) AdversarialDropColumn(drop AdversarialColumnDrop) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	// DDL identifiers cannot be bound; table/column come from the closed corpus.
-	if err := executeStatement(db.conn, drop.statement(), nil); err != nil {
+	if err := sqlitex.ExecuteTransient(db.conn, drop.query(), nil); err != nil {
 		return fmt.Errorf("AdversarialDropColumn: %w", err)
 	}
 	return nil
@@ -309,22 +310,24 @@ type AdversarialTableDrop uint8
 
 const AdversarialDropJournalTable AdversarialTableDrop = 1
 
-func (drop AdversarialTableDrop) statement() sealedSQLStatement {
-	if drop != AdversarialDropJournalTable {
+func (drop AdversarialTableDrop) query() string {
+	switch drop {
+	case AdversarialDropJournalTable:
+		return "DROP TABLE journal"
+	default:
 		panic("unknown adversarial table drop")
 	}
-	return sharedDDLDropJournal87b7
 }
 
 func (db *DB) AdversarialDropTable(drop AdversarialTableDrop) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if err := executeStatement(db.conn, sharedDDLPragmaForeignKeys1be4, nil); err != nil {
+	if err := sqlitex.ExecuteTransient(db.conn, "PRAGMA foreign_keys=OFF", nil); err != nil {
 		return fmt.Errorf("AdversarialDropTable: disable FK: %w", err)
 	}
-	defer func() { _ = executeStatement(db.conn, sharedDDLPragmaForeignKeysde7c, nil) }()
+	defer func() { _ = sqlitex.ExecuteTransient(db.conn, "PRAGMA foreign_keys=ON", nil) }()
 	// DDL identifier cannot be bound; table comes from the closed corpus.
-	if err := executeStatement(db.conn, drop.statement(), nil); err != nil {
+	if err := sqlitex.ExecuteTransient(db.conn, drop.query(), nil); err != nil {
 		return fmt.Errorf("AdversarialDropTable: %w", err)
 	}
 	return nil
@@ -380,11 +383,13 @@ type AdversarialTableAddition uint8
 
 const AdversarialAddUnreviewedJournalTable AdversarialTableAddition = 1
 
-func (addition AdversarialTableAddition) statement() sealedSQLStatement {
-	if addition != AdversarialAddUnreviewedJournalTable {
+func (addition AdversarialTableAddition) query() string {
+	switch addition {
+	case AdversarialAddUnreviewedJournalTable:
+		return "CREATE TABLE journal_unreviewed (journal_id INTEGER PRIMARY KEY) STRICT"
+	default:
 		panic("unknown adversarial table addition")
 	}
-	return adversarialDDLCreateJournalUnreviewed8b03
 }
 
 func (db *DB) AdversarialAddTable(addition AdversarialTableAddition) error {
@@ -392,7 +397,7 @@ func (db *DB) AdversarialAddTable(addition AdversarialTableAddition) error {
 	defer db.mu.Unlock()
 	// DDL identifier cannot be bound as a parameter; table comes from the closed
 	// corpus, never caller input, so identifier interpolation is safe here.
-	if err := executeStatement(db.conn, addition.statement(), nil); err != nil {
+	if err := sqlitex.ExecuteTransient(db.conn, addition.query(), nil); err != nil {
 		return fmt.Errorf("AdversarialAddTable: %w", err)
 	}
 	return nil
@@ -425,21 +430,21 @@ func (db *DB) AdversarialCorruptTaskProjection(task journal.TaskID, field Advers
 	default:
 		return fmt.Errorf("AdversarialCorruptTaskProjection: unknown projection field %q (closed set: owner_id/status_id/last_journal_id)", field)
 	}
-	if err := executeStatement(db.conn, field.statement(),
+	if err := sqlitex.Execute(db.conn, field.query(),
 		&sqlitex.ExecOptions{Args: []any{value, task.String()}}); err != nil {
 		return fmt.Errorf("AdversarialCorruptTaskProjection %q field %d: %w", task, field, err)
 	}
 	return nil
 }
 
-func (field AdversarialProjectionField) statement() sealedSQLStatement {
+func (field AdversarialProjectionField) query() string {
 	switch field {
 	case AdversarialFieldOwner:
-		return adversarialUpdateTasksc047
+		return "UPDATE tasks SET owner_id=?1 WHERE id=?2"
 	case AdversarialFieldStatus:
-		return adversarialUpdateTasks9d9f
+		return "UPDATE tasks SET status_id=?1 WHERE id=?2"
 	case AdversarialFieldWatermark:
-		return adversarialUpdateTasks4c22
+		return "UPDATE tasks SET last_journal_id=?1 WHERE id=?2"
 	default:
 		panic("unknown adversarial projection field")
 	}
@@ -456,9 +461,7 @@ func (field AdversarialProjectionField) statement() sealedSQLStatement {
 func (db *DB) AdversarialCorruptCommentBody(commentID, body string) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if err := executeStatement(db.conn,
-		adversarialUpdateComments6627,
-		&sqlitex.ExecOptions{Args: []any{body, commentID}}); err != nil {
+	if err := sqlitex.Execute(db.conn, "UPDATE comments SET body = ?1 WHERE id = ?2", &sqlitex.ExecOptions{Args: []any{body, commentID}}); err != nil {
 		return fmt.Errorf("AdversarialCorruptCommentBody %q: %w", commentID, err)
 	}
 	return nil
@@ -470,9 +473,7 @@ func (db *DB) AdversarialCorruptCommentBody(commentID, body string) error {
 func (db *DB) AdversarialInsertSpuriousAttribution(task journal.TaskID, actor journal.ActorID, jid journal.JournalID) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if err := executeStatement(db.conn,
-		adversarialInsertTaskAttributions0464,
-		&sqlitex.ExecOptions{Args: []any{task.String(), actor.String(), int64(jid)}}); err != nil {
+	if err := sqlitex.Execute(db.conn, "INSERT OR REPLACE INTO task_attributions (task_id, actor_id, first_journal_id) VALUES (?1, ?2, ?3)", &sqlitex.ExecOptions{Args: []any{task.String(), actor.String(), int64(jid)}}); err != nil {
 		return fmt.Errorf("AdversarialInsertSpuriousAttribution %q/%q: %w", task, actor, err)
 	}
 	return nil
@@ -524,9 +525,7 @@ func (db *DB) AdversarialCyclicParentChain(actor journal.ActorID, taskX, taskY, 
 	}
 	// Close the cycle: X.parent = Y. A production start effect can never write this
 	// (its cycle guard rejects it); the direct UPDATE is the corruption under test.
-	if txErr = executeStatement(db.conn,
-		adversarialUpdateJournalAuthorityAssignmentEpisodesf918,
-		&sqlitex.ExecOptions{Args: []any{"cyclic-parent-Y", "cyclic-parent-X"}}); txErr != nil {
+	if txErr = sqlitex.Execute(db.conn, "UPDATE journal_authority_assignment_episodes SET parent_assignment_id = ?1 WHERE assignment_id = ?2", &sqlitex.ExecOptions{Args: []any{"cyclic-parent-Y", "cyclic-parent-X"}}); txErr != nil {
 		return 0, journal.TaskID{}, 0, txErr
 	}
 	var jz int64
@@ -534,7 +533,7 @@ func (db *DB) AdversarialCyclicParentChain(actor journal.ActorID, taskX, taskY, 
 		return 0, journal.TaskID{}, 0, txErr
 	}
 	var maxJID int64
-	if txErr = executeStatement(db.conn, sharedSelectJournalde83,
+	if txErr = sqlitex.Execute(db.conn, "SELECT COALESCE(MAX(journal_id), ?1) FROM journal",
 		&sqlitex.ExecOptions{Args: []any{0}, ResultFunc: func(stmt *zs.Stmt) error { maxJID = stmt.ColumnInt64(0); return nil }}); txErr != nil {
 		return 0, journal.TaskID{}, 0, txErr
 	}
@@ -551,9 +550,7 @@ func (db *DB) seedActiveEpisodeLocked(actor journal.ActorID, task journal.TaskID
 	if err != nil {
 		return 0, err
 	}
-	if err := executeStatement(db.conn,
-		adversarialInsertJournalAuthorityAssignmentEpisodes2c6e,
-		&sqlitex.ExecOptions{Args: []any{string(assignment), task.String(), slotOwnerResponsibilityID, actor.String(), parent}}); err != nil {
+	if err := sqlitex.Execute(db.conn, "INSERT INTO journal_authority_assignment_episodes (assignment_id, task_id, slot_id, actor_id, predecessor_assignment_id, parent_assignment_id)\n\t\t VALUES (?1, ?2, ?3, ?4, ?6, ?5)", &sqlitex.ExecOptions{Args: []any{string(assignment), task.String(), slotOwnerResponsibilityID, actor.String(), parent, nil}}); err != nil {
 		return 0, fmt.Errorf("seed episode %q: %w", assignment, err)
 	}
 	if err := db.insertAuthorityAssignmentTransitionLocked(jid, assignment, transitionStartedID); err != nil {
