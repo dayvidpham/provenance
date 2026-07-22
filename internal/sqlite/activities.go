@@ -25,14 +25,11 @@ func (db *DB) StartActivity(agentID ptypes.AgentID, phase ptypes.Phase, stage pt
 
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO activities (id, agent_id, phase_id, stage_id, started_at, ended_at, notes)
-		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
-		&sqlitex.ExecOptions{Args: []any{
-			activity.ID.String(), activity.AgentID.String(),
-			int(activity.Phase), int(activity.Stage),
-			activity.StartedAt.UnixNano(), nil, activity.Notes,
-		}}); err != nil {
+	if err := sqlitex.Execute(db.conn, "INSERT INTO activities (id, agent_id, phase_id, stage_id, started_at, ended_at, notes)\n\t\t VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", &sqlitex.ExecOptions{Args: []any{
+		activity.ID.String(), activity.AgentID.String(),
+		int(activity.Phase), int(activity.Stage),
+		activity.StartedAt.UnixNano(), nil, activity.Notes,
+	}}); err != nil {
 		return ptypes.Activity{}, fmt.Errorf(
 			"sqlite.StartActivity: failed to insert activity for agent %q: %w — "+
 				"ensure the agent is registered before starting an activity",
@@ -55,15 +52,11 @@ func (db *DB) StartActivityWithID(id ptypes.ActivityID, agentID ptypes.AgentID, 
 
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO activities (id, agent_id, phase_id, stage_id, started_at, ended_at, notes)
-		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-		 ON CONFLICT(id) DO NOTHING`,
-		&sqlitex.ExecOptions{Args: []any{
-			id.String(), agentID.String(),
-			int(phase), int(stage),
-			now.UnixNano(), nil, notes,
-		}}); err != nil {
+	if err := sqlitex.Execute(db.conn, "INSERT INTO activities (id, agent_id, phase_id, stage_id, started_at, ended_at, notes)\n\t\t VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)\n\t\t ON CONFLICT(id) DO NOTHING", &sqlitex.ExecOptions{Args: []any{
+		id.String(), agentID.String(),
+		int(phase), int(stage),
+		now.UnixNano(), nil, notes,
+	}}); err != nil {
 		return ptypes.Activity{}, fmt.Errorf(
 			"sqlite.StartActivityWithID: failed to insert activity %q for agent %q: %w — "+
 				"ensure the agent is registered before starting an activity",
@@ -75,21 +68,18 @@ func (db *DB) StartActivityWithID(id ptypes.ActivityID, agentID ptypes.AgentID, 
 	// on conflict (idempotent replay).
 	var act ptypes.Activity
 	var found bool
-	if err := sqlitex.Execute(db.conn,
-		`SELECT id, agent_id, phase_id, stage_id, started_at, ended_at, notes
-		 FROM activities WHERE id = ?1`,
-		&sqlitex.ExecOptions{
-			Args: []any{id.String()},
-			ResultFunc: func(stmt *zs.Stmt) error {
-				var err error
-				act, err = ScanActivity(stmt)
-				if err != nil {
-					return err
-				}
-				found = true
-				return nil
-			},
-		}); err != nil {
+	if err := sqlitex.Execute(db.conn, "SELECT id, agent_id, phase_id, stage_id, started_at, ended_at, notes\n\t\t FROM activities WHERE id = ?1", &sqlitex.ExecOptions{
+		Args: []any{id.String()},
+		ResultFunc: func(stmt *zs.Stmt) error {
+			var err error
+			act, err = ScanActivity(stmt)
+			if err != nil {
+				return err
+			}
+			found = true
+			return nil
+		},
+	}); err != nil {
 		return ptypes.Activity{}, fmt.Errorf("sqlite.StartActivityWithID: re-fetch: %w", err)
 	}
 	if !found {
@@ -106,29 +96,24 @@ func (db *DB) EndActivity(id ptypes.ActivityID) (ptypes.Activity, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	if err := sqlitex.Execute(db.conn,
-		`UPDATE activities SET ended_at = ?2 WHERE id = ?1`,
-		&sqlitex.ExecOptions{Args: []any{id.String(), endTime.UnixNano()}}); err != nil {
+	if err := sqlitex.Execute(db.conn, "UPDATE activities SET ended_at = ?2 WHERE id = ?1", &sqlitex.ExecOptions{Args: []any{id.String(), endTime.UnixNano()}}); err != nil {
 		return ptypes.Activity{}, fmt.Errorf("sqlite.EndActivity: %w", err)
 	}
 
 	var act ptypes.Activity
 	var found bool
-	if err := sqlitex.Execute(db.conn,
-		`SELECT id, agent_id, phase_id, stage_id, started_at, ended_at, notes
-		 FROM activities WHERE id = ?1`,
-		&sqlitex.ExecOptions{
-			Args: []any{id.String()},
-			ResultFunc: func(stmt *zs.Stmt) error {
-				var err error
-				act, err = ScanActivity(stmt)
-				if err != nil {
-					return err
-				}
-				found = true
-				return nil
-			},
-		}); err != nil {
+	if err := sqlitex.Execute(db.conn, "SELECT id, agent_id, phase_id, stage_id, started_at, ended_at, notes\n\t\t FROM activities WHERE id = ?1", &sqlitex.ExecOptions{
+		Args: []any{id.String()},
+		ResultFunc: func(stmt *zs.Stmt) error {
+			var err error
+			act, err = ScanActivity(stmt)
+			if err != nil {
+				return err
+			}
+			found = true
+			return nil
+		},
+	}); err != nil {
 		return ptypes.Activity{}, fmt.Errorf("sqlite.EndActivity: re-fetch: %w", err)
 	}
 	if !found {
@@ -147,17 +132,14 @@ func (db *DB) GetActivities(agentID *ptypes.AgentID) ([]ptypes.Activity, error) 
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	query := `SELECT id, agent_id, phase_id, stage_id, started_at, ended_at, notes FROM activities`
-	var args []any
+	var agent any
 	if agentID != nil {
-		query += ` WHERE agent_id = ?1`
-		args = append(args, agentID.String())
+		agent = agentID.String()
 	}
-	query += ` ORDER BY started_at ASC`
 
 	var activities []ptypes.Activity
-	err := sqlitex.Execute(db.conn, query, &sqlitex.ExecOptions{
-		Args: args,
+	err := sqlitex.Execute(db.conn, "SELECT id,agent_id,phase_id,stage_id,started_at,ended_at,notes FROM activities WHERE (NOT ?1 OR agent_id=?2) ORDER BY started_at ASC", &sqlitex.ExecOptions{
+		Args: []any{agentID != nil, agent},
 		ResultFunc: func(stmt *zs.Stmt) error {
 			act, err := ScanActivity(stmt)
 			if err != nil {

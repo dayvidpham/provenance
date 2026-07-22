@@ -1054,7 +1054,7 @@ func TestCanonicalSQLConstraintsAreVersionAgnostic(t *testing.T) {
 	defer db.Unlock()
 	if err := sqlitex.Execute(db.Conn(), `SELECT sql FROM sqlite_master WHERE name IN ('journal_operations','journal_operations_canonical_insert','journal_operations_canonical_update')`, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error {
 		sql := stmt.ColumnText(0)
-		if strings.Contains(sql, MutationEncodingV1) {
+		if strings.Contains(sql, MutationEncodingV1.String()) {
 			t.Fatalf("SQLite schema embeds codec version: %s", sql)
 		}
 		if !strings.Contains(sql, "mutation_encoding_version") || !strings.Contains(sql, "canonical_mutation") {
@@ -1104,7 +1104,7 @@ func assertNoCodecVersionInSQLiteSchema(t *testing.T, tr Tracker) {
 	db.Lock()
 	defer db.Unlock()
 	if err := sqlitex.Execute(db.Conn(), `SELECT sql FROM sqlite_master WHERE name IN ('journal_operations','journal_operations_canonical_insert','journal_operations_canonical_update')`, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error {
-		if sql := stmt.ColumnText(0); strings.Contains(sql, MutationEncodingV1) {
+		if sql := stmt.ColumnText(0); strings.Contains(sql, MutationEncodingV1.String()) {
 			t.Fatalf("SQLite schema embeds codec version: %s", sql)
 		}
 		return nil

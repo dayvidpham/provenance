@@ -17,10 +17,9 @@ type Tracker interface {
 	// As binds a committing actor and a governing authority (a bootstrap or
 	// assignment authority's JournalID, obtained from a genesis operation or a
 	// started assignment episode) and returns a Session: the mutation SDK over the
-	// journal. The Session's task-lifecycle verbs (Create/Update/CloseTask) are
-	// journaled single-operation wrappers over Apply; its relationship/annotation
-	// verbs (AddEdge/RemoveEdge/AddLabel/RemoveLabel/AddComment) are un-journaled
-	// direct domain writes (docs/journal-relational-contract.md §6). See Session.
+	// journal. Every Session mutation is a journaled operation: task lifecycle,
+	// relationship, and annotation verbs all commit typed effects through Apply
+	// (docs/journal-relational-contract.md §6 and §9). See Session.
 	As(actor ActorID, authority JournalID) *Session
 
 	// ---------------------------------------------------------------------------
@@ -44,7 +43,7 @@ type Tracker interface {
 	// ---------------------------------------------------------------------------
 	//
 	// Edge MUTATIONS (AddEdge/RemoveEdge) live on the Session SDK (Tracker.As) as
-	// un-journaled §6 relationship writes; Edges reads are on Tracker.
+	// journaled §6 relationship writes; Edges reads are on Tracker.
 
 	// Edges returns all edges originating from id.
 	// If kind is non-nil, only edges of that kind are returned.
@@ -82,7 +81,7 @@ type Tracker interface {
 	// ---------------------------------------------------------------------------
 	//
 	// Label MUTATIONS (AddLabel/RemoveLabel) live on the Session SDK (Tracker.As)
-	// as un-journaled §6 annotation writes; Labels reads are on Tracker.
+	// as journaled §6 annotation writes; Labels reads are on Tracker.
 
 	// Labels returns all labels attached to a task.
 	Labels(id TaskID) ([]string, error)
@@ -91,8 +90,8 @@ type Tracker interface {
 	// Comments
 	// ---------------------------------------------------------------------------
 	//
-	// Comment MUTATION (AddComment) lives on the Session SDK (Tracker.As) as an
-	// un-journaled §6 annotation write; Comments reads are on Tracker.
+	// Comment MUTATION (AddComment) lives on the Session SDK (Tracker.As) as a
+	// journaled §6 annotation write; Comments reads are on Tracker.
 
 	// Comments returns all comments on a task in chronological order.
 	Comments(id TaskID) ([]Comment, error)

@@ -51,6 +51,7 @@ type (
 	OperationConflict       = journal.OperationConflict
 	CanonicalMutation       = journal.CanonicalMutation
 	CanonicalMutationError  = journal.CanonicalMutationError
+	MutationEncodingVersion = journal.MutationEncodingVersion
 
 	// Shared-reducer replay, migration, and preflight surface (§9, §13, §15).
 	TaskStatus                    = journal.TaskStatus

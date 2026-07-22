@@ -44,6 +44,8 @@ Exercises the full stack: bestiary catalog exploration, multi-provider agent reg
 - [CONCEPTS.md](CONCEPTS.md) -- domain model, PROV-O/PROV-DM alignment, edge semantics, all type definitions
 - [CONTRIBUTING.md](CONTRIBUTING.md) -- development workflow, testing, commit conventions
 - [CLAUDE.md](CLAUDE.md) -- coding standards, directory structure, quality gates
+- [docs/architecture.md](docs/architecture.md) -- components, package boundaries, journal and SQLite design, graph model, and DBOS durability
+- [docs/test-performance.md](docs/test-performance.md) -- measured test costs and safe optimization experiments
 
 ## Development
 

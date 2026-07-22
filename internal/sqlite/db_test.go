@@ -13,6 +13,8 @@ import (
 	"github.com/dayvidpham/provenance/pkg/ptypes"
 	"github.com/google/uuid"
 	"gopkg.in/yaml.v3"
+	zs "zombiezen.com/go/sqlite"
+	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 // openTestDB delegates to shared testutil.OpenTestDB.
@@ -110,6 +112,22 @@ func TestOpenAndClose(t *testing.T) {
 	}
 }
 
+func TestOpenRestoresRuntimeForeignKeyEnforcement(t *testing.T) {
+	db := openTestDB(t)
+	db.Lock()
+	defer db.Unlock()
+	enabled := 0
+	if err := sqlitex.Execute(db.Conn(), "PRAGMA foreign_keys", &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
+		enabled = stmt.ColumnInt(0)
+		return nil
+	}}); err != nil {
+		t.Fatalf("read runtime foreign-key state: %v", err)
+	}
+	if enabled != 1 {
+		t.Fatalf("runtime foreign-key enforcement = %d after Open, want 1", enabled)
+	}
+}
+
 func TestSchemaTablesExist(t *testing.T) {
 	db := openTestDB(t)
 
@@ -190,8 +208,8 @@ func TestFoldUpdateMaterializesMetadata(t *testing.T) {
 	id := journalCreate(t, db, actor, boot, "ns", "Original Title", "original description",
 		ptypes.TaskTypeTask, ptypes.PriorityMedium, ptypes.PhaseUnscoped)
 
-	newTitle := "Updated Title"
-	newNotes := "Updated notes"
+	newTitle := "Updated 'Title'; -- not SQL\x00control"
+	newNotes := "notes /* remain data */ \"quoted\""
 	journalApply(t, db, actor, boot, "op-update--"+id.String(), []journal.Effect{{
 		Sort:        journal.EffectTaskEvent,
 		TaskID:      id,
@@ -204,11 +222,11 @@ func TestFoldUpdateMaterializesMetadata(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("GetTask(found=%v): %v", found, err)
 	}
-	if got.Title != "Updated Title" {
-		t.Errorf("Title = %q, want %q", got.Title, "Updated Title")
+	if got.Title != newTitle {
+		t.Errorf("Title = %q, want %q", got.Title, newTitle)
 	}
-	if got.Notes != "Updated notes" {
-		t.Errorf("Notes = %q, want %q", got.Notes, "Updated notes")
+	if got.Notes != newNotes {
+		t.Errorf("Notes = %q, want %q", got.Notes, newNotes)
 	}
 	// status is a reducer-exclusive projection: a metadata update never touches it.
 	if got.Status != ptypes.StatusOpen {
@@ -856,6 +874,63 @@ func TestListTasksWithLabelFilter(t *testing.T) {
 	}
 	if tasks[0].Title != "Labeled" {
 		t.Errorf("Title = %q, want %q", tasks[0].Title, "Labeled")
+	}
+}
+
+func TestBoundQueryValuesRemainOpaqueAcrossTaskActivityAndEdgeReads(t *testing.T) {
+	hostileValues := []string{"' OR 1=1 --", "x' /* comment */ OR '1'='1", "nul\x00suffix"}
+	for _, hostile := range hostileValues {
+		t.Run(fmt.Sprintf("%q", hostile), func(t *testing.T) {
+			db := openTestDB(t)
+			matching := makeTask(hostile, "matching")
+			other := makeTask("safe", "other")
+			for _, task := range []ptypes.Task{matching, other} {
+				if err := db.SeedLegacyTaskRow(task); err != nil {
+					t.Fatalf("seed task: %v", err)
+				}
+			}
+			if err := db.AddLabel(matching.ID, hostile); err != nil {
+				t.Fatalf("add hostile label: %v", err)
+			}
+			byNamespace, err := db.ListTasks(ptypes.ListFilter{Namespace: hostile})
+			if err != nil || len(byNamespace) != 1 || byNamespace[0].ID != matching.ID {
+				t.Fatalf("namespace filter escaped binding: tasks=%v err=%v", byNamespace, err)
+			}
+			byLabel, err := db.ListTasks(ptypes.ListFilter{Label: hostile})
+			if err != nil || len(byLabel) != 1 || byLabel[0].ID != matching.ID {
+				t.Fatalf("label filter escaped binding: tasks=%v err=%v", byLabel, err)
+			}
+
+			agent, err := db.RegisterHumanAgent(hostile, "reader", hostile)
+			if err != nil {
+				t.Fatalf("register hostile agent: %v", err)
+			}
+			if _, err := db.StartActivity(agent.ID, ptypes.PhaseRequest, ptypes.StageInProgress, hostile); err != nil {
+				t.Fatalf("start hostile activity: %v", err)
+			}
+			activities, err := db.GetActivities(&agent.ID)
+			if err != nil || len(activities) != 1 || activities[0].AgentID != agent.ID {
+				t.Fatalf("activity filter escaped binding: activities=%v err=%v", activities, err)
+			}
+
+			if err := db.InsertEdge(matching.ID, other.ID.String(), ptypes.EdgeBlockedBy, time.Now().UTC()); err != nil {
+				t.Fatalf("insert hostile edge: %v", err)
+			}
+			kind := ptypes.EdgeBlockedBy
+			edges, err := db.GetEdges(matching.ID, &kind)
+			if err != nil || len(edges) != 1 || edges[0].TargetID != other.ID.String() {
+				t.Fatalf("edge filter escaped binding: edges=%v err=%v", edges, err)
+			}
+
+			ready, err := db.ReadyTasks()
+			if err != nil || len(ready) != 1 || ready[0].ID != other.ID {
+				t.Fatalf("ready query mishandled hostile persisted values: tasks=%v err=%v", ready, err)
+			}
+			blocked, err := db.BlockedTasks()
+			if err != nil || len(blocked) != 1 || blocked[0].ID != matching.ID {
+				t.Fatalf("blocked query mishandled hostile persisted values: tasks=%v err=%v", blocked, err)
+			}
+		})
 	}
 }
 

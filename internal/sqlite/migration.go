@@ -126,17 +126,13 @@ func isLegacyOperationsColumnSet(actual map[string]struct{}) bool {
 // promises alongside the extra-column direction (§13, checkColumns).
 func (db *DB) preflightNoUnexpectedSpineTableLocked() error {
 	var unexpected string
-	if err := sqlitex.Execute(db.conn,
-		`SELECT name FROM sqlite_master WHERE type='table'
-		   AND (name = 'journal' OR name LIKE 'journal\_%' ESCAPE '\')
-		 ORDER BY name ASC`,
-		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
-			name := stmt.ColumnText(0)
-			if _, ok := recognizedJournalSpineTables[name]; !ok && unexpected == "" {
-				unexpected = name
-			}
-			return nil
-		}}); err != nil {
+	if err := sqlitex.Execute(db.conn, "SELECT name FROM sqlite_master WHERE type=?1\n\t\t   AND (name = ?2 OR name LIKE ?3 ESCAPE ?4)\n\t\t ORDER BY name ASC", &sqlitex.ExecOptions{Args: []any{"table", "journal", `journal\_%`, `\`}, ResultFunc: func(stmt *zs.Stmt) error {
+		name := stmt.ColumnText(0)
+		if _, ok := recognizedJournalSpineTables[name]; !ok && unexpected == "" {
+			unexpected = name
+		}
+		return nil
+	}}); err != nil {
 		return fmt.Errorf("preflight: enumerate journal-spine tables: %w", err)
 	}
 	if unexpected != "" {
@@ -191,8 +187,8 @@ func checkColumns(want expectedTable, actual map[string]struct{}) error {
 func (db *DB) tableExistsLocked(table string) (bool, error) {
 	present := false
 	if err := sqlitex.Execute(db.conn,
-		`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1`,
-		&sqlitex.ExecOptions{Args: []any{table}, ResultFunc: func(*zs.Stmt) error { present = true; return nil }}); err != nil {
+		"SELECT ?3 FROM sqlite_master WHERE type=?1 AND name=?2",
+		&sqlitex.ExecOptions{Args: []any{"table", table, 1}, ResultFunc: func(*zs.Stmt) error { present = true; return nil }}); err != nil {
 		return false, fmt.Errorf("preflight: probe table %q: %w", table, err)
 	}
 	return present, nil
@@ -200,14 +196,10 @@ func (db *DB) tableExistsLocked(table string) (bool, error) {
 
 func (db *DB) tableColumnsLocked(table string) (map[string]struct{}, error) {
 	cols := map[string]struct{}{}
-	// PRAGMA table_info cannot be parameterized; the table name comes from the
-	// closed expectedJournalShape set, never from caller input.
-	if err := sqlitex.Execute(db.conn,
-		fmt.Sprintf(`PRAGMA table_info(%q)`, table),
-		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
-			cols[stmt.ColumnText(1)] = struct{}{} // column 1 is the column name
-			return nil
-		}}); err != nil {
+	if err := sqlitex.Execute(db.conn, "SELECT name FROM pragma_table_info(?1)", &sqlitex.ExecOptions{Args: []any{table}, ResultFunc: func(stmt *zs.Stmt) error {
+		cols[stmt.ColumnText(0)] = struct{}{}
+		return nil
+	}}); err != nil {
 		return nil, fmt.Errorf("preflight: read columns of %q: %w", table, err)
 	}
 	return cols, nil
@@ -307,7 +299,7 @@ func (db *DB) migrateLockedWithFault(in journal.MigrationInput, faultHook func(t
 		return journal.MigrationResult{}, err
 	}
 	if unanchored == 0 {
-		if err := db.rebuildTasksWatermarkLocked(tasksWatermarkClause(true), true /*copyWatermark*/); err != nil {
+		if err := db.rebuildTasksWatermarkLocked(tasksWatermarkNative); err != nil {
 			return journal.MigrationResult{}, fmt.Errorf(
 				"MigrateLegacyBaseline: re-tighten tasks.last_journal_id to NOT NULL — where: post-anchor "+
 					"schema re-tightening (§8.1, §13); when: after every legacy row was anchored and its "+
@@ -469,9 +461,7 @@ func (db *DB) CountBaselineAnchors() (int, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	var n int
-	if err := sqlitex.Execute(db.conn,
-		`SELECT COUNT(*) FROM journal_operations WHERE operation_id LIKE 'provenance.migration.baseline--%'`,
-		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
+	if err := sqlitex.Execute(db.conn, "SELECT COUNT(*) FROM journal_operations WHERE operation_id LIKE ?1", &sqlitex.ExecOptions{Args: []any{"provenance.migration.baseline--%"}, ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
 		return 0, fmt.Errorf("CountBaselineAnchors: %w", err)
 	}
 	return n, nil
@@ -489,15 +479,11 @@ func (db *DB) EpisodeTransitionRecordedAt(assignment journal.AssignmentID, start
 	}
 	var recordedAt int64
 	found := false
-	if err := sqlitex.Execute(db.conn,
-		`SELECT j.recorded_at FROM journal_authority_assignment_transitions t
-		 JOIN journal j ON j.journal_id = t.journal_id
-		 WHERE t.assignment_id = ?1 AND t.transition_id = ?2`,
-		&sqlitex.ExecOptions{Args: []any{string(assignment), transition}, ResultFunc: func(stmt *zs.Stmt) error {
-			found = true
-			recordedAt = stmt.ColumnInt64(0)
-			return nil
-		}}); err != nil {
+	if err := sqlitex.Execute(db.conn, "SELECT j.recorded_at FROM journal_authority_assignment_transitions t\n\t\t JOIN journal j ON j.journal_id = t.journal_id\n\t\t WHERE t.assignment_id = ?1 AND t.transition_id = ?2", &sqlitex.ExecOptions{Args: []any{string(assignment), transition}, ResultFunc: func(stmt *zs.Stmt) error {
+		found = true
+		recordedAt = stmt.ColumnInt64(0)
+		return nil
+	}}); err != nil {
 		return 0, false, fmt.Errorf("EpisodeTransitionRecordedAt %q: %w", assignment, err)
 	}
 	return recordedAt, found, nil
@@ -525,9 +511,7 @@ func (db *DB) CountEpisodesForTask(task journal.TaskID) (int, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	var n int
-	if err := sqlitex.Execute(db.conn,
-		`SELECT COUNT(*) FROM journal_authority_assignment_episodes WHERE task_id = ?1`,
-		&sqlitex.ExecOptions{Args: []any{task.String()}, ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
+	if err := sqlitex.Execute(db.conn, "SELECT COUNT(*) FROM journal_authority_assignment_episodes WHERE task_id = ?1", &sqlitex.ExecOptions{Args: []any{task.String()}, ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
 		return 0, fmt.Errorf("CountEpisodesForTask %q: %w", task, err)
 	}
 	return n, nil

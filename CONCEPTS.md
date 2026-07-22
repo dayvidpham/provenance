@@ -33,7 +33,9 @@ An **Agent** is something that bears responsibility for a task. Provenance uses 
 
 **Roles** (`Role`): Human, Architect, Supervisor, Worker, Reviewer. These correspond to the agent roles in the Aura Protocol workflow.
 
-**Providers** (`Provider`): Anthropic, Google, OpenAI, Local. String-typed to align with bestiary. Case-insensitive validation.
+**Providers** (`Provider`): String-typed to align with bestiary. `IsValid` uses
+the catalog's case-sensitive provider names; text decoding trims whitespace and
+normalizes case before validation.
 
 ### Activity (prov:Activity) -- Activity
 
@@ -85,11 +87,11 @@ Other edge kinds (DerivedFrom, Supersedes, DiscoveredFrom, GeneratedBy, Attribut
 
 ### Labels
 
-String tags attached to tasks. Used for phase tracking (`aura:p1-user:s1_1-classify`), severity classification (`aura:severity:blocker`), and workflow state (`aura:superseded`). Idempotent add/remove.
+String tags attached to tasks. Used for phase tracking (`aura:p1-user:s1_1-classify`), severity classification (`aura:severity:blocker`), and workflow state (`aura:superseded`). Add and remove are idempotent journaled mutations.
 
 ### Comments
 
-Timestamped notes on tasks, authored by an agent. Used for review votes, progress updates, and audit trail. Append-only.
+Timestamped notes on tasks, authored by an agent. Used for review votes, progress updates, and audit trail. Comments are append-only journaled mutations.
 
 ### Namespace
 
@@ -98,6 +100,31 @@ Every ID includes a namespace (e.g., `aura-plugins`, `my-project`) that scopes e
 ### ModelRegistry
 
 A queryable catalog of ML models used to seed the `ml_models` reference table and validate model names at agent registration time. Backed by [bestiary](https://github.com/dayvidpham/bestiary) (models.dev data). See `ModelRegistry` interface: `Models()`, `Lookup()`, `ModelsByProvider()`.
+
+## Mutation And History Model
+
+All task lifecycle, edge, label, and comment mutations are performed through a
+`Session` bound to a committing actor and governing authority. Each call creates
+one logical operation containing typed effects; `Session.Atomic` can commit
+multiple effects together.
+
+Provenance stores operations in one append-only global journal. `JournalID`, a
+database-generated integer, is the sole causal order. `RecordedAt` provides a
+readable audit timeline but never controls authorization, lifecycle, or replay.
+
+The journal also records authority lifecycles, decisions, and evidence. Task,
+edge, label, and comment tables are materialized projections. Apply validates
+and inserts each operation before using the same projection fold that replay
+runs against shadow tables. Exact retries identified by a stable `OperationID`
+return the original committed result; changed canonical input under the same ID
+returns a typed conflict.
+
+DBOS integration can durably execute these operations across crashes and lost
+responses. Provenance owns the versioned canonical input and outcome codecs;
+DBOS owns workflow execution and checkpointing. See
+[`docs/architecture.md`](docs/architecture.md) for the complete component model
+and [`docs/journal-relational-contract.md`](docs/journal-relational-contract.md)
+for the normative relational contract.
 
 ## PROV-O Alignment Summary
 
@@ -118,8 +145,18 @@ prov:wasDerivedFrom    --> EdgeDerivedFrom    (Task --> Task)
                        --> EdgeDiscoveredFrom (Task --> Task)
 ```
 
-## SQLite Schema
+## SQLite Persistence
 
-The persistence layer uses a single SQLite database with WAL mode. Reference data (statuses, priorities, providers, etc.) is stored in lookup tables with integer PKs. The `ml_models` table bridges the string-typed `Provider` from bestiary to integer FKs via the `providers(id, name)` table.
+The persistence layer uses a single SQLite database with WAL mode. The global
+journal uses class-table inheritance: one ordered supertype row plus exactly one
+typed subtype row. Operations and their materialized projections commit in one
+transaction. Startup integrity checks, full replay, and legacy migration fail
+closed on incompatible schema or history.
 
-See `internal/sqlite/db.go` for the full schema.
+Reference data (statuses, priorities, providers, etc.) is stored in lookup tables
+with integer primary keys. The `ml_models` table bridges the string-typed
+`Provider` from bestiary to relational foreign keys through
+`providers(id, name)`.
+
+See `docs/journal-relational-contract.md` for the normative journal schema and
+`internal/sqlite` for the executable schema and queries.

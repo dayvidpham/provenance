@@ -75,7 +75,7 @@ func (db *DB) foldMutationFamilyLocked(in journal.OperationInput, jid int64, eff
 		}
 	}
 	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO journal_task_events (journal_id, task_id, event_kind, payload) VALUES (?1, ?2, ?3, ?4)`,
+		insertJournalTaskEventSQL,
 		&sqlitex.ExecOptions{Args: []any{jid, eff.TaskID.String(), string(kind), string(payload)}}); err != nil {
 		return fmt.Errorf("Apply: insert journal_task_events (%s): %w", kind, err)
 	}
@@ -88,9 +88,7 @@ func (db *DB) foldMutationFamilyLocked(in journal.OperationInput, jid int64, eff
 		if err != nil {
 			return fmt.Errorf("Apply: encode context (%s): %w", kind, err)
 		}
-		if err := sqlitex.Execute(db.conn,
-			`INSERT INTO journal_task_event_contexts (event_journal_id, context_kind, context_identity, attached_by_journal_id) VALUES (?1, ?2, ?3, ?4)`,
-			&sqlitex.ExecOptions{Args: []any{jid, string(contextKind), identity, jid}}); err != nil {
+		if err := sqlitex.Execute(db.conn, "INSERT INTO journal_task_event_contexts (event_journal_id, context_kind, context_identity, attached_by_journal_id) VALUES (?1, ?2, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{jid, string(contextKind), identity, jid}}); err != nil {
 			return fmt.Errorf("Apply: insert context (%s): %w", kind, err)
 		}
 	}
@@ -118,15 +116,9 @@ func (db *DB) encodeMutationFamilyPayload(eff journal.Effect) ([]byte, error) {
 // same table the graph store reads, so journal and graph stay consistent (§6).
 func (db *DB) edgeCreatesCycleLocked(source, target string) (bool, error) {
 	found := false
-	query := fmt.Sprintf(`WITH RECURSIVE reach(node) AS (
-			SELECT ?1
-			UNION
-			SELECT e.target_id FROM %s e JOIN reach r ON e.source_id = r.node WHERE e.kind_id = ?3
-		)
-		SELECT 1 FROM reach WHERE node = ?2 LIMIT 1`, db.projEdges())
-	if err := sqlitex.Execute(db.conn, query,
+	if err := sqlitex.Execute(db.conn, db.projectionTarget.edgeCycleQuery(),
 		&sqlitex.ExecOptions{
-			Args:       []any{target, source, int(ptypes.EdgeBlockedBy)},
+			Args:       []any{target, source, int(ptypes.EdgeBlockedBy), 1, 1},
 			ResultFunc: func(*zs.Stmt) error { found = true; return nil },
 		}); err != nil {
 		return false, fmt.Errorf("edge cycle check %s->%s: %w", source, target, err)
@@ -152,7 +144,7 @@ func (db *DB) projectMutationFamilyRowLocked(task journal.TaskID, kind journal.E
 			return err
 		}
 		if err := sqlitex.Execute(db.conn,
-			fmt.Sprintf(`INSERT OR IGNORE INTO %s (source_id, target_id, kind_id, created_at) VALUES (?1, ?2, ?3, ?4)`, db.projEdges()),
+			db.projectionTarget.projectEdgeAddQuery(),
 			&sqlitex.ExecOptions{Args: []any{task.String(), p.Target, int(p.EdgeKind), recordedAt}}); err != nil {
 			return fmt.Errorf("project edge-add %s->%s: %w", task, p.Target, err)
 		}
@@ -162,7 +154,7 @@ func (db *DB) projectMutationFamilyRowLocked(task journal.TaskID, kind journal.E
 			return err
 		}
 		if err := sqlitex.Execute(db.conn,
-			fmt.Sprintf(`DELETE FROM %s WHERE source_id = ?1 AND target_id = ?2 AND kind_id = ?3`, db.projEdges()),
+			db.projectionTarget.projectEdgeRemoveQuery(),
 			&sqlitex.ExecOptions{Args: []any{task.String(), p.Target, int(p.EdgeKind)}}); err != nil {
 			return fmt.Errorf("project edge-remove %s->%s: %w", task, p.Target, err)
 		}
@@ -172,7 +164,7 @@ func (db *DB) projectMutationFamilyRowLocked(task journal.TaskID, kind journal.E
 			return err
 		}
 		if err := sqlitex.Execute(db.conn,
-			fmt.Sprintf(`INSERT OR IGNORE INTO %s (task_id, name) VALUES (?1, ?2)`, db.projLabels()),
+			db.projectionTarget.projectLabelAddQuery(),
 			&sqlitex.ExecOptions{Args: []any{task.String(), p.Label}}); err != nil {
 			return fmt.Errorf("project label-add %s %q: %w", task, p.Label, err)
 		}
@@ -182,7 +174,7 @@ func (db *DB) projectMutationFamilyRowLocked(task journal.TaskID, kind journal.E
 			return err
 		}
 		if err := sqlitex.Execute(db.conn,
-			fmt.Sprintf(`DELETE FROM %s WHERE task_id = ?1 AND name = ?2`, db.projLabels()),
+			db.projectionTarget.projectLabelRemoveQuery(),
 			&sqlitex.ExecOptions{Args: []any{task.String(), p.Label}}); err != nil {
 			return fmt.Errorf("project label-remove %s %q: %w", task, p.Label, err)
 		}
@@ -195,7 +187,7 @@ func (db *DB) projectMutationFamilyRowLocked(task journal.TaskID, kind journal.E
 		// idempotent (the caller-minted id is carried in the payload, §6), so the
 		// projection reproduces exactly one row.
 		if err := sqlitex.Execute(db.conn,
-			fmt.Sprintf(`INSERT OR IGNORE INTO %s (id, task_id, author_id, body, created_at) VALUES (?1, ?2, ?3, ?4, ?5)`, db.projComments()),
+			db.projectionTarget.projectCommentAddQuery(),
 			&sqlitex.ExecOptions{Args: []any{p.CommentID, task.String(), p.Author, p.Body, recordedAt}}); err != nil {
 			return fmt.Errorf("project comment-add %s %q: %w", task, p.CommentID, err)
 		}
@@ -203,4 +195,70 @@ func (db *DB) projectMutationFamilyRowLocked(task journal.TaskID, kind journal.E
 		return fmt.Errorf("provenance: %q is not a journaled mutation-family kind (§6)", kind)
 	}
 	return db.advanceWatermarkLocked(task, jid)
+}
+
+func (target projectionTarget) edgeCycleQuery() string {
+	switch target {
+	case projectionTargetLive:
+		return "WITH RECURSIVE reach(node) AS (SELECT ?1 UNION SELECT e.target_id FROM edges e JOIN reach r ON e.source_id=r.node WHERE e.kind_id=?3) SELECT ?4 FROM reach WHERE node=?2 LIMIT ?5"
+	case projectionTargetShadow:
+		return "WITH RECURSIVE reach(node) AS (SELECT ?1 UNION SELECT e.target_id FROM shadow_edges e JOIN reach r ON e.source_id=r.node WHERE e.kind_id=?3) SELECT ?4 FROM reach WHERE node=?2 LIMIT ?5"
+	default:
+		panic("unknown projection target")
+	}
+}
+
+func (target projectionTarget) projectEdgeAddQuery() string {
+	switch target {
+	case projectionTargetLive:
+		return "INSERT OR IGNORE INTO edges (source_id,target_id,kind_id,created_at) VALUES (?1,?2,?3,?4)"
+	case projectionTargetShadow:
+		return "INSERT OR IGNORE INTO shadow_edges (source_id,target_id,kind_id,created_at) VALUES (?1,?2,?3,?4)"
+	default:
+		panic("unknown projection target")
+	}
+}
+
+func (target projectionTarget) projectEdgeRemoveQuery() string {
+	switch target {
+	case projectionTargetLive:
+		return "DELETE FROM edges WHERE source_id=?1 AND target_id=?2 AND kind_id=?3"
+	case projectionTargetShadow:
+		return "DELETE FROM shadow_edges WHERE source_id=?1 AND target_id=?2 AND kind_id=?3"
+	default:
+		panic("unknown projection target")
+	}
+}
+
+func (target projectionTarget) projectLabelAddQuery() string {
+	switch target {
+	case projectionTargetLive:
+		return "INSERT OR IGNORE INTO labels (task_id,name) VALUES (?1,?2)"
+	case projectionTargetShadow:
+		return "INSERT OR IGNORE INTO shadow_labels (task_id,name) VALUES (?1,?2)"
+	default:
+		panic("unknown projection target")
+	}
+}
+
+func (target projectionTarget) projectLabelRemoveQuery() string {
+	switch target {
+	case projectionTargetLive:
+		return "DELETE FROM labels WHERE task_id=?1 AND name=?2"
+	case projectionTargetShadow:
+		return "DELETE FROM shadow_labels WHERE task_id=?1 AND name=?2"
+	default:
+		panic("unknown projection target")
+	}
+}
+
+func (target projectionTarget) projectCommentAddQuery() string {
+	switch target {
+	case projectionTargetLive:
+		return "INSERT OR IGNORE INTO comments (id,task_id,author_id,body,created_at) VALUES (?1,?2,?3,?4,?5)"
+	case projectionTargetShadow:
+		return "INSERT OR IGNORE INTO shadow_comments (id,task_id,author_id,body,created_at) VALUES (?1,?2,?3,?4,?5)"
+	default:
+		panic("unknown projection target")
+	}
 }

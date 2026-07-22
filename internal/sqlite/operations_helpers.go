@@ -32,9 +32,7 @@ func (db *DB) insertJournalRowLocked(kind journal.JournalKind, actor journal.Act
 	} else {
 		actorArg = actor.String()
 	}
-	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO journal (kind_id, actor_id, recorded_at, produced_by_operation_journal_id) VALUES (?1, ?2, ?3, ?4)`,
-		&sqlitex.ExecOptions{Args: []any{int(kind), actorArg, recordedAt, pbojArg}}); err != nil {
+	if err := sqlitex.Execute(db.conn, "INSERT INTO journal (kind_id, actor_id, recorded_at, produced_by_operation_journal_id) VALUES (?1, ?2, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{int(kind), actorArg, recordedAt, pbojArg}}); err != nil {
 		return 0, fmt.Errorf("insert journal row (kind %s): %w", kind, err)
 	}
 	return db.conn.LastInsertRowID(), nil
@@ -45,11 +43,7 @@ func (db *DB) insertOperationRowLocked(anchor int64, in journal.OperationInput, 
 	if in.AuthorityJournalID != nil {
 		authArg = int64(*in.AuthorityJournalID)
 	}
-	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO journal_operations
-		 (journal_id, operation_id, authority_journal_id, command_digest, mutation_digest, mutation_encoding_version, canonical_mutation)
-		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
-		&sqlitex.ExecOptions{Args: []any{anchor, string(in.OperationID), authArg, in.CommandDigest, prepared.DerivedDigest(), prepared.EncodingVersion(), prepared.CanonicalBytes()}}); err != nil {
+	if err := sqlitex.Execute(db.conn, "INSERT INTO journal_operations\n\t\t (journal_id, operation_id, authority_journal_id, command_digest, mutation_digest, mutation_encoding_version, canonical_mutation)\n\t\t VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", &sqlitex.ExecOptions{Args: []any{anchor, string(in.OperationID), authArg, in.CommandDigest, prepared.DerivedDigest(), prepared.EncodingVersion().String(), prepared.CanonicalBytes()}}); err != nil {
 		return fmt.Errorf("insert journal_operations for %q: %w", in.OperationID, err)
 	}
 	return nil
@@ -58,13 +52,11 @@ func (db *DB) insertOperationRowLocked(anchor int64, in journal.OperationInput, 
 func (db *DB) insertAuthorityAssignmentTransitionLocked(jid int64, assignment journal.AssignmentID, transitionID int) error {
 	opAuthID := fmt.Sprintf("authority--assignment--%d", jid)
 	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO journal_authorities (journal_id, authority_kind_id, operation_authority_id) VALUES (?1, ?2, ?3)`,
+		insertJournalAuthoritySQL,
 		&sqlitex.ExecOptions{Args: []any{jid, authKindAssignmentID, opAuthID}}); err != nil {
 		return fmt.Errorf("insert journal_authorities (assignment): %w", err)
 	}
-	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO journal_authority_assignment_transitions (journal_id, assignment_id, transition_id) VALUES (?1, ?2, ?3)`,
-		&sqlitex.ExecOptions{Args: []any{jid, string(assignment), transitionID}}); err != nil {
+	if err := sqlitex.Execute(db.conn, "INSERT INTO journal_authority_assignment_transitions (journal_id, assignment_id, transition_id) VALUES (?1, ?2, ?3)", &sqlitex.ExecOptions{Args: []any{jid, string(assignment), transitionID}}); err != nil {
 		return fmt.Errorf("insert assignment transition (%s): %w", journal.AssignmentTransition(transitionID), err)
 	}
 	return nil
@@ -77,9 +69,7 @@ func (db *DB) insertResultSlotLocked(anchor int64, slot journal.ResultSlotID, pr
 	if err := db.requireResultSlotOwnOperationLocked(anchor, producedJID); err != nil {
 		return err
 	}
-	if err := sqlitex.Execute(db.conn,
-		`INSERT INTO journal_operation_result_slots (journal_id, result_slot_id, produced_journal_id) VALUES (?1, ?2, ?3)`,
-		&sqlitex.ExecOptions{Args: []any{anchor, string(slot), producedJID}}); err != nil {
+	if err := sqlitex.Execute(db.conn, "INSERT INTO journal_operation_result_slots (journal_id, result_slot_id, produced_journal_id) VALUES (?1, ?2, ?3)", &sqlitex.ExecOptions{Args: []any{anchor, string(slot), producedJID}}); err != nil {
 		return fmt.Errorf("insert result slot %q: %w", slot, err)
 	}
 	return nil
@@ -88,15 +78,13 @@ func (db *DB) insertResultSlotLocked(anchor int64, slot journal.ResultSlotID, pr
 func (db *DB) requireResultSlotOwnOperationLocked(anchor, producedJID int64) error {
 	var producer int64
 	var isNull = true
-	if err := sqlitex.Execute(db.conn,
-		`SELECT produced_by_operation_journal_id FROM journal WHERE journal_id = ?1`,
-		&sqlitex.ExecOptions{Args: []any{producedJID}, ResultFunc: func(stmt *zs.Stmt) error {
-			if stmt.ColumnType(0) != zs.TypeNull {
-				producer = stmt.ColumnInt64(0)
-				isNull = false
-			}
-			return nil
-		}}); err != nil {
+	if err := sqlitex.Execute(db.conn, "SELECT produced_by_operation_journal_id FROM journal WHERE journal_id = ?1", &sqlitex.ExecOptions{Args: []any{producedJID}, ResultFunc: func(stmt *zs.Stmt) error {
+		if stmt.ColumnType(0) != zs.TypeNull {
+			producer = stmt.ColumnInt64(0)
+			isNull = false
+		}
+		return nil
+	}}); err != nil {
 		return fmt.Errorf("rule-9 check: load produced row %d: %w", producedJID, err)
 	}
 	if isNull || producer != anchor {
@@ -113,9 +101,9 @@ func (db *DB) insertAttributionLocked(task journal.TaskID, actor journal.ActorID
 	// Targets the real task_attributions during a live Apply and the shadow
 	// attribution table during a from-empty replay derivation (§8.2, §15).
 	if err := sqlitex.Execute(db.conn,
-		fmt.Sprintf(`INSERT OR IGNORE INTO %s (task_id, actor_id, first_journal_id) VALUES (?1, ?2, ?3)`, db.projAttribs()),
+		db.projectionTarget.insertAttributionQuery(),
 		&sqlitex.ExecOptions{Args: []any{task.String(), actor.String(), jid}}); err != nil {
-		return fmt.Errorf("update %s: %w", db.projAttribs(), err)
+		return fmt.Errorf("update %s attribution: %w", db.projectionTarget.label(), err)
 	}
 	return nil
 }
@@ -124,9 +112,9 @@ func (db *DB) advanceWatermarkLocked(task journal.TaskID, jid int64) error {
 	// Targets the real tasks table during a live Apply and the shadow tasks table
 	// during a from-empty replay derivation (§8.1, §15).
 	if err := sqlitex.Execute(db.conn,
-		fmt.Sprintf(`UPDATE %s SET last_journal_id = ?1 WHERE id = ?2`, db.projTasks()),
+		db.projectionTarget.advanceWatermarkQuery(),
 		&sqlitex.ExecOptions{Args: []any{jid, task.String()}}); err != nil {
-		return fmt.Errorf("advance %s.last_journal_id: %w", db.projTasks(), err)
+		return fmt.Errorf("advance %s task watermark: %w", db.projectionTarget.label(), err)
 	}
 	return nil
 }
@@ -138,26 +126,51 @@ func (db *DB) advanceWatermarkLocked(task journal.TaskID, jid int64) error {
 // projection table — real during Apply, shadow during replay (§15).
 func (db *DB) recomputeTaskOwnerLocked(task journal.TaskID, jid int64) error {
 	var owner any
-	if err := sqlitex.Execute(db.conn,
-		`SELECT e.actor_id FROM journal_authority_assignment_episodes e
-		 JOIN journal_authority_assignment_transitions started
-		   ON started.assignment_id = e.assignment_id AND started.transition_id = ?2
-		 WHERE e.task_id = ?1 AND e.slot_id = ?3
-		   AND NOT EXISTS (SELECT 1 FROM journal_authority_assignment_transitions ended
-		                   WHERE ended.assignment_id = e.assignment_id AND ended.transition_id = ?4)
-		 ORDER BY started.journal_id DESC LIMIT 1`,
-		&sqlitex.ExecOptions{
-			Args:       []any{task.String(), transitionStartedID, slotOwnerResponsibilityID, transitionEndedID},
-			ResultFunc: func(stmt *zs.Stmt) error { owner = stmt.ColumnText(0); return nil },
-		}); err != nil {
+	if err := sqlitex.Execute(db.conn, "SELECT e.actor_id FROM journal_authority_assignment_episodes e\n\t\t JOIN journal_authority_assignment_transitions started\n\t\t   ON started.assignment_id = e.assignment_id AND started.transition_id = ?2\n\t\t WHERE e.task_id = ?1 AND e.slot_id = ?3\n\t\t   AND NOT EXISTS (SELECT ?5 FROM journal_authority_assignment_transitions ended\n\t\t                   WHERE ended.assignment_id = e.assignment_id AND ended.transition_id = ?4)\n\t\t ORDER BY started.journal_id DESC LIMIT ?6", &sqlitex.ExecOptions{
+		Args:       []any{task.String(), transitionStartedID, slotOwnerResponsibilityID, transitionEndedID, 1, 1},
+		ResultFunc: func(stmt *zs.Stmt) error { owner = stmt.ColumnText(0); return nil },
+	}); err != nil {
 		return fmt.Errorf("recompute task owner: %w", err)
 	}
 	if err := sqlitex.Execute(db.conn,
-		fmt.Sprintf(`UPDATE %s SET owner_id = ?1, last_journal_id = ?2 WHERE id = ?3`, db.projTasks()),
+		db.projectionTarget.updateOwnerQuery(),
 		&sqlitex.ExecOptions{Args: []any{owner, jid, task.String()}}); err != nil {
-		return fmt.Errorf("update %s owner projection: %w", db.projTasks(), err)
+		return fmt.Errorf("update %s owner: %w", db.projectionTarget.label(), err)
 	}
 	return nil
+}
+
+func (target projectionTarget) insertAttributionQuery() string {
+	switch target {
+	case projectionTargetLive:
+		return "INSERT OR IGNORE INTO task_attributions (task_id, actor_id, first_journal_id) VALUES (?1, ?2, ?3)"
+	case projectionTargetShadow:
+		return "INSERT OR IGNORE INTO shadow_task_attributions (task_id, actor_id, first_journal_id) VALUES (?1, ?2, ?3)"
+	default:
+		panic("unknown projection target")
+	}
+}
+
+func (target projectionTarget) advanceWatermarkQuery() string {
+	switch target {
+	case projectionTargetLive:
+		return "UPDATE tasks SET last_journal_id = ?1 WHERE id = ?2"
+	case projectionTargetShadow:
+		return "UPDATE shadow_tasks SET last_journal_id = ?1 WHERE id = ?2"
+	default:
+		panic("unknown projection target")
+	}
+}
+
+func (target projectionTarget) updateOwnerQuery() string {
+	switch target {
+	case projectionTargetLive:
+		return "UPDATE tasks SET owner_id = ?1, last_journal_id = ?2 WHERE id = ?3"
+	case projectionTargetShadow:
+		return "UPDATE shadow_tasks SET owner_id = ?1, last_journal_id = ?2 WHERE id = ?3"
+	default:
+		panic("unknown projection target")
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -182,9 +195,7 @@ func (db *DB) episodeEndedLocked(assignment journal.AssignmentID) (ended bool, e
 
 func (db *DB) episodeExistsLocked(assignment journal.AssignmentID) (bool, error) {
 	found := false
-	if err := sqlitex.Execute(db.conn,
-		`SELECT 1 FROM journal_authority_assignment_episodes WHERE assignment_id = ?1`,
-		&sqlitex.ExecOptions{Args: []any{string(assignment)}, ResultFunc: func(*zs.Stmt) error { found = true; return nil }}); err != nil {
+	if err := sqlitex.Execute(db.conn, "SELECT ?2 FROM journal_authority_assignment_episodes WHERE assignment_id = ?1", &sqlitex.ExecOptions{Args: []any{string(assignment), 1}, ResultFunc: func(*zs.Stmt) error { found = true; return nil }}); err != nil {
 		return false, fmt.Errorf("episode exists %q: %w", assignment, err)
 	}
 	return found, nil
@@ -192,9 +203,7 @@ func (db *DB) episodeExistsLocked(assignment journal.AssignmentID) (bool, error)
 
 func (db *DB) transitionExistsLocked(assignment journal.AssignmentID, transitionID int) (bool, error) {
 	found := false
-	if err := sqlitex.Execute(db.conn,
-		`SELECT 1 FROM journal_authority_assignment_transitions WHERE assignment_id = ?1 AND transition_id = ?2`,
-		&sqlitex.ExecOptions{Args: []any{string(assignment), transitionID}, ResultFunc: func(*zs.Stmt) error { found = true; return nil }}); err != nil {
+	if err := sqlitex.Execute(db.conn, "SELECT ?3 FROM journal_authority_assignment_transitions WHERE assignment_id = ?1 AND transition_id = ?2", &sqlitex.ExecOptions{Args: []any{string(assignment), transitionID, 1}, ResultFunc: func(*zs.Stmt) error { found = true; return nil }}); err != nil {
 		return false, fmt.Errorf("transition exists %q/%d: %w", assignment, transitionID, err)
 	}
 	return found, nil
@@ -202,9 +211,7 @@ func (db *DB) transitionExistsLocked(assignment journal.AssignmentID, transition
 
 func (db *DB) episodeTaskLocked(assignment journal.AssignmentID) (journal.TaskID, error) {
 	var raw string
-	if err := sqlitex.Execute(db.conn,
-		`SELECT task_id FROM journal_authority_assignment_episodes WHERE assignment_id = ?1`,
-		&sqlitex.ExecOptions{Args: []any{string(assignment)}, ResultFunc: func(stmt *zs.Stmt) error { raw = stmt.ColumnText(0); return nil }}); err != nil {
+	if err := sqlitex.Execute(db.conn, "SELECT task_id FROM journal_authority_assignment_episodes WHERE assignment_id = ?1", &sqlitex.ExecOptions{Args: []any{string(assignment)}, ResultFunc: func(stmt *zs.Stmt) error { raw = stmt.ColumnText(0); return nil }}); err != nil {
 		return journal.TaskID{}, fmt.Errorf("episode task %q: %w", assignment, err)
 	}
 	if raw == "" {
@@ -217,15 +224,13 @@ func (db *DB) episodeTaskLocked(assignment journal.AssignmentID) (journal.TaskID
 // (§4.4, §14.5). hasParent is false when the episode cites no parent (NULL
 // parent_assignment_id) or does not exist.
 func (db *DB) episodeParentLocked(assignment journal.AssignmentID) (parent journal.AssignmentID, hasParent bool, err error) {
-	if execErr := sqlitex.Execute(db.conn,
-		`SELECT parent_assignment_id FROM journal_authority_assignment_episodes WHERE assignment_id = ?1`,
-		&sqlitex.ExecOptions{Args: []any{string(assignment)}, ResultFunc: func(stmt *zs.Stmt) error {
-			if stmt.ColumnType(0) != zs.TypeNull {
-				parent = journal.AssignmentID(stmt.ColumnText(0))
-				hasParent = parent != ""
-			}
-			return nil
-		}}); execErr != nil {
+	if execErr := sqlitex.Execute(db.conn, "SELECT parent_assignment_id FROM journal_authority_assignment_episodes WHERE assignment_id = ?1", &sqlitex.ExecOptions{Args: []any{string(assignment)}, ResultFunc: func(stmt *zs.Stmt) error {
+		if stmt.ColumnType(0) != zs.TypeNull {
+			parent = journal.AssignmentID(stmt.ColumnText(0))
+			hasParent = parent != ""
+		}
+		return nil
+	}}); execErr != nil {
 		return "", false, fmt.Errorf("episode parent %q: %w", assignment, execErr)
 	}
 	return parent, hasParent, nil
@@ -237,10 +242,7 @@ func (db *DB) episodeParentLocked(assignment journal.AssignmentID) (parent journ
 // transitionExistsLocked, which considers transitions at any position.
 func (db *DB) transitionExistsBeforeLocked(assignment journal.AssignmentID, transitionID int, beforeJID int64) (bool, error) {
 	found := false
-	if err := sqlitex.Execute(db.conn,
-		`SELECT 1 FROM journal_authority_assignment_transitions
-		 WHERE assignment_id = ?1 AND transition_id = ?2 AND journal_id < ?3 LIMIT 1`,
-		&sqlitex.ExecOptions{Args: []any{string(assignment), transitionID, beforeJID}, ResultFunc: func(*zs.Stmt) error { found = true; return nil }}); err != nil {
+	if err := sqlitex.Execute(db.conn, "SELECT ?4 FROM journal_authority_assignment_transitions\n\t\t WHERE assignment_id = ?1 AND transition_id = ?2 AND journal_id < ?3 LIMIT ?5", &sqlitex.ExecOptions{Args: []any{string(assignment), transitionID, beforeJID, 1, 1}, ResultFunc: func(*zs.Stmt) error { found = true; return nil }}); err != nil {
 		return false, fmt.Errorf("transition-before %q/%d < %d: %w", assignment, transitionID, beforeJID, err)
 	}
 	return found, nil
@@ -269,16 +271,10 @@ func (db *DB) episodeActiveAtLocked(assignment journal.AssignmentID, beforeJID i
 
 func (db *DB) taskHasActiveOwnerEpisodeLocked(task journal.TaskID) (bool, error) {
 	found := false
-	if err := sqlitex.Execute(db.conn,
-		`SELECT 1 FROM journal_authority_assignment_episodes e
-		 WHERE e.task_id = ?1 AND e.slot_id = ?2
-		   AND EXISTS (SELECT 1 FROM journal_authority_assignment_transitions s WHERE s.assignment_id = e.assignment_id AND s.transition_id = ?3)
-		   AND NOT EXISTS (SELECT 1 FROM journal_authority_assignment_transitions x WHERE x.assignment_id = e.assignment_id AND x.transition_id = ?4)
-		 LIMIT 1`,
-		&sqlitex.ExecOptions{
-			Args:       []any{task.String(), slotOwnerResponsibilityID, transitionStartedID, transitionEndedID},
-			ResultFunc: func(*zs.Stmt) error { found = true; return nil },
-		}); err != nil {
+	if err := sqlitex.Execute(db.conn, "SELECT ?5 FROM journal_authority_assignment_episodes e\n\t\t WHERE e.task_id = ?1 AND e.slot_id = ?2\n\t\t   AND EXISTS (SELECT ?6 FROM journal_authority_assignment_transitions s WHERE s.assignment_id = e.assignment_id AND s.transition_id = ?3)\n\t\t   AND NOT EXISTS (SELECT ?7 FROM journal_authority_assignment_transitions x WHERE x.assignment_id = e.assignment_id AND x.transition_id = ?4)\n\t\t LIMIT ?8", &sqlitex.ExecOptions{
+		Args:       []any{task.String(), slotOwnerResponsibilityID, transitionStartedID, transitionEndedID, 1, 1, 1, 1},
+		ResultFunc: func(*zs.Stmt) error { found = true; return nil },
+	}); err != nil {
 		return false, fmt.Errorf("active owner episode %q: %w", task, err)
 	}
 	return found, nil
@@ -290,8 +286,7 @@ func (db *DB) taskHasActiveOwnerEpisodeLocked(task journal.TaskID) (bool, error)
 
 func (db *DB) operationCountLocked() (int, error) {
 	var n int
-	if err := sqlitex.Execute(db.conn, `SELECT COUNT(*) FROM journal_operations`,
-		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
+	if err := sqlitex.Execute(db.conn, "SELECT COUNT(*) FROM journal_operations", &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
 		return 0, fmt.Errorf("count operations: %w", err)
 	}
 	return n, nil
@@ -322,9 +317,7 @@ func (db *DB) validateGenesisLocked(in journal.OperationInput) error {
 
 func (db *DB) requireAuthorityExistsLocked(authJID journal.JournalID) error {
 	found := false
-	if err := sqlitex.Execute(db.conn,
-		`SELECT 1 FROM journal_authorities WHERE journal_id = ?1`,
-		&sqlitex.ExecOptions{Args: []any{int64(authJID)}, ResultFunc: func(*zs.Stmt) error { found = true; return nil }}); err != nil {
+	if err := sqlitex.Execute(db.conn, "SELECT ?2 FROM journal_authorities WHERE journal_id = ?1", &sqlitex.ExecOptions{Args: []any{int64(authJID), 1}, ResultFunc: func(*zs.Stmt) error { found = true; return nil }}); err != nil {
 		return fmt.Errorf("require authority %d: %w", authJID, err)
 	}
 	if !found {
@@ -376,9 +369,7 @@ func (db *DB) authorityGovernsTaskAtLocked(authJID journal.JournalID, targetTask
 		return false, nil // authority does not precede the effect (§9.3)
 	}
 	var kind = -1
-	if err := sqlitex.Execute(db.conn,
-		`SELECT authority_kind_id FROM journal_authorities WHERE journal_id = ?1`,
-		&sqlitex.ExecOptions{Args: []any{int64(authJID)}, ResultFunc: func(stmt *zs.Stmt) error { kind = stmt.ColumnInt(0); return nil }}); err != nil {
+	if err := sqlitex.Execute(db.conn, "SELECT authority_kind_id FROM journal_authorities WHERE journal_id = ?1", &sqlitex.ExecOptions{Args: []any{int64(authJID)}, ResultFunc: func(stmt *zs.Stmt) error { kind = stmt.ColumnInt(0); return nil }}); err != nil {
 		return false, fmt.Errorf("authority kind %d: %w", authJID, err)
 	}
 	switch kind {
@@ -402,9 +393,7 @@ func (db *DB) authorityGovernsTaskAtLocked(authJID journal.JournalID, targetTask
 func (db *DB) assignmentAuthorityGovernsLocked(authJID journal.JournalID, targetTask journal.TaskID, beforeJID int64) (bool, error) {
 	// Resolve the assignment episode this authority (a transition row) belongs to.
 	var authEpisode string
-	if err := sqlitex.Execute(db.conn,
-		`SELECT assignment_id FROM journal_authority_assignment_transitions WHERE journal_id = ?1`,
-		&sqlitex.ExecOptions{Args: []any{int64(authJID)}, ResultFunc: func(stmt *zs.Stmt) error { authEpisode = stmt.ColumnText(0); return nil }}); err != nil {
+	if err := sqlitex.Execute(db.conn, "SELECT assignment_id FROM journal_authority_assignment_transitions WHERE journal_id = ?1", &sqlitex.ExecOptions{Args: []any{int64(authJID)}, ResultFunc: func(stmt *zs.Stmt) error { authEpisode = stmt.ColumnText(0); return nil }}); err != nil {
 		return false, fmt.Errorf("authority assignment %d: %w", authJID, err)
 	}
 	if authEpisode == "" {
@@ -457,12 +446,10 @@ func (db *DB) assignmentAuthorityGovernsLocked(authJID journal.JournalID, target
 // entry points). A task typically has few episodes.
 func (db *DB) episodesOnTaskLocked(task journal.TaskID) ([]journal.AssignmentID, error) {
 	var out []journal.AssignmentID
-	if err := sqlitex.Execute(db.conn,
-		`SELECT assignment_id FROM journal_authority_assignment_episodes WHERE task_id = ?1`,
-		&sqlitex.ExecOptions{Args: []any{task.String()}, ResultFunc: func(stmt *zs.Stmt) error {
-			out = append(out, journal.AssignmentID(stmt.ColumnText(0)))
-			return nil
-		}}); err != nil {
+	if err := sqlitex.Execute(db.conn, "SELECT assignment_id FROM journal_authority_assignment_episodes WHERE task_id = ?1", &sqlitex.ExecOptions{Args: []any{task.String()}, ResultFunc: func(stmt *zs.Stmt) error {
+		out = append(out, journal.AssignmentID(stmt.ColumnText(0)))
+		return nil
+	}}); err != nil {
 		return nil, fmt.Errorf("episodes on task %q: %w", task, err)
 	}
 	return out, nil
@@ -518,8 +505,7 @@ func (db *DB) parentChainReachesLocked(start, target journal.AssignmentID, befor
 
 func (db *DB) countEpisodesLocked() (int, error) {
 	var n int
-	if err := sqlitex.Execute(db.conn, `SELECT COUNT(*) FROM journal_authority_assignment_episodes`,
-		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
+	if err := sqlitex.Execute(db.conn, "SELECT COUNT(*) FROM journal_authority_assignment_episodes", &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
 		return 0, fmt.Errorf("count episodes: %w", err)
 	}
 	return n, nil
@@ -639,43 +625,37 @@ type storedOperation struct {
 func (db *DB) lookupOperationLocked(op journal.OperationID) (storedOperation, bool, error) {
 	var out storedOperation
 	found := false
-	if err := sqlitex.Execute(db.conn,
-		`SELECT journal_id, authority_journal_id, command_digest, mutation_digest,
-		        mutation_encoding_version, canonical_mutation
-		 FROM journal_operations WHERE operation_id = ?1`,
-		&sqlitex.ExecOptions{Args: []any{string(op)}, ResultFunc: func(stmt *zs.Stmt) error {
-			found = true
-			out.anchor = stmt.ColumnInt64(0)
-			if stmt.ColumnType(1) != zs.TypeNull {
-				a := journal.JournalID(stmt.ColumnInt64(1))
-				out.identity.AuthorityJournalID = &a
-			}
-			out.identity.CommandDigest = readBlob(stmt, 2)
-			out.identity.MutationDigest = readBlob(stmt, 3)
-			if stmt.ColumnType(4) != zs.TypeNull {
-				out.encodingVersion = stmt.ColumnText(4)
-			}
-			if stmt.ColumnType(5) != zs.TypeNull {
-				out.canonicalMutation = readBlob(stmt, 5)
-			}
-			return nil
-		}}); err != nil {
+	if err := sqlitex.Execute(db.conn, "SELECT journal_id, authority_journal_id, command_digest, mutation_digest,\n\t\t        mutation_encoding_version, canonical_mutation\n\t\t FROM journal_operations WHERE operation_id = ?1", &sqlitex.ExecOptions{Args: []any{string(op)}, ResultFunc: func(stmt *zs.Stmt) error {
+		found = true
+		out.anchor = stmt.ColumnInt64(0)
+		if stmt.ColumnType(1) != zs.TypeNull {
+			a := journal.JournalID(stmt.ColumnInt64(1))
+			out.identity.AuthorityJournalID = &a
+		}
+		out.identity.CommandDigest = readBlob(stmt, 2)
+		out.identity.MutationDigest = readBlob(stmt, 3)
+		if stmt.ColumnType(4) != zs.TypeNull {
+			out.encodingVersion = stmt.ColumnText(4)
+		}
+		if stmt.ColumnType(5) != zs.TypeNull {
+			out.canonicalMutation = readBlob(stmt, 5)
+		}
+		return nil
+	}}); err != nil {
 		return storedOperation{}, false, fmt.Errorf("lookup operation %q: %w", op, err)
 	}
 	if !found {
 		return storedOperation{}, false, nil
 	}
 	// The committing actor lives on the anchor journal row.
-	if err := sqlitex.Execute(db.conn,
-		`SELECT actor_id FROM journal WHERE journal_id = ?1`,
-		&sqlitex.ExecOptions{Args: []any{out.anchor}, ResultFunc: func(stmt *zs.Stmt) error {
-			actor, err := journalParseActor(stmt.ColumnText(0))
-			if err != nil {
-				return err
-			}
-			out.identity.ActorID = actor
-			return nil
-		}}); err != nil {
+	if err := sqlitex.Execute(db.conn, "SELECT actor_id FROM journal WHERE journal_id = ?1", &sqlitex.ExecOptions{Args: []any{out.anchor}, ResultFunc: func(stmt *zs.Stmt) error {
+		actor, err := journalParseActor(stmt.ColumnText(0))
+		if err != nil {
+			return err
+		}
+		out.identity.ActorID = actor
+		return nil
+	}}); err != nil {
 		return storedOperation{}, false, fmt.Errorf("lookup operation actor %q: %w", op, err)
 	}
 	return out, true, nil
@@ -738,7 +718,7 @@ func (db *DB) reconcileAllocatedTaskCreatesLocked(in journal.OperationInput, exi
 		slots[binding.Slot] = binding
 	}
 	var produced []journal.JournalID
-	if err := sqlitex.Execute(db.conn, `SELECT journal_id FROM journal WHERE produced_by_operation_journal_id=?1 ORDER BY journal_id`, &sqlitex.ExecOptions{Args: []any{existing.anchor}, ResultFunc: func(stmt *zs.Stmt) error {
+	if err := sqlitex.Execute(db.conn, "SELECT journal_id FROM journal WHERE produced_by_operation_journal_id=?1 ORDER BY journal_id", &sqlitex.ExecOptions{Args: []any{existing.anchor}, ResultFunc: func(stmt *zs.Stmt) error {
 		produced = append(produced, journal.JournalID(stmt.ColumnInt64(0)))
 		return nil
 	}}); err != nil {
@@ -808,7 +788,7 @@ func (db *DB) committedOutcomeForExistingLocked(in journal.OperationInput, exist
 			fmt.Errorf("%w: %w", journal.ErrOperationConflict, conflict)
 	}
 	if existing.encodingVersion != "" {
-		if existing.encodingVersion != prepared.EncodingVersion() || !bytes.Equal(existing.canonicalMutation, prepared.CanonicalBytes()) {
+		if existing.encodingVersion != prepared.EncodingVersion().String() || !bytes.Equal(existing.canonicalMutation, prepared.CanonicalBytes()) {
 			conflict := &journal.OperationConflict{OperationID: in.OperationID, Field: "canonical effects"}
 			return journal.CommittedResult{Kind: journal.CommittedConflict, Conflict: conflict},
 				fmt.Errorf("%w: %w", journal.ErrOperationConflict, conflict)
@@ -851,35 +831,27 @@ func (db *DB) resolveOperationIDInsertRaceLocked(in journal.OperationInput, call
 func (db *DB) reconstructCommittedLocked(anchor int64) (journal.CommittedResult, error) {
 	res := journal.CommittedResult{Kind: journal.CommittedExact, AnchorJournalID: journal.JournalID(anchor)}
 	// EmittedEvents: the flat task_event closure in JournalID order (§2.1, §3.2).
-	if err := sqlitex.Execute(db.conn,
-		`SELECT journal_id FROM journal WHERE produced_by_operation_journal_id = ?1 AND kind_id = ?2 ORDER BY journal_id ASC`,
-		&sqlitex.ExecOptions{Args: []any{anchor, int(journal.JournalKindTaskEvent)}, ResultFunc: func(stmt *zs.Stmt) error {
-			res.EmittedEvents = append(res.EmittedEvents, journal.JournalID(stmt.ColumnInt64(0)))
-			return nil
-		}}); err != nil {
+	if err := sqlitex.Execute(db.conn, "SELECT journal_id FROM journal WHERE produced_by_operation_journal_id = ?1 AND kind_id = ?2 ORDER BY journal_id ASC", &sqlitex.ExecOptions{Args: []any{anchor, int(journal.JournalKindTaskEvent)}, ResultFunc: func(stmt *zs.Stmt) error {
+		res.EmittedEvents = append(res.EmittedEvents, journal.JournalID(stmt.ColumnInt64(0)))
+		return nil
+	}}); err != nil {
 		return journal.CommittedResult{}, fmt.Errorf("reconstruct emitted events: %w", err)
 	}
 	// Slot-keyed result map (§3.2), bucketed by JournalKind.
-	if err := sqlitex.Execute(db.conn,
-		`SELECT s.result_slot_id, s.produced_journal_id, j.kind_id, te.task_id
-		 FROM journal_operation_result_slots s
-		 JOIN journal j ON j.journal_id = s.produced_journal_id
-		 LEFT JOIN journal_task_events te ON te.journal_id = s.produced_journal_id
-		 WHERE s.journal_id = ?1 ORDER BY s.result_slot_id ASC`,
-		&sqlitex.ExecOptions{Args: []any{anchor}, ResultFunc: func(stmt *zs.Stmt) error {
-			binding := journal.ResultSlotBinding{
-				Slot:              journal.ResultSlotID(stmt.ColumnText(0)),
-				ProducedJournalID: journal.JournalID(stmt.ColumnInt64(1)),
-				Kind:              journal.JournalKind(stmt.ColumnInt(2)),
+	if err := sqlitex.Execute(db.conn, "SELECT s.result_slot_id, s.produced_journal_id, j.kind_id, te.task_id\n\t\t FROM journal_operation_result_slots s\n\t\t JOIN journal j ON j.journal_id = s.produced_journal_id\n\t\t LEFT JOIN journal_task_events te ON te.journal_id = s.produced_journal_id\n\t\t WHERE s.journal_id = ?1 ORDER BY s.result_slot_id ASC", &sqlitex.ExecOptions{Args: []any{anchor}, ResultFunc: func(stmt *zs.Stmt) error {
+		binding := journal.ResultSlotBinding{
+			Slot:              journal.ResultSlotID(stmt.ColumnText(0)),
+			ProducedJournalID: journal.JournalID(stmt.ColumnInt64(1)),
+			Kind:              journal.JournalKind(stmt.ColumnInt(2)),
+		}
+		if stmt.ColumnType(3) != zs.TypeNull {
+			if tid, err := journalParseTask(stmt.ColumnText(3)); err == nil {
+				binding.TaskID = &tid
 			}
-			if stmt.ColumnType(3) != zs.TypeNull {
-				if tid, err := journalParseTask(stmt.ColumnText(3)); err == nil {
-					binding.TaskID = &tid
-				}
-			}
-			res.ResultSlots = append(res.ResultSlots, binding)
-			return nil
-		}}); err != nil {
+		}
+		res.ResultSlots = append(res.ResultSlots, binding)
+		return nil
+	}}); err != nil {
 		return journal.CommittedResult{}, fmt.Errorf("reconstruct result slots: %w", err)
 	}
 	return res, nil
@@ -921,9 +893,7 @@ func (db *DB) CountAuthoritiesOfKind(kind int) (int, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	var n int
-	if err := sqlitex.Execute(db.conn,
-		`SELECT COUNT(*) FROM journal_authorities WHERE authority_kind_id = ?1`,
-		&sqlitex.ExecOptions{Args: []any{kind}, ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
+	if err := sqlitex.Execute(db.conn, "SELECT COUNT(*) FROM journal_authorities WHERE authority_kind_id = ?1", &sqlitex.ExecOptions{Args: []any{kind}, ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
 		return 0, fmt.Errorf("CountAuthoritiesOfKind %d: %w", kind, err)
 	}
 	return n, nil
@@ -936,9 +906,7 @@ func (db *DB) CountSuccessorEpisodes(task journal.TaskID) (int, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	var n int
-	if err := sqlitex.Execute(db.conn,
-		`SELECT COUNT(*) FROM journal_authority_assignment_episodes WHERE task_id = ?1 AND predecessor_assignment_id IS NOT NULL`,
-		&sqlitex.ExecOptions{Args: []any{task.String()}, ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
+	if err := sqlitex.Execute(db.conn, "SELECT COUNT(*) FROM journal_authority_assignment_episodes WHERE task_id = ?1 AND predecessor_assignment_id IS NOT ?2", &sqlitex.ExecOptions{Args: []any{task.String(), nil}, ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
 		return 0, fmt.Errorf("CountSuccessorEpisodes %q: %w", task, err)
 	}
 	return n, nil

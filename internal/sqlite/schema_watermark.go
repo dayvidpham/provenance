@@ -25,83 +25,48 @@ import (
 // tight again, so a fresh downgrade seam is what a later test uses to model new legacy
 // state.
 
-// tasksTableColumns is the shared 14-column body of the tasks table — every column
-// except the last_journal_id watermark, whose nullability is the single axis that
-// differs between the native (NOT NULL) and legacy (nullable) shapes. Keeping it in one
-// place keeps ensureSchema and every watermark rebuild from drifting.
-const tasksTableColumns = `id           TEXT PRIMARY KEY,
-		namespace    TEXT NOT NULL,
-		title        TEXT NOT NULL,
-		description  TEXT NOT NULL DEFAULT '',
-		status_id    INTEGER NOT NULL DEFAULT 0 REFERENCES statuses(id),
-		priority_id  INTEGER NOT NULL DEFAULT 2 REFERENCES priorities(id),
-		type_id      INTEGER NOT NULL DEFAULT 2 REFERENCES task_types(id),
-		phase_id     INTEGER NOT NULL REFERENCES phases(id),
-		owner_id     TEXT REFERENCES agents(id),
-		notes        TEXT NOT NULL DEFAULT '',
-		created_at   INTEGER NOT NULL,
-		updated_at   INTEGER NOT NULL,
-		closed_at    INTEGER,
-		close_reason TEXT NOT NULL DEFAULT ''`
+type tasksWatermarkShape uint8
 
-// tasksWatermarkClause returns the last_journal_id column declaration. The watermark's
-// FK target journal(journal_id) is resolved at row time (SQLite defers cross-table FK
-// resolution), so this is valid even when tasks is created before the journal table.
-func tasksWatermarkClause(notNull bool) string {
-	if notNull {
-		return "last_journal_id INTEGER NOT NULL REFERENCES journal(journal_id)"
-	}
-	return "last_journal_id INTEGER REFERENCES journal(journal_id)"
-}
-
-// tasksCreateDDL builds the CREATE TABLE statement for the tasks table (or a rebuild
-// scratch table) with the watermark at the requested nullability.
-func tasksCreateDDL(table string, watermarkNotNull bool) string {
-	return tasksCreateDDLClause(table, tasksWatermarkClause(watermarkNotNull))
-}
-
-// tasksCreateDDLClause builds the CREATE TABLE statement with the given watermark
-// column clause; an empty clause produces the even-older column-less legacy shape (the
-// tasks table that predates last_journal_id entirely, §13).
-func tasksCreateDDLClause(table, watermarkClause string) string {
-	if watermarkClause == "" {
-		return fmt.Sprintf("CREATE TABLE %s (\n\t\t%s\n\t) STRICT", table, tasksTableColumns)
-	}
-	return fmt.Sprintf("CREATE TABLE %s (\n\t\t%s,\n\t\t%s\n\t) STRICT", table, tasksTableColumns, watermarkClause)
-}
-
-// tasksIndexDDL returns the CREATE INDEX statements for the tasks table. They are
-// recreated after every watermark rebuild because the rebuild drops and renames the
-// table (the indexes go with the dropped table).
-func tasksIndexDDL() []string {
-	return []string{
-		`CREATE INDEX IF NOT EXISTS idx_tasks_namespace ON tasks (namespace)`,
-		`CREATE INDEX IF NOT EXISTS idx_tasks_status    ON tasks (status_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_tasks_priority  ON tasks (priority_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_tasks_type      ON tasks (type_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_tasks_phase     ON tasks (phase_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_tasks_owner     ON tasks (owner_id)`,
-	}
-}
-
-// tasksAllColumns / tasksBaseColumns are the copy column lists for a watermark rebuild.
 const (
-	tasksAllColumns  = `id,namespace,title,description,status_id,priority_id,type_id,phase_id,owner_id,notes,created_at,updated_at,closed_at,close_reason,last_journal_id`
-	tasksBaseColumns = `id,namespace,title,description,status_id,priority_id,type_id,phase_id,owner_id,notes,created_at,updated_at,closed_at,close_reason`
+	tasksWatermarkNative tasksWatermarkShape = iota + 1
+	tasksWatermarkNullable
+	tasksWatermarkColumnless
 )
+
+func (shape tasksWatermarkShape) createRebuildQuery() string {
+	switch shape {
+	case tasksWatermarkNative:
+		return "CREATE TABLE tasks_watermark_rebuild (id TEXT PRIMARY KEY,namespace TEXT NOT NULL,title TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',status_id INTEGER NOT NULL DEFAULT 0 REFERENCES statuses(id),priority_id INTEGER NOT NULL DEFAULT 2 REFERENCES priorities(id),type_id INTEGER NOT NULL DEFAULT 2 REFERENCES task_types(id),phase_id INTEGER NOT NULL REFERENCES phases(id),owner_id TEXT REFERENCES agents(id),notes TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,closed_at INTEGER,close_reason TEXT NOT NULL DEFAULT '',last_journal_id INTEGER NOT NULL REFERENCES journal(journal_id)) STRICT"
+	case tasksWatermarkNullable:
+		return "CREATE TABLE tasks_watermark_rebuild (id TEXT PRIMARY KEY,namespace TEXT NOT NULL,title TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',status_id INTEGER NOT NULL DEFAULT 0 REFERENCES statuses(id),priority_id INTEGER NOT NULL DEFAULT 2 REFERENCES priorities(id),type_id INTEGER NOT NULL DEFAULT 2 REFERENCES task_types(id),phase_id INTEGER NOT NULL REFERENCES phases(id),owner_id TEXT REFERENCES agents(id),notes TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,closed_at INTEGER,close_reason TEXT NOT NULL DEFAULT '',last_journal_id INTEGER REFERENCES journal(journal_id)) STRICT"
+	case tasksWatermarkColumnless:
+		return "CREATE TABLE tasks_watermark_rebuild (id TEXT PRIMARY KEY,namespace TEXT NOT NULL,title TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',status_id INTEGER NOT NULL DEFAULT 0 REFERENCES statuses(id),priority_id INTEGER NOT NULL DEFAULT 2 REFERENCES priorities(id),type_id INTEGER NOT NULL DEFAULT 2 REFERENCES task_types(id),phase_id INTEGER NOT NULL REFERENCES phases(id),owner_id TEXT REFERENCES agents(id),notes TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,closed_at INTEGER,close_reason TEXT NOT NULL DEFAULT '') STRICT"
+	default:
+		panic("unknown tasks watermark shape")
+	}
+}
+
+func (shape tasksWatermarkShape) copyQuery() string {
+	switch shape {
+	case tasksWatermarkNative, tasksWatermarkNullable:
+		return "INSERT INTO tasks_watermark_rebuild (id,namespace,title,description,status_id,priority_id,type_id,phase_id,owner_id,notes,created_at,updated_at,closed_at,close_reason,last_journal_id) SELECT id,namespace,title,description,status_id,priority_id,type_id,phase_id,owner_id,notes,created_at,updated_at,closed_at,close_reason,last_journal_id FROM tasks"
+	case tasksWatermarkColumnless:
+		return "INSERT INTO tasks_watermark_rebuild (id,namespace,title,description,status_id,priority_id,type_id,phase_id,owner_id,notes,created_at,updated_at,closed_at,close_reason) SELECT id,namespace,title,description,status_id,priority_id,type_id,phase_id,owner_id,notes,created_at,updated_at,closed_at,close_reason FROM tasks"
+	default:
+		panic("unknown tasks watermark shape")
+	}
+}
 
 // tasksWatermarkColumnInfoLocked reports whether the tasks table has a last_journal_id
 // column and, if so, whether it is declared NOT NULL. Assumes db.mu is held.
 func (db *DB) tasksWatermarkColumnInfoLocked() (present bool, notNull bool, err error) {
-	if err := sqlitex.Execute(db.conn,
-		`PRAGMA table_info(tasks)`,
-		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
-			if stmt.ColumnText(1) == "last_journal_id" {
-				present = true
-				notNull = stmt.ColumnInt(3) == 1 // column 3 of table_info is "notnull"
-			}
-			return nil
-		}}); err != nil {
+	if err := sqlitex.Execute(db.conn, "PRAGMA table_info(tasks)", &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
+		if stmt.ColumnText(1) == "last_journal_id" {
+			present = true
+			notNull = stmt.ColumnInt(3) == 1 // column 3 of table_info is "notnull"
+		}
+		return nil
+	}}); err != nil {
 		return false, false, fmt.Errorf("tasksWatermarkColumnInfo: %w", err)
 	}
 	return present, notNull, nil
@@ -126,9 +91,7 @@ func (db *DB) countUnanchoredTasksLocked() (int, error) {
 				"nothing re-tightened; fix: this indicates the column-add path was skipped, which is a bug")
 	}
 	var n int
-	if err := sqlitex.Execute(db.conn,
-		`SELECT COUNT(*) FROM tasks WHERE last_journal_id IS NULL`,
-		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
+	if err := sqlitex.Execute(db.conn, "SELECT COUNT(*) FROM tasks WHERE last_journal_id IS ?1", &sqlitex.ExecOptions{Args: []any{nil}, ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
 		return 0, fmt.Errorf("countUnanchoredTasks: %w", err)
 	}
 	return n, nil
@@ -142,46 +105,61 @@ func (db *DB) countUnanchoredTasksLocked() (int, error) {
 // table has no such column). FK enforcement is toggled around an explicit transaction
 // exactly as completeJournalOperationFK does; a detected violation rolls the whole
 // rebuild back. Assumes db.mu is held.
-func (db *DB) rebuildTasksWatermarkLocked(watermarkClause string, copyWatermark bool) error {
-	if err := sqlitex.ExecuteTransient(db.conn, `PRAGMA foreign_keys=OFF`, nil); err != nil {
+func (db *DB) rebuildTasksWatermarkLocked(shape tasksWatermarkShape) error {
+	if err := sqlitex.ExecuteTransient(db.conn, "PRAGMA foreign_keys=OFF", nil); err != nil {
 		return fmt.Errorf("rebuildTasksWatermark: disable FK enforcement: %w", err)
 	}
-	defer func() { _ = sqlitex.ExecuteTransient(db.conn, `PRAGMA foreign_keys=ON`, nil) }()
+	defer func() { _ = sqlitex.ExecuteTransient(db.conn, "PRAGMA foreign_keys=ON", nil) }()
 
-	selectCols := tasksBaseColumns
-	if copyWatermark {
-		selectCols = tasksAllColumns
+	if err := sqlitex.ExecuteTransient(db.conn, "BEGIN IMMEDIATE", nil); err != nil {
+		return fmt.Errorf("rebuildTasksWatermark: begin: %w", err)
 	}
-	steps := []string{
-		`BEGIN IMMEDIATE`,
-		tasksCreateDDLClause("tasks_watermark_rebuild", watermarkClause),
-		fmt.Sprintf(`INSERT INTO tasks_watermark_rebuild (%s) SELECT %s FROM tasks`, selectCols, selectCols),
-		`DROP TABLE tasks`,
-		`ALTER TABLE tasks_watermark_rebuild RENAME TO tasks`,
+	if err := sqlitex.ExecuteTransient(db.conn, shape.createRebuildQuery(), nil); err != nil {
+		_ = sqlitex.ExecuteTransient(db.conn, "ROLLBACK", nil)
+		return fmt.Errorf("rebuildTasksWatermark: create rebuild table: %w", err)
 	}
-	steps = append(steps, tasksIndexDDL()...)
-	for _, stmt := range steps {
-		if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
-			_ = sqlitex.ExecuteTransient(db.conn, `ROLLBACK`, nil)
-			return fmt.Errorf("rebuildTasksWatermark: step %q: %w", stmt[:min(len(stmt), 40)], err)
+	if err := sqlitex.Execute(db.conn, shape.copyQuery(), nil); err != nil {
+		_ = sqlitex.ExecuteTransient(db.conn, "ROLLBACK", nil)
+		return fmt.Errorf("rebuildTasksWatermark: copy rows: %w", err)
+	}
+	if err := sqlitex.ExecuteTransient(db.conn, "DROP TABLE tasks", nil); err != nil {
+		_ = sqlitex.ExecuteTransient(db.conn, "ROLLBACK", nil)
+		return fmt.Errorf("rebuildTasksWatermark: drop old table: %w", err)
+	}
+	if err := sqlitex.ExecuteTransient(db.conn, "ALTER TABLE tasks_watermark_rebuild RENAME TO tasks", nil); err != nil {
+		_ = sqlitex.ExecuteTransient(db.conn, "ROLLBACK", nil)
+		return fmt.Errorf("rebuildTasksWatermark: rename rebuilt table: %w", err)
+	}
+	// Recreate the indexes dropped with the old tasks table.
+	for _, ddl := range []string{
+		"CREATE INDEX IF NOT EXISTS idx_tasks_namespace ON tasks (namespace)",
+		"CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks (status_id)",
+		"CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks (priority_id)",
+		"CREATE INDEX IF NOT EXISTS idx_tasks_type ON tasks (type_id)",
+		"CREATE INDEX IF NOT EXISTS idx_tasks_phase ON tasks (phase_id)",
+		"CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks (owner_id)",
+	} {
+		if err := sqlitex.ExecuteTransient(db.conn, ddl, nil); err != nil {
+			_ = sqlitex.ExecuteTransient(db.conn, "ROLLBACK", nil)
+			return fmt.Errorf("rebuildTasksWatermark: recreate index: %w", err)
 		}
 	}
 	var violations int
-	if err := sqlitex.ExecuteTransient(db.conn, `PRAGMA foreign_key_check`,
+	if err := sqlitex.ExecuteTransient(db.conn, "PRAGMA foreign_key_check",
 		&sqlitex.ExecOptions{ResultFunc: func(*zs.Stmt) error { violations++; return nil }}); err != nil {
-		_ = sqlitex.ExecuteTransient(db.conn, `ROLLBACK`, nil)
+		_ = sqlitex.ExecuteTransient(db.conn, "ROLLBACK", nil)
 		return fmt.Errorf("rebuildTasksWatermark: foreign_key_check: %w", err)
 	}
 	if violations > 0 {
-		_ = sqlitex.ExecuteTransient(db.conn, `ROLLBACK`, nil)
+		_ = sqlitex.ExecuteTransient(db.conn, "ROLLBACK", nil)
 		return fmt.Errorf(
 			"rebuildTasksWatermark: rebuild left %d foreign-key violations, rolled back — where: tasks "+
 				"watermark rebuild; impact: the rebuild was reverted and the database left unchanged; fix: "+
 				"this indicates a child row (edge/label/comment) references a task id that does not exist",
 			violations)
 	}
-	if err := sqlitex.ExecuteTransient(db.conn, `COMMIT`, nil); err != nil {
-		_ = sqlitex.ExecuteTransient(db.conn, `ROLLBACK`, nil)
+	if err := sqlitex.ExecuteTransient(db.conn, "COMMIT", nil); err != nil {
+		_ = sqlitex.ExecuteTransient(db.conn, "ROLLBACK", nil)
 		return fmt.Errorf("rebuildTasksWatermark: commit rebuild: %w", err)
 	}
 	return nil
@@ -201,7 +179,7 @@ func (db *DB) downgradeTasksWatermarkToLegacyLocked() error {
 	if !present || !notNull {
 		return nil // already legacy-shaped (nullable, or the even-older column-less shape)
 	}
-	return db.rebuildTasksWatermarkLocked(tasksWatermarkClause(false), true /*copyWatermark*/)
+	return db.rebuildTasksWatermarkLocked(tasksWatermarkNullable)
 }
 
 // DowngradeTasksToColumnlessLegacy rebuilds the tasks table to the even-older legacy
@@ -219,7 +197,7 @@ func (db *DB) DowngradeTasksToColumnlessLegacy() error {
 	if !present {
 		return nil
 	}
-	return db.rebuildTasksWatermarkLocked("" /*column-less*/, false /*copyWatermark*/)
+	return db.rebuildTasksWatermarkLocked(tasksWatermarkColumnless)
 }
 
 // ensureTasksWatermarkColumnLocked is migration's column-add path (§13): a legacy
@@ -237,7 +215,7 @@ func (db *DB) ensureTasksWatermarkColumnLocked() error {
 		return nil
 	}
 	if err := sqlitex.ExecuteTransient(db.conn,
-		`ALTER TABLE tasks ADD COLUMN `+tasksWatermarkClause(false), nil); err != nil {
+		"ALTER TABLE tasks ADD COLUMN last_journal_id INTEGER REFERENCES journal(journal_id)", nil); err != nil {
 		return fmt.Errorf(
 			"ensureTasksWatermarkColumn: add legacy last_journal_id column — where: migration column-add "+
 				"path (§13); when: before any legacy row is anchored; impact: nothing committed; fix: the "+

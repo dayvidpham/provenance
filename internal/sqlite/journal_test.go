@@ -93,6 +93,12 @@ type opEvent struct {
 	payload    json.RawMessage
 }
 
+type hostileContextID string
+
+func (hostileContextID) EventContextDomain() journal.EventContextKind {
+	return "fixture.hostile"
+}
+
 // appendEventsOp emits the given task events as ONE operation under boot (each event's
 // RecordedAt carried via a per-effect override, §12), the operation-anchored replacement
 // for a run of bare AppendTaskEvent calls. Because one operation produces one anchor row
@@ -158,6 +164,46 @@ func findEvent(t *testing.T, db *DB, jid journal.JournalID) journal.TaskEventRow
 	}
 	t.Fatalf("findEvent: no task event with JournalID %d", jid)
 	return journal.TaskEventRow{}
+}
+
+func TestQueryTaskEventsTreatsHostileTaskAndContextFiltersAsData(t *testing.T) {
+	for _, hostile := range []string{"' OR 1=1 --", "x' /* comment */ OR '1'='1", "nul\x00suffix"} {
+		t.Run(fmt.Sprintf("%q", hostile), func(t *testing.T) {
+			db := newJournalDB(t)
+			actor, _ := seedActorAndTask(t, db)
+			boot := genesisBoot(t, db, actor)
+			task := ptypes.Task{
+				ID:        ptypes.TaskID{Namespace: hostile, UUID: uuid.New()},
+				Title:     "hostile filter fixture",
+				Phase:     ptypes.PhaseUnscoped,
+				CreatedAt: time.Now().UTC(),
+				UpdatedAt: time.Now().UTC(),
+			}
+			if err := db.SeedLegacyTaskRow(task); err != nil {
+				t.Fatalf("seed hostile task: %v", err)
+			}
+			descriptor, err := journal.DefineExtensionContext[hostileContextID](func(hostileContextID) error { return nil })
+			if err != nil {
+				t.Fatalf("define context: %v", err)
+			}
+			context, err := journal.ExtensionContext(descriptor, hostileContextID(hostile))
+			if err != nil {
+				t.Fatalf("construct hostile context: %v", err)
+			}
+			ids := appendEventsOp(t, db, boot, actor, task.ID, "op-hostile", []opEvent{{
+				kind: journal.EventKindTaskUpdated, recordedAt: time.Now().UTC(), contexts: []journal.EventContext{context}, payload: json.RawMessage(`{"safe":true}`),
+			}})
+			page, err := db.QueryTaskEvents(journal.JournalQueryV1{
+				OrderBy:    journal.OrderByJournalID,
+				TaskIDs:    []journal.TaskID{task.ID},
+				EventKinds: []journal.EventKind{journal.EventKindTaskUpdated},
+				Contexts:   []journal.EventContext{context},
+			})
+			if err != nil || len(page.Events) != 1 || page.Events[0].JournalID != ids[0] {
+				t.Fatalf("hostile query filter escaped binding: events=%v err=%v", page.Events, err)
+			}
+		})
+	}
 }
 
 func TestJournalKindsSeededMatchGoEnum(t *testing.T) {

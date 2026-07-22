@@ -27,71 +27,27 @@ import (
 type DB struct {
 	mu   sync.Mutex
 	conn *zs.Conn
-
-	// projTasksTable / projAttribTable name the tables the shared reducer's
-	// projection-WRITE steps target (docs/journal-relational-contract.md §8, §15).
-	// They are the real projection tables ("tasks", "task_attributions") during a
-	// live Apply, and are temporarily repointed at connection-scoped shadow tables
-	// during ReplayProjections' from-empty convergence check so the real rows are
-	// never mutated while the check runs (SHADOW DERIVATION — the real tables stay
-	// read-only during the check, so the check is constraint-independent and the
-	// NOT NULL tasks.last_journal_id tightening cannot be tripped by a clear-in-place
-	// scratch UPDATE). Both are always held under db.mu; the swap+restore is bracketed
-	// inside one locked ReplayProjections call so a live Apply never observes the
-	// shadow target. Empty is treated as the real default by projTasks/projAttribs.
-	projTasksTable  string
-	projAttribTable string
-	// projEdgesTable / projLabelsTable / projCommentsTable name the domain-projection
-	// WRITE targets for the journaled relationship/annotation mutation families (§6
-	// amendment, §15). Real ("edges"/"labels"/"comments") during a live Apply; repointed
-	// at connection-scoped shadow tables during ReplayProjections' from-empty convergence
-	// check so the real rows stay read-only. Empty is treated as the real default.
-	projEdgesTable    string
-	projLabelsTable   string
-	projCommentsTable string
+	// projectionTarget is a closed selector for complete static SQL variants.
+	// SQLite cannot bind identifiers, so arbitrary table names are never stored.
+	projectionTarget projectionTarget
 }
 
-// projTasks returns the projection-write target table for tasks: the shadow table
-// during a from-empty replay derivation, else the real "tasks" table (§8, §15).
-func (db *DB) projTasks() string {
-	if db.projTasksTable == "" {
-		return "tasks"
-	}
-	return db.projTasksTable
-}
+type projectionTarget uint8
 
-// projAttribs returns the projection-write target table for task attributions:
-// the shadow table during a from-empty replay derivation, else the real
-// "task_attributions" table (§8.2, §15).
-func (db *DB) projAttribs() string {
-	if db.projAttribTable == "" {
-		return "task_attributions"
-	}
-	return db.projAttribTable
-}
+const (
+	projectionTargetLive projectionTarget = iota
+	projectionTargetShadow
+)
 
-// projEdges / projLabels / projComments return the domain-projection write target for
-// the journaled edge/label/comment mutation families: the shadow table during a
-// from-empty replay derivation, else the real base table (§6 amendment, §15).
-func (db *DB) projEdges() string {
-	if db.projEdgesTable == "" {
-		return "edges"
+func (target projectionTarget) label() string {
+	switch target {
+	case projectionTargetLive:
+		return "live projection"
+	case projectionTargetShadow:
+		return "shadow projection"
+	default:
+		panic("unknown projection target")
 	}
-	return db.projEdgesTable
-}
-
-func (db *DB) projLabels() string {
-	if db.projLabelsTable == "" {
-		return "labels"
-	}
-	return db.projLabelsTable
-}
-
-func (db *DB) projComments() string {
-	if db.projCommentsTable == "" {
-		return "comments"
-	}
-	return db.projCommentsTable
 }
 
 // Open opens (or creates) a SQLite database at dbPath and returns an
@@ -130,7 +86,10 @@ func Open(dbPath string, models []ptypes.ModelEntry) (*DB, error) {
 
 	db := &DB{conn: conn}
 
-	if err := db.applyNonPersistentPragmas(); err != nil {
+	// SQLite table rebuilds must run with FK enforcement disabled before the
+	// activation transaction starts. VerifyIntegrity checks the complete FK graph
+	// before commit; runtime enforcement is restored after the transaction ends.
+	if err := db.applyActivationPragmas(); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("sqlite.Open: failed to apply pragmas on %q: %w", dbPath, err)
 	}
@@ -231,7 +190,7 @@ func preflightActivationClone(source *zs.Conn, models []ptypes.ModelEntry) error
 		return fmt.Errorf("finish read-only activation clone: %w", err)
 	}
 	db := &DB{conn: clone}
-	if err = db.applyNonPersistentPragmas(); err != nil {
+	if err = db.applyActivationPragmas(); err != nil {
 		return err
 	}
 	var activationErr error
@@ -290,24 +249,21 @@ func (db *DB) Close() error {
 // Pragmas
 // ---------------------------------------------------------------------------
 
-func (db *DB) applyNonPersistentPragmas() error {
-	for _, p := range []string{
-		"PRAGMA busy_timeout=5000;",
-		"PRAGMA foreign_keys=OFF;",
-	} {
-		if err := sqlitex.ExecuteTransient(db.conn, p, nil); err != nil {
-			return fmt.Errorf("pragma %q: %w", p, err)
+func (db *DB) applyActivationPragmas() error {
+	for _, pragma := range []string{"PRAGMA busy_timeout=5000;", "PRAGMA foreign_keys=OFF;"} {
+		if err := sqlitex.ExecuteTransient(db.conn, pragma, nil); err != nil {
+			return fmt.Errorf("pragma %q: %w", pragma, err)
 		}
 	}
 	return nil
 }
 
 func (db *DB) enableWAL() error {
-	return sqlitex.ExecuteTransient(db.conn, `PRAGMA journal_mode=WAL`, nil)
+	return sqlitex.ExecuteTransient(db.conn, "PRAGMA journal_mode=WAL", nil)
 }
 
 func (db *DB) enableForeignKeys() error {
-	return sqlitex.ExecuteTransient(db.conn, `PRAGMA foreign_keys=ON`, nil)
+	return sqlitex.ExecuteTransient(db.conn, "PRAGMA foreign_keys=ON", nil)
 }
 
 // ---------------------------------------------------------------------------
@@ -316,98 +272,52 @@ func (db *DB) enableForeignKeys() error {
 
 func (db *DB) ensureSchema(models []ptypes.ModelEntry) error {
 	ddl := []string{
-		`CREATE TABLE IF NOT EXISTS statuses (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT`,
-		`CREATE TABLE IF NOT EXISTS priorities (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT`,
-		`CREATE TABLE IF NOT EXISTS task_types (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT`,
-		`CREATE TABLE IF NOT EXISTS edge_kinds (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT`,
-		`CREATE TABLE IF NOT EXISTS agent_kinds (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT`,
-		`CREATE TABLE IF NOT EXISTS providers (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT`,
-		`CREATE TABLE IF NOT EXISTS roles (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT`,
-		`CREATE TABLE IF NOT EXISTS phases (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT`,
-		`CREATE TABLE IF NOT EXISTS stages (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT`,
+		"CREATE TABLE IF NOT EXISTS statuses (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT",
+		"CREATE TABLE IF NOT EXISTS priorities (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT",
+		"CREATE TABLE IF NOT EXISTS task_types (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT",
+		"CREATE TABLE IF NOT EXISTS edge_kinds (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT",
+		"CREATE TABLE IF NOT EXISTS agent_kinds (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT",
+		"CREATE TABLE IF NOT EXISTS providers (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT",
+		"CREATE TABLE IF NOT EXISTS roles (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT",
+		"CREATE TABLE IF NOT EXISTS phases (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT",
+		"CREATE TABLE IF NOT EXISTS stages (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT",
 		`CREATE TABLE IF NOT EXISTS ml_models (
-			id          INTEGER PRIMARY KEY,
-			provider_id INTEGER NOT NULL REFERENCES providers(id),
-			name        TEXT NOT NULL,
-			UNIQUE (provider_id, name)
-		) STRICT`,
-		`CREATE TABLE IF NOT EXISTS agents (
-			id      TEXT PRIMARY KEY,
-			kind_id INTEGER NOT NULL REFERENCES agent_kinds(id)
-		) STRICT`,
-		`CREATE TABLE IF NOT EXISTS agents_human (
-			agent_id TEXT PRIMARY KEY REFERENCES agents(id),
-			name     TEXT NOT NULL,
-			contact  TEXT NOT NULL DEFAULT ''
-		) STRICT, WITHOUT ROWID`,
-		`CREATE TABLE IF NOT EXISTS agents_ml (
-			agent_id TEXT PRIMARY KEY REFERENCES agents(id),
-			role_id  INTEGER NOT NULL REFERENCES roles(id),
-			model_id INTEGER NOT NULL REFERENCES ml_models(id)
-		) STRICT, WITHOUT ROWID`,
-		`CREATE TABLE IF NOT EXISTS agents_software (
-			agent_id TEXT PRIMARY KEY REFERENCES agents(id),
-			name     TEXT NOT NULL,
-			version  TEXT NOT NULL DEFAULT '',
-			source   TEXT NOT NULL DEFAULT ''
-		) STRICT, WITHOUT ROWID`,
-		// tasks carries the last_journal_id projection watermark (§8.1): the JournalID
-		// whose ordered history this row's derived state reflects. A fresh native
-		// database ships it NOT NULL — every production tasks-row INSERT is the reducer
-		// fold, which carries the watermark, so no un-journaled task row can exist. A
-		// legacy database predates the tightening and is upgraded by MigrateLegacyBaseline
-		// (§13). The column body and shape live in schema_watermark.go so ensureSchema and
-		// every watermark rebuild share one source of truth. FK target journal(journal_id)
-		// is created by ensureJournalSchema (SQLite resolves cross-table FKs at row time).
-		fmt.Sprintf("CREATE TABLE IF NOT EXISTS tasks (\n\t\t\t%s,\n\t\t\t%s\n\t\t) STRICT",
-			tasksTableColumns, tasksWatermarkClause(true)),
-		`CREATE INDEX IF NOT EXISTS idx_tasks_namespace ON tasks (namespace)`,
-		`CREATE INDEX IF NOT EXISTS idx_tasks_status    ON tasks (status_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_tasks_priority  ON tasks (priority_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_tasks_type      ON tasks (type_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_tasks_phase     ON tasks (phase_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_tasks_owner     ON tasks (owner_id)`,
-		`CREATE TABLE IF NOT EXISTS edges (
-			source_id  TEXT NOT NULL REFERENCES tasks(id),
-			target_id  TEXT NOT NULL,
-			kind_id    INTEGER NOT NULL REFERENCES edge_kinds(id),
-			created_at INTEGER NOT NULL,
-			PRIMARY KEY (source_id, target_id, kind_id)
-		) STRICT, WITHOUT ROWID`,
-		`CREATE INDEX IF NOT EXISTS idx_edges_source ON edges (source_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_edges_target ON edges (target_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_edges_kind   ON edges (kind_id)`,
-		`CREATE TABLE IF NOT EXISTS activities (
-			id         TEXT PRIMARY KEY,
-			agent_id   TEXT NOT NULL REFERENCES agents(id),
-			phase_id   INTEGER NOT NULL REFERENCES phases(id),
-			stage_id   INTEGER NOT NULL REFERENCES stages(id),
-			started_at INTEGER NOT NULL,
-			ended_at   INTEGER,
-			notes      TEXT NOT NULL DEFAULT ''
-		) STRICT`,
-		`CREATE INDEX IF NOT EXISTS idx_activities_agent ON activities (agent_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_activities_phase ON activities (phase_id)`,
-		`CREATE TABLE IF NOT EXISTS labels (
-			task_id TEXT NOT NULL REFERENCES tasks(id),
-			name    TEXT NOT NULL,
-			PRIMARY KEY (task_id, name)
-		) STRICT, WITHOUT ROWID`,
-		`CREATE INDEX IF NOT EXISTS idx_labels_name ON labels (name)`,
-		`CREATE TABLE IF NOT EXISTS comments (
-			id         TEXT PRIMARY KEY,
-			task_id    TEXT NOT NULL REFERENCES tasks(id),
-			author_id  TEXT NOT NULL REFERENCES agents(id),
-			body       TEXT NOT NULL,
-			created_at INTEGER NOT NULL
-		) STRICT`,
-		`CREATE INDEX IF NOT EXISTS idx_comments_task   ON comments (task_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_comments_author ON comments (author_id)`,
+			id INTEGER PRIMARY KEY, provider_id INTEGER NOT NULL REFERENCES providers(id), name TEXT NOT NULL,
+			UNIQUE (provider_id, name)) STRICT`,
+		"CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, kind_id INTEGER NOT NULL REFERENCES agent_kinds(id)) STRICT",
+		"CREATE TABLE IF NOT EXISTS agents_human (agent_id TEXT PRIMARY KEY REFERENCES agents(id), name TEXT NOT NULL, contact TEXT NOT NULL DEFAULT '') STRICT, WITHOUT ROWID",
+		"CREATE TABLE IF NOT EXISTS agents_ml (agent_id TEXT PRIMARY KEY REFERENCES agents(id), role_id INTEGER NOT NULL REFERENCES roles(id), model_id INTEGER NOT NULL REFERENCES ml_models(id)) STRICT, WITHOUT ROWID",
+		"CREATE TABLE IF NOT EXISTS agents_software (agent_id TEXT PRIMARY KEY REFERENCES agents(id), name TEXT NOT NULL, version TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT '') STRICT, WITHOUT ROWID",
+		`CREATE TABLE IF NOT EXISTS tasks (
+			id TEXT PRIMARY KEY, namespace TEXT NOT NULL, title TEXT NOT NULL,
+			description TEXT NOT NULL DEFAULT '', status_id INTEGER NOT NULL DEFAULT 0 REFERENCES statuses(id),
+			priority_id INTEGER NOT NULL DEFAULT 2 REFERENCES priorities(id), type_id INTEGER NOT NULL DEFAULT 2 REFERENCES task_types(id),
+			phase_id INTEGER NOT NULL REFERENCES phases(id), owner_id TEXT REFERENCES agents(id), notes TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, closed_at INTEGER, close_reason TEXT NOT NULL DEFAULT '',
+			last_journal_id INTEGER NOT NULL REFERENCES journal(journal_id)) STRICT`,
+		"CREATE INDEX IF NOT EXISTS idx_tasks_namespace ON tasks (namespace)",
+		"CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks (status_id)",
+		"CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks (priority_id)",
+		"CREATE INDEX IF NOT EXISTS idx_tasks_type ON tasks (type_id)",
+		"CREATE INDEX IF NOT EXISTS idx_tasks_phase ON tasks (phase_id)",
+		"CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks (owner_id)",
+		"CREATE TABLE IF NOT EXISTS edges (source_id TEXT NOT NULL REFERENCES tasks(id), target_id TEXT NOT NULL, kind_id INTEGER NOT NULL REFERENCES edge_kinds(id), created_at INTEGER NOT NULL, PRIMARY KEY (source_id, target_id, kind_id)) STRICT, WITHOUT ROWID",
+		"CREATE INDEX IF NOT EXISTS idx_edges_source ON edges (source_id)",
+		"CREATE INDEX IF NOT EXISTS idx_edges_target ON edges (target_id)",
+		"CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges (kind_id)",
+		"CREATE TABLE IF NOT EXISTS activities (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL REFERENCES agents(id), phase_id INTEGER NOT NULL REFERENCES phases(id), stage_id INTEGER NOT NULL REFERENCES stages(id), started_at INTEGER NOT NULL, ended_at INTEGER, notes TEXT NOT NULL DEFAULT '') STRICT",
+		"CREATE INDEX IF NOT EXISTS idx_activities_agent ON activities (agent_id)",
+		"CREATE INDEX IF NOT EXISTS idx_activities_phase ON activities (phase_id)",
+		"CREATE TABLE IF NOT EXISTS labels (task_id TEXT NOT NULL REFERENCES tasks(id), name TEXT NOT NULL, PRIMARY KEY (task_id, name)) STRICT, WITHOUT ROWID",
+		"CREATE INDEX IF NOT EXISTS idx_labels_name ON labels (name)",
+		"CREATE TABLE IF NOT EXISTS comments (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), author_id TEXT NOT NULL REFERENCES agents(id), body TEXT NOT NULL, created_at INTEGER NOT NULL) STRICT",
+		"CREATE INDEX IF NOT EXISTS idx_comments_task ON comments (task_id)",
+		"CREATE INDEX IF NOT EXISTS idx_comments_author ON comments (author_id)",
 	}
 
 	for _, stmt := range ddl {
 		if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
-			return fmt.Errorf("ensureSchema: %w — statement: %s", err, stmt[:min(len(stmt), 80)])
+			return fmt.Errorf("ensureSchema: statement %q: %w", stmt, err)
 		}
 	}
 	if err := db.seedReferenceData(models); err != nil {
@@ -424,20 +334,25 @@ func (db *DB) ensureSchema(models []ptypes.ModelEntry) error {
 // ---------------------------------------------------------------------------
 
 func (db *DB) seedReferenceData(models []ptypes.ModelEntry) error {
-	seeds := []string{
-		`INSERT OR IGNORE INTO statuses (id, name) VALUES (0,'open'),(1,'in_progress'),(2,'closed')`,
-		`INSERT OR IGNORE INTO priorities (id, name) VALUES (0,'critical'),(1,'high'),(2,'medium'),(3,'low'),(4,'backlog')`,
-		`INSERT OR IGNORE INTO task_types (id, name) VALUES (0,'bug'),(1,'feature'),(2,'task'),(3,'epic'),(4,'chore')`,
-		`INSERT OR IGNORE INTO edge_kinds (id, name) VALUES (0,'blocked_by'),(1,'derived_from'),(2,'supersedes'),(3,'discovered_from'),(4,'generated_by'),(5,'attributed_to')`,
-		`INSERT OR IGNORE INTO agent_kinds (id, name) VALUES (0,'human'),(1,'machine_learning'),(2,'software')`,
-		`INSERT OR IGNORE INTO providers (id, name) VALUES (0,'anthropic'),(1,'google'),(2,'openai'),(3,'local')`,
-		`INSERT OR IGNORE INTO roles (id, name) VALUES (0,'human'),(1,'architect'),(2,'supervisor'),(3,'worker'),(4,'reviewer')`,
-		`INSERT OR IGNORE INTO phases (id, name) VALUES (0,'request'),(1,'elicit'),(2,'propose'),(3,'review'),(4,'plan_uat'),(5,'ratify'),(6,'handoff'),(7,'impl_plan'),(8,'worker_slices'),(9,'code_review'),(10,'impl_uat'),(11,'landing'),(12,'unscoped')`,
-		`INSERT OR IGNORE INTO stages (id, name) VALUES (0,'not_started'),(1,'in_progress'),(2,'blocked'),(3,'complete')`,
+	seeds := []struct {
+		kind  referenceSeedKind
+		names []string
+	}{
+		{seedStatuses, []string{"open", "in_progress", "closed"}},
+		{seedPriorities, []string{"critical", "high", "medium", "low", "backlog"}},
+		{seedTaskTypes, []string{"bug", "feature", "task", "epic", "chore"}},
+		{seedEdgeKinds, []string{"blocked_by", "derived_from", "supersedes", "discovered_from", "generated_by", "attributed_to"}},
+		{seedAgentKinds, []string{"human", "machine_learning", "software"}},
+		{seedProviders, []string{"anthropic", "google", "openai", "local"}},
+		{seedRoles, []string{"human", "architect", "supervisor", "worker", "reviewer"}},
+		{seedPhases, []string{"request", "elicit", "propose", "review", "plan_uat", "ratify", "handoff", "impl_plan", "worker_slices", "code_review", "impl_uat", "landing", "unscoped"}},
+		{seedStages, []string{"not_started", "in_progress", "blocked", "complete"}},
 	}
 	for _, seed := range seeds {
-		if err := sqlitex.ExecuteTransient(db.conn, seed, nil); err != nil {
-			return fmt.Errorf("seedReferenceData: %w — seed: %s", err, seed[:min(len(seed), 80)])
+		for id, name := range seed.names {
+			if err := sqlitex.Execute(db.conn, seed.kind.query(), &sqlitex.ExecOptions{Args: []any{id, name}}); err != nil {
+				return fmt.Errorf("seedReferenceData: kind %d id %d: %w", seed.kind, id, err)
+			}
 		}
 	}
 
@@ -448,20 +363,56 @@ func (db *DB) seedReferenceData(models []ptypes.ModelEntry) error {
 	return nil
 }
 
+type referenceSeedKind uint8
+
+const (
+	seedStatuses referenceSeedKind = iota + 1
+	seedPriorities
+	seedTaskTypes
+	seedEdgeKinds
+	seedAgentKinds
+	seedProviders
+	seedRoles
+	seedPhases
+	seedStages
+)
+
+func (kind referenceSeedKind) query() string {
+	switch kind {
+	case seedStatuses:
+		return "INSERT OR IGNORE INTO statuses (id,name) VALUES (?1,?2)"
+	case seedPriorities:
+		return "INSERT OR IGNORE INTO priorities (id,name) VALUES (?1,?2)"
+	case seedTaskTypes:
+		return "INSERT OR IGNORE INTO task_types (id,name) VALUES (?1,?2)"
+	case seedEdgeKinds:
+		return "INSERT OR IGNORE INTO edge_kinds (id,name) VALUES (?1,?2)"
+	case seedAgentKinds:
+		return "INSERT OR IGNORE INTO agent_kinds (id,name) VALUES (?1,?2)"
+	case seedProviders:
+		return "INSERT OR IGNORE INTO providers (id,name) VALUES (?1,?2)"
+	case seedRoles:
+		return "INSERT OR IGNORE INTO roles (id,name) VALUES (?1,?2)"
+	case seedPhases:
+		return "INSERT OR IGNORE INTO phases (id,name) VALUES (?1,?2)"
+	case seedStages:
+		return "INSERT OR IGNORE INTO stages (id,name) VALUES (?1,?2)"
+	default:
+		panic("unknown reference seed kind")
+	}
+}
+
 // seedMLModels inserts model entries into the ml_models table.
 // Uses INSERT OR IGNORE so existing rows are preserved on re-open.
 // Each model is inserted with parameterized queries to prevent SQL injection.
 func (db *DB) seedMLModels(models []ptypes.ModelEntry) error {
 	var existing int
-	if err := sqlitex.Execute(db.conn,
-		`SELECT COUNT(*) FROM ml_models`,
-		&sqlitex.ExecOptions{
-			ResultFunc: func(stmt *zs.Stmt) error {
-				existing = stmt.ColumnInt(0)
-				return nil
-			},
+	if err := sqlitex.Execute(db.conn, "SELECT COUNT(*) FROM ml_models", &sqlitex.ExecOptions{
+		ResultFunc: func(stmt *zs.Stmt) error {
+			existing = stmt.ColumnInt(0)
+			return nil
 		},
-	); err != nil {
+	}); err != nil {
 		return fmt.Errorf("seedMLModels: count existing models: %w", err)
 	}
 	if existing >= len(models) {
@@ -472,10 +423,7 @@ func (db *DB) seedMLModels(models []ptypes.ModelEntry) error {
 	endTx := sqlitex.Save(db.conn)
 	defer endTx(&err)
 	for _, m := range models {
-		if err = sqlitex.Execute(db.conn,
-			`INSERT OR IGNORE INTO ml_models (provider_id, name) VALUES ((SELECT id FROM providers WHERE name = ?1), ?2)`,
-			&sqlitex.ExecOptions{Args: []any{string(m.Provider), string(m.Name)}},
-		); err != nil {
+		if err = sqlitex.Execute(db.conn, "INSERT OR IGNORE INTO ml_models (provider_id, name) VALUES ((SELECT id FROM providers WHERE name = ?1), ?2)", &sqlitex.ExecOptions{Args: []any{string(m.Provider), string(m.Name)}}); err != nil {
 			return fmt.Errorf("seedMLModels: inserting model (%s, %q): %w",
 				m.Provider.String(), m.Name, err)
 		}

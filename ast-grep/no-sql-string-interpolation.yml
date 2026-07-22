@@ -12,6 +12,8 @@ note: >
   The only safe use of fmt.Sprintf in SQL is for parameter index numbers
   (e.g., fmt.Sprintf("col = ?%d", idx)) where no user values are interpolated.
 rule:
-  pattern: sqlitex.ExecuteTransient($CONN, fmt.Sprintf($$$), $OPTS)
+  any:
+    - pattern: sqlitex.Execute($CONN, fmt.Sprintf($$$), $OPTS)
+    - pattern: sqlitex.ExecuteTransient($CONN, fmt.Sprintf($$$), $OPTS)
 ignore:
   - "**/vendor/**"
