@@ -3,6 +3,7 @@ package provenance
 import (
 	"context"
 	"database/sql"
+	_ "embed"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -12,8 +13,88 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dayvidpham/provenance/internal/testcorpus"
 	dbos "github.com/dbos-inc/dbos-transact-golang/dbos"
 )
+
+//go:embed testdata/contract/dbos_retry.yaml
+var dbosRetryYAML []byte
+
+type dbosRetryInput struct {
+	OperationID       string            `yaml:"operationID"`
+	Command           string            `yaml:"command"`
+	RecordedAt        int64             `yaml:"recordedAt"`
+	EffectRecordedAt  int64             `yaml:"effectRecordedAt"`
+	TaskNamespace     string            `yaml:"taskNamespace"`
+	CommentID         string            `yaml:"commentID"`
+	UpdateTitle       string            `yaml:"updateTitle"`
+	UpdateDescription string            `yaml:"updateDescription"`
+	UpdateNotes       string            `yaml:"updateNotes"`
+	Label             string            `yaml:"label"`
+	CloseReason       string            `yaml:"closeReason"`
+	Effects           []dbosRetryEffect `yaml:"effects"`
+}
+
+type dbosRetryEffect struct {
+	Family           string `yaml:"family"`
+	ResultSlot       string `yaml:"resultSlot"`
+	TaskRef          string `yaml:"taskRef"`
+	Payload          string `yaml:"payload"`
+	ContextRef       string `yaml:"contextRef"`
+	Title            string `yaml:"title"`
+	Description      string `yaml:"description"`
+	EventKind        string `yaml:"eventKind"`
+	AssignmentID     string `yaml:"assignmentID"`
+	AssignmentSlot   string `yaml:"assignmentSlot"`
+	OccupantRef      string `yaml:"occupantRef"`
+	Predecessor      string `yaml:"predecessor"`
+	Parent           string `yaml:"parent"`
+	DecisionKind     string `yaml:"decisionKind"`
+	EvidenceKind     string `yaml:"evidenceKind"`
+	ContentDigestHex string `yaml:"contentDigestHex"`
+	EdgeTargetRef    string `yaml:"edgeTargetRef"`
+	EdgeKind         string `yaml:"edgeKind"`
+	Label            string `yaml:"label"`
+	CommentRef       string `yaml:"commentRef"`
+	CommentAuthorRef string `yaml:"commentAuthorRef"`
+	CommentBody      string `yaml:"commentBody"`
+	CloseReason      string `yaml:"closeReason"`
+	Forced           bool   `yaml:"forced"`
+}
+
+type dbosRetryExpected struct {
+	EffectCount           int `yaml:"effectCount"`
+	MismatchOperatorCount int `yaml:"mismatchOperatorCount"`
+}
+
+func loadDBOSRetryFixture(t *testing.T) testcorpus.Case[dbosRetryInput, dbosRetryExpected] {
+	t.Helper()
+	corpus, err := testcorpus.LoadCorpus[dbosRetryInput, dbosRetryExpected](dbosRetryYAML)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := corpus.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := corpus.CheckExact(1); err != nil {
+		t.Fatal(err)
+	}
+	c := corpus.Cases[0]
+	wantFamilies := []string{"task_create", "task_event_update", "task_event_generic", "assignment_start", "assignment_end", "decision", "evidence", "edge_add", "edge_remove", "label_add", "label_remove", "comment_add", "task_event_close"}
+	gotFamilies := make([]string, len(c.Input.Effects))
+	for i, effect := range c.Input.Effects {
+		gotFamilies[i] = effect.Family
+		for field, ref := range map[string]string{"taskRef": effect.TaskRef, "contextRef": effect.ContextRef, "occupantRef": effect.OccupantRef, "edgeTargetRef": effect.EdgeTargetRef, "commentRef": effect.CommentRef, "commentAuthorRef": effect.CommentAuthorRef} {
+			if ref != "" && ref != "task" && ref != "target" && ref != "actor" && ref != "comment" && ref != "task-context" {
+				t.Fatalf("DBOS retry effect %q has unknown symbolic runtime reference %s=%q", effect.Family, field, ref)
+			}
+		}
+	}
+	if c.Name != "all-canonical-operands" || c.Mutation.Operator != "all-canonical-operands" || c.Classification != testcorpus.MustPass || !slices.Equal(gotFamilies, wantFamilies) || c.Expected.EffectCount != len(wantFamilies) || c.Expected.MismatchOperatorCount != 88 {
+		t.Fatalf("DBOS retry YAML is outside closed baseline membership: %#v", c)
+	}
+	return c
+}
 
 func snapshotSQLTables(t *testing.T, db *sql.DB, tables ...string) map[string][][]string {
 	t.Helper()
@@ -187,25 +268,62 @@ func TestDBOSCompletedRetryEveryCanonicalOperandHasZeroCallbackAndWrites(t *test
 
 func dbosAllOperandOperation(t *testing.T, fixture retryMatrixFixture, target TaskID) (OperationInput, CommittedResult) {
 	t.Helper()
+	baseline := loadDBOSRetryFixture(t)
 	task := newCorpusTaskID()
-	comment, _ := ParseCommentID("retry--018f0000-0000-7000-8000-000000000011")
+	comment, _ := ParseCommentID(baseline.Input.CommentID)
 	ctx, _ := TaskContext(target)
-	title, description, notes := "updated", "updated description", "notes"
-	priority, phase, at := PriorityHigh, PhaseCodeReview, int64(700)
-	effects := []Effect{
-		{Sort: EffectTaskCreate, ResultSlot: "create", RecordedAtOverride: &at, TaskID: task, Payload: []byte(`{"birth":1}`), Contexts: []EventContext{ctx}, Title: "title", Description: "description", Type: TaskTypeFeature, Priority: PriorityMedium, Phase: PhaseUnscoped},
-		{Sort: EffectTaskEvent, ResultSlot: "update", RecordedAtOverride: &at, TaskID: task, EventKind: EventKindTaskUpdated, Payload: []byte(`{"update":1}`), Contexts: []EventContext{ctx}, UpdateTitle: &title, UpdateDescription: &description, UpdatePriority: &priority, UpdatePhase: &phase, UpdateNotes: &notes},
-		{Sort: EffectTaskEvent, ResultSlot: "generic", RecordedAtOverride: &at, TaskID: task, EventKind: "retry.generic.one", Payload: []byte(`{"generic":1}`), Contexts: []EventContext{ctx}},
-		{Sort: EffectAssignmentStart, ResultSlot: "assignment-start", RecordedAtOverride: &at, TaskID: task, AssignmentID: "retry-assignment", SlotID: SlotOwnerResponsibility, Occupant: fixture.actor, Predecessor: "previous", Parent: "parent"},
-		{Sort: EffectAssignmentEnd, ResultSlot: "assignment-end", RecordedAtOverride: &at, TaskID: task, AssignmentID: "retry-assignment", SlotID: SlotOwnerResponsibility},
-		{Sort: EffectDecision, ResultSlot: "decision", RecordedAtOverride: &at, TaskID: task, DecisionKind: "retry.decision", Payload: []byte(`{"decision":1}`)},
-		{Sort: EffectEvidence, ResultSlot: "evidence", RecordedAtOverride: &at, TaskID: task, EvidenceKind: "retry.evidence", ContentDigest: []byte{1, 2, 3}, Payload: []byte(`{"evidence":1}`)},
-		{Sort: EffectEdgeAdd, ResultSlot: "edge-add", RecordedAtOverride: &at, TaskID: task, EdgeTargetID: target.String(), EdgeRelKind: EdgeDerivedFrom, Contexts: []EventContext{ctx}},
-		{Sort: EffectEdgeRemove, ResultSlot: "edge-remove", RecordedAtOverride: &at, TaskID: task, EdgeTargetID: target.String(), EdgeRelKind: EdgeDerivedFrom, Contexts: []EventContext{ctx}},
-		{Sort: EffectLabelAdd, ResultSlot: "label-add", RecordedAtOverride: &at, TaskID: task, Label: "label", Contexts: []EventContext{ctx}},
-		{Sort: EffectLabelRemove, ResultSlot: "label-remove", RecordedAtOverride: &at, TaskID: task, Label: "label", Contexts: []EventContext{ctx}},
-		{Sort: EffectCommentAdd, ResultSlot: "comment", RecordedAtOverride: &at, TaskID: task, CommentIdentity: comment, CommentAuthor: fixture.actor, CommentBody: "body", Contexts: []EventContext{ctx}},
-		{Sort: EffectTaskEvent, ResultSlot: "close", RecordedAtOverride: &at, TaskID: task, EventKind: EventKindTaskClosed, CloseReason: "done", Forced: true},
+	title, description, notes := baseline.Input.UpdateTitle, baseline.Input.UpdateDescription, baseline.Input.UpdateNotes
+	priority, phase, at := PriorityHigh, PhaseCodeReview, baseline.Input.EffectRecordedAt
+	effects := make([]Effect, len(baseline.Input.Effects))
+	for i, source := range baseline.Input.Effects {
+		effect := Effect{ResultSlot: ResultSlotID(source.ResultSlot), RecordedAtOverride: &at, TaskID: task}
+		if source.Payload != "" {
+			effect.Payload = []byte(source.Payload)
+		}
+		if source.ContextRef != "" {
+			effect.Contexts = []EventContext{ctx}
+		}
+		switch source.Family {
+		case "task_create":
+			effect.Sort, effect.Title, effect.Description, effect.Type, effect.Priority, effect.Phase = EffectTaskCreate, source.Title, source.Description, TaskTypeFeature, PriorityMedium, PhaseUnscoped
+		case "task_event_update":
+			effect.Sort, effect.EventKind, effect.UpdateTitle, effect.UpdateDescription, effect.UpdatePriority, effect.UpdatePhase, effect.UpdateNotes = EffectTaskEvent, EventKind(source.EventKind), &title, &description, &priority, &phase, &notes
+		case "task_event_generic":
+			effect.Sort, effect.EventKind = EffectTaskEvent, EventKind(source.EventKind)
+		case "assignment_start":
+			effect.Sort, effect.AssignmentID, effect.SlotID, effect.Occupant, effect.Predecessor, effect.Parent = EffectAssignmentStart, AssignmentID(source.AssignmentID), SlotOwnerResponsibility, fixture.actor, AssignmentID(source.Predecessor), AssignmentID(source.Parent)
+		case "assignment_end":
+			effect.Sort, effect.AssignmentID, effect.SlotID = EffectAssignmentEnd, AssignmentID(source.AssignmentID), SlotOwnerResponsibility
+		case "decision":
+			effect.Sort, effect.DecisionKind = EffectDecision, DecisionKind(source.DecisionKind)
+		case "evidence":
+			digest, err := hex.DecodeString(source.ContentDigestHex)
+			if err != nil {
+				t.Fatalf("retry evidence digest: %v", err)
+			}
+			effect.Sort, effect.EvidenceKind, effect.ContentDigest = EffectEvidence, EvidenceKind(source.EvidenceKind), digest
+		case "edge_add", "edge_remove":
+			effect.EdgeTargetID, effect.EdgeRelKind = target.String(), EdgeDerivedFrom
+			if source.Family == "edge_add" {
+				effect.Sort = EffectEdgeAdd
+			} else {
+				effect.Sort = EffectEdgeRemove
+			}
+		case "label_add", "label_remove":
+			effect.Label = source.Label
+			if source.Family == "label_add" {
+				effect.Sort = EffectLabelAdd
+			} else {
+				effect.Sort = EffectLabelRemove
+			}
+		case "comment_add":
+			effect.Sort, effect.CommentIdentity, effect.CommentAuthor, effect.CommentBody = EffectCommentAdd, comment, fixture.actor, source.CommentBody
+		case "task_event_close":
+			effect.Sort, effect.EventKind, effect.CloseReason, effect.Forced, effect.Contexts = EffectTaskEvent, EventKind(source.EventKind), source.CloseReason, source.Forced, nil
+		default:
+			t.Fatalf("unknown DBOS retry effect family %q", source.Family)
+		}
+		effects[i] = effect
 	}
-	return OperationInput{OperationID: "dbos-exhaustive-operation", ActorID: fixture.actor, AuthorityJournalID: &fixture.authority, CommandDigest: []byte("command"), RecordedAt: 600, Effects: effects}, CommittedResult{}
+	return OperationInput{OperationID: OperationID(baseline.Input.OperationID), ActorID: fixture.actor, AuthorityJournalID: &fixture.authority, CommandDigest: []byte(baseline.Input.Command), RecordedAt: baseline.Input.RecordedAt, Effects: effects}, CommittedResult{}
 }

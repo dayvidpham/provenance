@@ -120,8 +120,11 @@ return the original committed result; changed canonical input under the same ID
 returns a typed conflict.
 
 DBOS integration can durably execute these operations across crashes and lost
-responses. Provenance owns the versioned canonical input and outcome codecs;
-DBOS owns workflow execution and checkpointing. See
+responses. Provenance owns one closed canonical input/outcome contract; DBOS
+owns workflow execution and checkpointing. The durable `/v2` identity strings
+remain pinned, but there is no alternate decoder or workflow registration.
+Strict typed YAML corpora pin the independently authored wire bytes and retry
+baseline used to detect contract drift. See
 [`docs/architecture.md`](docs/architecture.md) for the complete component model
 and [`docs/journal-relational-contract.md`](docs/journal-relational-contract.md)
 for the normative relational contract.

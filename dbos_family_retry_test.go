@@ -413,12 +413,12 @@ func TestDBOSCompletedRetryUsesOneValidBaselineAndOneFieldChangePerFamily(t *tes
 	conflicting := families[0].input
 	conflicting.Effects = cloneRetryEffects(conflicting.Effects)
 	conflicting.Effects[0].Title = "negative-control-conflict"
-	input, _, err := encodeApplyInputV2(conflicting)
+	input, _, err := encodeApplyInput(conflicting)
 	if err != nil {
 		t.Fatal(err)
 	}
 	entriesBefore := env.workflowEntries
-	handle, err := dbos.RunWorkflow(env.root, env.adapter.applyWorkflowV2, input,
+	handle, err := dbos.RunWorkflow(env.root, env.adapter.applyWorkflow, input,
 		dbos.WithWorkflowID("dbos-callback-entry-negative-control-"+uuid.NewString()),
 		dbos.WithApplicationVersion(env.root.GetApplicationVersion()))
 	if err != nil {

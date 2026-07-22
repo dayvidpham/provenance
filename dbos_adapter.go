@@ -53,8 +53,7 @@ func defaultApplyTestHooks() applyTestHooks {
 }
 
 // DBOSAdapter runs Provenance operations as durable DBOS workflows over a shared
-// journal contract. It owns one workflow per durable schema version: V1 remains
-// registered only to recover persisted history; new Apply calls use V2.
+// journal contract. It owns one workflow for the single supported DBOS contract.
 type DBOSAdapter struct {
 	root               dbos.DBOSContext
 	tracker            Tracker
@@ -64,8 +63,7 @@ type DBOSAdapter struct {
 
 // NewDBOSAdapter validates the root and tracker, derives the actual application
 // version from the DBOS root, rejects a non-empty mismatched expectation, and
-// registers the historical V1 and current V2 workflows on the not-yet-launched root
-// so both are recovery-visible after Launch.
+// registers the workflow on the not-yet-launched root.
 func NewDBOSAdapter(root dbos.DBOSContext, tracker Tracker, config DBOSAdapterConfig) (*DBOSAdapter, error) {
 	if root == nil {
 		return nil, fmt.Errorf(
@@ -95,11 +93,7 @@ func NewDBOSAdapter(root dbos.DBOSContext, tracker Tracker, config DBOSAdapterCo
 		applicationVersion: actual,
 		testHooks:          defaultApplyTestHooks(),
 	}
-	// Keep the V1 function registered under its historical runtime identity and add
-	// V2 separately. DBOS can therefore resume persisted V1 executions while all new
-	// Apply calls use canonical V2 transport and identities.
 	dbos.RegisterWorkflow(root, a.applyWorkflow)
-	dbos.RegisterWorkflow(root, a.applyWorkflowV2)
 	return a, nil
 }
 
@@ -122,7 +116,7 @@ func (a *DBOSAdapter) Apply(ctx context.Context, in journal.OperationInput) (Com
 		}
 	}
 
-	input, normalized, err := encodeApplyInputV2(in)
+	input, normalized, err := encodeApplyInput(in)
 	if err != nil {
 		return CommittedResult{}, fmt.Errorf("provenance.DBOSAdapter.Apply: canonicalize operation %q: %w", in.OperationID, err)
 	}
@@ -144,18 +138,18 @@ func (a *DBOSAdapter) Apply(ctx context.Context, in journal.OperationInput) (Com
 		if err != nil {
 			return CommittedResult{}, err
 		}
-		input, normalized, err = encodeApplyInputV2(normalized)
+		input, normalized, err = encodeApplyInput(normalized)
 		if err != nil {
 			return CommittedResult{}, fmt.Errorf("provenance.DBOSAdapter.Apply: canonicalize reconciled operation %q: %w", in.OperationID, err)
 		}
 	}
-	fp, err := fingerprintV2(a.applicationVersion, input)
+	fp, err := fingerprint(a.applicationVersion, input)
 	if err != nil {
-		return CommittedResult{}, fmt.Errorf("provenance.DBOSAdapter.Apply: derive V2 workflow identity for operation %q: %w", in.OperationID, err)
+		return CommittedResult{}, fmt.Errorf("provenance.DBOSAdapter.Apply: derive workflow identity for operation %q: %w", in.OperationID, err)
 	}
-	workflowID := applyWorkflowIDPrefixV2 + fp
+	workflowID := applyWorkflowIDPrefix + fp
 	if existing.Kind == journal.CommittedExact {
-		outcome, retrieveErr := awaitWorkflowResult[DBOSStepOutcomeV1](ctx, a.root, workflowID, normalized.OperationID)
+		outcome, retrieveErr := awaitWorkflowResult[DBOSStepOutcome](ctx, a.root, workflowID, normalized.OperationID)
 		if retrieveErr == nil {
 			return a.postValidate(normalized, outcome)
 		}
@@ -165,7 +159,7 @@ func (a *DBOSAdapter) Apply(ctx context.Context, in journal.OperationInput) (Com
 		}
 		var dbosErr *dbos.DBOSError
 		if !errors.As(retrieveErr, &dbosErr) || dbosErr.Code != dbos.NonExistentWorkflowError {
-			return CommittedResult{}, fmt.Errorf("provenance.DBOSAdapter.Apply: retrieve existing V2 workflow %q for operation %q before read-only replay: %w — where: completed-operation attachment; impact: no workflow or domain write is attempted; fix: repair or recover the matching DBOS workflow history, then retry", workflowID, normalized.OperationID, retrieveErr)
+			return CommittedResult{}, fmt.Errorf("provenance.DBOSAdapter.Apply: retrieve existing workflow %q for operation %q before read-only replay: %w — where: completed-operation attachment; impact: no workflow or domain write is attempted; fix: repair or recover the matching DBOS workflow history, then retry", workflowID, normalized.OperationID, retrieveErr)
 		}
 	}
 
@@ -173,7 +167,7 @@ func (a *DBOSAdapter) Apply(ctx context.Context, in journal.OperationInput) (Com
 	// caller cancellation never cancels durable work.
 	if _, err := dbos.RunWorkflow(
 		a.root,
-		a.applyWorkflowV2,
+		a.applyWorkflow,
 		input,
 		dbos.WithWorkflowID(workflowID),
 		dbos.WithApplicationVersion(a.applicationVersion),
@@ -185,7 +179,7 @@ func (a *DBOSAdapter) Apply(ctx context.Context, in journal.OperationInput) (Com
 			workflowID, in.OperationID, err)
 	}
 
-	outcome, err := awaitWorkflowResult[DBOSStepOutcomeV1](ctx, a.root, workflowID, normalized.OperationID)
+	outcome, err := awaitWorkflowResult[DBOSStepOutcome](ctx, a.root, workflowID, normalized.OperationID)
 	if err != nil {
 		return CommittedResult{}, err
 	}
@@ -212,72 +206,33 @@ func reconcileDBOSAllocatedCreates(in journal.OperationInput, result journal.Com
 	return in, nil
 }
 
-// applyWorkflow is the historical V1 durable workflow retained for persisted
-// recovery. It decodes and runs one atomic fold step. A
+// applyWorkflow decodes and runs one atomic fold step. A
 // domain failure is checkpointed as a closed outcome (nil Go error); only DBOS
 // infrastructure failures use the Go-error channel.
-func (a *DBOSAdapter) applyWorkflow(wfCtx dbos.DBOSContext, input DBOSApplyInputV1) (DBOSStepOutcomeV1, error) {
+func (a *DBOSAdapter) applyWorkflow(wfCtx dbos.DBOSContext, input DBOSApplyInput) (DBOSStepOutcome, error) {
 	a.testHooks.onWorkflowEntry()
 	in, err := decodeApplyInput(input)
 	if err != nil {
-		return DBOSStepOutcomeV1{}, fmt.Errorf("provenance.applyWorkflow: %w", err)
+		return DBOSStepOutcome{}, fmt.Errorf("provenance.applyWorkflow: %w", err)
 	}
-	fp := fingerprintV1(a.applicationVersion, in)
-
-	outcome, err := dbos.RunAsStep(
-		wfCtx,
-		func(stepCtx context.Context) (DBOSStepOutcomeV1, error) {
-			a.testHooks.beforeDomainCommit()
-			result, applyErr := a.foldDomainMutation(in)
-			if applyErr != nil {
-				// INFRASTRUCTURE failures (a shut-down store, or a transient WAL lock
-				// that survived the bounded retry — the borrowed bridge shares one WAL
-				// with the DBOS system connection) are propagated on the Go-error
-				// channel, NEVER checkpointed: checkpointing a transient lock as a
-				// domain failure would make a recoverable condition falsely permanent.
-				// Everything else is a §5/§9 DOMAIN failure, checkpointed as a closed
-				// outcome with a nil Go error.
-				if isInfrastructureError(applyErr) {
-					return DBOSStepOutcomeV1{}, applyErr
-				}
-				return encodeDBOSApplyFailure(in.OperationID, in.MutationDigest, applyErr)
-			}
-			a.testHooks.afterDomainCommit()
-			return encodeDBOSApplySuccess(in.OperationID, in.MutationDigest, result)
-		},
-		dbos.WithStepName(applyStepNamePrefix+fp),
-	)
+	fp, err := fingerprint(a.applicationVersion, input)
 	if err != nil {
-		return DBOSStepOutcomeV1{}, err
+		return DBOSStepOutcome{}, fmt.Errorf("provenance.applyWorkflow: derive step identity: %w", err)
 	}
-	a.testHooks.afterStepCheckpoint()
-	return outcome, nil
-}
-
-func (a *DBOSAdapter) applyWorkflowV2(wfCtx dbos.DBOSContext, input DBOSApplyInputV2) (DBOSStepOutcomeV1, error) {
-	a.testHooks.onWorkflowEntry()
-	in, err := decodeApplyInputV2(input)
-	if err != nil {
-		return DBOSStepOutcomeV1{}, fmt.Errorf("provenance.applyWorkflowV2: %w", err)
-	}
-	fp, err := fingerprintV2(a.applicationVersion, input)
-	if err != nil {
-		return DBOSStepOutcomeV1{}, fmt.Errorf("provenance.applyWorkflowV2: derive step identity: %w", err)
-	}
-	outcome, err := dbos.RunAsStep(wfCtx, func(stepCtx context.Context) (DBOSStepOutcomeV1, error) {
+	outcome, err := dbos.RunAsStep(wfCtx, func(stepCtx context.Context) (DBOSStepOutcome, error) {
 		a.testHooks.beforeDomainCommit()
 		result, applyErr := a.foldDomainMutation(in)
 		if applyErr != nil {
 			if isInfrastructureError(applyErr) {
-				return DBOSStepOutcomeV1{}, applyErr
+				return DBOSStepOutcome{}, applyErr
 			}
 			return encodeDBOSApplyFailure(in.OperationID, in.MutationDigest, applyErr)
 		}
 		a.testHooks.afterDomainCommit()
 		return encodeDBOSApplySuccess(in.OperationID, in.MutationDigest, result)
-	}, dbos.WithStepName(applyStepNamePrefixV2+fp))
+	}, dbos.WithStepName(applyStepNamePrefix+fp))
 	if err != nil {
-		return DBOSStepOutcomeV1{}, err
+		return DBOSStepOutcome{}, err
 	}
 	a.testHooks.afterStepCheckpoint()
 	return outcome, nil
@@ -317,7 +272,7 @@ func isInfrastructureError(err error) bool {
 // checkpointed outcome. A failure outcome decodes to its typed journal error and
 // writes nothing; a divergence returns CheckpointDivergenceError and writes
 // nothing; an unknown lookup variant fails closed.
-func (a *DBOSAdapter) postValidate(in journal.OperationInput, outcome DBOSStepOutcomeV1) (CommittedResult, error) {
+func (a *DBOSAdapter) postValidate(in journal.OperationInput, outcome DBOSStepOutcome) (CommittedResult, error) {
 	// Guard outcome identity BEFORE trusting either arm (defense-in-depth parity): a
 	// mis-keyed/forged outcome — success OR failure — must not be attributed to this
 	// operation. Applying it symmetrically means a decoded FAILURE outcome cannot
@@ -443,12 +398,12 @@ func awaitWorkflowResult[T any](
 
 // canonicalResultsEqual reports whether two canonical results name the same
 // journal-anchored committed operation: identical anchor, ordered emitted-event
-// closure, and slot-sorted bindings. CanonicalMutationResultV1 holds only
+// closure, and slot-sorted bindings. CanonicalMutationResult holds only
 // journal-anchored fields (the per-call §9.4 ShortCircuited flag now lives on
-// DBOSStepOutcomeV1, not inside the canonical result), so this comparison — like the
+// DBOSStepOutcome, not inside the canonical result), so this comparison — like the
 // struct's own == — never spuriously diverges a legitimate replay against its own
 // committed record.
-func canonicalResultsEqual(a, b CanonicalMutationResultV1) bool {
+func canonicalResultsEqual(a, b CanonicalMutationResult) bool {
 	if a.AnchorJournalID != b.AnchorJournalID {
 		return false
 	}

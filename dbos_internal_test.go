@@ -27,11 +27,11 @@ func testActorID(t *testing.T) ptypes.ActorID {
 	return ptypes.ActorID{Namespace: "provenance-test", UUID: uuid.Must(uuid.NewV7())}
 }
 
-func mustFingerprintV2(t *testing.T, version string, input DBOSApplyInputV2) string {
+func mustFingerprint(t *testing.T, version string, input DBOSApplyInput) string {
 	t.Helper()
-	fingerprint, err := fingerprintV2(version, input)
+	fingerprint, err := fingerprint(version, input)
 	if err != nil {
-		t.Fatalf("fingerprintV2: %v", err)
+		t.Fatalf("fingerprint: %v", err)
 	}
 	return fingerprint
 }
@@ -82,12 +82,12 @@ func richOperationInput(t *testing.T) journal.OperationInput {
 
 func TestWire_RoundTripIsStable(t *testing.T) {
 	in := richOperationInput(t)
-	enc1, err := encodeApplyInput(in)
+	enc1, normalized, err := encodeApplyInput(in)
 	if err != nil {
 		t.Fatalf("encodeApplyInput: %v", err)
 	}
-	if enc1.Schema != DBOSApplyInputSchemaV1 {
-		t.Errorf("schema = %q, want %q", enc1.Schema, DBOSApplyInputSchemaV1)
+	if enc1.Schema != DBOSApplyInputSchema {
+		t.Errorf("schema = %q, want %q", enc1.Schema, DBOSApplyInputSchema)
 	}
 	dec, err := decodeApplyInput(enc1)
 	if err != nil {
@@ -107,42 +107,45 @@ func TestWire_RoundTripIsStable(t *testing.T) {
 		t.Errorf("task_event effect drifted: %+v", dec.Effects[1])
 	}
 	// Re-encoding the decoded input yields identical bytes (deterministic codec).
-	enc2, err := encodeApplyInput(dec)
+	enc2, _, err := encodeApplyInput(dec)
 	if err != nil {
 		t.Fatalf("re-encode: %v", err)
 	}
 	if !bytes.Equal(enc1.Context, enc2.Context) || !bytes.Equal(enc1.Mutation, enc2.Mutation) {
 		t.Error("encode/decode/encode is not byte-stable")
 	}
+	if !bytes.Equal(dec.MutationDigest, normalized.MutationDigest) {
+		t.Error("derived mutation digest drifted")
+	}
 }
 
 func TestWire_WrongSchemaFailsClosed(t *testing.T) {
 	in := richOperationInput(t)
-	enc, _ := encodeApplyInput(in)
+	enc, _, _ := encodeApplyInput(in)
 	enc.Schema = "provenance.dbos-apply-input/v0"
 	if _, err := decodeApplyInput(enc); err == nil {
 		t.Fatal("expected schema rejection")
 	}
 }
 
-func TestWireV2_TransportsCanonicalBytesAndRejectsMalformedFrames(t *testing.T) {
+func TestWire_TransportsCanonicalBytesAndRejectsMalformedFrames(t *testing.T) {
 	in := richOperationInput(t)
 	prepared, err := journal.PrepareMutationV1(in.Effects)
 	if err != nil {
 		t.Fatalf("PrepareMutationV1: %v", err)
 	}
-	encoded, normalized, err := encodeApplyInputV2(in)
+	encoded, normalized, err := encodeApplyInput(in)
 	if err != nil {
-		t.Fatalf("encodeApplyInputV2: %v", err)
+		t.Fatalf("encodeApplyInput: %v", err)
 	}
-	if encoded.Schema != DBOSApplyInputSchemaV2 || !bytes.Equal(encoded.Mutation, prepared.CanonicalBytes()) {
+	if encoded.Schema != DBOSApplyInputSchema || !bytes.Equal(encoded.Mutation, prepared.CanonicalBytes()) {
 		t.Fatalf("V2 did not carry canonical bytes directly: schema=%q mutation-equal=%v", encoded.Schema, bytes.Equal(encoded.Mutation, prepared.CanonicalBytes()))
 	}
-	decoded, err := decodeApplyInputV2(encoded)
+	decoded, err := decodeApplyInput(encoded)
 	if err != nil {
-		t.Fatalf("decodeApplyInputV2: %v", err)
+		t.Fatalf("decodeApplyInput: %v", err)
 	}
-	reencoded, _, err := encodeApplyInputV2(decoded)
+	reencoded, _, err := encodeApplyInput(decoded)
 	if err != nil {
 		t.Fatalf("re-encode V2: %v", err)
 	}
@@ -150,24 +153,24 @@ func TestWireV2_TransportsCanonicalBytesAndRejectsMalformedFrames(t *testing.T) 
 		t.Fatal("V2 encode/decode/encode is not byte-stable")
 	}
 
-	tests := map[string]func(DBOSApplyInputV2) DBOSApplyInputV2{
-		"unknown input version":  func(x DBOSApplyInputV2) DBOSApplyInputV2 { x.Schema = "provenance.dbos-apply-input/v3"; return x },
-		"missing context field":  func(x DBOSApplyInputV2) DBOSApplyInputV2 { x.Context = x.Context[:len(x.Context)-12]; return x },
-		"trailing context field": func(x DBOSApplyInputV2) DBOSApplyInputV2 { x.Context = append(x.Context, 0, 0, 0, 0); return x },
-		"unknown context version": func(x DBOSApplyInputV2) DBOSApplyInputV2 {
+	tests := map[string]func(DBOSApplyInput) DBOSApplyInput{
+		"unknown input version":  func(x DBOSApplyInput) DBOSApplyInput { x.Schema = "provenance.dbos-apply-input/v3"; return x },
+		"missing context field":  func(x DBOSApplyInput) DBOSApplyInput { x.Context = x.Context[:len(x.Context)-12]; return x },
+		"trailing context field": func(x DBOSApplyInput) DBOSApplyInput { x.Context = append(x.Context, 0, 0, 0, 0); return x },
+		"unknown context version": func(x DBOSApplyInput) DBOSApplyInput {
 			x.Context = append([]byte(nil), x.Context...)
 			x.Context[4] ^= 0x01
 			return x
 		},
-		"malformed canonical mutation": func(x DBOSApplyInputV2) DBOSApplyInputV2 { x.Mutation = append(x.Mutation, 0); return x },
-		"oversized canonical mutation": func(x DBOSApplyInputV2) DBOSApplyInputV2 {
+		"malformed canonical mutation": func(x DBOSApplyInput) DBOSApplyInput { x.Mutation = append(x.Mutation, 0); return x },
+		"oversized canonical mutation": func(x DBOSApplyInput) DBOSApplyInput {
 			x.Mutation = make([]byte, MaxCanonicalMutationBytes+1)
 			return x
 		},
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
-			_, err := decodeApplyInputV2(mutate(encoded))
+			_, err := decodeApplyInput(mutate(encoded))
 			if err == nil {
 				t.Fatal("malformed V2 input decoded successfully")
 			}
@@ -188,93 +191,50 @@ func TestWireV2_TransportsCanonicalBytesAndRejectsMalformedFrames(t *testing.T) 
 		})
 	}
 
-	legacy, err := encodeApplyInput(in)
-	if err != nil {
-		t.Fatalf("encode historical V1: %v", err)
-	}
-	if _, err := decodeApplyInput(legacy); err != nil {
-		t.Fatalf("historical V1 no longer decodes: %v", err)
-	}
-	if applyWorkflowIDPrefix+fingerprintV1("v1", in) == applyWorkflowIDPrefixV2+mustFingerprintV2(t, "v1", encoded) {
-		t.Fatal("V1 and V2 workflow identities collided")
-	}
 }
 
 func TestFingerprint_StableAndSensitive(t *testing.T) {
 	in := richOperationInput(t)
-	legacyBase := fingerprintV1("v1", in)
-	if legacyBase != fingerprintV1("v1", in) {
-		t.Fatal("fingerprint not stable for identical input")
-	}
-
-	mutators := map[string]func(journal.OperationInput) journal.OperationInput{
-		"version":   func(x journal.OperationInput) journal.OperationInput { return x }, // handled below
-		"actor":     func(x journal.OperationInput) journal.OperationInput { x.ActorID = testActorID(t); return x },
-		"operation": func(x journal.OperationInput) journal.OperationInput { x.OperationID = "op-other"; return x },
-		"command":   func(x journal.OperationInput) journal.OperationInput { x.CommandDigest = []byte("other"); return x },
-		"mutation":  func(x journal.OperationInput) journal.OperationInput { x.MutationDigest = []byte("other"); return x },
-		"authority": func(x journal.OperationInput) journal.OperationInput {
-			a := journal.JournalID(99)
-			x.AuthorityJournalID = &a
-			return x
-		},
-	}
-	for name, m := range mutators {
-		if name == "version" {
-			if fingerprintV1("v2", in) == legacyBase {
-				t.Errorf("fingerprint insensitive to application version")
-			}
-			continue
-		}
-		if fingerprintV1("v1", m(in)) == legacyBase {
-			t.Errorf("fingerprint insensitive to %s change", name)
-		}
-	}
-
-	// A genesis (nil authority) operation never collides with an authority-0 op.
-	genesis := in
-	genesis.AuthorityJournalID = nil
-	zero := journal.JournalID(0)
-	authZero := in
-	authZero.AuthorityJournalID = &zero
-	if fingerprintV1("v1", genesis) == fingerprintV1("v1", authZero) {
-		t.Error("genesis and authority-0 fingerprints collide")
-	}
-
-	input, _, err := encodeApplyInputV2(in)
+	input, _, err := encodeApplyInput(in)
 	if err != nil {
 		t.Fatalf("encode V2: %v", err)
 	}
-	base := mustFingerprintV2(t, "v1", input)
+	base := mustFingerprint(t, "v1", input)
+	if mustFingerprint(t, "v1", input) != base {
+		t.Fatal("fingerprint not stable for identical input")
+	}
+	if mustFingerprint(t, "v2", input) == base {
+		t.Fatal("fingerprint insensitive to application version")
+	}
 	changedDigest := in
 	changedDigest.MutationDigest = []byte("caller-controlled")
-	inputChangedDigest, _, err := encodeApplyInputV2(changedDigest)
+	inputChangedDigest, _, err := encodeApplyInput(changedDigest)
 	if err != nil {
 		t.Fatalf("encode V2 changed caller digest: %v", err)
 	}
-	if mustFingerprintV2(t, "v1", inputChangedDigest) != base {
+	if mustFingerprint(t, "v1", inputChangedDigest) != base {
 		t.Error("V2 fingerprint depends on caller MutationDigest")
 	}
 	changedEffect := in
 	changedEffect.Effects = append([]journal.Effect(nil), in.Effects...)
 	changedEffect.Effects[0].Title = "different canonical operand"
-	inputChangedEffect, _, err := encodeApplyInputV2(changedEffect)
+	inputChangedEffect, _, err := encodeApplyInput(changedEffect)
 	if err != nil {
 		t.Fatalf("encode V2 changed effect: %v", err)
 	}
-	if mustFingerprintV2(t, "v1", inputChangedEffect) == base {
+	if mustFingerprint(t, "v1", inputChangedEffect) == base {
 		t.Error("V2 fingerprint is insensitive to canonical effect bytes")
 	}
 	changedRecordedAt := in
 	changedRecordedAt.RecordedAt++
-	inputChangedRecordedAt, _, err := encodeApplyInputV2(changedRecordedAt)
+	inputChangedRecordedAt, _, err := encodeApplyInput(changedRecordedAt)
 	if err != nil {
 		t.Fatalf("encode V2 changed RecordedAt: %v", err)
 	}
 	if bytes.Equal(inputChangedRecordedAt.Context, input.Context) {
 		t.Error("V2 transport omitted changed audit RecordedAt")
 	}
-	if mustFingerprintV2(t, "v1", inputChangedRecordedAt) != base {
+	if mustFingerprint(t, "v1", inputChangedRecordedAt) != base {
 		t.Error("V2 logical identity includes audit-only RecordedAt")
 	}
 }
@@ -303,7 +263,7 @@ func TestOutcome_SuccessGoldenAndDecode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	var back DBOSStepOutcomeV1
+	var back DBOSStepOutcome
 	if err := json.Unmarshal(raw, &back); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
@@ -339,7 +299,7 @@ func TestOutcome_FailureRoundTripsTypedError(t *testing.T) {
 			}
 			// Survives a JSON serialize round trip.
 			raw, _ := json.Marshal(outcome)
-			var back DBOSStepOutcomeV1
+			var back DBOSStepOutcome
 			if err := json.Unmarshal(raw, &back); err != nil {
 				t.Fatalf("unmarshal: %v", err)
 			}
@@ -359,7 +319,7 @@ func TestOutcome_ConflictReExposesTypedConflict(t *testing.T) {
 	wrapped := errors.Join(journal.ErrOperationConflict, conflict)
 	outcome, _ := encodeDBOSApplyFailure("op-c", []byte("m"), wrapped)
 	raw, _ := json.Marshal(outcome)
-	var back DBOSStepOutcomeV1
+	var back DBOSStepOutcome
 	_ = json.Unmarshal(raw, &back)
 	_, decErr := back.Decode()
 	var oc *journal.OperationConflict

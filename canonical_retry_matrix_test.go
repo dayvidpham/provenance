@@ -1,9 +1,13 @@
 package provenance
 
 import (
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"reflect"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 
@@ -178,6 +182,17 @@ func retryMismatchCandidates(t *testing.T, f retryMatrixFixture) map[string]Oper
 	const expectedRetryMismatchCandidates = 88
 	if len(out) != expectedRetryMismatchCandidates {
 		t.Fatalf("retry mismatch matrix has %d candidates, want exactly %d", len(out), expectedRetryMismatchCandidates)
+	}
+	names := make([]string, 0, len(out))
+	for name := range out {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	// This independently pinned closed-membership digest detects a renamed,
+	// missing, duplicated, or substituted operator rather than checking count alone.
+	const expectedOperatorMembership = "98b56db90155eb97f9b94dff14277e291ca78efffe72ab53d5ac7042372c1fd2"
+	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(names, "\n")))); got != expectedOperatorMembership {
+		t.Fatalf("retry mutation operator membership drifted: got %s want %s\nnames=%v", got, expectedOperatorMembership, names)
 	}
 	return out
 }

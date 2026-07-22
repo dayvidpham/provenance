@@ -1,0 +1,34 @@
+cases:
+  - name: all-canonical-operands
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#6 completed retry preflight"}
+    mutation: {description: "The DBOS retry baseline exercises every canonical operand family.", operator: all-canonical-operands}
+    input:
+      operationID: dbos-exhaustive-operation
+      command: command
+      recordedAt: 600
+      effectRecordedAt: 700
+      taskNamespace: corpus
+      commentID: retry--018f0000-0000-7000-8000-000000000011
+      updateTitle: updated
+      updateDescription: updated description
+      updateNotes: notes
+      label: label
+      closeReason: done
+      effects:
+        - {family: task_create, resultSlot: create, taskRef: task, payload: '{"birth":1}', contextRef: task-context, title: title, description: description}
+        - {family: task_event_update, resultSlot: update, taskRef: task, payload: '{"update":1}', contextRef: task-context, eventKind: provenance.task.updated}
+        - {family: task_event_generic, resultSlot: generic, taskRef: task, payload: '{"generic":1}', contextRef: task-context, eventKind: retry.generic.one}
+        - {family: assignment_start, resultSlot: assignment-start, taskRef: task, assignmentID: retry-assignment, assignmentSlot: owner-responsibility, occupantRef: actor, predecessor: previous, parent: parent}
+        - {family: assignment_end, resultSlot: assignment-end, taskRef: task, assignmentID: retry-assignment, assignmentSlot: owner-responsibility}
+        - {family: decision, resultSlot: decision, taskRef: task, payload: '{"decision":1}', decisionKind: retry.decision}
+        - {family: evidence, resultSlot: evidence, taskRef: task, payload: '{"evidence":1}', evidenceKind: retry.evidence, contentDigestHex: '010203'}
+        - {family: edge_add, resultSlot: edge-add, taskRef: task, contextRef: task-context, edgeTargetRef: target, edgeKind: derived_from}
+        - {family: edge_remove, resultSlot: edge-remove, taskRef: task, contextRef: task-context, edgeTargetRef: target, edgeKind: derived_from}
+        - {family: label_add, resultSlot: label-add, taskRef: task, contextRef: task-context, label: label}
+        - {family: label_remove, resultSlot: label-remove, taskRef: task, contextRef: task-context, label: label}
+        - {family: comment_add, resultSlot: comment, taskRef: task, contextRef: task-context, commentRef: comment, commentAuthorRef: actor, commentBody: body}
+        - {family: task_event_close, resultSlot: close, taskRef: task, eventKind: provenance.task.closed, closeReason: done, forced: true}
+    expected:
+      effectCount: 13
+      mismatchOperatorCount: 88

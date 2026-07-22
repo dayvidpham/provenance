@@ -70,18 +70,18 @@ func (s *internalDBOSStack) operation(id string) OperationInput {
 func TestDBOSExplicitResponseLossRetrievesCompleteResult(t *testing.T) {
 	s := newInternalDBOSStack(t, "response-loss")
 	op := s.operation("response-loss-operation")
-	input, normalized, err := encodeApplyInputV2(op)
+	input, normalized, err := encodeApplyInput(op)
 	if err != nil {
 		t.Fatal(err)
 	}
-	fp, err := fingerprintV2(s.root.GetApplicationVersion(), input)
+	fp, err := fingerprint(s.root.GetApplicationVersion(), input)
 	if err != nil {
 		t.Fatal(err)
 	}
-	workflowID := applyWorkflowIDPrefixV2 + fp
+	workflowID := applyWorkflowIDPrefix + fp
 	// Start durable work and deliberately discard the returned handle without ever
 	// observing its result, modelling transport/response loss after acceptance.
-	if _, err := dbos.RunWorkflow(s.root, s.adapter.applyWorkflowV2, input, dbos.WithWorkflowID(workflowID), dbos.WithApplicationVersion(s.root.GetApplicationVersion())); err != nil {
+	if _, err := dbos.RunWorkflow(s.root, s.adapter.applyWorkflow, input, dbos.WithWorkflowID(workflowID), dbos.WithApplicationVersion(s.root.GetApplicationVersion())); err != nil {
 		t.Fatalf("start discarded-response workflow: %v", err)
 	}
 	got, err := s.adapter.Apply(context.Background(), op)

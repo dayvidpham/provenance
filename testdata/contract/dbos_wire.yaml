@@ -1,0 +1,104 @@
+cases:
+  - &base
+    name: task-event-update
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#6 canonical DBOS wire"}
+    mutation: {description: "Task update transports every canonical operand.", operator: task-event-update}
+    input:
+      contextHex: &context 0000001a70726f76656e616e63652e64626f732d636f6e746578742f763200000011666978747572652d6f7065726174696f6e0000002d666978747572652d2d30313866303030302d303030302d373030302d383030302d303030303030303030303032000000090100000000000000070000000f666978747572652d636f6d6d616e64000000080000000000000063
+      mutation: |
+        version:22:provenance.mutation.v1
+        effect-count:1:1
+        effect.0.family:10:task_event
+        effect.0.result-slot:5:event
+        effect.0.recorded-at-override:3:142
+        effect.0.task:45:fixture--018f0000-0000-7000-8000-000000000001
+        effect.0.event-kind:23:provenance.task.updated
+        effect.0.payload:13:{"a":1,"b":2}
+        effect.0.context-count:1:1
+        effect.0.context.0.kind:4:task
+        effect.0.context.0.identity:45:fixture--018f0000-0000-7000-8000-000000000001
+        effect.0.update-title:4:1new
+        effect.0.update-description:16:1new description
+        effect.0.update-priority:5:1high
+        effect.0.update-phase:12:1code_review
+        effect.0.update-notes:6:1notes
+    expected: {sort: task_event, digestHex: 4fd9396a9ce6df1ac68ab8680ecbedecca109bb364b3f81d3f7705121258a4ba, fingerprint: 0a14627ffd97c84e019df3cad8f868301cc5f97cc7f9b2a357742c9d8b9a9286}
+  - name: task-event-close
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#6 canonical DBOS wire"}
+    mutation: {description: "Task close remains distinct from update.", operator: task-event-close}
+    input: {contextHex: *context, mutation: "version:22:provenance.mutation.v1\neffect-count:1:1\neffect.0.family:10:task_event\neffect.0.result-slot:5:close\neffect.0.recorded-at-override:3:142\neffect.0.task:45:fixture--018f0000-0000-7000-8000-000000000001\neffect.0.event-kind:22:provenance.task.closed\neffect.0.payload:2:{}\neffect.0.context-count:1:0\neffect.0.forced:4:true\neffect.0.close-reason:4:done\n"}
+    expected: {sort: task_event, digestHex: 8b8c21ea2274bc523323cb05836360caf390151756c97577e9d15661acb74b21, fingerprint: 67a614dc8a8dc068feca99d5dd0ea312d51bd3660170c98c506d3e02fae1a2cd}
+  - name: bootstrap-authority
+    classification: must-pass
+    provenance: {source: enum, ref: "EffectBootstrapAuthority"}
+    mutation: {description: "Bootstrap authority operands are immutable.", operator: bootstrap-authority}
+    input: {contextHex: *context, mutation: "version:22:provenance.mutation.v1\neffect-count:1:1\neffect.0.family:19:bootstrap_authority\neffect.0.result-slot:9:bootstrap\neffect.0.recorded-at-override:3:142\neffect.0.bootstrap-label:4:root\neffect.0.operation-authority:4:auth\n"}
+    expected: {sort: bootstrap_authority, digestHex: c404ad673f363769c90a726a3531fc64fe25131f0607d9b8f44664b960ef0ba3, fingerprint: 978869ed47e0b7b1e04ba574e5c2e31b93423e348b5b0b588eafd22d19878b1d}
+  - name: assignment-start
+    classification: must-pass
+    provenance: {source: enum, ref: "EffectAssignmentStart"}
+    mutation: {description: "Assignment start operands are immutable.", operator: assignment-start}
+    input: {contextHex: *context, mutation: "version:22:provenance.mutation.v1\neffect-count:1:1\neffect.0.family:16:assignment_start\neffect.0.result-slot:5:start\neffect.0.recorded-at-override:3:142\neffect.0.task:45:fixture--018f0000-0000-7000-8000-000000000001\neffect.0.assignment:1:a\neffect.0.slot:20:owner-responsibility\neffect.0.occupant:45:fixture--018f0000-0000-7000-8000-000000000002\neffect.0.predecessor:1:p\neffect.0.parent:6:parent\n"}
+    expected: {sort: assignment_start, digestHex: 90173c1d8e31659199462e28d1ff906344755e9df2d8a1e9908f6edba354252a, fingerprint: ef51a3e6ebff135286aa2cd67e109a17713757b3fbc249e5272bfca21832cd3d}
+  - name: assignment-end
+    classification: must-pass
+    provenance: {source: enum, ref: "EffectAssignmentEnd"}
+    mutation: {description: "Assignment end operands are immutable.", operator: assignment-end}
+    input: {contextHex: *context, mutation: "version:22:provenance.mutation.v1\neffect-count:1:1\neffect.0.family:14:assignment_end\neffect.0.result-slot:3:end\neffect.0.recorded-at-override:3:142\neffect.0.task:45:fixture--018f0000-0000-7000-8000-000000000001\neffect.0.assignment:1:a\neffect.0.slot:20:owner-responsibility\n"}
+    expected: {sort: assignment_end, digestHex: 644e9ef74f35b67ad78b0ab11657551c3c538611e52842ba8d3a89583442784f, fingerprint: 33a4dd860e16625173721c6f477810512847412ed9affa8ea2ba07f119609cb3}
+  - name: decision
+    classification: must-pass
+    provenance: {source: enum, ref: "EffectDecision"}
+    mutation: {description: "Decision operands are immutable.", operator: decision}
+    input: {contextHex: *context, mutation: "version:22:provenance.mutation.v1\neffect-count:1:1\neffect.0.family:8:decision\neffect.0.result-slot:8:decision\neffect.0.recorded-at-override:3:142\neffect.0.task:45:fixture--018f0000-0000-7000-8000-000000000001\neffect.0.decision-kind:16:fixture.decision\neffect.0.payload:7:{\"x\":1}\n"}
+    expected: {sort: decision, digestHex: 016537171e2327b6efd22bd617c9df83203a499a32d692913245feff01fe7dd5, fingerprint: 9b977de8e48974c7787ad6f4f26cee5f6a42e12d72aa1829edf8a42e924c9aea}
+  - name: evidence
+    classification: must-pass
+    provenance: {source: enum, ref: "EffectEvidence"}
+    mutation: {description: "Evidence operands are immutable.", operator: evidence}
+    input: {contextHex: *context, mutation: "version:22:provenance.mutation.v1\neffect-count:1:1\neffect.0.family:8:evidence\neffect.0.result-slot:8:evidence\neffect.0.recorded-at-override:3:142\neffect.0.task:45:fixture--018f0000-0000-7000-8000-000000000001\neffect.0.evidence-kind:16:fixture.evidence\neffect.0.content-digest:2:\u0001\u0002\neffect.0.payload:7:{\"x\":1}\n"}
+    expected: {sort: evidence, digestHex: 1772829bf85799dfea3b331a0486da2c120eb13456513d8fef6405830c93ccd6, fingerprint: 5fdf4fdafa26bb20749267957b0f034594e701e23b22612316f8e294528175ae}
+  - name: task-create
+    classification: must-pass
+    provenance: {source: enum, ref: "EffectTaskCreate"}
+    mutation: {description: "Task create operands are immutable.", operator: task-create}
+    input: {contextHex: *context, mutation: "version:22:provenance.mutation.v1\neffect-count:1:1\neffect.0.family:11:task_create\neffect.0.result-slot:6:create\neffect.0.recorded-at-override:3:142\neffect.0.task:45:fixture--018f0000-0000-7000-8000-000000000001\neffect.0.payload:7:{\"x\":1}\neffect.0.context-count:1:1\neffect.0.context.0.kind:4:task\neffect.0.context.0.identity:45:fixture--018f0000-0000-7000-8000-000000000001\neffect.0.title:5:title\neffect.0.description:11:description\neffect.0.type:4:task\neffect.0.priority:6:medium\neffect.0.phase:8:unscoped\n"}
+    expected: {sort: task_create, digestHex: 3a64f293ec1ae932239417929030910d93d7430810c45ae1f82c53d51518fbec, fingerprint: af0684b9fc97cae0568d12a93aa11b829a61aa0d21585ea81b83d2f2591a09da}
+  - name: task-create-allocated
+    classification: must-pass
+    provenance: {source: enum, ref: "EffectTaskCreateAllocated"}
+    mutation: {description: "Allocated task create operands are immutable.", operator: task-create-allocated}
+    input: {contextHex: *context, mutation: "version:22:provenance.mutation.v1\neffect-count:1:1\neffect.0.family:21:task_create_allocated\neffect.0.result-slot:9:allocated\neffect.0.recorded-at-override:3:142\neffect.0.task:45:fixture--018f0000-0000-7000-8000-000000000001\neffect.0.payload:7:{\"x\":1}\neffect.0.context-count:1:1\neffect.0.context.0.kind:4:task\neffect.0.context.0.identity:45:fixture--018f0000-0000-7000-8000-000000000001\neffect.0.title:5:title\neffect.0.description:11:description\neffect.0.type:4:task\neffect.0.priority:6:medium\neffect.0.phase:8:unscoped\n"}
+    expected: {sort: task_create_allocated, digestHex: f7d5f0fcc27a6d65a03e868baebe6dd41b696fae174473dd15456b590d66fb2a, fingerprint: cff6a1cefb00cec847712d93fcfd23f2d447dc27754ce2d0a61cbadb89e5b5f0}
+  - name: edge-add
+    classification: must-pass
+    provenance: {source: enum, ref: "EffectEdgeAdd"}
+    mutation: {description: "Edge add operands are immutable.", operator: edge-add}
+    input: {contextHex: *context, mutation: "version:22:provenance.mutation.v1\neffect-count:1:1\neffect.0.family:8:edge_add\neffect.0.result-slot:8:edge-add\neffect.0.recorded-at-override:3:142\neffect.0.task:45:fixture--018f0000-0000-7000-8000-000000000001\neffect.0.edge-target:45:fixture--018f0000-0000-7000-8000-000000000001\neffect.0.edge-kind:12:derived_from\neffect.0.context-count:1:1\neffect.0.context.0.kind:4:task\neffect.0.context.0.identity:45:fixture--018f0000-0000-7000-8000-000000000001\n"}
+    expected: {sort: edge_add, digestHex: 6f04923d70ca43c21a4611b1b2b2be9dfb858b873895d94713f8cb3ed6517922, fingerprint: 28afcb51041e4beba3cb0a0135f296c2fe82c5df9197606db5cc8d1dacd0e35a}
+  - name: edge-remove
+    classification: must-pass
+    provenance: {source: enum, ref: "EffectEdgeRemove"}
+    mutation: {description: "Edge remove operands are immutable.", operator: edge-remove}
+    input: {contextHex: *context, mutation: "version:22:provenance.mutation.v1\neffect-count:1:1\neffect.0.family:11:edge_remove\neffect.0.result-slot:11:edge-remove\neffect.0.recorded-at-override:3:142\neffect.0.task:45:fixture--018f0000-0000-7000-8000-000000000001\neffect.0.edge-target:45:fixture--018f0000-0000-7000-8000-000000000001\neffect.0.edge-kind:12:derived_from\neffect.0.context-count:1:1\neffect.0.context.0.kind:4:task\neffect.0.context.0.identity:45:fixture--018f0000-0000-7000-8000-000000000001\n"}
+    expected: {sort: edge_remove, digestHex: 3dd68b2c04778dcf770674e40ff88f324069054d0b4a7846a7ed6d2931c10997, fingerprint: 946f8cf444e979b233c2992a3a00054e26cd5a9c005d2f2080d7d9f15f17d1c9}
+  - name: label-add
+    classification: must-pass
+    provenance: {source: enum, ref: "EffectLabelAdd"}
+    mutation: {description: "Label add operands are immutable.", operator: label-add}
+    input: {contextHex: *context, mutation: "version:22:provenance.mutation.v1\neffect-count:1:1\neffect.0.family:9:label_add\neffect.0.result-slot:9:label-add\neffect.0.recorded-at-override:3:142\neffect.0.task:45:fixture--018f0000-0000-7000-8000-000000000001\neffect.0.label:5:label\neffect.0.context-count:1:1\neffect.0.context.0.kind:4:task\neffect.0.context.0.identity:45:fixture--018f0000-0000-7000-8000-000000000001\n"}
+    expected: {sort: label_add, digestHex: 804a38689f50f421c458a3a8dae9d4255349c3fc93bd879b1990ce06b84ad2db, fingerprint: 2804a6301c34cbd58b7fae066cd5ea5d59454493abd24f422a89b97cd68e51b2}
+  - name: label-remove
+    classification: must-pass
+    provenance: {source: enum, ref: "EffectLabelRemove"}
+    mutation: {description: "Label remove operands are immutable.", operator: label-remove}
+    input: {contextHex: *context, mutation: "version:22:provenance.mutation.v1\neffect-count:1:1\neffect.0.family:12:label_remove\neffect.0.result-slot:12:label-remove\neffect.0.recorded-at-override:3:142\neffect.0.task:45:fixture--018f0000-0000-7000-8000-000000000001\neffect.0.label:5:label\neffect.0.context-count:1:1\neffect.0.context.0.kind:4:task\neffect.0.context.0.identity:45:fixture--018f0000-0000-7000-8000-000000000001\n"}
+    expected: {sort: label_remove, digestHex: c542027cb41eec89cdaadc67ec94f88131eb5269f3e7a73ce82dc5e45711ddf7, fingerprint: 3682fb9ca2bfdb01237c449e09baf8176794d8ae556e85161455e1e263095071}
+  - name: comment-add
+    classification: must-pass
+    provenance: {source: enum, ref: "EffectCommentAdd"}
+    mutation: {description: "Comment add operands are immutable.", operator: comment-add}
+    input: {contextHex: *context, mutation: "version:22:provenance.mutation.v1\neffect-count:1:1\neffect.0.family:11:comment_add\neffect.0.result-slot:7:comment\neffect.0.recorded-at-override:3:142\neffect.0.task:45:fixture--018f0000-0000-7000-8000-000000000001\neffect.0.comment:45:fixture--018f0000-0000-7000-8000-000000000003\neffect.0.comment-author:45:fixture--018f0000-0000-7000-8000-000000000002\neffect.0.comment-body:4:body\neffect.0.context-count:1:1\neffect.0.context.0.kind:4:task\neffect.0.context.0.identity:45:fixture--018f0000-0000-7000-8000-000000000001\n"}
+    expected: {sort: comment_add, digestHex: ccf75528afa6ee8d25cd53fc0735f74d0a4b39f8efe7812d79f13300562fefdc, fingerprint: 9d5a7ce1d59678301adde6e7cb29d5fa37c8971f2c5b2ba942138f993cc0fa29}

@@ -250,8 +250,7 @@ The explicit codec instead provides these guarantees:
   `RecordedAtOverride` is a canonical operand and does change identity.
 - Unknown schemas, variants, fields, duplicate fields, trailing data, and
   oversized values fail closed before domain writes.
-- Persisted versions remain independently decodable after a new write format is
-  introduced.
+- The single supported DBOS contract fails closed on every other schema.
 - Provenance domain failures retain their typed `errors.Is` and `errors.As`
   behavior after DBOS recovery.
 
@@ -260,7 +259,7 @@ domain boundary used by the DBOS workflow engine.
 
 ### Input Formats
 
-`DBOSApplyInputV2` is the current write format. It contains:
+`DBOSApplyInput` is the sole supported write and recovery format. It contains:
 
 - A closed outer schema tag.
 - A bounded, ordered context frame containing operation identity, actor,
@@ -268,12 +267,9 @@ domain boundary used by the DBOS workflow engine.
 - The canonical mutation bytes produced by the journal codec.
 
 The mutation digest is derived from the canonical bytes. A caller-supplied
-digest is not authoritative for new workflows.
-
-`DBOSApplyInputV1` is retained only to decode and resume already-persisted V1
-workflow history. New operations do not emit V1 input. Removing a historical
-decoder would strand durable work, so read compatibility and current writes are
-kept as separate concerns.
+digest is never authoritative. Durable identity strings retain their `/v2`
+suffix so unused experimental `/v1` tokens are not reassigned to incompatible
+bytes; there is no compatibility decoder or second workflow registration.
 
 ### Workflow And Retry Identity
 
@@ -293,7 +289,7 @@ answer.
 
 ### Outcome Format
 
-`DBOSStepOutcomeV1` is a closed checkpoint format with exactly one success or
+`DBOSStepOutcome` is a closed checkpoint format with exactly one success or
 failure variant.
 
 A success contains journal-anchored state: the operation's anchor journal row,
@@ -313,7 +309,12 @@ which prevents the incremental and reconstruction paths from silently diverging.
 
 The DBOS suite treats persisted formats and retry behavior as architecture:
 
-- Immutable V1 and V2 fixtures detect accidental wire changes.
+- Strict typed YAML corpora under `testdata/contract` pin independently authored
+  context bytes, canonical mutation bytes, mutation digests, fingerprints,
+  malformed frames, and the exhaustive retry baseline.
+- Corpus loaders reject unknown YAML fields, trailing documents, duplicate or
+  empty names, invalid classification/provenance, incomplete mutation metadata,
+  and values outside closed symbolic memberships.
 - Family and exhaustive retry tests cover every canonical mutation operand.
 - Replay tests require zero callbacks and zero writes for completed work.
 - Crash-gap tests exercise failures around domain commit and DBOS checkpoints.

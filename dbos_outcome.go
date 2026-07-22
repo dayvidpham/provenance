@@ -8,8 +8,8 @@ package provenance
 // plain string, erasing its type. A Provenance DOMAIN failure (a §5/§9 typed
 // journal error) must survive recovery as a typed, errors.As/errors.Is-matchable
 // value, so a domain failure is NEVER returned as the step's Go error: it is
-// encoded INTO a DBOSStepOutcomeV1 (returned with a nil Go error) as a closed
-// CanonicalApplyFailureV1 variant. Only genuine DBOS INFRASTRUCTURE failures use
+// encoded INTO a DBOSStepOutcome (returned with a nil Go error) as a closed
+// CanonicalApplyFailure variant. Only genuine DBOS INFRASTRUCTURE failures use
 // the step/workflow Go-error channel.
 //
 // Re-anchoring (Proposal 50 amendment): the canonical mutation result is the
@@ -34,37 +34,34 @@ import (
 // the fingerprint, so a change to any of them deliberately changes every workflow
 // and step ID (a different code contract must not silently reuse a checkpoint).
 const (
-	ApplyWorkflowSchemaV1     = "provenance.apply/v1"
-	ApplyWorkflowSchemaV2     = "provenance.apply/v2"
-	DBOSStepOutcomeSchemaV1   = "provenance.dbos-step-outcome/v1"
+	ApplyWorkflowSchema       = "provenance.apply/v2"
+	DBOSStepOutcomeSchema     = "provenance.dbos-step-outcome/v2"
 	PinnedDBOSContractVersion = "github.com/dbos-inc/dbos-transact-golang v0.16.0"
 
-	applyWorkflowIDPrefix   = "provenance.apply/v1/"
-	applyStepNamePrefix     = "provenance.apply-step/v1/"
-	applyWorkflowIDPrefixV2 = "provenance.apply/v2/"
-	applyStepNamePrefixV2   = "provenance.apply-step/v2/"
+	applyWorkflowIDPrefix = "provenance.apply/v2/"
+	applyStepNamePrefix   = "provenance.apply-step/v2/"
 )
 
-// CanonicalResultSlotV1 is one slot→produced-row binding in the canonical result:
+// CanonicalResultSlot is one slot→produced-row binding in the canonical result:
 // the caller's local slot handle, the produced journal row, its JournalKind, and,
 // for a task_event row, the resolved TaskID (empty otherwise).
-type CanonicalResultSlotV1 struct {
+type CanonicalResultSlot struct {
 	Slot              string `json:"slot"`
 	ProducedJournalID int64  `json:"produced_journal_id"`
 	Kind              int    `json:"kind"`
 	TaskID            string `json:"task_id,omitempty"`
 }
 
-// CanonicalMutationResultV1 is the journal-anchored canonical result of one
+// CanonicalMutationResult is the journal-anchored canonical result of one
 // committed operation. EmittedEvents is the task_event closure in ascending
 // JournalID order; ResultSlots is slot-sorted and slot-unique. Every field here is
 // canonical, journal-anchored state, so its natural equality (== / reflect.DeepEqual,
 // and canonicalResultsEqual) is honest — the per-call §9.4 replay flag deliberately
-// does NOT live here (see DBOSStepOutcomeV1.ShortCircuited).
-type CanonicalMutationResultV1 struct {
-	AnchorJournalID int64                   `json:"anchor_journal_id"`
-	EmittedEvents   []int64                 `json:"emitted_events"`
-	ResultSlots     []CanonicalResultSlotV1 `json:"result_slots"`
+// does NOT live here (see DBOSStepOutcome.ShortCircuited).
+type CanonicalMutationResult struct {
+	AnchorJournalID int64                 `json:"anchor_journal_id"`
+	EmittedEvents   []int64               `json:"emitted_events"`
+	ResultSlots     []CanonicalResultSlot `json:"result_slots"`
 }
 
 // ApplyFailureKind is the closed discriminator over every public journal failure
@@ -130,10 +127,10 @@ func classifyFailure(err error) ApplyFailureKind {
 	return FailureUnexpected
 }
 
-// CanonicalApplyFailureV1 is the closed encoding of one checkpointed domain
+// CanonicalApplyFailure is the closed encoding of one checkpointed domain
 // failure. Message is the original actionable text; Kind selects the sentinel a
 // decoded failure wraps so callers recover the typed error with errors.Is.
-type CanonicalApplyFailureV1 struct {
+type CanonicalApplyFailure struct {
 	Kind    ApplyFailureKind `json:"kind"`
 	Message string           `json:"message"`
 	// ConflictField, when Kind is FailureOperationConflict, carries the first
@@ -143,18 +140,18 @@ type CanonicalApplyFailureV1 struct {
 	OperationID   string `json:"operation_id,omitempty"`
 }
 
-// DBOSStepOutcomeV1 is the closed step checkpoint: exactly one of Success or
+// DBOSStepOutcome is the closed step checkpoint: exactly one of Success or
 // Failure is non-nil. OperationID and MutationDigest bind the outcome to its
 // operation so post-validation can reject an outcome that drifted from its input.
-type DBOSStepOutcomeV1 struct {
-	Schema         string                     `json:"schema"`
-	OperationID    string                     `json:"operation_id"`
-	MutationDigest []byte                     `json:"mutation_digest"`
-	Success        *CanonicalMutationResultV1 `json:"success,omitempty"`
-	Failure        *CanonicalApplyFailureV1   `json:"failure,omitempty"`
+type DBOSStepOutcome struct {
+	Schema         string                   `json:"schema"`
+	OperationID    string                   `json:"operation_id"`
+	MutationDigest []byte                   `json:"mutation_digest"`
+	Success        *CanonicalMutationResult `json:"success,omitempty"`
+	Failure        *CanonicalApplyFailure   `json:"failure,omitempty"`
 	// ShortCircuited is a PER-CALL §9.4 replay flag, not journal-anchored canonical
 	// state (LookupCommitted, a pure read, never short-circuits anything), so it lives
-	// BESIDE the canonical result rather than inside CanonicalMutationResultV1 — keeping
+	// BESIDE the canonical result rather than inside CanonicalMutationResult — keeping
 	// that struct's equality honest for any future == / reflect.DeepEqual user. It is
 	// informational (audit) only; post-validation compares canonical results, never it.
 	ShortCircuited bool `json:"short_circuited,omitempty"`
@@ -164,19 +161,19 @@ type DBOSStepOutcomeV1 struct {
 // outcome. It validates the result is a CommittedExact, slot-sorts and
 // deduplicates the bindings, revalidates every typed ID, and stamps the exact
 // OperationID/MutationDigest.
-func encodeDBOSApplySuccess(operation journal.OperationID, mutation []byte, result journal.CommittedResult) (DBOSStepOutcomeV1, error) {
+func encodeDBOSApplySuccess(operation journal.OperationID, mutation []byte, result journal.CommittedResult) (DBOSStepOutcome, error) {
 	if result.Kind != journal.CommittedExact {
-		return DBOSStepOutcomeV1{}, fmt.Errorf(
+		return DBOSStepOutcome{}, fmt.Errorf(
 			"provenance: encode success outcome for operation %q — reducer returned a non-Exact result (%s) — "+
 				"where: step success encode; impact: nothing is checkpointed as success; fix: a committed "+
 				"operation must reconstruct as CommittedExact",
 			operation, result.Kind)
 	}
-	slots := make([]CanonicalResultSlotV1, 0, len(result.ResultSlots))
+	slots := make([]CanonicalResultSlot, 0, len(result.ResultSlots))
 	seen := make(map[string]struct{}, len(result.ResultSlots))
 	for _, b := range result.ResultSlots {
 		if _, dup := seen[string(b.Slot)]; dup {
-			return DBOSStepOutcomeV1{}, fmt.Errorf(
+			return DBOSStepOutcome{}, fmt.Errorf(
 				"provenance: encode success outcome for operation %q — duplicate result slot %q — "+
 					"where: step success encode; impact: the binding map is ambiguous; fix: each "+
 					"ResultSlotID must be unique within one operation (§3.2)",
@@ -186,12 +183,12 @@ func encodeDBOSApplySuccess(operation journal.OperationID, mutation []byte, resu
 		taskID := ""
 		if b.TaskID != nil {
 			if err := journalValidateTaskID(*b.TaskID); err != nil {
-				return DBOSStepOutcomeV1{}, fmt.Errorf(
+				return DBOSStepOutcome{}, fmt.Errorf(
 					"provenance: encode success outcome for operation %q slot %q: %w", operation, b.Slot, err)
 			}
 			taskID = b.TaskID.String()
 		}
-		slots = append(slots, CanonicalResultSlotV1{
+		slots = append(slots, CanonicalResultSlot{
 			Slot:              string(b.Slot),
 			ProducedJournalID: int64(b.ProducedJournalID),
 			Kind:              int(b.Kind),
@@ -203,11 +200,11 @@ func encodeDBOSApplySuccess(operation journal.OperationID, mutation []byte, resu
 	for i, e := range result.EmittedEvents {
 		emitted[i] = int64(e)
 	}
-	return DBOSStepOutcomeV1{
-		Schema:         DBOSStepOutcomeSchemaV1,
+	return DBOSStepOutcome{
+		Schema:         DBOSStepOutcomeSchema,
 		OperationID:    string(operation),
 		MutationDigest: append([]byte(nil), mutation...),
-		Success: &CanonicalMutationResultV1{
+		Success: &CanonicalMutationResult{
 			AnchorJournalID: int64(result.AnchorJournalID),
 			EmittedEvents:   emitted,
 			ResultSlots:     slots,
@@ -219,9 +216,9 @@ func encodeDBOSApplySuccess(operation journal.OperationID, mutation []byte, resu
 // encodeDBOSApplyFailure encodes a reducer error as a closed failure outcome. The
 // returned Go error is ALWAYS nil: a domain failure is a legitimate, durable
 // checkpoint, not a step infrastructure error.
-func encodeDBOSApplyFailure(operation journal.OperationID, mutation []byte, err error) (DBOSStepOutcomeV1, error) {
+func encodeDBOSApplyFailure(operation journal.OperationID, mutation []byte, err error) (DBOSStepOutcome, error) {
 	kind := classifyFailure(err)
-	fail := &CanonicalApplyFailureV1{
+	fail := &CanonicalApplyFailure{
 		Kind:        kind,
 		Message:     err.Error(),
 		OperationID: string(operation),
@@ -230,8 +227,8 @@ func encodeDBOSApplyFailure(operation journal.OperationID, mutation []byte, err 
 	if errors.As(err, &conflict) {
 		fail.ConflictField = conflict.Field
 	}
-	return DBOSStepOutcomeV1{
-		Schema:         DBOSStepOutcomeSchemaV1,
+	return DBOSStepOutcome{
+		Schema:         DBOSStepOutcomeSchema,
 		OperationID:    string(operation),
 		MutationDigest: append([]byte(nil), mutation...),
 		Failure:        fail,
@@ -241,23 +238,23 @@ func encodeDBOSApplyFailure(operation journal.OperationID, mutation []byte, err 
 // Decode returns the canonical success result, or the reconstructed typed failure
 // error for a failure outcome. A malformed outcome (wrong schema, neither or both
 // arms set) fails closed.
-func (o DBOSStepOutcomeV1) Decode() (CanonicalMutationResultV1, error) {
-	if o.Schema != DBOSStepOutcomeSchemaV1 {
-		return CanonicalMutationResultV1{}, fmt.Errorf(
+func (o DBOSStepOutcome) Decode() (CanonicalMutationResult, error) {
+	if o.Schema != DBOSStepOutcomeSchema {
+		return CanonicalMutationResult{}, fmt.Errorf(
 			"provenance: decode step outcome — schema tag %q is not %q — where: outcome decode; "+
 				"impact: the checkpoint is not trusted; fix: outcomes are produced only by "+
 				"encodeDBOSApplySuccess/Failure",
-			o.Schema, DBOSStepOutcomeSchemaV1)
+			o.Schema, DBOSStepOutcomeSchema)
 	}
 	if (o.Success == nil) == (o.Failure == nil) {
-		return CanonicalMutationResultV1{}, fmt.Errorf(
+		return CanonicalMutationResult{}, fmt.Errorf(
 			"provenance: decode step outcome for operation %q — exactly one of Success or Failure must be "+
 				"set — where: outcome decode; impact: the checkpoint is ambiguous and rejected; fix: a "+
 				"well-formed outcome is a closed one-of",
 			o.OperationID)
 	}
 	if o.Failure != nil {
-		return CanonicalMutationResultV1{}, o.Failure.asError()
+		return CanonicalMutationResult{}, o.Failure.asError()
 	}
 	return *o.Success, nil
 }
@@ -265,7 +262,7 @@ func (o DBOSStepOutcomeV1) Decode() (CanonicalMutationResultV1, error) {
 // asError reconstructs a typed, errors.Is/As-matchable error from a checkpointed
 // failure. A FailureOperationConflict re-exposes a *journal.OperationConflict; any
 // other known kind wraps its sentinel; an unexpected kind carries its message.
-func (f *CanonicalApplyFailureV1) asError() error {
+func (f *CanonicalApplyFailure) asError() error {
 	if f.Kind == FailureOperationConflict {
 		return fmt.Errorf("%w: %w", journal.ErrOperationConflict,
 			&journal.OperationConflict{OperationID: journal.OperationID(f.OperationID), Field: f.ConflictField})
@@ -288,45 +285,10 @@ func (f *CanonicalApplyFailureV1) asError() error {
 // step, over the length-delimited pinned schema/contract/version identity plus the
 // operation's four-field replay identity and structural mutation. It is stable for
 // an exact input and changes for any version/actor/authority/OperationID/command/
-// mutation change.
-func fingerprintV1(applicationVersion string, in journal.OperationInput) string {
-	h := sha256.New()
-	write := func(b []byte) {
-		var n [8]byte
-		binary.BigEndian.PutUint64(n[:], uint64(len(b)))
-		_, _ = h.Write(n[:])
-		_, _ = h.Write(b)
-	}
-	writeStr := func(s string) { write([]byte(s)) }
-
-	writeStr(DBOSApplyInputSchemaV1)
-	writeStr(ApplyWorkflowSchemaV1)
-	writeStr(DBOSStepOutcomeSchemaV1)
-	writeStr(PinnedDBOSContractVersion)
-	writeStr(applicationVersion)
-	writeStr(in.ActorID.String())
-	// Exact governing authority: the JournalID, or a distinct genesis sentinel when
-	// nil, so a genesis operation and an authority-0 operation never collide.
-	if in.AuthorityJournalID == nil {
-		writeStr("authority:genesis")
-	} else {
-		var a [8]byte
-		binary.BigEndian.PutUint64(a[:], uint64(int64(*in.AuthorityJournalID)))
-		write(a[:])
-	}
-	writeStr(string(in.OperationID))
-	write(in.CommandDigest)
-	write(in.MutationDigest)
-
-	sum := h.Sum(nil)
-	return fmt.Sprintf("%x", sum)
-}
-
-// fingerprintV2 binds the runtime contract and canonical replay identity.
-// Mutation is the reviewed canonical byte stream, never the caller's digest;
+// mutation change. Mutation is the reviewed canonical byte stream, never the caller's digest;
 // audit-only RecordedAt remains transported but deliberately is not hashed.
-func fingerprintV2(applicationVersion string, input DBOSApplyInputV2) (string, error) {
-	identity, err := decodeDBOSContextV2(input.Context)
+func fingerprint(applicationVersion string, input DBOSApplyInput) (string, error) {
+	identity, err := decodeDBOSContext(input.Context)
 	if err != nil {
 		return "", err
 	}
@@ -338,8 +300,8 @@ func fingerprintV2(applicationVersion string, input DBOSApplyInputV2) (string, e
 		_, _ = h.Write(value)
 	}
 	values := [][]byte{
-		[]byte(DBOSApplyInputSchemaV2), []byte(ApplyWorkflowSchemaV2),
-		[]byte(DBOSStepOutcomeSchemaV1), []byte(PinnedDBOSContractVersion),
+		[]byte(DBOSApplyInputSchema), []byte(ApplyWorkflowSchema),
+		[]byte(DBOSStepOutcomeSchema), []byte(PinnedDBOSContractVersion),
 		[]byte(applicationVersion), []byte(identity.OperationID), []byte(actorToWire(identity.ActorID)),
 	}
 	if identity.AuthorityJournalID == nil {
