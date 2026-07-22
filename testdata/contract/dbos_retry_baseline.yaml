@@ -1,0 +1,120 @@
+cases:
+  - name: all-canonical-operands
+    classification: must-pass
+    provenance: {source: requirement, ref: "provenance#6 completed retry preflight"}
+    mutation: {description: "The DBOS retry baseline exercises every canonical operand family.", operator: all-canonical-operands}
+    input:
+      operationID: dbos-exhaustive-operation
+      command: command
+      recordedAt: 600
+      effectRecordedAt: 700
+      commentID: retry--018f0000-0000-7000-8000-000000000011
+      updateTitle: updated
+      updateDescription: updated description
+      updateNotes: notes
+      effects:
+        - {family: task_create, resultSlot: create, taskRef: task, payload: '{"birth":1}', contextRef: task-context, title: title, description: description}
+        - {family: task_event_update, resultSlot: update, taskRef: task, payload: '{"update":1}', contextRef: task-context, eventKind: provenance.task.updated}
+        - {family: task_event_generic, resultSlot: generic, taskRef: task, payload: '{"generic":1}', contextRef: task-context, eventKind: retry.generic.one}
+        - {family: assignment_start, resultSlot: assignment-start, taskRef: task, assignmentID: retry-assignment, assignmentSlot: owner-responsibility, occupantRef: actor, predecessor: previous, parent: parent}
+        - {family: assignment_end, resultSlot: assignment-end, taskRef: task, assignmentID: retry-assignment, assignmentSlot: owner-responsibility}
+        - {family: decision, resultSlot: decision, taskRef: task, payload: '{"decision":1}', decisionKind: retry.decision}
+        - {family: evidence, resultSlot: evidence, taskRef: task, payload: '{"evidence":1}', evidenceKind: retry.evidence, contentDigestHex: '010203'}
+        - {family: edge_add, resultSlot: edge-add, taskRef: task, contextRef: task-context, edgeTargetRef: target, edgeKind: derived_from}
+        - {family: edge_remove, resultSlot: edge-remove, taskRef: task, contextRef: task-context, edgeTargetRef: target, edgeKind: derived_from}
+        - {family: label_add, resultSlot: label-add, taskRef: task, contextRef: task-context, label: label}
+        - {family: label_remove, resultSlot: label-remove, taskRef: task, contextRef: task-context, label: label}
+        - {family: comment_add, resultSlot: comment, taskRef: task, contextRef: task-context, commentRef: comment, commentAuthorRef: actor, commentBody: body}
+        - {family: task_event_close, resultSlot: close, taskRef: task, eventKind: provenance.task.closed, closeReason: done, forced: true}
+    expected:
+      effectCount: 13
+      mismatchOperatorCount: 88
+      targets:
+        - {operator: actor, family: operation, effectIndex: -1, path: ActorID, mutationClass: replace}
+        - {operator: authority-null, family: operation, effectIndex: -1, path: AuthorityJournalID, mutationClass: remove}
+        - {operator: command, family: operation, effectIndex: -1, path: CommandDigest, mutationClass: replace}
+        - {operator: effect-order, family: operation, effectIndex: -1, path: Effects.order, mutationClass: reorder}
+        - {operator: result-slot-a, family: task_create, effectIndex: 0, path: 'Effects[0].ResultSlot', mutationClass: replace}
+        - {operator: result-slot-b, family: task_event_update, effectIndex: 1, path: 'Effects[1].ResultSlot', mutationClass: replace}
+        - {operator: result-slot-c, family: task_event_generic, effectIndex: 2, path: 'Effects[2].ResultSlot', mutationClass: replace}
+        - {operator: result-slot-d, family: assignment_start, effectIndex: 3, path: 'Effects[3].ResultSlot', mutationClass: replace}
+        - {operator: result-slot-e, family: assignment_end, effectIndex: 4, path: 'Effects[4].ResultSlot', mutationClass: replace}
+        - {operator: result-slot-f, family: decision, effectIndex: 5, path: 'Effects[5].ResultSlot', mutationClass: replace}
+        - {operator: result-slot-g, family: evidence, effectIndex: 6, path: 'Effects[6].ResultSlot', mutationClass: replace}
+        - {operator: result-slot-h, family: edge_add, effectIndex: 7, path: 'Effects[7].ResultSlot', mutationClass: replace}
+        - {operator: result-slot-i, family: edge_remove, effectIndex: 8, path: 'Effects[8].ResultSlot', mutationClass: replace}
+        - {operator: result-slot-j, family: label_add, effectIndex: 9, path: 'Effects[9].ResultSlot', mutationClass: replace}
+        - {operator: result-slot-k, family: label_remove, effectIndex: 10, path: 'Effects[10].ResultSlot', mutationClass: replace}
+        - {operator: result-slot-l, family: comment_add, effectIndex: 11, path: 'Effects[11].ResultSlot', mutationClass: replace}
+        - {operator: result-slot-m, family: task_event_close, effectIndex: 12, path: 'Effects[12].ResultSlot', mutationClass: replace}
+        - {operator: recorded-at-a, family: task_create, effectIndex: 0, path: 'Effects[0].RecordedAtOverride', mutationClass: replace}
+        - {operator: recorded-at-b, family: task_event_update, effectIndex: 1, path: 'Effects[1].RecordedAtOverride', mutationClass: replace}
+        - {operator: recorded-at-c, family: task_event_generic, effectIndex: 2, path: 'Effects[2].RecordedAtOverride', mutationClass: replace}
+        - {operator: recorded-at-d, family: assignment_start, effectIndex: 3, path: 'Effects[3].RecordedAtOverride', mutationClass: replace}
+        - {operator: recorded-at-e, family: assignment_end, effectIndex: 4, path: 'Effects[4].RecordedAtOverride', mutationClass: replace}
+        - {operator: recorded-at-f, family: decision, effectIndex: 5, path: 'Effects[5].RecordedAtOverride', mutationClass: replace}
+        - {operator: recorded-at-g, family: evidence, effectIndex: 6, path: 'Effects[6].RecordedAtOverride', mutationClass: replace}
+        - {operator: recorded-at-h, family: edge_add, effectIndex: 7, path: 'Effects[7].RecordedAtOverride', mutationClass: replace}
+        - {operator: recorded-at-i, family: edge_remove, effectIndex: 8, path: 'Effects[8].RecordedAtOverride', mutationClass: replace}
+        - {operator: recorded-at-j, family: label_add, effectIndex: 9, path: 'Effects[9].RecordedAtOverride', mutationClass: replace}
+        - {operator: recorded-at-k, family: label_remove, effectIndex: 10, path: 'Effects[10].RecordedAtOverride', mutationClass: replace}
+        - {operator: recorded-at-l, family: comment_add, effectIndex: 11, path: 'Effects[11].RecordedAtOverride', mutationClass: replace}
+        - {operator: recorded-at-m, family: task_event_close, effectIndex: 12, path: 'Effects[12].RecordedAtOverride', mutationClass: replace}
+        - {operator: task-a, family: task_create, effectIndex: 0, path: 'Effects[0].TaskID', mutationClass: replace}
+        - {operator: task-b, family: task_event_update, effectIndex: 1, path: 'Effects[1].TaskID', mutationClass: replace}
+        - {operator: task-c, family: task_event_generic, effectIndex: 2, path: 'Effects[2].TaskID', mutationClass: replace}
+        - {operator: task-d, family: assignment_start, effectIndex: 3, path: 'Effects[3].TaskID', mutationClass: replace}
+        - {operator: task-e, family: assignment_end, effectIndex: 4, path: 'Effects[4].TaskID', mutationClass: replace}
+        - {operator: task-f, family: decision, effectIndex: 5, path: 'Effects[5].TaskID', mutationClass: replace}
+        - {operator: task-g, family: evidence, effectIndex: 6, path: 'Effects[6].TaskID', mutationClass: replace}
+        - {operator: task-h, family: edge_add, effectIndex: 7, path: 'Effects[7].TaskID', mutationClass: replace}
+        - {operator: task-i, family: edge_remove, effectIndex: 8, path: 'Effects[8].TaskID', mutationClass: replace}
+        - {operator: task-j, family: label_add, effectIndex: 9, path: 'Effects[9].TaskID', mutationClass: replace}
+        - {operator: task-k, family: label_remove, effectIndex: 10, path: 'Effects[10].TaskID', mutationClass: replace}
+        - {operator: task-l, family: comment_add, effectIndex: 11, path: 'Effects[11].TaskID', mutationClass: replace}
+        - {operator: task-m, family: task_event_close, effectIndex: 12, path: 'Effects[12].TaskID', mutationClass: replace}
+        - {operator: create-payload, family: task_create, effectIndex: 0, path: 'Effects[0].Payload', mutationClass: replace}
+        - {operator: create-context, family: task_create, effectIndex: 0, path: 'Effects[0].Contexts', mutationClass: replace}
+        - {operator: create-title, family: task_create, effectIndex: 0, path: 'Effects[0].Title', mutationClass: replace}
+        - {operator: create-description, family: task_create, effectIndex: 0, path: 'Effects[0].Description', mutationClass: replace}
+        - {operator: create-type, family: task_create, effectIndex: 0, path: 'Effects[0].Type', mutationClass: replace}
+        - {operator: create-priority, family: task_create, effectIndex: 0, path: 'Effects[0].Priority', mutationClass: replace}
+        - {operator: create-phase, family: task_create, effectIndex: 0, path: 'Effects[0].Phase', mutationClass: replace}
+        - {operator: event-kind, family: task_event_generic, effectIndex: 2, path: 'Effects[2].EventKind', mutationClass: replace}
+        - {operator: generic-event-payload, family: task_event_generic, effectIndex: 2, path: 'Effects[2].Payload', mutationClass: replace}
+        - {operator: generic-event-context, family: task_event_generic, effectIndex: 2, path: 'Effects[2].Contexts', mutationClass: replace}
+        - {operator: event-payload, family: task_event_update, effectIndex: 1, path: 'Effects[1].Payload', mutationClass: replace}
+        - {operator: event-context, family: task_event_update, effectIndex: 1, path: 'Effects[1].Contexts', mutationClass: replace}
+        - {operator: update-title, family: task_event_update, effectIndex: 1, path: 'Effects[1].UpdateTitle', mutationClass: replace}
+        - {operator: update-description, family: task_event_update, effectIndex: 1, path: 'Effects[1].UpdateDescription', mutationClass: replace}
+        - {operator: update-priority, family: task_event_update, effectIndex: 1, path: 'Effects[1].UpdatePriority', mutationClass: replace}
+        - {operator: update-phase, family: task_event_update, effectIndex: 1, path: 'Effects[1].UpdatePhase', mutationClass: replace}
+        - {operator: update-notes, family: task_event_update, effectIndex: 1, path: 'Effects[1].UpdateNotes', mutationClass: replace}
+        - {operator: close-forced, family: task_event_close, effectIndex: 12, path: 'Effects[12].Forced', mutationClass: replace}
+        - {operator: close-reason, family: task_event_close, effectIndex: 12, path: 'Effects[12].CloseReason', mutationClass: replace}
+        - {operator: assignment-id, family: assignment_start, effectIndex: 3, path: 'Effects[3].AssignmentID', mutationClass: replace}
+        - {operator: assignment-slot, family: assignment_start, effectIndex: 3, path: 'Effects[3].SlotID', mutationClass: replace}
+        - {operator: assignment-occupant, family: assignment_start, effectIndex: 3, path: 'Effects[3].Occupant', mutationClass: replace}
+        - {operator: assignment-predecessor, family: assignment_start, effectIndex: 3, path: 'Effects[3].Predecessor', mutationClass: replace}
+        - {operator: assignment-parent, family: assignment_start, effectIndex: 3, path: 'Effects[3].Parent', mutationClass: replace}
+        - {operator: assignment-end-id, family: assignment_end, effectIndex: 4, path: 'Effects[4].AssignmentID', mutationClass: replace}
+        - {operator: assignment-end-slot, family: assignment_end, effectIndex: 4, path: 'Effects[4].SlotID', mutationClass: replace}
+        - {operator: decision-kind, family: decision, effectIndex: 5, path: 'Effects[5].DecisionKind', mutationClass: replace}
+        - {operator: decision-payload, family: decision, effectIndex: 5, path: 'Effects[5].Payload', mutationClass: replace}
+        - {operator: evidence-kind, family: evidence, effectIndex: 6, path: 'Effects[6].EvidenceKind', mutationClass: replace}
+        - {operator: evidence-digest, family: evidence, effectIndex: 6, path: 'Effects[6].ContentDigest', mutationClass: replace}
+        - {operator: evidence-payload, family: evidence, effectIndex: 6, path: 'Effects[6].Payload', mutationClass: replace}
+        - {operator: edge-target, family: edge_add, effectIndex: 7, path: 'Effects[7].EdgeTargetID', mutationClass: replace}
+        - {operator: edge-kind, family: edge_add, effectIndex: 7, path: 'Effects[7].EdgeRelKind', mutationClass: replace}
+        - {operator: edge-context, family: edge_add, effectIndex: 7, path: 'Effects[7].Contexts', mutationClass: replace}
+        - {operator: edge-remove-target, family: edge_remove, effectIndex: 8, path: 'Effects[8].EdgeTargetID', mutationClass: replace}
+        - {operator: edge-remove-kind, family: edge_remove, effectIndex: 8, path: 'Effects[8].EdgeRelKind', mutationClass: replace}
+        - {operator: edge-remove-context, family: edge_remove, effectIndex: 8, path: 'Effects[8].Contexts', mutationClass: replace}
+        - {operator: label, family: label_add, effectIndex: 9, path: 'Effects[9].Label', mutationClass: replace}
+        - {operator: label-context, family: label_add, effectIndex: 9, path: 'Effects[9].Contexts', mutationClass: replace}
+        - {operator: label-remove, family: label_remove, effectIndex: 10, path: 'Effects[10].Label', mutationClass: replace}
+        - {operator: label-remove-context, family: label_remove, effectIndex: 10, path: 'Effects[10].Contexts', mutationClass: replace}
+        - {operator: comment-id, family: comment_add, effectIndex: 11, path: 'Effects[11].CommentIdentity', mutationClass: replace}
+        - {operator: comment-author, family: comment_add, effectIndex: 11, path: 'Effects[11].CommentAuthor', mutationClass: replace}
+        - {operator: comment-body, family: comment_add, effectIndex: 11, path: 'Effects[11].CommentBody', mutationClass: replace}
+        - {operator: comment-context, family: comment_add, effectIndex: 11, path: 'Effects[11].Contexts', mutationClass: replace}

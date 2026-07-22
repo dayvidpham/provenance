@@ -56,9 +56,13 @@ nix develop             # enters devshell with Go, gopls, ast-grep, delve
 
 make fmt                # gofmt
 make lint               # go vet + ast-grep
-make test               # CGO_ENABLED=1 go test -race -count=1 ./...
+make test               # go test -count=2 + CGO1 race -count=2 -timeout=20m
 make build              # CGO_ENABLED=0 go build ./...
 ```
+
+`make lint` also enforces that production code contains no `time.Sleep` calls.
+SQLite's `busy_timeout=5000` is the sole local contention wait; DBOS owns durable
+retry policy. Full tests are not run with `CGO_ENABLED=0`.
 
 ## License
 

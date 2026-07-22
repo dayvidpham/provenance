@@ -191,30 +191,31 @@ func TestAllocatedCreateApplyReturnsCompleteResultAcrossRetryModes(t *testing.T)
 			}(i, tr)
 		}
 		wg.Wait()
+		successes := 0
 		for _, err := range errs {
-			if err != nil {
-				t.Fatal(err)
+			if err == nil {
+				successes++
+			} else if !isSQLiteContentionError(err) {
+				t.Fatalf("simultaneous allocated create returned non-contention error: %v", err)
 			}
 		}
-		short := 0
-		for _, result := range results {
-			if result.ShortCircuited {
-				short++
+		if successes == 0 {
+			t.Fatalf("simultaneous allocated create made no progress: %v", errs)
+		}
+		for i, tracker := range []Tracker{firstTracker, secondTracker} {
+			results[i], errs[i] = tracker.Journal().LookupCommitted(inputs[i].OperationID)
+			if errs[i] != nil || results[i].Kind != CommittedExact {
+				t.Fatalf("independent allocation lookup %d: result=%+v err=%v", i, results[i], errs[i])
 			}
 		}
-		if short != 1 {
-			t.Fatalf("simultaneous results had %d short circuits, want one: %+v", short, results)
+		if !reflect.DeepEqual(results[0], results[1]) {
+			t.Fatalf("independent allocation lookups differ: %+v %+v", results[0], results[1])
 		}
-		winner, loser := results[0], results[1]
-		if winner.ShortCircuited {
-			winner, loser = loser, winner
-		}
-		committedTask, ok := taskSlotID(winner, "task")
+		committedTask, ok := taskSlotID(results[0], "task")
 		if !ok {
 			t.Fatal("winner returned no task slot")
 		}
-		assertCompleteAllocatedResult(t, winner, committedTask)
-		assertSameCompleteResult(t, winner, loser)
+		assertCompleteAllocatedResult(t, results[0], committedTask)
 		after := readAllocationCounts(t, firstTracker)
 		want := before
 		want.journal += 2

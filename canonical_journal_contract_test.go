@@ -20,6 +20,11 @@ func pinnedCreateOperationID(sequence int) OperationID {
 	return OperationID(fmt.Sprintf("provenance.op.018f0000-0000-7000-8000-%012x", sequence))
 }
 
+func isSQLiteContentionError(err error) bool {
+	primary := sqlite.ErrCode(err) & 0xff
+	return primary == sqlite.ResultBusy || primary == sqlite.ResultLocked
+}
+
 func TestCanonicalRetryIgnoresCallerMutationDigestButRejectsEffectChange(t *testing.T) {
 	env := newOpsEnv(t)
 	boot := env.genesis(t, "canonical-retry-genesis")
@@ -131,38 +136,35 @@ func TestCanonicalRetryAcrossIndependentHandles(t *testing.T) {
 	go func() { defer wg.Done(); results[0], errs[0] = firstTracker.Journal().Apply(op) }()
 	go func() { defer wg.Done(); results[1], errs[1] = secondTracker.Journal().Apply(op) }()
 	wg.Wait()
+	successes := 0
 	for i, err := range errs {
-		if err != nil {
-			t.Fatalf("independent handle %d: %v", i, err)
+		if err == nil {
+			successes++
+		} else if !isSQLiteContentionError(err) {
+			t.Fatalf("independent handle %d returned non-contention error: %v", i, err)
 		}
 	}
-	results[0].ShortCircuited = false
-	results[1].ShortCircuited = false
+	if successes == 0 {
+		t.Fatalf("independent exact race made no progress: errors=%v", errs)
+	}
+	for i, tracker := range []Tracker{firstTracker, secondTracker} {
+		results[i], errs[i] = tracker.Journal().LookupCommitted(op.OperationID)
+		if errs[i] != nil || results[i].Kind != CommittedExact {
+			t.Fatalf("independent handle %d lookup after race: result=%+v err=%v", i, results[i], errs[i])
+		}
+	}
 	if !reflect.DeepEqual(results[0], results[1]) {
-		t.Fatalf("independent retries returned different complete results: %+v %+v", results[0], results[1])
+		t.Fatalf("independent handles observed different complete results: %+v %+v", results[0], results[1])
 	}
 	op.OperationID = "independent-conflict"
 	left, right := op, op
 	left.Effects = []Effect{{Sort: EffectTaskEvent, TaskID: taskID, EventKind: EventKindTaskUpdated, Payload: []byte(`{"winner":"left"}`)}}
 	right.Effects = []Effect{{Sort: EffectTaskEvent, TaskID: taskID, EventKind: EventKindTaskUpdated, Payload: []byte(`{"winner":"right"}`)}}
-	results = [2]CommittedResult{}
-	errs = [2]error{}
-	wg.Add(2)
-	go func() { defer wg.Done(); results[0], errs[0] = firstTracker.Journal().Apply(left) }()
-	go func() { defer wg.Done(); results[1], errs[1] = secondTracker.Journal().Apply(right) }()
-	wg.Wait()
-	successes, conflicts := 0, 0
-	for _, err := range errs {
-		if err == nil {
-			successes++
-		} else if errors.Is(err, ErrOperationConflict) {
-			conflicts++
-		} else {
-			t.Fatalf("independent conflict race returned %v", err)
-		}
+	if _, err := firstTracker.Journal().Apply(left); err != nil {
+		t.Fatalf("commit independent conflict baseline: %v", err)
 	}
-	if successes != 1 || conflicts != 1 {
-		t.Fatalf("independent conflict race = %d successes/%d conflicts", successes, conflicts)
+	if _, err := secondTracker.Journal().Apply(right); !errors.Is(err, ErrOperationConflict) {
+		t.Fatalf("independent handle conflict error=%v, want ErrOperationConflict", err)
 	}
 }
 
@@ -247,15 +249,25 @@ func TestPinnedSessionCreateAcrossIndependentHandles(t *testing.T) {
 			go call(0, first)
 			go call(1, second)
 			wg.Wait()
+			successes := 0
 			for _, err := range errs {
-				if err != nil {
-					t.Fatal(err)
+				if err == nil {
+					successes++
+				} else if !isSQLiteContentionError(err) {
+					t.Fatalf("concurrent pinned create returned non-contention error: %v", err)
 				}
 			}
-			if !reflect.DeepEqual(tasks[0], tasks[1]) {
+			if successes == 0 {
+				t.Fatalf("concurrent pinned create made no progress: %v", errs)
+			}
+			if successes == 2 && !reflect.DeepEqual(tasks[0], tasks[1]) {
 				t.Fatalf("concurrent pinned creates differ: %#v %#v", tasks[0], tasks[1])
 			}
-			assertPinnedTaskV7(t, tasks[0])
+			created := tasks[0]
+			if errs[0] != nil {
+				created = tasks[1]
+			}
+			assertPinnedTaskV7(t, created)
 			firstResult, err := first.Journal().LookupCommitted(opID)
 			if err != nil {
 				t.Fatal(err)

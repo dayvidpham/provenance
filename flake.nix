@@ -50,12 +50,13 @@
         ast-grep
       ];
 
-      # No native build deps — pure Go, CGO_ENABLED=0
-      nativeBuildDeps = pkgs: [ ];
+      # ast-grep is part of the package checkPhase, not only the dev shell.
+      nativeBuildDeps = pkgs: [ pkgs.ast-grep ];
 
       # Quality gates matching Makefile
       extraCheckPhase = ''
         go vet ./...
+        ast-grep scan --config sgconfig.yml .
       '';
 
       # Library — no binary to install
@@ -91,7 +92,8 @@
 
               checkPhase = ''
                 runHook preCheck
-                CGO_ENABLED=1 go test -race -count=1 ./...
+                go test -count=2 ./...
+                CGO_ENABLED=1 go test -race -count=2 -timeout=20m ./...
                 CGO_ENABLED=0 go build ./...
                 ${extraCheckPhase}
                 runHook postCheck

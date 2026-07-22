@@ -96,7 +96,7 @@ Before committing, ensure all gates pass:
 ```bash
 make fmt    # Reformat code
 make lint   # Check for errors
-make test   # Run tests
+make test   # Run repeated normal and CGO_ENABLED=1 race tests
 make build  # Build with CGO_ENABLED=0
 ```
 
@@ -268,17 +268,18 @@ func TestTrackerCreateTask(t *testing.T) {
 ### Running Tests
 
 ```bash
-# Run all tests with race detection
-CGO_ENABLED=1 go test -race -count=1 ./...
+# Run both authoritative repeated suites
+go test -count=2 ./...
+CGO_ENABLED=1 go test -race -count=2 -timeout=20m ./...
 
 # Run a specific test
-CGO_ENABLED=1 go test -race -count=1 ./... -run TestTrackerCreateTask
+CGO_ENABLED=1 go test -race -count=2 -timeout=20m ./... -run TestTrackerCreateTask
 
 # Run tests with verbose output
-CGO_ENABLED=1 go test -race -count=1 -v ./...
+CGO_ENABLED=1 go test -race -count=2 -timeout=20m -v ./...
 
 # Run tests with coverage
-CGO_ENABLED=1 go test -race -count=1 -cover ./...
+CGO_ENABLED=1 go test -race -count=2 -timeout=20m -cover ./...
 ```
 
 ## Build Targets
@@ -288,12 +289,15 @@ All build targets are defined in the `Makefile`:
 ```bash
 make fmt    # Format all Go files with gofmt
 make lint   # go vet ./... + ast-grep scan
-make test   # CGO_ENABLED=1 go test -race -count=1 ./...
+make test   # go test -count=2 + CGO1 race -count=2 -timeout=20m
 make build  # CGO_ENABLED=0 go build ./...
 make clean  # Remove bin/ directory
 ```
 
 Each target can be run independently. All four quality gates (`fmt`, `lint`, `test`, `build`) must pass before committing.
+Do not run full tests or race tests with `CGO_ENABLED=0`; that mode is reserved
+for `go build ./...`. The ast-grep lint gate rejects production `time.Sleep`, so
+SQLite `busy_timeout=5000` remains the sole local wait and DBOS owns retries.
 
 ## Troubleshooting
 

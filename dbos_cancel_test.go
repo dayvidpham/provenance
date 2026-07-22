@@ -50,8 +50,8 @@ func TestCancel_AlreadyCancelled_StartsNothing(t *testing.T) {
 	if !errors.As(err, &wce) {
 		t.Fatalf("err = %v, want *ApplyWaitCanceledError", err)
 	}
-	if wce.Stage != "pre-start" {
-		t.Errorf("Stage = %q, want pre-start", wce.Stage)
+	if wce.Stage != provenance.DBOSDiagStageApplyPreStart {
+		t.Errorf("Stage = %q, want %q", wce.Stage, provenance.DBOSDiagStageApplyPreStart)
 	}
 	if after := journalMax(t, s.tracker); after != before {
 		t.Errorf("a workflow ran despite a pre-cancelled context: max %d → %d", before, after)
@@ -101,7 +101,7 @@ func TestCancel_WhileGated_DurableWorkContinues(t *testing.T) {
 		if !errors.As(r.err, &wce) {
 			t.Fatalf("err = %v, want *ApplyWaitCanceledError", r.err)
 		}
-		if wce.Stage != "await-workflow" && wce.Stage != "retrieve-workflow" {
+		if wce.Stage != provenance.DBOSDiagStageWorkflowAwait && wce.Stage != provenance.DBOSDiagStageWorkflowRetrieve {
 			t.Errorf("Stage = %q, want an await stage", wce.Stage)
 		}
 	case <-time.After(10 * time.Second):

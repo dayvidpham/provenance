@@ -3,6 +3,24 @@
 This project uses **bd** (beads) for issue tracking. Run `bd onboard` to get started.
 
 For the domain model and PROV-O/PROV-DM alignment, see [CONCEPTS.md](CONCEPTS.md).
+For test architecture, fixture rules, SQLite lifecycle rules, and performance
+measurement, see [TESTING.md](TESTING.md).
+
+## Quality Gates
+
+- Run normal tests repeatedly with `go test -count=2 ./...`.
+- Run repeated race tests with `CGO_ENABLED=1 go test -race -count=2 -timeout=20m ./...`.
+- Verify pure-Go/static compatibility with `CGO_ENABLED=0 go build ./...`.
+  **CGO-disabled mode is build-only:** a CGO0 test run is redundant and is not a
+  supported gate. Never run any `go test` command with `CGO_ENABLED=0`, with or
+  without `-race`.
+- Run `go vet ./...` and `ast-grep scan --config sgconfig.yml .`; the latter
+  rejects production `time.Sleep`, keeping local contention waits in SQLite's
+  `busy_timeout=5000` and durable retries in DBOS.
+- Run `nix flake check --no-build` for the Nix evaluation gate.
+- There is no supported CGO-disabled test or race mode. Do not interpret the
+  CGO-disabled build gate as permission to run a package, focused, full, or
+  race test with `CGO_ENABLED=0`.
 
 ## Quick Reference
 

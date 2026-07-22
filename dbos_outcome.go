@@ -1,8 +1,8 @@
 package provenance
 
 // dbos_outcome.go defines the closed, JSON-stable step-outcome encoding the
-// adapter checkpoints through DBOS, and the deterministic operation fingerprint
-// that keys the durable workflow and step (issue dayvidpham/provenance#6).
+// adapter checkpoints through DBOS, and the deterministic operation-scoped
+// workflow identity plus full input fingerprint (issue dayvidpham/provenance#6).
 //
 // Pinned DBOS v0.16.0 serializes an ordinary Go error returned from a step as a
 // plain string, erasing its type. A Provenance DOMAIN failure (a §5/§9 typed
@@ -15,34 +15,25 @@ package provenance
 // Re-anchoring (Proposal 50 amendment): the canonical mutation result is the
 // journal-anchored committed operation — its anchor JournalID, the task_event
 // ProducedByOperationJournalID closure (EmittedEvents in JournalID order), and the
-// slot→produced-row bindings — reconstructed from journal.CommittedResult, not a
+// slot->produced-row bindings — reconstructed from journal.CommittedResult, not a
 // second decision/result ledger. A zero-task-event operation still has an anchor,
 // so post-validation never depends on any task-event being present.
+//
+// Schema tags and prefix constants are owned exclusively by dbos_contract.go.
 
 import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
 	"sort"
 
 	"github.com/dayvidpham/provenance/internal/journal"
 	"github.com/dayvidpham/provenance/pkg/ptypes"
 )
 
-// Closed schema tags and the pinned durable-identity constants. They are inputs to
-// the fingerprint, so a change to any of them deliberately changes every workflow
-// and step ID (a different code contract must not silently reuse a checkpoint).
-const (
-	ApplyWorkflowSchema       = "provenance.apply/v2"
-	DBOSStepOutcomeSchema     = "provenance.dbos-step-outcome/v2"
-	PinnedDBOSContractVersion = "github.com/dbos-inc/dbos-transact-golang v0.16.0"
-
-	applyWorkflowIDPrefix = "provenance.apply/v2/"
-	applyStepNamePrefix   = "provenance.apply-step/v2/"
-)
-
-// CanonicalResultSlot is one slot→produced-row binding in the canonical result:
+// CanonicalResultSlot is one slot->produced-row binding in the canonical result:
 // the caller's local slot handle, the produced journal row, its JournalKind, and,
 // for a task_event row, the resolved TaskID (empty otherwise).
 type CanonicalResultSlot struct {
@@ -56,7 +47,7 @@ type CanonicalResultSlot struct {
 // committed operation. EmittedEvents is the task_event closure in ascending
 // JournalID order; ResultSlots is slot-sorted and slot-unique. Every field here is
 // canonical, journal-anchored state, so its natural equality (== / reflect.DeepEqual,
-// and canonicalResultsEqual) is honest — the per-call §9.4 replay flag deliberately
+// and canonicalResultsEqual) is honest -- the per-call §9.4 replay flag deliberately
 // does NOT live here (see DBOSStepOutcome.ShortCircuited).
 type CanonicalMutationResult struct {
 	AnchorJournalID int64                 `json:"anchor_journal_id"`
@@ -64,72 +55,157 @@ type CanonicalMutationResult struct {
 	ResultSlots     []CanonicalResultSlot `json:"result_slots"`
 }
 
-// ApplyFailureKind is the closed discriminator over every public journal failure
-// the reducer can return, plus an unexpected-failure catch-all. It is what lets a
-// checkpointed domain failure reconstruct an errors.Is-matchable typed error after
-// DBOS has erased the original Go error's type.
-type ApplyFailureKind int
+// ApplyFailureKind is the closed, string-backed wire discriminator over every
+// public journal failure the reducer can return. It is what lets a checkpointed
+// domain failure reconstruct an errors.Is-matchable typed error after DBOS has
+// erased the original Go error's type. String backing provides stable, self-
+// describing JSON wire values (Proposal 54).
+//
+// There is no "unexpected" catch-all: an error matching zero or multiple
+// descriptors is NOT a durable domain failure and remains on the Go-error channel.
+type ApplyFailureKind string
 
 const (
-	FailureUnexpected ApplyFailureKind = iota
-	FailureOperationConflict
-	FailureGenesis
-	FailureAuthorityScope
-	FailureAssignmentLifecycle
-	FailureOrphanedEvidence
-	FailureStaleEpisode
-	FailureResultSlotIntegrity
-	FailureCloseWithoutEnding
-	FailureParentCitation
-	FailureCorruptParentChain
-	FailureInvalidID
-	FailureNotFound
-	FailureAlreadyClosed
-	FailureGenesisRequired
+	FailureOperationConflict   ApplyFailureKind = "operation_conflict"
+	FailureGenesis             ApplyFailureKind = "genesis"
+	FailureAuthorityScope      ApplyFailureKind = "authority_scope"
+	FailureAssignmentLifecycle ApplyFailureKind = "assignment_lifecycle"
+	FailureOrphanedEvidence    ApplyFailureKind = "orphaned_evidence"
+	FailureStaleEpisode        ApplyFailureKind = "stale_episode"
+	FailureResultSlotIntegrity ApplyFailureKind = "result_slot_integrity"
+	FailureCloseWithoutEnding  ApplyFailureKind = "close_without_ending"
+	FailureParentCitation      ApplyFailureKind = "parent_citation"
+	FailureCorruptParentChain  ApplyFailureKind = "corrupt_parent_chain"
+	FailureInvalidID           ApplyFailureKind = "invalid_id"
+	FailureNotFound            ApplyFailureKind = "not_found"
+	FailureAlreadyClosed       ApplyFailureKind = "already_closed"
+	FailureGenesisRequired     ApplyFailureKind = "genesis_required"
 )
 
-// failureSentinels maps each closed kind to the sentinel a decoded failure wraps,
-// so errors.Is(decoded, journal.ErrGenesis) (etc.) holds after recovery. The
-// unexpected variant wraps no sentinel (nil) and carries only its message.
-var failureSentinels = map[ApplyFailureKind]error{
-	FailureOperationConflict:   journal.ErrOperationConflict,
-	FailureGenesis:             journal.ErrGenesis,
-	FailureAuthorityScope:      journal.ErrAuthorityScope,
-	FailureAssignmentLifecycle: journal.ErrAssignmentLifecycle,
-	FailureOrphanedEvidence:    journal.ErrOrphanedEvidence,
-	FailureStaleEpisode:        journal.ErrStaleEpisode,
-	FailureResultSlotIntegrity: journal.ErrResultSlotIntegrity,
-	FailureCloseWithoutEnding:  journal.ErrCloseWithoutEnding,
-	FailureParentCitation:      journal.ErrParentCitation,
-	FailureCorruptParentChain:  journal.ErrCorruptParentChain,
-	FailureInvalidID:           ptypes.ErrInvalidID,
-	FailureNotFound:            ErrNotFound,
-	FailureAlreadyClosed:       ErrAlreadyClosed,
-	FailureGenesisRequired:     ErrGenesisRequired,
+// applyFailureDescriptor pairs one closed domain-failure kind with the sentinel
+// error it matches and reconstructs. The slice is the sole authority for the
+// domain-failure contract; no parallel map or iota enum exists.
+type applyFailureDescriptor struct {
+	kind        ApplyFailureKind
+	sentinel    error
+	extract     func(error, *CanonicalApplyFailure) error
+	validate    func(*CanonicalApplyFailure) error
+	reconstruct func(*CanonicalApplyFailure) error
 }
 
-// classifyFailure maps a reducer error onto its closed kind by matching each
-// public sentinel in a deterministic order (most-specific-first is unnecessary:
-// the sentinels are disjoint). An error matching none is FailureUnexpected.
-func classifyFailure(err error) ApplyFailureKind {
-	// Ordered so the enum's own order is the scan order; disjoint sentinels.
-	for _, k := range []ApplyFailureKind{
-		FailureOperationConflict, FailureGenesis, FailureAuthorityScope,
-		FailureAssignmentLifecycle, FailureOrphanedEvidence, FailureStaleEpisode,
-		FailureResultSlotIntegrity, FailureCloseWithoutEnding, FailureParentCitation,
-		FailureCorruptParentChain, FailureInvalidID, FailureNotFound,
-		FailureAlreadyClosed, FailureGenesisRequired,
-	} {
-		if errors.Is(err, failureSentinels[k]) {
-			return k
+func extractOperationConflict(err error, failure *CanonicalApplyFailure) error {
+	var conflict *journal.OperationConflict
+	if !errors.As(err, &conflict) || conflict.Field == "" {
+		return fmt.Errorf("operation conflict does not expose a non-empty *journal.OperationConflict.Field")
+	}
+	failure.ConflictField = conflict.Field
+	return nil
+}
+
+func validateOperationConflict(failure *CanonicalApplyFailure) error {
+	if failure.ConflictField == "" {
+		return fmt.Errorf("operation conflict requires conflict_field")
+	}
+	return nil
+}
+
+func reconstructOperationConflict(failure *CanonicalApplyFailure) error {
+	return fmt.Errorf("%s (recovered from checkpointed outcome): %w: %w", failure.Message,
+		journal.ErrOperationConflict,
+		&journal.OperationConflict{OperationID: journal.OperationID(failure.OperationID), Field: failure.ConflictField})
+}
+
+// canonicalApplyFailureDescriptors is the sole ordered descriptor literal. Each
+// call returns fresh values, so callers cannot mutate shared classification or
+// reconstruction authority.
+func canonicalApplyFailureDescriptors() []applyFailureDescriptor {
+	return []applyFailureDescriptor{
+		{kind: FailureOperationConflict, sentinel: journal.ErrOperationConflict, extract: extractOperationConflict, validate: validateOperationConflict, reconstruct: reconstructOperationConflict},
+		{kind: FailureGenesis, sentinel: journal.ErrGenesis},
+		{kind: FailureAuthorityScope, sentinel: journal.ErrAuthorityScope},
+		{kind: FailureAssignmentLifecycle, sentinel: journal.ErrAssignmentLifecycle},
+		{kind: FailureOrphanedEvidence, sentinel: journal.ErrOrphanedEvidence},
+		{kind: FailureStaleEpisode, sentinel: journal.ErrStaleEpisode},
+		{kind: FailureResultSlotIntegrity, sentinel: journal.ErrResultSlotIntegrity},
+		{kind: FailureCloseWithoutEnding, sentinel: journal.ErrCloseWithoutEnding},
+		{kind: FailureParentCitation, sentinel: journal.ErrParentCitation},
+		{kind: FailureCorruptParentChain, sentinel: journal.ErrCorruptParentChain},
+		{kind: FailureInvalidID, sentinel: ptypes.ErrInvalidID},
+		{kind: FailureNotFound, sentinel: ErrNotFound},
+		{kind: FailureAlreadyClosed, sentinel: ErrAlreadyClosed},
+		{kind: FailureGenesisRequired, sentinel: ErrGenesisRequired},
+	}
+}
+
+// AmbiguousApplyFailureError reports an invalid error graph that matches more
+// than one closed domain descriptor. It remains on DBOS's Go-error channel.
+type AmbiguousApplyFailureError struct {
+	Class  DBOSDiagnosticClass
+	Field  DBOSDiagnosticField
+	Stage  DBOSDiagnosticStage
+	Reason string
+	Impact string
+	Fix    string
+	cause  error
+	kinds  []ApplyFailureKind
+}
+
+func (e *AmbiguousApplyFailureError) Error() string {
+	return fmt.Sprintf("provenance: ambiguous apply failure -- class=%s field=%s stage=%s matched=%v; reason: %s; impact: %s; fix: %s; cause: %v",
+		e.Class, e.Field, e.Stage, e.kinds, e.Reason, e.Impact, e.Fix, e.cause)
+}
+
+func (e *AmbiguousApplyFailureError) Unwrap() error { return e.cause }
+
+// MatchedKinds returns stable contract-order evidence without exposing mutable
+// internal storage.
+func (e *AmbiguousApplyFailureError) MatchedKinds() []ApplyFailureKind {
+	return append([]ApplyFailureKind(nil), e.kinds...)
+}
+
+// classifyDomainFailure returns a descriptor only for exactly one match. Zero
+// matches return the original error; multiple matches return typed ambiguity.
+func classifyDomainFailure(err error) (applyFailureDescriptor, error) {
+	descriptors := canonicalApplyFailureDescriptors()
+	matched := make([]applyFailureDescriptor, 0, 1)
+	kinds := make([]ApplyFailureKind, 0, 1)
+	for _, descriptor := range descriptors {
+		if errors.Is(err, descriptor.sentinel) {
+			matched = append(matched, descriptor)
+			kinds = append(kinds, descriptor.kind)
 		}
 	}
-	return FailureUnexpected
+	switch len(matched) {
+	case 0:
+		return applyFailureDescriptor{}, err
+	case 1:
+		return matched[0], nil
+	default:
+		return applyFailureDescriptor{}, &AmbiguousApplyFailureError{
+			Class: DBOSDiagClassClassify, Field: DBOSDiagFieldDescriptorMatch, Stage: DBOSDiagStageDomainFoldClassify,
+			Reason: "the error graph matches multiple closed domain failure descriptors",
+			Impact: "nothing is checkpointed; DBOS treats the fold as a retryable Go error",
+			Fix:    "make the returned domain sentinel graph disjoint so exactly one ApplyFailureKind matches",
+			cause:  err, kinds: kinds,
+		}
+	}
+}
+
+// failureSentinel returns the sentinel error for the given kind from the
+// closed contract table. Returns false if the kind is not in the contract.
+func failureDescriptor(kind ApplyFailureKind) (applyFailureDescriptor, bool) {
+	for _, descriptor := range canonicalApplyFailureDescriptors() {
+		if descriptor.kind == kind {
+			return descriptor, true
+		}
+	}
+	return applyFailureDescriptor{}, false
 }
 
 // CanonicalApplyFailure is the closed encoding of one checkpointed domain
 // failure. Message is the original actionable text; Kind selects the sentinel a
 // decoded failure wraps so callers recover the typed error with errors.Is.
+// OperationID must equal the outer DBOSStepOutcome.OperationID (validated on decode).
 type CanonicalApplyFailure struct {
 	Kind    ApplyFailureKind `json:"kind"`
 	Message string           `json:"message"`
@@ -151,7 +227,7 @@ type DBOSStepOutcome struct {
 	Failure        *CanonicalApplyFailure   `json:"failure,omitempty"`
 	// ShortCircuited is a PER-CALL §9.4 replay flag, not journal-anchored canonical
 	// state (LookupCommitted, a pure read, never short-circuits anything), so it lives
-	// BESIDE the canonical result rather than inside CanonicalMutationResult — keeping
+	// BESIDE the canonical result rather than inside CanonicalMutationResult -- keeping
 	// that struct's equality honest for any future == / reflect.DeepEqual user. It is
 	// informational (audit) only; post-validation compares canonical results, never it.
 	ShortCircuited bool `json:"short_circuited,omitempty"`
@@ -161,10 +237,10 @@ type DBOSStepOutcome struct {
 // outcome. It validates the result is a CommittedExact, slot-sorts and
 // deduplicates the bindings, revalidates every typed ID, and stamps the exact
 // OperationID/MutationDigest.
-func encodeDBOSApplySuccess(operation journal.OperationID, mutation []byte, result journal.CommittedResult) (DBOSStepOutcome, error) {
+func encodeDBOSApplySuccess(contract dbosContractSnapshot, operation journal.OperationID, mutation []byte, result journal.CommittedResult) (DBOSStepOutcome, error) {
 	if result.Kind != journal.CommittedExact {
 		return DBOSStepOutcome{}, fmt.Errorf(
-			"provenance: encode success outcome for operation %q — reducer returned a non-Exact result (%s) — "+
+			"provenance: encode success outcome for operation %q -- reducer returned a non-Exact result (%s) -- "+
 				"where: step success encode; impact: nothing is checkpointed as success; fix: a committed "+
 				"operation must reconstruct as CommittedExact",
 			operation, result.Kind)
@@ -174,7 +250,7 @@ func encodeDBOSApplySuccess(operation journal.OperationID, mutation []byte, resu
 	for _, b := range result.ResultSlots {
 		if _, dup := seen[string(b.Slot)]; dup {
 			return DBOSStepOutcome{}, fmt.Errorf(
-				"provenance: encode success outcome for operation %q — duplicate result slot %q — "+
+				"provenance: encode success outcome for operation %q -- duplicate result slot %q -- "+
 					"where: step success encode; impact: the binding map is ambiguous; fix: each "+
 					"ResultSlotID must be unique within one operation (§3.2)",
 				operation, b.Slot)
@@ -201,7 +277,7 @@ func encodeDBOSApplySuccess(operation journal.OperationID, mutation []byte, resu
 		emitted[i] = int64(e)
 	}
 	return DBOSStepOutcome{
-		Schema:         DBOSStepOutcomeSchema,
+		Schema:         contract.outcomeSchema,
 		OperationID:    string(operation),
 		MutationDigest: append([]byte(nil), mutation...),
 		Success: &CanonicalMutationResult{
@@ -213,22 +289,34 @@ func encodeDBOSApplySuccess(operation journal.OperationID, mutation []byte, resu
 	}, nil
 }
 
-// encodeDBOSApplyFailure encodes a reducer error as a closed failure outcome. The
-// returned Go error is ALWAYS nil: a domain failure is a legitimate, durable
-// checkpoint, not a step infrastructure error.
-func encodeDBOSApplyFailure(operation journal.OperationID, mutation []byte, err error) (DBOSStepOutcome, error) {
-	kind := classifyFailure(err)
+// encodeDBOSApplyFailure encodes a uniquely classified reducer error as a closed
+// failure outcome. The returned Go error is ALWAYS nil: a domain failure is a
+// legitimate, durable checkpoint, not a step infrastructure error.
+//
+// Callers MUST have verified via classifyDomainFailure that err has exactly one
+// matching descriptor before calling this function.
+func encodeDBOSApplyFailure(contract dbosContractSnapshot, operation journal.OperationID, mutation []byte, err error) (DBOSStepOutcome, error) {
+	descriptor, classifyErr := classifyDomainFailure(err)
+	if classifyErr != nil {
+		return DBOSStepOutcome{}, classifyErr
+	}
 	fail := &CanonicalApplyFailure{
-		Kind:        kind,
+		Kind:        descriptor.kind,
 		Message:     err.Error(),
 		OperationID: string(operation),
 	}
-	var conflict *journal.OperationConflict
-	if errors.As(err, &conflict) {
-		fail.ConflictField = conflict.Field
+	if descriptor.extract != nil {
+		if extractErr := descriptor.extract(err, fail); extractErr != nil {
+			return DBOSStepOutcome{}, diagnostic(DBOSDiagClassClassify, DBOSDiagFieldConflictField,
+				DBOSDiagStageOutcomeEncode, operation, "", extractErr.Error(), "nothing is checkpointed",
+				"return the descriptor's complete typed domain error", err)
+		}
+	}
+	if validateErr := validateApplyFailureEnvelope(string(operation), fail, descriptor); validateErr != nil {
+		return DBOSStepOutcome{}, validateErr
 	}
 	return DBOSStepOutcome{
-		Schema:         DBOSStepOutcomeSchema,
+		Schema:         contract.outcomeSchema,
 		OperationID:    string(operation),
 		MutationDigest: append([]byte(nil), mutation...),
 		Failure:        fail,
@@ -237,49 +325,96 @@ func encodeDBOSApplyFailure(operation journal.OperationID, mutation []byte, err 
 
 // Decode returns the canonical success result, or the reconstructed typed failure
 // error for a failure outcome. A malformed outcome (wrong schema, neither or both
-// arms set) fails closed.
-func (o DBOSStepOutcome) Decode() (CanonicalMutationResult, error) {
-	if o.Schema != DBOSStepOutcomeSchema {
-		return CanonicalMutationResult{}, fmt.Errorf(
-			"provenance: decode step outcome — schema tag %q is not %q — where: outcome decode; "+
-				"impact: the checkpoint is not trusted; fix: outcomes are produced only by "+
-				"encodeDBOSApplySuccess/Failure",
-			o.Schema, DBOSStepOutcomeSchema)
+// arms set, unknown failure kind, or mismatched nested OperationID) fails closed.
+func decodeDBOSStepOutcome(contract dbosContractSnapshot, o DBOSStepOutcome) (CanonicalMutationResult, error) {
+	operation := journal.OperationID(o.OperationID)
+	if o.Schema != contract.outcomeSchema {
+		return CanonicalMutationResult{}, diagnostic(DBOSDiagClassOutcomeDecode, DBOSDiagFieldSchema,
+			DBOSDiagStageOutcomeDecode, operation, "", fmt.Sprintf("schema %q is not %q", o.Schema, contract.outcomeSchema),
+			"the checkpoint is not trusted", "restore an outcome produced by this adapter contract", nil)
 	}
 	if (o.Success == nil) == (o.Failure == nil) {
-		return CanonicalMutationResult{}, fmt.Errorf(
-			"provenance: decode step outcome for operation %q — exactly one of Success or Failure must be "+
-				"set — where: outcome decode; impact: the checkpoint is ambiguous and rejected; fix: a "+
-				"well-formed outcome is a closed one-of",
-			o.OperationID)
+		return CanonicalMutationResult{}, diagnostic(DBOSDiagClassOutcomeDecode, DBOSDiagFieldSuccessFailure,
+			DBOSDiagStageOutcomeDecode, operation, "", "exactly one of success or failure must be set",
+			"the ambiguous checkpoint is rejected", "restore a closed one-of outcome", nil)
 	}
 	if o.Failure != nil {
-		return CanonicalMutationResult{}, o.Failure.asError()
+		descriptor, known := failureDescriptor(o.Failure.Kind)
+		if !known {
+			return CanonicalMutationResult{}, diagnostic(DBOSDiagClassOutcomeDecode, DBOSDiagFieldKind,
+				DBOSDiagStageOutcomeDecode, operation, "", fmt.Sprintf("unknown durable failure kind %q", o.Failure.Kind),
+				"the checkpoint is rejected", "restore an outcome produced by the closed failure contract", nil)
+		}
+		if err := validateApplyFailureEnvelope(o.OperationID, o.Failure, descriptor); err != nil {
+			return CanonicalMutationResult{}, err
+		}
+		return CanonicalMutationResult{}, descriptor.asError(o.Failure)
 	}
 	return *o.Success, nil
 }
 
-// asError reconstructs a typed, errors.Is/As-matchable error from a checkpointed
-// failure. A FailureOperationConflict re-exposes a *journal.OperationConflict; any
-// other known kind wraps its sentinel; an unexpected kind carries its message.
-func (f *CanonicalApplyFailure) asError() error {
-	if f.Kind == FailureOperationConflict {
-		return fmt.Errorf("%w: %w", journal.ErrOperationConflict,
-			&journal.OperationConflict{OperationID: journal.OperationID(f.OperationID), Field: f.ConflictField})
+func validateApplyFailureEnvelope(outerOperation string, failure *CanonicalApplyFailure, descriptor applyFailureDescriptor) error {
+	op := journal.OperationID(outerOperation)
+	reject := func(field DBOSDiagnosticField, reason, fix string) error {
+		return diagnostic(DBOSDiagClassOutcomeDecode, field, DBOSDiagStageOutcomeDecode, op, "", reason,
+			"the malformed durable checkpoint is rejected", fix, nil)
 	}
-	if sentinel, ok := failureSentinels[f.Kind]; ok {
-		return fmt.Errorf("%s (recovered from checkpointed outcome): %w", f.Message, sentinel)
+	if err := journal.ValidateOperationID(op); err != nil {
+		return reject(DBOSDiagFieldOperation, "outer operation identity is invalid: "+err.Error(), "restore the original valid operation identity")
 	}
-	return fmt.Errorf(
-		"provenance: checkpointed unexpected domain failure for operation %q: %s — where: recovered "+
-			"step outcome; impact: the operation failed and nothing was committed; fix: inspect the "+
-			"original message; this failure kind is outside the closed reducer set",
-		f.OperationID, f.Message)
+	nested := journal.OperationID(failure.OperationID)
+	if err := journal.ValidateOperationID(nested); err != nil {
+		return reject(DBOSDiagFieldNestedOpID, "nested operation identity is invalid: "+err.Error(), "restore the original valid nested operation identity")
+	}
+	if failure.OperationID != outerOperation {
+		return reject(DBOSDiagFieldNestedOpID, fmt.Sprintf("nested operation %q does not match outer operation %q", failure.OperationID, outerOperation), "restore both identities from the same execution")
+	}
+	if failure.Message == "" {
+		return reject(DBOSDiagFieldMessage, "failure message is empty", "restore the original actionable domain failure message")
+	}
+	if descriptor.kind != FailureOperationConflict && failure.ConflictField != "" {
+		return reject(DBOSDiagFieldConflictField, "conflict_field is forbidden for this failure kind", "remove conflict metadata from non-conflict failures")
+	}
+	if descriptor.validate != nil {
+		if err := descriptor.validate(failure); err != nil {
+			return reject(DBOSDiagFieldConflictField, err.Error(), "restore the descriptor-required conflict metadata")
+		}
+	}
+	return nil
+}
+
+func (d applyFailureDescriptor) asError(failure *CanonicalApplyFailure) error {
+	if d.reconstruct != nil {
+		return d.reconstruct(failure)
+	}
+	return fmt.Errorf("%s (recovered from checkpointed outcome): %w", failure.Message, d.sentinel)
+}
+
+func diagnostic(class DBOSDiagnosticClass, field DBOSDiagnosticField, stage DBOSDiagnosticStage, operation OperationID, workflow, reason, impact, fix string, cause error) error {
+	return &DBOSDiagnosticError{Class: class, Field: field, Stage: stage, Operation: operation, Workflow: workflow,
+		Reason: reason, Impact: impact, Fix: fix, Cause: cause}
 }
 
 // ---------------------------------------------------------------------------
-// Deterministic operation fingerprint (§9.4 alternate key over the pinned contract)
+// Deterministic workflow identity and operation fingerprint
 // ---------------------------------------------------------------------------
+
+// workflowIdentity computes the operation-scoped portion of the durable workflow
+// ID. Every canonical input variant for one OperationID must address one DBOS
+// workflow; fingerprint remains the stricter input/step collision guard below.
+func workflowIdentity(contract dbosContractSnapshot, applicationVersion string, operation OperationID) string {
+	h := sha256.New()
+	for _, value := range [][]byte{
+		[]byte(contract.applyInputSchema), []byte(contract.contextSchema),
+		[]byte(contract.outcomeSchema), []byte(contract.workflowSchema),
+		[]byte(contract.workflowPrefix), []byte(contract.stepPrefix),
+		[]byte(contract.pinnedLibrary),
+		[]byte(applicationVersion), []byte(operation),
+	} {
+		writeFingerprintValue(h, value)
+	}
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
 
 // fingerprint computes the SHA-256 hex digest that keys the durable workflow and
 // step, over the length-delimited pinned schema/contract/version identity plus the
@@ -287,21 +422,19 @@ func (f *CanonicalApplyFailure) asError() error {
 // an exact input and changes for any version/actor/authority/OperationID/command/
 // mutation change. Mutation is the reviewed canonical byte stream, never the caller's digest;
 // audit-only RecordedAt remains transported but deliberately is not hashed.
-func fingerprint(applicationVersion string, input DBOSApplyInput) (string, error) {
-	identity, err := decodeDBOSContext(input.Context)
+//
+// All schema/contract strings are drawn from the adapter-captured dbosContractSnapshot
+// via the adapter field, NOT from the package-level const aliases — the snapshot is
+// the sole identity authority per Proposal 54.
+func fingerprint(contract dbosContractSnapshot, applicationVersion string, input DBOSApplyInput) (string, error) {
+	identity, err := decodeDBOSContext(contract, input.Context)
 	if err != nil {
 		return "", err
 	}
 	h := sha256.New()
-	write := func(value []byte) {
-		var size [8]byte
-		binary.BigEndian.PutUint64(size[:], uint64(len(value)))
-		_, _ = h.Write(size[:])
-		_, _ = h.Write(value)
-	}
 	values := [][]byte{
-		[]byte(DBOSApplyInputSchema), []byte(ApplyWorkflowSchema),
-		[]byte(DBOSStepOutcomeSchema), []byte(PinnedDBOSContractVersion),
+		[]byte(contract.applyInputSchema), []byte(contract.workflowSchema),
+		[]byte(contract.outcomeSchema), []byte(contract.pinnedLibrary),
 		[]byte(applicationVersion), []byte(identity.OperationID), []byte(actorToWire(identity.ActorID)),
 	}
 	if identity.AuthorityJournalID == nil {
@@ -313,9 +446,16 @@ func fingerprint(applicationVersion string, input DBOSApplyInput) (string, error
 	}
 	values = append(values, identity.CommandDigest, input.Mutation)
 	for _, value := range values {
-		write(value)
+		writeFingerprintValue(h, value)
 	}
 	return fmt.Sprintf("%x", h.Sum(nil)), nil
+}
+
+func writeFingerprintValue(h hash.Hash, value []byte) {
+	var size [8]byte
+	binary.BigEndian.PutUint64(size[:], uint64(len(value)))
+	_, _ = h.Write(size[:])
+	_, _ = h.Write(value)
 }
 
 // journalValidateTaskID mirrors the journal package's task-ID validity check for a

@@ -7,7 +7,8 @@ project. All contributors (human and AI) must follow these standards.
 
 - **Module:** `github.com/dayvidpham/provenance`
 - **Language:** Go 1.24+
-- **CGo:** disabled (`CGO_ENABLED=0`) — all dependencies must be pure Go
+- **CGo:** production builds use `CGO_ENABLED=0`; race tests use
+  `CGO_ENABLED=1` as required by Go's race detector. Dependencies remain pure Go.
 
 ## Directory Structure
 
@@ -201,9 +202,12 @@ func (id TaskID) Hash() string {
 
 ### Mandatory flags
 ```bash
-CGO_ENABLED=1 go test -race -count=1 ./...
+go test -count=2 ./...
+CGO_ENABLED=1 go test -race -count=2 -timeout=20m ./...
 ```
-Tests run with `CGO_ENABLED=1` and `-race` to detect concurrent access issues. Production builds use `CGO_ENABLED=0`.
+Both repeated suites are mandatory. The second uses `CGO_ENABLED=1` and `-race`
+to detect concurrent access issues. Production builds use `CGO_ENABLED=0`; do
+not run full tests or race tests with `CGO_ENABLED=0`.
 
 ### Test file conventions
 - Test files: `*_test.go` using `package foo_test` (black-box) or `package foo` (white-box).
@@ -215,7 +219,7 @@ Tests run with `CGO_ENABLED=1` and `-race` to detect concurrent access issues. P
 ```bash
 make fmt    # gofmt — fails if any file needs formatting
 make lint   # go vet ./... + ast-grep scan
-make test   # CGO_ENABLED=1 go test -race -count=1 ./...
+make test   # go test -count=2, then CGO_ENABLED=1 race -count=2 -timeout=20m
 make build  # CGO_ENABLED=0 go build ./...
 ```
 
@@ -224,7 +228,7 @@ make build  # CGO_ENABLED=0 go build ./...
 ```bash
 make fmt            # gofmt -w .
 make lint           # go vet ./... + ast-grep scan
-make test           # CGO_ENABLED=1 go test -race -count=1 ./...
+make test           # repeated normal and CGO_ENABLED=1 race suites
 make build          # runs fmt + lint + test, then CGO_ENABLED=0 go build ./...
 make clean          # rm -rf bin/
 ```

@@ -36,12 +36,13 @@ import (
 )
 
 const (
-	crashAppName      = "provenance-crashgap"
-	crashAppVersion   = "crash-v1"
-	crashExitBefore   = 41
-	crashExitDomain   = 42
-	crashExitStep     = 43
-	crashExitFinished = 7 // child returned without crashing (a failure)
+	dbosInternalTestPoolSize = 16
+	crashAppName             = "provenance-crashgap"
+	crashAppVersion          = "crash-v1"
+	crashExitBefore          = 41
+	crashExitDomain          = 42
+	crashExitStep            = 43
+	crashExitFinished        = 7 // child returned without crashing (a failure)
 )
 
 // TestCrashGapChild is the re-exec child entry point. It is a no-op unless
@@ -61,7 +62,8 @@ func openSharedSQL(path string) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1)
+	db.SetMaxOpenConns(dbosInternalTestPoolSize)
+	db.SetMaxIdleConns(dbosInternalTestPoolSize / 2)
 	if err := db.Ping(); err != nil {
 		return nil, err
 	}

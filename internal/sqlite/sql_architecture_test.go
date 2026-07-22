@@ -49,6 +49,45 @@ func TestProductionSQLUsesDirectStaticSinks(t *testing.T) {
 	}
 }
 
+func TestApplyDelegatesExactlyOnceWithoutLoop(t *testing.T) {
+	program := loadProductionSQLProgram(t)
+	applyMethods := 0
+	preparedCalls := 0
+	loops := 0
+	for _, file := range program.files {
+		for _, declaration := range file.Decls {
+			method, ok := declaration.(*ast.FuncDecl)
+			if !ok || method.Name.Name != "Apply" || method.Recv == nil {
+				continue
+			}
+			receiver, ok := method.Recv.List[0].Type.(*ast.StarExpr)
+			if !ok {
+				continue
+			}
+			name, okName := receiver.X.(*ast.Ident)
+			if !okName || name.Name != "DB" {
+				continue
+			}
+			applyMethods++
+			ast.Inspect(method.Body, func(node ast.Node) bool {
+				switch node := node.(type) {
+				case *ast.ForStmt, *ast.RangeStmt:
+					loops++
+				case *ast.CallExpr:
+					selector, ok := node.Fun.(*ast.SelectorExpr)
+					if ok && selector.Sel.Name == "applyPreparedLocked" {
+						preparedCalls++
+					}
+				}
+				return true
+			})
+		}
+	}
+	if applyMethods != 1 || preparedCalls != 1 || loops != 0 {
+		t.Fatalf("DB.Apply source contract: methods=%d applyPreparedLocked calls=%d loops=%d, want 1/1/0", applyMethods, preparedCalls, loops)
+	}
+}
+
 func TestSQLArchitectureRejectsRuntimeAndIndirectSQL(t *testing.T) {
 	controls := map[string]string{
 		"runtime parameter": `func bad(conn *sqlite.Conn, query string) { sqlitex.Execute(conn, query, nil) }`,

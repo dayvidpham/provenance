@@ -121,10 +121,28 @@ returns a typed conflict.
 
 DBOS integration can durably execute these operations across crashes and lost
 responses. Provenance owns one closed canonical input/outcome contract; DBOS
-owns workflow execution and checkpointing. The durable `/v2` identity strings
-remain pinned, but there is no alternate decoder or workflow registration.
-Strict typed YAML corpora pin the independently authored wire bytes and retry
-baseline used to detect contract drift. See
+owns workflow execution and checkpointing. DBOS identity tokens are
+unversioned; the adapter captures the single const-backed contract in
+`dbos_contract.go` before registration and passes that snapshot through every
+codec, fingerprint, workflow, step, and outcome path. Workflow identity uses only
+that contract, the application version, and canonical `OperationID`; the full
+canonical input fingerprint guards step identity and input collisions. There is no alternate
+decoder or workflow registration. Exactly four strict typed YAML corpora pin
+the independently authored wire, malformed-outcome, and exact retry-target
+contracts. Durable domain failures use a closed set of stable string discriminators
+(`ApplyFailureKind`). Exactly one descriptor match checkpoints the failure;
+zero or multiple matches leave the error on DBOS's retryable Go-error channel.
+SQLite's `busy_timeout=5000` is the sole local contention wait. A borrowed write
+performs one operation after its liveness check; any `BUSY` or `LOCKED` error
+that escapes SQLite is returned unchanged. Inside the adapter, DBOS owns the
+configured durable step retries for that escaped infrastructure error. There is
+no application-level sleep or retry loop.
+Exhausted infrastructure failures record only DBOS terminal `ERROR`. Replaying
+the same `OperationID` retrieves that typed terminal diagnostic without fold
+callbacks or durable writes; new work requires a new ID. Durable domain failures
+use one validated `CanonicalApplyFailure`; exhausted infrastructure creates no
+`CanonicalApplyFailure` or second Provenance ledger. There is no recovery
+workflow, resume, or fork. See
 [`docs/architecture.md`](docs/architecture.md) for the complete component model
 and [`docs/journal-relational-contract.md`](docs/journal-relational-contract.md)
 for the normative relational contract.

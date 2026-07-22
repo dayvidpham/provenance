@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/dayvidpham/provenance/internal/journal"
 	zs "zombiezen.com/go/sqlite"
@@ -392,23 +391,7 @@ func (db *DB) Apply(in journal.OperationInput) (journal.CommittedResult, error) 
 	}
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	var res journal.CommittedResult
-	for attempt := 0; attempt < 5; attempt++ {
-		res, err = db.applyPreparedLocked(in, prepared, callerMutationDigest, nil)
-		if !isTransientSQLiteContention(err) {
-			return res, err
-		}
-		time.Sleep(time.Duration(attempt+1) * 10 * time.Millisecond)
-	}
-	return res, fmt.Errorf("Apply: independent-handle contention did not clear after 5 bounded retries: %w", err)
-}
-
-func isTransientSQLiteContention(err error) bool {
-	if err == nil {
-		return false
-	}
-	primary := zs.ErrCode(err) & 0xff
-	return primary == zs.ResultBusy || primary == zs.ResultLocked
+	return db.applyPreparedLocked(in, prepared, callerMutationDigest, nil)
 }
 
 // validateApplyInput runs the pre-transaction input checks shared by the public

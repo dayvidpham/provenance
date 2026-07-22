@@ -1,0 +1,12 @@
+id: no-production-time-sleep
+language: Go
+severity: error
+message: >
+  Production code must not call time.Sleep. SQLite busy_timeout is the sole
+  local contention wait, and DBOS owns durable retries. Use synchronization or
+  an injected clock in tests rather than adding a hidden production retry loop.
+rule:
+  pattern: time.Sleep($DURATION)
+ignore:
+  - "**/*_test.go"
+  - "**/vendor/**"

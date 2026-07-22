@@ -23,6 +23,8 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+const dbosTestPoolSize = 16
+
 // uuidV7 mints a fresh UUIDv7 string, matching how Session.Create mints task ids.
 func uuidV7() string { return uuid.Must(uuid.NewV7()).String() }
 
@@ -43,6 +45,13 @@ type dbosStack struct {
 // borrowed tracker, or a wrapper for divergence injection.
 func newDBOSStack(t *testing.T, wrap func(provenance.Tracker) provenance.Tracker) *dbosStack {
 	t.Helper()
+	stack := newDBOSStackUnlaunched(t, wrap)
+	launchDBOSStack(t, stack)
+	return stack
+}
+
+func newDBOSStackUnlaunched(t *testing.T, wrap func(provenance.Tracker) provenance.Tracker) *dbosStack {
+	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "shared.db")
 
@@ -50,7 +59,8 @@ func newDBOSStack(t *testing.T, wrap func(provenance.Tracker) provenance.Tracker
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
 	}
-	db.SetMaxOpenConns(1) // one shared modernc connection, mirroring DBOS's sqlite pool
+	db.SetMaxOpenConns(dbosTestPoolSize)
+	db.SetMaxIdleConns(dbosTestPoolSize / 2)
 	if err := db.Ping(); err != nil {
 		t.Fatalf("ping shared db: %v", err)
 	}
@@ -87,10 +97,6 @@ func newDBOSStack(t *testing.T, wrap func(provenance.Tracker) provenance.Tracker
 	}
 	boot := establishGenesisBorrowed(t, borrowed, sys.ID)
 
-	if err := dbos.Launch(root); err != nil {
-		t.Fatalf("Launch: %v", err)
-	}
-
 	t.Cleanup(func() {
 		root.Shutdown(5 * time.Second)
 		_ = borrowed.Close()
@@ -99,6 +105,13 @@ func newDBOSStack(t *testing.T, wrap func(provenance.Tracker) provenance.Tracker
 	return &dbosStack{
 		root: root, db: db, tracker: tracker, adapter: adapter,
 		path: path, actor: sys.ID, boot: boot,
+	}
+}
+
+func launchDBOSStack(t *testing.T, stack *dbosStack) {
+	t.Helper()
+	if err := dbos.Launch(stack.root); err != nil {
+		t.Fatalf("Launch: %v", err)
 	}
 }
 
@@ -111,7 +124,8 @@ func newUnlaunchedRoot(t *testing.T, appVersion string) (dbos.DBOSContext, prove
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
 	}
-	db.SetMaxOpenConns(1)
+	db.SetMaxOpenConns(dbosTestPoolSize)
+	db.SetMaxIdleConns(dbosTestPoolSize / 2)
 	if err := db.Ping(); err != nil {
 		t.Fatalf("ping: %v", err)
 	}

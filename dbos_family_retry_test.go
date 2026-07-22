@@ -191,7 +191,7 @@ func newDBOSFamilyEnv(t *testing.T, name string, withGenesis bool) *dbosFamilyEn
 	if err != nil {
 		t.Fatal(err)
 	}
-	root, err := dbos.NewDBOSContext(context.Background(), dbos.Config{AppName: name, SqliteSystemDB: db, ApplicationVersion: "family-v2"})
+	root, err := dbos.NewDBOSContext(context.Background(), dbos.Config{AppName: name, SqliteSystemDB: db, ApplicationVersion: "family-current"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,11 +221,15 @@ func newDBOSFamilyEnv(t *testing.T, name string, withGenesis bool) *dbosFamilyEn
 	}
 	env := &dbosFamilyEnv{db: db, root: root, tracker: tracker, adapter: adapter, actor: actor.ID, other: other.ID, authority: authority}
 	adapter.testHooks.onWorkflowEntry = func() { env.workflowEntries++ }
-	if err := dbos.Launch(root); err != nil {
-		t.Fatal(err)
-	}
 	t.Cleanup(func() { root.Shutdown(5 * time.Second); _ = tracker.Close(); _ = db.Close() })
 	return env
+}
+
+func launchDBOSFamilyEnv(t *testing.T, env *dbosFamilyEnv) {
+	t.Helper()
+	if err := dbos.Launch(env.root); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func fieldChange(field string, effect int, change func(*Effect)) dbosFieldMutation {
@@ -264,6 +268,7 @@ func familyOperation(env *dbosFamilyEnv, name string, effects ...Effect) Operati
 
 func TestDBOSCompletedRetryUsesOneValidBaselineAndOneFieldChangePerFamily(t *testing.T) {
 	bootstrapEnv := newDBOSFamilyEnv(t, "family-bootstrap", false)
+	launchDBOSFamilyEnv(t, bootstrapEnv)
 	at := int64(700)
 	bootstrap := dbosFamilyBaseline{name: "bootstrap_authority", sort: EffectBootstrapAuthority, input: OperationInput{OperationID: "family-bootstrap", ActorID: bootstrapEnv.actor, CommandDigest: []byte("command"), MutationDigest: []byte("fixed-caller-digest"), RecordedAt: 600, Effects: []Effect{{Sort: EffectBootstrapAuthority, ResultSlot: "authority", RecordedAtOverride: &at, BootstrapLabel: "root", OperationAuthorityID: "authority-id"}}}}
 	bootstrap.mutations = append(commonFieldChanges(0),
@@ -308,6 +313,7 @@ func TestDBOSCompletedRetryUsesOneValidBaselineAndOneFieldChangePerFamily(t *tes
 	)); err != nil {
 		t.Fatal(err)
 	}
+	launchDBOSFamilyEnv(t, env)
 	taskContext, _ := TaskContext(target.ID)
 	actorContext, _ := ActorContext(env.actor)
 	contexts := []EventContext{taskContext, actorContext}
@@ -413,7 +419,8 @@ func TestDBOSCompletedRetryUsesOneValidBaselineAndOneFieldChangePerFamily(t *tes
 	conflicting := families[0].input
 	conflicting.Effects = cloneRetryEffects(conflicting.Effects)
 	conflicting.Effects[0].Title = "negative-control-conflict"
-	input, _, err := encodeApplyInput(conflicting)
+	contract := newDBOSContractSnapshot()
+	input, _, err := encodeApplyInput(contract, conflicting)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -428,7 +435,7 @@ func TestDBOSCompletedRetryUsesOneValidBaselineAndOneFieldChangePerFamily(t *tes
 	if err != nil {
 		t.Fatalf("await callback-entry negative control: %v", err)
 	}
-	if _, err := outcome.Decode(); !errors.Is(err, ErrOperationConflict) {
+	if _, err := decodeDBOSStepOutcome(contract, outcome); !errors.Is(err, ErrOperationConflict) {
 		t.Fatalf("negative control outcome error=%v, want ErrOperationConflict", err)
 	}
 	if env.workflowEntries-entriesBefore != 1 {

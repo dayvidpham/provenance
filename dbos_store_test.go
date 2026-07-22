@@ -9,8 +9,10 @@ package provenance_test
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/dayvidpham/provenance"
@@ -24,7 +26,8 @@ func openFileDB(t *testing.T) (*sql.DB, string) {
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
 	}
-	db.SetMaxOpenConns(1)
+	db.SetMaxOpenConns(dbosTestPoolSize)
+	db.SetMaxIdleConns(dbosTestPoolSize / 2)
 	if err := db.Ping(); err != nil {
 		t.Fatalf("ping: %v", err)
 	}
@@ -44,7 +47,8 @@ func TestOpenBorrowedSQLite_InMemoryRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
 	}
-	db.SetMaxOpenConns(1)
+	db.SetMaxOpenConns(dbosTestPoolSize)
+	db.SetMaxIdleConns(dbosTestPoolSize / 2)
 	t.Cleanup(func() { _ = db.Close() })
 	_, err = provenance.OpenBorrowedSQLite(db)
 	if err == nil {
@@ -52,6 +56,87 @@ func TestOpenBorrowedSQLite_InMemoryRejected(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "OpenMemory") {
 		t.Errorf("in-memory rejection must name OpenMemory as the alternative: %v", err)
+	}
+}
+
+func TestOpenBorrowedSQLite_PreservesCallerPoolLimits(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		maxOpen int
+	}{
+		{name: "deliberate small pool", maxOpen: 1},
+		{name: "recommended DBOS test pool", maxOpen: dbosTestPoolSize},
+		{name: "unlimited", maxOpen: 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "pool.db")
+			db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.maxOpen != 0 {
+				db.SetMaxOpenConns(test.maxOpen)
+				db.SetMaxIdleConns(test.maxOpen / 2)
+			}
+			t.Cleanup(func() { _ = db.Close() })
+
+			tr, err := provenance.OpenBorrowedSQLite(db)
+			if err != nil {
+				t.Fatalf("OpenBorrowedSQLite with MaxOpenConnections=%d: %v", test.maxOpen, err)
+			}
+			if got := db.Stats().MaxOpenConnections; got != test.maxOpen {
+				t.Fatalf("OpenBorrowedSQLite mutated caller pool limit: got %d, want %d", got, test.maxOpen)
+			}
+			if err := tr.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestDBOSBorrowedSQLitePool16SupportsConcurrentOperations(t *testing.T) {
+	s := newDBOSStack(t, nil)
+	if got := s.db.Stats().MaxOpenConnections; got != dbosTestPoolSize {
+		t.Fatalf("DBOS test pool limit = %d, want %d", got, dbosTestPoolSize)
+	}
+
+	const dbosOperations = 4
+	start := make(chan struct{})
+	errs := make(chan error, dbosOperations*2)
+	var wg sync.WaitGroup
+	for i := 0; i < dbosOperations; i++ {
+		i := i
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			op := s.createTaskOp(fmt.Sprintf("op-pool-%d", i), "pool", fmt.Sprintf("pool-%d", i))
+			if _, err := s.adapter.Apply(context.Background(), op); err != nil {
+				errs <- fmt.Errorf("concurrent DBOS Apply %d: %w", i, err)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			if _, err := s.tracker.List(provenance.ListFilter{}); err != nil {
+				errs <- fmt.Errorf("concurrent borrowed List %d: %w", i, err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	for i := 0; i < dbosOperations; i++ {
+		result, err := s.tracker.Journal().LookupCommitted(provenance.OperationID(fmt.Sprintf("op-pool-%d", i)))
+		if err != nil {
+			t.Fatalf("LookupCommitted operation %d: %v", i, err)
+		}
+		if result.Kind != provenance.CommittedExact {
+			t.Errorf("operation %d kind = %v, want CommittedExact", i, result.Kind)
+		}
 	}
 }
 

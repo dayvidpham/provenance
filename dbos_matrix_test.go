@@ -18,8 +18,8 @@ import (
 
 // fakeJournal wraps a real JournalAPI, counting fold ATTEMPTS (every Apply call,
 // which the step skips entirely on a §9.4/DBOS replay) and successful COMMITS (the
-// "execute once" oracle, retry-tolerant because a transient-lock retry does not
-// commit), and optionally transforming LookupCommitted to inject a matrix
+// "execute once" oracle, tolerant of DBOS retry attempts that do not commit),
+// and optionally transforming LookupCommitted to inject a matrix
 // divergence.
 type fakeJournal struct {
 	provenance.JournalAPI
@@ -65,7 +65,14 @@ type counters struct {
 // records into c (may be nil) and applies the optional lookup transform.
 func stackWithJournal(t *testing.T, c *counters, lookup func(provenance.CommittedResult, error) (provenance.CommittedResult, error)) *dbosStack {
 	t.Helper()
-	return newDBOSStack(t, func(real provenance.Tracker) provenance.Tracker {
+	stack := stackWithJournalUnlaunched(t, c, lookup)
+	launchDBOSStack(t, stack)
+	return stack
+}
+
+func stackWithJournalUnlaunched(t *testing.T, c *counters, lookup func(provenance.CommittedResult, error) (provenance.CommittedResult, error)) *dbosStack {
+	t.Helper()
+	return newDBOSStackUnlaunched(t, func(real provenance.Tracker) provenance.Tracker {
 		fj := &fakeJournal{JournalAPI: real.Journal(), lookup: lookup}
 		if c != nil {
 			fj.attempts = &c.attempts
@@ -97,7 +104,7 @@ func TestMatrix_AbsentAbsent_Succeeds(t *testing.T) {
 // the adapter's step folds onto an already-committed operation (§9.4).
 func TestMatrix_AbsentExact_ReplaySucceeds(t *testing.T) {
 	var c counters
-	s := stackWithJournal(t, &c, nil)
+	s := stackWithJournalUnlaunched(t, &c, nil)
 	op := s.createTaskOp("op-r2", "aura", "r2")
 
 	// Commit directly (bypassing the adapter) so DBOS has no workflow but Provenance
@@ -105,6 +112,7 @@ func TestMatrix_AbsentExact_ReplaySucceeds(t *testing.T) {
 	if _, err := s.tracker.Journal().Apply(op); err != nil {
 		t.Fatalf("direct Apply: %v", err)
 	}
+	launchDBOSStack(t, s)
 	before := c.commits
 	res, err := s.adapter.Apply(context.Background(), op)
 	if err != nil {
@@ -124,11 +132,12 @@ func TestMatrix_AbsentExact_ReplaySucceeds(t *testing.T) {
 // Row 3: absent (DBOS) | conflict (Provenance) → typed conflict; no new domain/
 // checkpoint success. Same OperationID committed first with different digests.
 func TestMatrix_AbsentConflict_TypedConflict(t *testing.T) {
-	s := stackWithJournal(t, nil, nil)
+	s := stackWithJournalUnlaunched(t, nil, nil)
 	op := s.createTaskOp("op-r3", "aura", "r3")
 	if _, err := s.tracker.Journal().Apply(op); err != nil {
 		t.Fatalf("direct Apply: %v", err)
 	}
+	launchDBOSStack(t, s)
 	// Reuse the OperationID with a different command digest → different fingerprint,
 	// absent DBOS workflow, Provenance conflict at the fold.
 	conflicting := op
@@ -369,6 +378,9 @@ func TestMatrix_PresentFailureOutcome_TypedFailurePermanent(t *testing.T) {
 		t.Fatalf("err = %v, want ErrGenesis decoded from checkpointed failure", err)
 	}
 	attemptsAfterFirst := c.attempts
+	if attemptsAfterFirst != 1 {
+		t.Fatalf("first durable domain failure fold attempts=%d, want exactly 1", attemptsAfterFirst)
+	}
 	// Re-Apply: DBOS returns the checkpointed failure outcome without re-running the
 	// step, so the fold is not attempted again — the failure is permanent.
 	_, err2 := s.adapter.Apply(context.Background(), op)

@@ -11,7 +11,8 @@ lint:
 	ast-grep scan --config sgconfig.yml .
 
 test:
-	CGO_ENABLED=1 go test -race -count=1 ./...
+	go test -count=2 ./...
+	CGO_ENABLED=1 go test -race -count=2 -timeout=20m ./...
 
 clean:
 	rm -rf bin/

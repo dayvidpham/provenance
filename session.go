@@ -62,11 +62,6 @@ type Session struct {
 	// StoreUnavailableError instead of writing through the still-open bridge
 	// connection. A standalone Session (OpenSQLite/OpenMemory) leaves it nil.
 	gate func(op string) error
-	// retry, when non-nil, wraps a borrowed Session's domain writes in the shared-WAL
-	// transient-lock bounded retry so they absorb contention with the DBOS system
-	// connection exactly as the borrowed journal surface does. Nil for a standalone
-	// Session (no shared WAL, nothing to contend with).
-	retry func(op string, fn func() error) error
 }
 
 // As implements Tracker.As.
@@ -82,15 +77,6 @@ func (s *Session) checkGate(op string) error {
 		return nil
 	}
 	return s.gate("Session." + op)
-}
-
-// writeThrough runs a borrowed Session's domain write under the shared-WAL
-// transient-lock retry (a direct pass-through for a standalone Session).
-func (s *Session) writeThrough(op string, fn func() error) error {
-	if s.retry == nil {
-		return fn()
-	}
-	return s.retry("Session."+op, fn)
 }
 
 // ErrGenesisRequired is returned by a journaled Session verb invoked against a journal
@@ -208,13 +194,7 @@ func (s *Session) applyOne(cfg applyConfig, effects []Effect) (CommittedResult, 
 		RecordedAt:         time.Now().UTC().UnixNano(),
 		Effects:            effects,
 	}
-	var res CommittedResult
-	err := s.writeThrough("Apply", func() error {
-		var e error
-		res, e = s.tr.db.Apply(in)
-		return e
-	})
-	return res, err
+	return s.tr.db.Apply(in)
 }
 
 // ---------------------------------------------------------------------------

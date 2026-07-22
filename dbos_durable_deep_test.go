@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -14,6 +15,18 @@ import (
 	dbos "github.com/dbos-inc/dbos-transact-golang/dbos"
 	"github.com/google/uuid"
 )
+
+type duplicateLookupInput struct{}
+
+func (duplicateLookupInput) MarshalJSON() ([]byte, error) {
+	return []byte(`{"schema":"provenance.dbos.apply-input","context":"Yw==","mutation":{"nested":1,"nested":2}}`), nil
+}
+
+func (*duplicateLookupInput) UnmarshalJSON([]byte) error { return nil }
+
+func duplicateLookupWorkflow(dbos.DBOSContext, duplicateLookupInput) (string, error) {
+	return "seeded", nil
+}
 
 type internalDBOSStack struct {
 	root            dbos.DBOSContext
@@ -32,7 +45,7 @@ func newInternalDBOSStack(t *testing.T, name string) *internalDBOSStack {
 	if err != nil {
 		t.Fatal(err)
 	}
-	root, err := dbos.NewDBOSContext(context.Background(), dbos.Config{AppName: name, SqliteSystemDB: db, ApplicationVersion: "durable-v2"})
+	root, err := dbos.NewDBOSContext(context.Background(), dbos.Config{AppName: name, SqliteSystemDB: db, ApplicationVersion: "durable-current"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,15 +83,11 @@ func (s *internalDBOSStack) operation(id string) OperationInput {
 func TestDBOSExplicitResponseLossRetrievesCompleteResult(t *testing.T) {
 	s := newInternalDBOSStack(t, "response-loss")
 	op := s.operation("response-loss-operation")
-	input, normalized, err := encodeApplyInput(op)
+	input, normalized, err := encodeApplyInput(s.adapter.contract, op)
 	if err != nil {
 		t.Fatal(err)
 	}
-	fp, err := fingerprint(s.root.GetApplicationVersion(), input)
-	if err != nil {
-		t.Fatal(err)
-	}
-	workflowID := applyWorkflowIDPrefix + fp
+	workflowID := s.adapter.contract.workflowPrefix + workflowIdentity(s.adapter.contract, s.root.GetApplicationVersion(), normalized.OperationID)
 	// Start durable work and deliberately discard the returned handle without ever
 	// observing its result, modelling transport/response loss after acceptance.
 	if _, err := dbos.RunWorkflow(s.root, s.adapter.applyWorkflow, input, dbos.WithWorkflowID(workflowID), dbos.WithApplicationVersion(s.root.GetApplicationVersion())); err != nil {
@@ -101,6 +110,75 @@ func TestDBOSExplicitResponseLossRetrievesCompleteResult(t *testing.T) {
 	}
 	if task.ID != normalized.Effects[0].TaskID || task.Title != "durable" || task.Description != "complete tuple" || task.Status != StatusOpen || task.Type != TaskTypeTask || task.Priority != PriorityMedium || task.Phase != PhaseWorkerSlices || task.Owner != nil || task.Notes != "" || task.CreatedAt.UnixNano() != normalized.RecordedAt || !task.UpdatedAt.Equal(task.CreatedAt) || task.ClosedAt != nil || task.CloseReason != "" {
 		t.Fatalf("response-loss complete task tuple drifted: %#v", task)
+	}
+}
+
+func TestDBOSApplyRejectsDuplicateStoredInputBeforeCallbacksOrWrites(t *testing.T) {
+	path := t.TempDir() + "/lookup-boundary.db"
+	db, err := openSharedSQL(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := dbos.NewDBOSContext(context.Background(), dbos.Config{AppName: "lookup-boundary", SqliteSystemDB: db, ApplicationVersion: "lookup-boundary"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tracker, err := OpenBorrowedSQLite(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent, err := tracker.RegisterSoftwareAgent("lookup", "actor", "1", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	genesis, err := tracker.Journal().Apply(OperationInput{OperationID: "lookup-boundary-genesis", ActorID: agent.ID, CommandDigest: []byte("genesis"), Effects: []Effect{{Sort: EffectBootstrapAuthority, ResultSlot: "authority", BootstrapLabel: "root"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority, _ := slotJournalID(genesis, "authority")
+	adapter, err := NewDBOSAdapter(root, tracker, DBOSAdapterConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbos.RegisterWorkflow(root, duplicateLookupWorkflow)
+	var workflowEntries atomic.Int64
+	adapter.testHooks.onWorkflowEntry = func() { workflowEntries.Add(1) }
+	if err := dbos.Launch(root); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { root.Shutdown(5 * time.Second); _ = tracker.Close(); _ = db.Close() })
+
+	op := OperationInput{OperationID: "lookup-boundary-operation", ActorID: agent.ID, AuthorityJournalID: &authority, CommandDigest: []byte("command"), Effects: []Effect{{Sort: EffectTaskCreate, ResultSlot: "task", TaskID: ptypes.TaskID{Namespace: "lookup", UUID: uuid.Must(uuid.NewV7())}, Title: "must-not-write", Type: TaskTypeTask, Priority: PriorityMedium, Phase: PhaseWorkerSlices}}}
+	_, normalized, err := encodeApplyInput(adapter.contract, op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflowID := adapter.contract.workflowPrefix + workflowIdentity(adapter.contract, root.GetApplicationVersion(), normalized.OperationID)
+	handle, err := dbos.RunWorkflow(root, duplicateLookupWorkflow, duplicateLookupInput{}, dbos.WithWorkflowID(workflowID), dbos.WithApplicationVersion(root.GetApplicationVersion()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := handle.GetResult(); err != nil {
+		t.Fatal(err)
+	}
+
+	tables := auditedSnapshotTableNames(t, db)
+	before := snapshotSQLTables(t, db, tables...)
+	_, applyErr := adapter.Apply(context.Background(), op)
+	var diagnostic *DBOSDiagnosticError
+	if !errors.As(applyErr, &diagnostic) || diagnostic.Class != DBOSDiagClassTerminalRetrieval || diagnostic.Stage != DBOSDiagStageWorkflowTerminalLookup || !strings.Contains(applyErr.Error(), "duplicate JSON object key") {
+		t.Fatalf("Apply duplicate-input rejection=%#v err=%v", diagnostic, applyErr)
+	}
+	if workflowEntries.Load() != 0 {
+		t.Fatalf("malformed lookup entered adapter workflow %d times", workflowEntries.Load())
+	}
+	looked, err := tracker.Journal().LookupCommitted(op.OperationID)
+	if err != nil || looked.Kind != CommittedAbsent {
+		t.Fatalf("malformed lookup wrote journal operation: result=%#v err=%v", looked, err)
+	}
+	after := snapshotSQLTables(t, db, tables...)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("malformed lookup changed durable tuples\nbefore=%#v\nafter=%#v", before, after)
 	}
 }
 

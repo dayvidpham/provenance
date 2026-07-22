@@ -1,0 +1,67 @@
+cases:
+  - name: unknown-mutation-version
+    classification: must-fail
+    provenance: {source: boundary, ref: "canonical mutation version is closed"}
+    mutation: {description: "An unknown mutation version fails closed.", operator: unknown-mutation-version}
+    input:
+      schema: provenance.dbos-apply-input
+      contextHex: &context 0000001770726f76656e616e63652e64626f732d636f6e7465787400000011666978747572652d6f7065726174696f6e0000002d666978747572652d2d30313866303030302d303030302d373030302d383030302d303030303030303030303032000000090100000000000000070000000f666978747572652d636f6d6d616e64000000080000000000000063
+      mutation: "version:22:provenance.mutation.v2\neffect-count:1:1\neffect.0.family:19:bootstrap_authority\neffect.0.result-slot:9:bootstrap\neffect.0.recorded-at-override:3:142\neffect.0.bootstrap-label:4:root\neffect.0.operation-authority:4:auth\n"
+    expected: {errorClass: canonical-mutation, field: wire}
+  - name: unknown-mutation-field
+    classification: must-fail
+    provenance: {source: boundary, ref: "canonical mutation fields are closed"}
+    mutation: {description: "An unknown mutation field fails closed.", operator: unknown-mutation-field}
+    input: {schema: provenance.dbos-apply-input, contextHex: *context, mutation: "version:22:provenance.mutation.v1\neffect-count:1:1\neffect.0.family:19:bootstrap_authority\neffect.0.zzzz:9:bootstrap\neffect.0.recorded-at-override:3:142\neffect.0.bootstrap-label:4:root\neffect.0.operation-authority:4:auth\n"}
+    expected: {errorClass: canonical-mutation, field: wire}
+  - name: missing-mutation-field
+    classification: must-fail
+    provenance: {source: boundary, ref: "canonical mutation required fields"}
+    mutation: {description: "A missing mutation field fails closed.", operator: missing-mutation-field}
+    input: {schema: provenance.dbos-apply-input, contextHex: *context, mutation: "version:22:provenance.mutation.v1\neffect-count:1:1\neffect.0.family:19:bootstrap_authority\neffect.0.recorded-at-override:3:142\neffect.0.bootstrap-label:4:root\neffect.0.operation-authority:4:auth\n"}
+    expected: {errorClass: canonical-mutation, field: wire}
+  - name: duplicate-mutation-field
+    classification: must-fail
+    provenance: {source: boundary, ref: "canonical mutation fields are unique"}
+    mutation: {description: "A duplicate mutation field fails closed.", operator: duplicate-mutation-field}
+    input: {schema: provenance.dbos-apply-input, contextHex: *context, mutation: "version:22:provenance.mutation.v1\neffect-count:1:1\neffect.0.family:19:bootstrap_authority\neffect.0.result-slot:9:bootstrap\neffect.0.result-slot:9:bootstrap\neffect.0.bootstrap-label:4:root\neffect.0.operation-authority:4:auth\n"}
+    expected: {errorClass: canonical-mutation, field: wire}
+  - name: trailing-mutation-field
+    classification: must-fail
+    provenance: {source: boundary, ref: "canonical mutation consumes exact bytes"}
+    mutation: {description: "Trailing mutation bytes fail closed.", operator: trailing-mutation-field}
+    input: {schema: provenance.dbos-apply-input, contextHex: *context, mutation: "version:22:provenance.mutation.v1\neffect-count:1:1\neffect.0.family:19:bootstrap_authority\neffect.0.result-slot:9:bootstrap\neffect.0.recorded-at-override:3:142\neffect.0.bootstrap-label:4:root\neffect.0.operation-authority:4:auth\nx"}
+    expected: {errorClass: canonical-mutation, field: wire}
+  - name: duplicate-context-field
+    classification: must-fail
+    provenance: {source: boundary, ref: "DBOS context has six fields"}
+    mutation: {description: "A trailing duplicate context field fails closed.", operator: duplicate-context-field}
+    input:
+      schema: provenance.dbos-apply-input
+      contextHex: 0000001770726f76656e616e63652e64626f732d636f6e7465787400000011666978747572652d6f7065726174696f6e0000002d666978747572652d2d30313866303030302d303030302d373030302d383030302d303030303030303030303032000000090100000000000000070000000f666978747572652d636f6d6d616e640000000800000000000000630000000100
+      mutation: &validMutation "version:22:provenance.mutation.v1\neffect-count:1:1\neffect.0.family:19:bootstrap_authority\neffect.0.result-slot:9:bootstrap\neffect.0.recorded-at-override:3:142\neffect.0.bootstrap-label:4:root\neffect.0.operation-authority:4:auth\n"
+    expected: {errorClass: context-frame, field: trailing}
+  - name: out-of-order-context
+    classification: must-fail
+    provenance: {source: boundary, ref: "DBOS context order is closed"}
+    mutation: {description: "Swapped operation and actor fields fail closed.", operator: out-of-order-context}
+    input: {schema: provenance.dbos-apply-input, contextHex: 0000001770726f76656e616e63652e64626f732d636f6e746578740000002d666978747572652d2d30313866303030302d303030302d373030302d383030302d30303030303030303030303200000011666978747572652d6f7065726174696f6e000000090100000000000000070000000f666978747572652d636f6d6d616e64000000080000000000000063, mutation: *validMutation}
+    expected: {errorClass: context-frame, field: actor}
+  - name: unknown-context-version
+    classification: must-fail
+    provenance: {source: boundary, ref: "DBOS context version is closed"}
+    mutation: {description: "An unknown context version fails closed.", operator: unknown-context-version}
+    input: {schema: provenance.dbos-apply-input, contextHex: 0000001a70726f76656e616e63652e64626f732d636f6e746578742f763300000011666978747572652d6f7065726174696f6e0000002d666978747572652d2d30313866303030302d303030302d373030302d383030302d303030303030303030303032000000090100000000000000070000000f666978747572652d636f6d6d616e64000000080000000000000063, mutation: *validMutation}
+    expected: {errorClass: context-frame, field: context_version}
+  - name: zero-actor
+    classification: must-fail
+    provenance: {source: boundary, ref: "DBOS operation actor is required"}
+    mutation: {description: "A zero actor fails closed.", operator: zero-actor}
+    input: {schema: provenance.dbos-apply-input, contextHex: 0000001770726f76656e616e63652e64626f732d636f6e7465787400000011666978747572652d6f7065726174696f6e00000000000000090100000000000000070000000f666978747572652d636f6d6d616e64000000080000000000000063, mutation: *validMutation}
+    expected: {errorClass: context-frame, field: actor}
+  - name: empty-command-digest
+    classification: must-fail
+    provenance: {source: boundary, ref: "DBOS operation command digest is required"}
+    mutation: {description: "An empty command digest fails closed.", operator: empty-command-digest}
+    input: {schema: provenance.dbos-apply-input, contextHex: 0000001770726f76656e616e63652e64626f732d636f6e7465787400000011666978747572652d6f7065726174696f6e0000002d666978747572652d2d30313866303030302d303030302d373030302d383030302d3030303030303030303030320000000901000000000000000700000000000000080000000000000063, mutation: *validMutation}
+    expected: {errorClass: context-frame, field: command}
