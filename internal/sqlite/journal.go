@@ -133,7 +133,7 @@ func (db *DB) AppendTaskEvent(in journal.AppendTaskEventInput) (journal.TaskEven
 	journalID = db.conn.LastInsertRowID()
 
 	if txErr = executeStatement(db.conn,
-		journalInsertJournalTaskEventsa34e,
+		sharedInsertJournalTaskEventsf716,
 		&sqlitex.ExecOptions{Args: []any{
 			journalID, in.TaskID.String(), string(in.EventKind), string(in.Payload),
 		}},

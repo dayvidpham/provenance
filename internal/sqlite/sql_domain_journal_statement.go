@@ -11,7 +11,6 @@ const (
 	journalInsertJournal11c0 journalStatement = iota + 1
 	journalInsertJournalKinds9c1d
 	journalInsertJournalTaskEventContextsc7c0
-	journalInsertJournalTaskEventsa34e
 	journalInsertTaskAttributions5227
 	journalPragmaForeignKeyCheck6847
 	journalSelectJournal3447
@@ -58,8 +57,6 @@ func (statement journalStatement) execute(conn *zs.Conn, options *sqlitex.ExecOp
 		return sqlitex.Execute(conn, "INSERT OR IGNORE INTO journal_kinds (id, name) VALUES (?1, ?2)", options)
 	case journalInsertJournalTaskEventContextsc7c0:
 		return sqlitex.Execute(conn, "INSERT OR IGNORE INTO journal_task_event_contexts\n\t\t\t\t(event_journal_id, context_kind, context_identity, attached_by_journal_id)\n\t\t\t VALUES (?1, ?2, ?3, ?4)", options)
-	case journalInsertJournalTaskEventsa34e:
-		return sqlitex.Execute(conn, "INSERT INTO journal_task_events (journal_id, task_id, event_kind, payload)\n\t\t VALUES (?1, ?2, ?3, ?4)", options)
 	case journalInsertTaskAttributions5227:
 		return sqlitex.Execute(conn, "INSERT OR IGNORE INTO task_attributions (task_id, actor_id, first_journal_id)\n\t\t VALUES (?1, ?2, ?3)", options)
 	case journalPragmaForeignKeyCheck6847:

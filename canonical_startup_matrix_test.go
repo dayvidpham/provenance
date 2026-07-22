@@ -433,6 +433,10 @@ func TestStartupCorruptionMatrixLeavesBytesUnchanged(t *testing.T) {
 			corruptCanonicalWire(t, tr, f.anchor, func([]byte) []byte { return bytes.Repeat([]byte{'x'}, MaxCanonicalMutationBytes+1) })
 		},
 	}
+	const expectedCorruptionCases = 98
+	if len(cases) != expectedCorruptionCases {
+		t.Fatalf("startup corruption matrix has %d cases, want exactly %d", len(cases), expectedCorruptionCases)
+	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "db.sqlite")

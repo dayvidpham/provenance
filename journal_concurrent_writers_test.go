@@ -105,10 +105,11 @@ func (r *raceTracker) assertConverged(t *testing.T) {
 }
 
 // TestConcurrentSameOperationIDSingleWinner races N goroutines committing the
-// IDENTICAL operation (same OperationID, same actor, same digests, same effects). The
-// serialized write path lets exactly one goroutine commit the anchor; every other
-// goroutine's Apply short-circuits (§9.4) to that same committed anchor. No second
-// anchor and no duplicate task_event is ever produced.
+// same canonical operation (same OperationID, actor, command digest, and effects)
+// with distinct caller-supplied mutation digests. Canonical effects derive mutation
+// identity, so the serialized write path lets exactly one goroutine commit the anchor;
+// every other Apply short-circuits (§9.4) to that same committed anchor. No second
+// anchor, caller-digest conflict, or duplicate task_event is ever produced.
 func TestConcurrentSameOperationIDSingleWinner(t *testing.T) {
 	r := newRaceTracker(t)
 	task := r.createTask(t, "single-winner")
@@ -130,9 +131,11 @@ func TestConcurrentSameOperationIDSingleWinner(t *testing.T) {
 	)
 	wg.Add(goroutines)
 	for i := 0; i < goroutines; i++ {
-		go func() {
+		go func(i int) {
 			defer wg.Done()
-			res, err := r.tr.Journal().Apply(op)
+			in := op
+			in.MutationDigest = []byte(fmt.Sprintf("caller-mutation-%d", i))
+			res, err := r.tr.Journal().Apply(in)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
@@ -147,7 +150,7 @@ func TestConcurrentSameOperationIDSingleWinner(t *testing.T) {
 			} else {
 				fresh++
 			}
-		}()
+		}(i)
 	}
 	wg.Wait()
 
@@ -170,7 +173,7 @@ func TestConcurrentSameOperationIDSingleWinner(t *testing.T) {
 }
 
 // TestConcurrentSameOperationIDConflictingIdentityLoserGetsTypedConflict races two
-// goroutines committing the SAME OperationID with DIFFERENT mutation digests (a reused
+// goroutines committing the same OperationID with different canonical effects (a reused
 // id presenting different arguments, §11). Exactly one wins; the loser receives a typed
 // ErrOperationConflict with the closed CommittedConflict variant, and nothing extra is
 // committed.
@@ -183,9 +186,7 @@ func TestConcurrentSameOperationIDConflictingIdentityLoserGetsTypedConflict(t *t
 		CommandDigest: []byte("conf-c"), Effects: []Effect{{Sort: EffectTaskEvent, TaskID: task, EventKind: EventKindTaskUpdated, UpdateTitle: strPtr("v")}},
 	}
 	opA := base
-	opA.MutationDigest = []byte("mutation-a")
 	opB := base
-	opB.MutationDigest = []byte("mutation-b")
 	opB.Effects = []Effect{{Sort: EffectTaskEvent, TaskID: task, EventKind: EventKindTaskUpdated, UpdateTitle: strPtr("different canonical effect")}}
 
 	type outcome struct {

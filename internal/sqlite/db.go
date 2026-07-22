@@ -82,7 +82,10 @@ func Open(dbPath string, models []ptypes.ModelEntry) (*DB, error) {
 
 	db := &DB{conn: conn}
 
-	if err := db.applyNonPersistentPragmas(); err != nil {
+	// SQLite table rebuilds must run with FK enforcement disabled before the
+	// activation transaction starts. VerifyIntegrity checks the complete FK graph
+	// before commit; runtime enforcement is restored after the transaction ends.
+	if err := db.applyActivationPragmas(); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("sqlite.Open: failed to apply pragmas on %q: %w", dbPath, err)
 	}
@@ -183,7 +186,7 @@ func preflightActivationClone(source *zs.Conn, models []ptypes.ModelEntry) error
 		return fmt.Errorf("finish read-only activation clone: %w", err)
 	}
 	db := &DB{conn: clone}
-	if err = db.applyNonPersistentPragmas(); err != nil {
+	if err = db.applyActivationPragmas(); err != nil {
 		return err
 	}
 	var activationErr error
@@ -242,8 +245,8 @@ func (db *DB) Close() error {
 // Pragmas
 // ---------------------------------------------------------------------------
 
-func (db *DB) applyNonPersistentPragmas() error {
-	for _, p := range []sealedSQLStatement{schemaDDLPragmaBusyTimeout44ea, schemaDDLPragmaForeignKeyscc13} {
+func (db *DB) applyActivationPragmas() error {
+	for _, p := range []sealedSQLStatement{schemaDDLPragmaBusyTimeout44ea, schemaDDLPragmaForeignKeysOffcc13} {
 		if err := executeStatement(db.conn, p, nil); err != nil {
 			return fmt.Errorf("pragma %q: %w", p, err)
 		}

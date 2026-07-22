@@ -48,6 +48,10 @@ var canonicalCodecRegistry = canonicalCodecDescriptors{
 }
 
 func canonicalCodecForVersion(version MutationEncodingVersion) (canonicalCodecDescriptor, bool) {
+	if canonicalCodecRegistry.validate() != nil {
+		var zero canonicalCodecDescriptor
+		return zero, false
+	}
 	return canonicalCodecRegistry.codecForVersion(version)
 }
 
@@ -71,10 +75,6 @@ func (registry canonicalCodecDescriptors) validate() error {
 }
 
 func (registry canonicalCodecDescriptors) codecForVersion(version MutationEncodingVersion) (canonicalCodecDescriptor, bool) {
-	if registry.validate() != nil {
-		var zero canonicalCodecDescriptor
-		return zero, false
-	}
 	for _, descriptor := range registry {
 		if descriptor.version == version {
 			return descriptor, true
@@ -85,9 +85,6 @@ func (registry canonicalCodecDescriptors) codecForVersion(version MutationEncodi
 }
 
 func (registry canonicalCodecDescriptors) versionForTag(tag string) (MutationEncodingVersion, bool) {
-	if registry.validate() != nil {
-		return 0, false
-	}
 	for _, descriptor := range registry {
 		if descriptor.wireTag == tag {
 			return descriptor.version, true
@@ -101,6 +98,9 @@ func inspectMutationEncodingTag(text string) inspectedMutationEncodingTag {
 }
 
 func (tag inspectedMutationEncodingTag) version() (MutationEncodingVersion, bool) {
+	if canonicalCodecRegistry.validate() != nil {
+		return 0, false
+	}
 	return canonicalCodecRegistry.versionForTag(tag.text)
 }
 
@@ -418,7 +418,7 @@ func PrepareMutationV1(effects []Effect) (CanonicalMutation, error) {
 }
 
 func prepareCanonicalMutation(version MutationEncodingVersion, effects []Effect) (CanonicalMutation, error) {
-	descriptor, ok := canonicalCodecRegistry.codecForVersion(version)
+	descriptor, ok := canonicalCodecForVersion(version)
 	if !ok {
 		return CanonicalMutation{}, canonicalMutationError("codec-registry", fmt.Sprintf("mutation encoding version %d has no complete registered codec", version), "register exactly one complete codec descriptor before preparing mutations")
 	}

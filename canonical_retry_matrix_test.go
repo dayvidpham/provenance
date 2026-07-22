@@ -169,6 +169,10 @@ func retryMismatchCandidates(t *testing.T, f retryMatrixFixture) map[string]Oper
 	add("comment-author", func(v *OperationInput) { v.Effects[11].CommentAuthor = f.other })
 	add("comment-body", func(v *OperationInput) { v.Effects[11].CommentBody = "changed" })
 	add("comment-context", func(v *OperationInput) { v.Effects[11].Contexts = []EventContext{altCtx} })
+	const expectedRetryMismatchCandidates = 86
+	if len(out) != expectedRetryMismatchCandidates {
+		t.Fatalf("retry mismatch matrix has %d candidates, want exactly %d", len(out), expectedRetryMismatchCandidates)
+	}
 	return out
 }
 

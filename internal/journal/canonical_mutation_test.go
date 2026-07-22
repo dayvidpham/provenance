@@ -14,6 +14,29 @@ import (
 	"github.com/google/uuid"
 )
 
+const independentEvidenceDigestWire = "\x01\x02"
+
+var independentFamilyDigestCorpus = [14]struct {
+	name      string
+	sort      EffectSort
+	digestHex string
+}{
+	{"task-event-update", EffectTaskEvent, "4fd9396a9ce6df1ac68ab8680ecbedecca109bb364b3f81d3f7705121258a4ba"},
+	{"task-event-close", EffectTaskEvent, "8b8c21ea2274bc523323cb05836360caf390151756c97577e9d15661acb74b21"},
+	{"bootstrap-authority", EffectBootstrapAuthority, "c404ad673f363769c90a726a3531fc64fe25131f0607d9b8f44664b960ef0ba3"},
+	{"assignment-start", EffectAssignmentStart, "90173c1d8e31659199462e28d1ff906344755e9df2d8a1e9908f6edba354252a"},
+	{"assignment-end", EffectAssignmentEnd, "644e9ef74f35b67ad78b0ab11657551c3c538611e52842ba8d3a89583442784f"},
+	{"decision", EffectDecision, "016537171e2327b6efd22bd617c9df83203a499a32d692913245feff01fe7dd5"},
+	{"evidence", EffectEvidence, "1772829bf85799dfea3b331a0486da2c120eb13456513d8fef6405830c93ccd6"},
+	{"task-create", EffectTaskCreate, "3a64f293ec1ae932239417929030910d93d7430810c45ae1f82c53d51518fbec"},
+	{"task-create-allocated", EffectTaskCreateAllocated, "f7d5f0fcc27a6d65a03e868baebe6dd41b696fae174473dd15456b590d66fb2a"},
+	{"edge-add", EffectEdgeAdd, "6f04923d70ca43c21a4611b1b2b2be9dfb858b873895d94713f8cb3ed6517922"},
+	{"edge-remove", EffectEdgeRemove, "3dd68b2c04778dcf770674e40ff88f324069054d0b4a7846a7ed6d2931c10997"},
+	{"label-add", EffectLabelAdd, "804a38689f50f421c458a3a8dae9d4255349c3fc93bd879b1990ce06b84ad2db"},
+	{"label-remove", EffectLabelRemove, "c542027cb41eec89cdaadc67ec94f88131eb5269f3e7a73ce82dc5e45711ddf7"},
+	{"comment-add", EffectCommentAdd, "ccf75528afa6ee8d25cd53fc0735f74d0a4b39f8efe7812d79f13300562fefdc"},
+}
+
 type invalidCanonicalV1Ref struct{}
 
 func (invalidCanonicalV1Ref) canonicalV1FieldRef() {}
@@ -65,7 +88,7 @@ func validFamilyEffects(t *testing.T) []Effect {
 		{Sort: EffectAssignmentStart, ResultSlot: "start", RecordedAtOverride: &recordedAt, TaskID: task, AssignmentID: "a", SlotID: SlotOwnerResponsibility, Occupant: actor, Predecessor: "p", Parent: "parent"},
 		{Sort: EffectAssignmentEnd, ResultSlot: "end", RecordedAtOverride: &recordedAt, TaskID: task, AssignmentID: "a", SlotID: SlotOwnerResponsibility},
 		{Sort: EffectDecision, ResultSlot: "decision", RecordedAtOverride: &recordedAt, TaskID: task, DecisionKind: "fixture.decision", Payload: []byte(`{"x":1}`)},
-		{Sort: EffectEvidence, ResultSlot: "evidence", RecordedAtOverride: &recordedAt, TaskID: task, EvidenceKind: "fixture.evidence", ContentDigest: []byte{1, 2}, Payload: []byte(`{"x":1}`)},
+		{Sort: EffectEvidence, ResultSlot: "evidence", RecordedAtOverride: &recordedAt, TaskID: task, EvidenceKind: "fixture.evidence", ContentDigest: []byte(independentEvidenceDigestWire), Payload: []byte(`{"x":1}`)},
 		{Sort: EffectTaskCreate, ResultSlot: "create", RecordedAtOverride: &recordedAt, TaskID: task, Title: "title", Description: "description", Type: ptypes.TaskTypeTask, Priority: ptypes.PriorityMedium, Phase: ptypes.PhaseUnscoped, Payload: []byte(`{"x":1}`), Contexts: []EventContext{ctx}},
 		{Sort: EffectTaskCreateAllocated, ResultSlot: "allocated", RecordedAtOverride: &recordedAt, TaskID: task, Title: "title", Description: "description", Type: ptypes.TaskTypeTask, Priority: ptypes.PriorityMedium, Phase: ptypes.PhaseUnscoped, Payload: []byte(`{"x":1}`), Contexts: []EventContext{ctx}},
 		{Sort: EffectEdgeAdd, ResultSlot: "edge-add", RecordedAtOverride: &recordedAt, TaskID: task, EdgeTargetID: task.String(), EdgeRelKind: ptypes.EdgeDerivedFrom, Contexts: []EventContext{ctx}},
@@ -78,8 +101,17 @@ func validFamilyEffects(t *testing.T) []Effect {
 
 func TestCanonicalMutationV1EveryFamilyRoundTripsMeaningfulSemantics(t *testing.T) {
 	covered := map[string]bool{}
-	for fixtureIndex, effect := range validFamilyEffects(t) {
-		t.Run(effect.Sort.String(), func(t *testing.T) {
+	effects := validFamilyEffects(t)
+	fields := independentFamilyFields(t)
+	if len(effects) != len(fields) || len(effects) != len(independentFamilyDigestCorpus) {
+		t.Fatalf("independent family corpus lengths: effects=%d fields=%d digests=%d", len(effects), len(fields), len(independentFamilyDigestCorpus))
+	}
+	for fixtureIndex, effect := range effects {
+		digestFixture := independentFamilyDigestCorpus[fixtureIndex]
+		t.Run(digestFixture.name, func(t *testing.T) {
+			if effect.Sort != digestFixture.sort {
+				t.Fatalf("digest corpus sort = %s, want %s", digestFixture.sort, effect.Sort)
+			}
 			prepared, err := PrepareMutationV1([]Effect{effect})
 			if err != nil {
 				t.Fatal(err)
@@ -89,9 +121,16 @@ func TestCanonicalMutationV1EveryFamilyRoundTripsMeaningfulSemantics(t *testing.
 				t.Fatal(err)
 			}
 			expected := effect
-			literalWire := independentFixtureWire(independentFamilyFields(t)[fixtureIndex])
+			literalWire := independentFixtureWire(fields[fixtureIndex])
 			if !bytes.Equal(prepared.CanonicalBytes(), literalWire) {
 				t.Fatalf("family %s wire drifted\n got %q\nwant %q", effect.Sort, prepared.CanonicalBytes(), literalWire)
+			}
+			wantDigest, err := hex.DecodeString(digestFixture.digestHex)
+			if err != nil {
+				t.Fatalf("invalid independent digest fixture: %v", err)
+			}
+			if !bytes.Equal(prepared.DerivedDigest(), wantDigest) {
+				t.Fatalf("family %s digest drifted: got %x want %x", effect.Sort, prepared.DerivedDigest(), wantDigest)
 			}
 			decoded, err = DecodeCanonicalMutation(literalWire)
 			if err != nil {
@@ -249,7 +288,7 @@ func independentFamilyFields(t *testing.T) [][]independentField {
 		common("assignment_start", "start", independentField{"task", task.String()}, independentField{"assignment", "a"}, independentField{"slot", "owner-responsibility"}, independentField{"occupant", actor.String()}, independentField{"predecessor", "p"}, independentField{"parent", "parent"}),
 		common("assignment_end", "end", independentField{"task", task.String()}, independentField{"assignment", "a"}, independentField{"slot", "owner-responsibility"}),
 		common("decision", "decision", independentField{"task", task.String()}, independentField{"decision-kind", "fixture.decision"}, independentField{"payload", `{"x":1}`}),
-		common("evidence", "evidence", independentField{"task", task.String()}, independentField{"evidence-kind", "fixture.evidence"}, independentField{"content-digest", string([]byte{1, 2})}, independentField{"payload", `{"x":1}`}),
+		common("evidence", "evidence", independentField{"task", task.String()}, independentField{"evidence-kind", "fixture.evidence"}, independentField{"content-digest", independentEvidenceDigestWire}, independentField{"payload", `{"x":1}`}),
 		append(append(common("task_create", "create", independentField{"task", task.String()}, independentField{"payload", `{"x":1}`}), ctx...), independentField{"title", "title"}, independentField{"description", "description"}, independentField{"type", "task"}, independentField{"priority", "medium"}, independentField{"phase", "unscoped"}),
 		append(append(common("task_create_allocated", "allocated", independentField{"task", task.String()}, independentField{"payload", `{"x":1}`}), ctx...), independentField{"title", "title"}, independentField{"description", "description"}, independentField{"type", "task"}, independentField{"priority", "medium"}, independentField{"phase", "unscoped"}),
 		withCtx(common("edge_add", "edge-add", independentField{"task", task.String()}, independentField{"edge-target", task.String()}, independentField{"edge-kind", "derived_from"})),

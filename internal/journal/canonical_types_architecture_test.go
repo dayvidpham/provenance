@@ -20,6 +20,10 @@ import (
 	"testing"
 )
 
+// canonicalV1RendererBodyHash is SHA-256 of go/format's rendering of the
+// renderFieldName function body. A legitimate renderer change fails with the
+// replacement hash, which must be reviewed together with the V1 byte corpus
+// before updating this seal.
 const canonicalV1RendererBodyHash = "10dd69c44061b716c9987446c22c2fed109a606a0b7bce8f63f7f7002557c5b0"
 
 type typedCanonicalPackage struct {
@@ -177,7 +181,7 @@ func inspectTypedCanonicalArchitecture(typed typedCanonicalPackage) []string {
 				if signature.Recv() != nil && types.Identical(derefCanonical(signature.Recv().Type()), codecType) && signature.Params().Len() == 1 && types.Identical(signature.Params().At(0).Type(), fieldRefType) && signature.Results().Len() == 2 {
 					hash := canonicalBodyHash(typed.fset, value.Body)
 					if hash != canonicalV1RendererBodyHash {
-						findings = append(findings, "V1 renderer body/return dataflow differs from sealed shape")
+						findings = append(findings, fmt.Sprintf("V1 renderer body/return dataflow differs from sealed shape; reviewed replacement hash would be %s", hash))
 					} else if renderer != nil {
 						findings = append(findings, "multiple V1 renderers")
 					} else {

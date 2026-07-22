@@ -41,7 +41,7 @@ const (
 	schemaDDLCreateTaskTypes4c16
 	schemaDDLCreateTaskscc07
 	schemaDDLPragmaBusyTimeout44ea
-	schemaDDLPragmaForeignKeyscc13
+	schemaDDLPragmaForeignKeysOffcc13
 	schemaDDLPragmaJournalMode606c
 )
 
@@ -115,7 +115,7 @@ func (statement schemaDDL) execute(conn *zs.Conn, options *sqlitex.ExecOptions) 
 		return sqlitex.ExecuteTransient(conn, "CREATE TABLE IF NOT EXISTS tasks (\n\t\t\tid TEXT PRIMARY KEY, namespace TEXT NOT NULL, title TEXT NOT NULL,\n\t\t\tdescription TEXT NOT NULL DEFAULT '', status_id INTEGER NOT NULL DEFAULT 0 REFERENCES statuses(id),\n\t\t\tpriority_id INTEGER NOT NULL DEFAULT 2 REFERENCES priorities(id), type_id INTEGER NOT NULL DEFAULT 2 REFERENCES task_types(id),\n\t\t\tphase_id INTEGER NOT NULL REFERENCES phases(id), owner_id TEXT REFERENCES agents(id), notes TEXT NOT NULL DEFAULT '',\n\t\t\tcreated_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, closed_at INTEGER, close_reason TEXT NOT NULL DEFAULT '',\n\t\t\tlast_journal_id INTEGER NOT NULL REFERENCES journal(journal_id)\n\t\t) STRICT", options)
 	case schemaDDLPragmaBusyTimeout44ea:
 		return sqlitex.ExecuteTransient(conn, "PRAGMA busy_timeout=5000;", options)
-	case schemaDDLPragmaForeignKeyscc13:
+	case schemaDDLPragmaForeignKeysOffcc13:
 		return sqlitex.ExecuteTransient(conn, "PRAGMA foreign_keys=OFF;", options)
 	case schemaDDLPragmaJournalMode606c:
 		return sqlitex.ExecuteTransient(conn, "PRAGMA journal_mode=WAL", options)
