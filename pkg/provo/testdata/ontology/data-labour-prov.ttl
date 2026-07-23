@@ -1,0 +1,118 @@
+@prefix :        <https://example.org/data-labour-prov#> .
+@prefix owl:     <http://www.w3.org/2002/07/owl#> .
+@prefix rdf:     <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs:    <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd:     <http://www.w3.org/2001/XMLSchema#> .
+@prefix prov:    <http://www.w3.org/ns/prov#> .
+@prefix dct:     <http://purl.org/dc/terms/> .
+
+#################################################################
+# Ontology header
+#
+# NAMESPACE CAVEAT: https://example.org/data-labour-prov# is a
+# PLACEHOLDER namespace, copied verbatim from the paper's example
+# listings (Section 4 / Approach). It is NOT registered anywhere
+# and does NOT resolve. Do NOT treat it as a permanent identifier
+# and do NOT attempt to register it with w3id.org, PURL, or any
+# other redirect service as part of this artifact -- the paper's
+# Conclusion names permanent-namespace selection as future work,
+# to be decided separately before any public release.
+#################################################################
+
+<https://example.org/data-labour-prov#> a owl:Ontology ;
+    dct:title "Data-Labour PROV-O Extension Vocabulary" ;
+    dct:description """Machine-readable OWL vocabulary for the terms minted by
+the taxonomy-of-benchmarks project (its Section 4, Approach). Extends W3C PROV-O with item identity and
+lineage (:EvalItem, :ItemExpression, :derivationKind and its controlled
+vocabulary), LLM agent typing (:LLMAgent and its configuration properties),
+and an attribution-granularity marker (:attributionGranularity). This file
+is generated documentation of the paper's minted vocabulary; it is not a
+new design -- every class, property, and individual here corresponds to a
+term the paper's Approach section and Glossary appendix already define.
+
+NAMESPACE PLACEHOLDER: the https://example.org/data-labour-prov# base IRI
+is provisional (matches the paper's own example listings) and is pending
+registration of a permanent namespace (e.g. via w3id.org) before any
+public/citable release. This artifact does not perform or attempt that
+registration.""" ;
+    dct:created "2026-07-18"^^xsd:date ;
+    rdfs:comment "PLACEHOLDER NAMESPACE -- see dct:description. Do not register externally." .
+
+#################################################################
+# L1 Item identity & lineage
+#################################################################
+
+:EvalItem a owl:Class ;
+    rdfs:subClassOf prov:Entity ;
+    rdfs:label "Evaluation Item"@en ;
+    rdfs:comment "The abstract evaluation-item concept (task identity), stable across rewordings and releases; modelled on LRMoo's Work. Verbatim from the paper's Glossary: ':EvalItem ⊑ prov:Entity. The abstract evaluation-item concept (task identity), stable across rewordings and releases; modelled on LRMoo's Work.'"@en .
+
+:ItemExpression a owl:Class ;
+    rdfs:subClassOf prov:Entity ;
+    rdfs:label "Item Expression"@en ;
+    rdfs:comment "A concrete realization of an :EvalItem -- the exact prompt/answer wording where item identifiers live; modelled on LRMoo's Expression. Verbatim from the paper's Glossary: ':ItemExpression ⊑ prov:Entity. A concrete realization of an :EvalItem --- the exact prompt/answer wording where item identifiers live; modelled on LRMoo's Expression.'"@en .
+
+:DerivationKind a owl:Class ;
+    rdfs:label "Derivation Kind"@en ;
+    rdfs:comment "The class of the controlled-vocabulary values that :derivationKind may take. Not itself a term named in the paper's Glossary; introduced here only as the OWL container class for the seven named individuals the paper does enumerate, so that :derivationKind's range can be expressed and closed with a SHACL sh:in constraint. MODELLING JUDGMENT CALL: the paper never types the vocabulary itself as a class -- it just lists seven individuals -- so this class is an artifact of OWL/SHACL encoding, not a minted term."@en .
+
+:derivationKind a owl:ObjectProperty ;
+    rdfs:label "derivation kind"@en ;
+    rdfs:range :DerivationKind ;
+    rdfs:comment "The typed reason for a dataset derivation, attached only via prov:qualifiedDerivation -- never directly to prov:wasRevisionOf or prov:wasDerivedFrom, so that the fact of a revision is not conflated with its reason. Verbatim from the paper's Glossary: ':derivationKind. The typed reason for a dataset derivation, attached only via prov:qualifiedDerivation. Controlled vocabulary: :LabelCorrection, :Deduplication, :DifficultyFiltering, :Translation, :ContaminationScrubbing, :AdversarialFiltering, :VerificationSubset.' No rdfs:domain is declared here (conservative choice -- see README): the paper's own Listings 3, 5, and 6 attach :derivationKind only to the anonymous blank node typed prov:Derivation inside a prov:qualifiedDerivation block, and that structural constraint is encoded in shapes.ttl rather than as an OWL domain axiom, since OWL domain axioms are global entailments, not local shape checks."@en .
+
+:LabelCorrection a :DerivationKind ; rdfs:label "Label Correction"@en .
+:Deduplication a :DerivationKind ; rdfs:label "Deduplication"@en .
+:DifficultyFiltering a :DerivationKind ; rdfs:label "Difficulty Filtering"@en .
+:Translation a :DerivationKind ; rdfs:label "Translation"@en .
+:ContaminationScrubbing a :DerivationKind ; rdfs:label "Contamination Scrubbing"@en .
+:AdversarialFiltering a :DerivationKind ; rdfs:label "Adversarial Filtering"@en .
+:VerificationSubset a :DerivationKind ; rdfs:label "Verification Subset"@en .
+
+#################################################################
+# L6 Agents: LLM typing
+#################################################################
+
+:LLMAgent a owl:Class ;
+    rdfs:subClassOf prov:SoftwareAgent ;
+    rdfs:label "LLM Agent"@en ;
+    rdfs:comment "An LLM acting as an agent, configured by :modelId, :modelVersion, and :decodingParameters. Verbatim from the paper's Glossary: ':LLMAgent ⊑ prov:SoftwareAgent. An LLM acting as an agent, configured by :modelId, :modelVersion, and :decodingParameters.' These three configuration properties suffice to distinguish an LLM annotator from a deterministic program and to record which model produced a label, without over-specifying a full model card (Section 4.6)."@en .
+
+:modelId a owl:DatatypeProperty ;
+    rdfs:label "model ID"@en ;
+    rdfs:domain :LLMAgent ;
+    rdfs:range xsd:string ;
+    rdfs:comment "Identifies the LLM model used by an :LLMAgent, e.g. \"gpt-4o\" (paper Listing 2 and the unlabelled run-provenance example, ex:gpt-judge, in Section 4.9). Semantics: the model's IDENTITY string, identity-version included (e.g. a \"4.5\" vs \"4.6\" distinction lives here, not in :modelVersion). Recommended value space: the bestiary registry's canonical grammar -- see README, 'Recommended value space'."@en .
+
+:modelVersion a owl:DatatypeProperty ;
+    rdfs:label "model version"@en ;
+    rdfs:domain :LLMAgent ;
+    rdfs:range xsd:string ;
+    rdfs:comment "Identifies the version/snapshot of the LLM model used by an :LLMAgent, e.g. \"2026-01\" (paper Listing 2). Semantics: the RELEASE/SNAPSHOT DATE of the deployed instance (YYYY-MM-DD or YYYY-MM), not the identity version -- identity-version (\"4.5\") belongs inside :modelId. This mirrors the bestiary registry's Version-vs-Date split; the paper's own example value is date-shaped."@en .
+
+:decodingParameters a owl:DatatypeProperty ;
+    rdfs:label "decoding parameters"@en ;
+    rdfs:domain :LLMAgent ;
+    rdfs:range xsd:string ;
+    rdfs:comment "Records the decoding configuration used to produce output from an :LLMAgent, e.g. \"temperature=0.0;top_p=1.0\" (paper Listing 2). MODELLING JUDGMENT CALL: the paper's own example serializes this as a single semicolon-delimited string rather than a structured key-value map; this vocabulary follows that precedent (xsd:string) rather than inventing a structured representation the paper does not use."@en .
+
+#################################################################
+# L6 Agents: attribution granularity
+#################################################################
+
+:AttributionGranularityValue a owl:Class ;
+    rdfs:label "Attribution Granularity Value"@en ;
+    rdfs:comment "The class of the five controlled values that :attributionGranularity may take. As with :DerivationKind, the paper enumerates the five values without naming a container class for them; this class is introduced here only as an OWL/SHACL encoding artifact to give :attributionGranularity a closed range."@en .
+
+:attributionGranularity a owl:ObjectProperty ;
+    rdfs:label "attribution granularity"@en ;
+    rdfs:range :AttributionGranularityValue ;
+    rdfs:comment "The level at which attribution is recorded: person, team, organization, undeterminable (authorship cannot be recovered, e.g. in-the-wild data), or unspecified (knowable but undocumented). Verbatim from the paper's Glossary: ':attributionGranularity. The level at which attribution is recorded: person, team, organization, undeterminable (authorship cannot be recovered, e.g. in-the-wild data), or unspecified (knowable but undocumented).' No rdfs:domain is declared (conservative choice -- see README): the paper's Listing 4 attaches it to a plain prov:Entity, and Listing 6 attaches it to an :ItemExpression; a single shared OWL domain covering both without over-constraining future uses is best left unstated, matching the paper's own usage across more than one entity subtype."@en .
+
+:person a :AttributionGranularityValue ; rdfs:label "person"@en .
+:team a :AttributionGranularityValue ; rdfs:label "team"@en .
+:organization a :AttributionGranularityValue ; rdfs:label "organization"@en .
+:undeterminable a :AttributionGranularityValue ; rdfs:label "undeterminable"@en ;
+    rdfs:comment "Authorship cannot be recovered, e.g. in-the-wild data (paper Section 4.6, Listing 6 worked example: SWE-Bench repository committers)."@en .
+:unspecified a :AttributionGranularityValue ; rdfs:label "unspecified"@en ;
+    rdfs:comment "Attribution that is knowable but simply undocumented -- deliberately distinct from :undeterminable (paper Section 4.6)."@en .
