@@ -293,6 +293,107 @@ func TestEdgeKindStringValues(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// DerivationKind
+// ---------------------------------------------------------------------------
+
+func allDerivationKinds() []ptypes.DerivationKind {
+	return []ptypes.DerivationKind{
+		ptypes.DerivationLabelCorrection,
+		ptypes.DerivationDeduplication,
+		ptypes.DerivationDifficultyFiltering,
+		ptypes.DerivationTranslation,
+		ptypes.DerivationContaminationScrubbing,
+		ptypes.DerivationAdversarialFiltering,
+		ptypes.DerivationVerificationSubset,
+	}
+}
+
+func TestDerivationKindRoundTrip(t *testing.T) {
+	for _, dk := range allDerivationKinds() {
+		b, err := dk.MarshalText()
+		if err != nil {
+			t.Fatalf("DerivationKind(%d).MarshalText(): %v", int(dk), err)
+		}
+		var got ptypes.DerivationKind
+		if err := got.UnmarshalText(b); err != nil {
+			t.Fatalf("DerivationKind.UnmarshalText(%q): %v", string(b), err)
+		}
+		if got != dk {
+			t.Errorf("DerivationKind round-trip: got %v, want %v", got, dk)
+		}
+	}
+}
+
+func TestDerivationKindStringValues(t *testing.T) {
+	// Wire tokens are the paper's controlled vocabulary, lower_snake_case EXACTLY.
+	cases := []struct {
+		dk   ptypes.DerivationKind
+		want string
+	}{
+		{ptypes.DerivationLabelCorrection, "label_correction"},
+		{ptypes.DerivationDeduplication, "deduplication"},
+		{ptypes.DerivationDifficultyFiltering, "difficulty_filtering"},
+		{ptypes.DerivationTranslation, "translation"},
+		{ptypes.DerivationContaminationScrubbing, "contamination_scrubbing"},
+		{ptypes.DerivationAdversarialFiltering, "adversarial_filtering"},
+		{ptypes.DerivationVerificationSubset, "verification_subset"},
+	}
+	for _, c := range cases {
+		if got := c.dk.String(); got != c.want {
+			t.Errorf("DerivationKind(%d).String() = %q, want %q", int(c.dk), got, c.want)
+		}
+	}
+	// Out-of-range renders the diagnostic form and is not valid.
+	if got := ptypes.DerivationKind(99).String(); got != "DerivationKind(99)" {
+		t.Errorf("DerivationKind(99).String() = %q, want %q", got, "DerivationKind(99)")
+	}
+}
+
+func TestDerivationKindValidity(t *testing.T) {
+	for _, dk := range allDerivationKinds() {
+		if !dk.IsValid() {
+			t.Errorf("DerivationKind(%d) should be valid", int(dk))
+		}
+	}
+	for _, bad := range []ptypes.DerivationKind{-1, 7, 99} {
+		if bad.IsValid() {
+			t.Errorf("DerivationKind(%d) should be invalid", int(bad))
+		}
+		if _, err := bad.MarshalText(); err == nil {
+			t.Errorf("DerivationKind(%d).MarshalText() expected error", int(bad))
+		}
+	}
+	var dk ptypes.DerivationKind
+	if err := dk.UnmarshalText([]byte("not_a_kind")); err == nil {
+		t.Error("DerivationKind.UnmarshalText(\"not_a_kind\") expected error, got nil")
+	}
+}
+
+// TestDerivationKindPermutation exercises every value through String → MarshalText
+// → UnmarshalText and asserts each token is distinct, mirroring the enum discipline.
+func TestDerivationKindPermutation(t *testing.T) {
+	seen := map[string]bool{}
+	for _, dk := range allDerivationKinds() {
+		token := dk.String()
+		if seen[token] {
+			t.Fatalf("duplicate DerivationKind wire token %q", token)
+		}
+		seen[token] = true
+		b, err := dk.MarshalText()
+		if err != nil || string(b) != token {
+			t.Fatalf("DerivationKind(%d): MarshalText=%q err=%v, want %q", int(dk), string(b), err, token)
+		}
+		var got ptypes.DerivationKind
+		if err := got.UnmarshalText([]byte(token)); err != nil || got != dk {
+			t.Fatalf("DerivationKind round-trip %q: got %v err=%v", token, got, err)
+		}
+	}
+	if len(seen) != 7 {
+		t.Fatalf("expected 7 distinct DerivationKind tokens, got %d", len(seen))
+	}
+}
+
+// ---------------------------------------------------------------------------
 // AgentKind
 // ---------------------------------------------------------------------------
 
