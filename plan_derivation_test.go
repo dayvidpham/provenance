@@ -230,6 +230,18 @@ func TestQualifyDerivationHappyPath(t *testing.T) {
 	if q.ActivityID == nil || *q.ActivityID != act.ID {
 		t.Errorf("qualifier activity = %v, want %v", q.ActivityID, act.ID)
 	}
+
+	// A successful qualification journals exactly one who-provenance event (the
+	// positive control that makes the non-existent-activity regression non-vacuous).
+	page, err := tt.Journal().QueryTaskEvents(provenance.JournalQueryV1{
+		EventKinds: []provenance.EventKind{provenance.EventKindDerivationQualified},
+	})
+	if err != nil {
+		t.Fatalf("QueryTaskEvents: %v", err)
+	}
+	if len(page.Events) != 1 {
+		t.Fatalf("expected exactly 1 %q journal event, got %d", provenance.EventKindDerivationQualified, len(page.Events))
+	}
 }
 
 func TestQualifyDerivationWithoutActivity(t *testing.T) {
@@ -338,6 +350,45 @@ func TestQualifyDerivationReQualifyReplaces(t *testing.T) {
 	}
 	if quals[0].Kind != provenance.DerivationLabelCorrection {
 		t.Errorf("re-qualify kind = %v, want %v", quals[0].Kind, provenance.DerivationLabelCorrection)
+	}
+}
+
+// TestQualifyDerivationNonExistentActivityLeavesNoJournalEvent proves the verb's
+// journal-honesty invariant: qualifying with a non-existent ActivityID must be
+// rejected BEFORE the who-provenance event is committed, so the journal never
+// records a qualification that did not materialize (the divergence itself, not just
+// the returned error).
+func TestQualifyDerivationNonExistentActivityLeavesNoJournalEvent(t *testing.T) {
+	tt, src, tgt := newDerivationFixture(t)
+	defer tt.Close()
+
+	// An ActivityID that was never registered via StartActivity.
+	ghost := provenance.ActivityID{Namespace: "provenance-test", UUID: src.ID.UUID}
+
+	err := tt.s.QualifyDerivation(src.ID, tgt.ID, provenance.DerivationDeduplication, &ghost)
+	if !errors.Is(err, provenance.ErrNotFound) {
+		t.Fatalf("QualifyDerivation with non-existent activity = %v, want ErrNotFound", err)
+	}
+
+	// No projection row.
+	quals, err := tt.DerivationQualifiers(src.ID)
+	if err != nil {
+		t.Fatalf("DerivationQualifiers: %v", err)
+	}
+	if len(quals) != 0 {
+		t.Fatalf("expected no qualifier written, got %d", len(quals))
+	}
+
+	// AND no who-provenance journal event — the invariant the reviewer flagged.
+	page, err := tt.Journal().QueryTaskEvents(provenance.JournalQueryV1{
+		EventKinds: []provenance.EventKind{provenance.EventKindDerivationQualified},
+	})
+	if err != nil {
+		t.Fatalf("QueryTaskEvents: %v", err)
+	}
+	if len(page.Events) != 0 {
+		t.Fatalf("journal recorded %d %q event(s) for a qualification that never materialized; want 0",
+			len(page.Events), provenance.EventKindDerivationQualified)
 	}
 }
 

@@ -629,6 +629,24 @@ func (s *Session) QualifyDerivation(source, target TaskID, kind DerivationKind, 
 				"edge from source to target first, then qualify it",
 			ErrNoDerivationEdge, source.String(), target.String())
 	}
+	// Authorization-time pre-check of the optional activity, mirroring the edge gate
+	// above: a non-existent ActivityID must be rejected BEFORE the who-provenance
+	// event is journaled, otherwise the event would commit (txn #1) and only the
+	// projection's activity-FK would fail (txn #2), leaving the journal recording a
+	// qualification that never materialized. Verifying here keeps the journal honest.
+	if activity != nil {
+		exists, err := s.tr.db.ActivityExists(*activity)
+		if err != nil {
+			return fmt.Errorf("provenance.Session.QualifyDerivation: %w", err)
+		}
+		if !exists {
+			return fmt.Errorf(
+				"%w: Session.QualifyDerivation — activity %q does not exist — "+
+					"verify the ActivityID was obtained from StartActivity, or pass nil to qualify "+
+					"without an activity",
+				ErrNotFound, activity.String())
+		}
+	}
 
 	payload, err := json.Marshal(derivationQualifiedPayload{
 		Target:   target.String(),
