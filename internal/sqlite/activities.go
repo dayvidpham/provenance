@@ -10,9 +10,10 @@ import (
 	"zombiezen.com/go/sqlite/sqlitex"
 )
 
-// StartActivity records the start of an activity for the given agent.
-// A UUIDv7 ActivityID is assigned automatically. Acquires the DB mutex.
-func (db *DB) StartActivity(agentID ptypes.AgentID, phase ptypes.Phase, stage ptypes.Stage, notes string) (ptypes.Activity, error) {
+// StartActivity records the start of an activity for the given agent, carried out
+// under planID (nil = unplanned). A UUIDv7 ActivityID is assigned automatically.
+// Acquires the DB mutex.
+func (db *DB) StartActivity(agentID ptypes.AgentID, phase ptypes.Phase, stage ptypes.Stage, notes string, planID *ptypes.PlanID) (ptypes.Activity, error) {
 	now := time.Now().UTC()
 	activity := ptypes.Activity{
 		ID:        ptypes.ActivityID{Namespace: agentID.Namespace, UUID: uuid.Must(uuid.NewV7())},
@@ -21,14 +22,15 @@ func (db *DB) StartActivity(agentID ptypes.AgentID, phase ptypes.Phase, stage pt
 		Stage:     stage,
 		StartedAt: now,
 		Notes:     notes,
+		PlanID:    planID,
 	}
 
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if err := sqlitex.Execute(db.conn, "INSERT INTO activities (id, agent_id, phase_id, stage_id, started_at, ended_at, notes)\n\t\t VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", &sqlitex.ExecOptions{Args: []any{
+	if err := sqlitex.Execute(db.conn, "INSERT INTO activities (id, agent_id, phase_id, stage_id, started_at, ended_at, notes, plan_id)\n\t\t VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", &sqlitex.ExecOptions{Args: []any{
 		activity.ID.String(), activity.AgentID.String(),
 		int(activity.Phase), int(activity.Stage),
-		activity.StartedAt.UnixNano(), nil, activity.Notes,
+		activity.StartedAt.UnixNano(), nil, activity.Notes, planIDArg(planID),
 	}}); err != nil {
 		return ptypes.Activity{}, fmt.Errorf(
 			"sqlite.StartActivity: failed to insert activity for agent %q: %w — "+
@@ -39,6 +41,14 @@ func (db *DB) StartActivity(agentID ptypes.AgentID, phase ptypes.Phase, stage pt
 	return activity, nil
 }
 
+// planIDArg renders a nullable PlanID for a SQLite bind arg (nil → NULL).
+func planIDArg(planID *ptypes.PlanID) any {
+	if planID == nil {
+		return nil
+	}
+	return planID.String()
+}
+
 // StartActivityWithID records the start of an activity using a CALLER-SUPPLIED
 // ActivityID, idempotently. Unlike StartActivity (which mints a random UUIDv7),
 // the caller owns the id; a second call with the same id is a no-op
@@ -47,15 +57,15 @@ func (db *DB) StartActivity(agentID ptypes.AgentID, phase ptypes.Phase, stage pt
 // re-executes after a crash, a deterministic id (such as a name-based UUIDv5
 // over the workflow's logical identity) collapses the duplicate to one row.
 // Acquires the DB mutex.
-func (db *DB) StartActivityWithID(id ptypes.ActivityID, agentID ptypes.AgentID, phase ptypes.Phase, stage ptypes.Stage, notes string) (ptypes.Activity, error) {
+func (db *DB) StartActivityWithID(id ptypes.ActivityID, agentID ptypes.AgentID, phase ptypes.Phase, stage ptypes.Stage, notes string, planID *ptypes.PlanID) (ptypes.Activity, error) {
 	now := time.Now().UTC()
 
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if err := sqlitex.Execute(db.conn, "INSERT INTO activities (id, agent_id, phase_id, stage_id, started_at, ended_at, notes)\n\t\t VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)\n\t\t ON CONFLICT(id) DO NOTHING", &sqlitex.ExecOptions{Args: []any{
+	if err := sqlitex.Execute(db.conn, "INSERT INTO activities (id, agent_id, phase_id, stage_id, started_at, ended_at, notes, plan_id)\n\t\t VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)\n\t\t ON CONFLICT(id) DO NOTHING", &sqlitex.ExecOptions{Args: []any{
 		id.String(), agentID.String(),
 		int(phase), int(stage),
-		now.UnixNano(), nil, notes,
+		now.UnixNano(), nil, notes, planIDArg(planID),
 	}}); err != nil {
 		return ptypes.Activity{}, fmt.Errorf(
 			"sqlite.StartActivityWithID: failed to insert activity %q for agent %q: %w — "+
@@ -68,7 +78,7 @@ func (db *DB) StartActivityWithID(id ptypes.ActivityID, agentID ptypes.AgentID, 
 	// on conflict (idempotent replay).
 	var act ptypes.Activity
 	var found bool
-	if err := sqlitex.Execute(db.conn, "SELECT id, agent_id, phase_id, stage_id, started_at, ended_at, notes\n\t\t FROM activities WHERE id = ?1", &sqlitex.ExecOptions{
+	if err := sqlitex.Execute(db.conn, "SELECT id, agent_id, phase_id, stage_id, started_at, ended_at, notes, plan_id\n\t\t FROM activities WHERE id = ?1", &sqlitex.ExecOptions{
 		Args: []any{id.String()},
 		ResultFunc: func(stmt *zs.Stmt) error {
 			var err error
@@ -102,7 +112,7 @@ func (db *DB) EndActivity(id ptypes.ActivityID) (ptypes.Activity, error) {
 
 	var act ptypes.Activity
 	var found bool
-	if err := sqlitex.Execute(db.conn, "SELECT id, agent_id, phase_id, stage_id, started_at, ended_at, notes\n\t\t FROM activities WHERE id = ?1", &sqlitex.ExecOptions{
+	if err := sqlitex.Execute(db.conn, "SELECT id, agent_id, phase_id, stage_id, started_at, ended_at, notes, plan_id\n\t\t FROM activities WHERE id = ?1", &sqlitex.ExecOptions{
 		Args: []any{id.String()},
 		ResultFunc: func(stmt *zs.Stmt) error {
 			var err error
@@ -138,7 +148,7 @@ func (db *DB) GetActivities(agentID *ptypes.AgentID) ([]ptypes.Activity, error) 
 	}
 
 	var activities []ptypes.Activity
-	err := sqlitex.Execute(db.conn, "SELECT id,agent_id,phase_id,stage_id,started_at,ended_at,notes FROM activities WHERE (NOT ?1 OR agent_id=?2) ORDER BY started_at ASC", &sqlitex.ExecOptions{
+	err := sqlitex.Execute(db.conn, "SELECT id,agent_id,phase_id,stage_id,started_at,ended_at,notes,plan_id FROM activities WHERE (NOT ?1 OR agent_id=?2) ORDER BY started_at ASC", &sqlitex.ExecOptions{
 		Args: []any{agentID != nil, agent},
 		ResultFunc: func(stmt *zs.Stmt) error {
 			act, err := ScanActivity(stmt)

@@ -563,6 +563,113 @@ func (s *Session) AddComment(id TaskID, authorID AgentID, body string) (Comment,
 }
 
 // ---------------------------------------------------------------------------
+// Derivation qualifier (roadmap §3.3)
+// ---------------------------------------------------------------------------
+
+// EventKindDerivationQualified is the caller-domain task_event kind journaled by
+// QualifyDerivation to record the who-provenance of a qualification (who, under
+// which authority, at which journal position). See QualifyDerivation's doc for the
+// journaling judgment call.
+const EventKindDerivationQualified EventKind = "provenance.derivation.qualified"
+
+// derivationQualifiedPayload is the JSON payload carried on the who-provenance
+// task_event a QualifyDerivation journals: the operands of the qualification, so
+// the fact is legible from the journal row alone.
+type derivationQualifiedPayload struct {
+	Target   string  `json:"target"`
+	Kind     string  `json:"kind"`
+	Activity *string `json:"activity,omitempty"`
+}
+
+// QualifyDerivation attaches a typed derivation kind (the paper's :derivationKind)
+// to the existing derivation relationship from source to target, optionally citing
+// the activity that performed it (prov:hadActivity). The (source, target) pair must
+// already carry a derived_from or supersedes edge; otherwise ErrNoDerivationEdge is
+// returned and nothing is written. Re-qualifying replaces the kind and activity.
+//
+// JOURNALING JUDGMENT CALL (roadmap §3.3 escape hatch). The ideal — a full
+// journaled mutation-family effect mirroring EffectEdgeAdd — was rejected as
+// disproportionate: it would require extending the VERSIONED canonical-mutation V1
+// codec (internal/journal/canonical_mutation.go: a new family descriptor, effect
+// fields, and encode/decode), the §15 replay shadow-table / convergence set
+// (internal/sqlite/replay.go), and the corpus enum-freshness tests — a large,
+// wire-format-risky change for one additive qualifier. Instead, this verb takes the
+// CLOSEST CONFORMING SHAPE: it journals the who-provenance of the qualification as a
+// caller-domain task_event (EventKindDerivationQualified) through the SAME Apply
+// path edges use — authorized against the source task exactly like AddEdge (§9.3),
+// so who qualified, under which authority, at which journal position is queryable —
+// and then projects the qualifier into the direct-write derivation_qualifiers table
+// (the same non-journaled projection category as activities/agents, which §15
+// convergence already excludes). The journal event gates the projection (it is
+// committed first), mirroring how an edge's journal row precedes its projection. A
+// follow-up may promote this to a full mutation family if the derivation table ever
+// needs from-empty journal re-derivation.
+func (s *Session) QualifyDerivation(source, target TaskID, kind DerivationKind, activity *ActivityID) error {
+	if err := s.checkGate("QualifyDerivation"); err != nil {
+		return err
+	}
+	if err := s.requireInitialized("QualifyDerivation"); err != nil {
+		return err
+	}
+	if !kind.IsValid() {
+		return fmt.Errorf(
+			"provenance.Session.QualifyDerivation: invalid DerivationKind(%d) — "+
+				"use one of the seven controlled-vocabulary values", int(kind))
+	}
+	// Authorization-time pre-check: a qualifier can attach only to an existing
+	// derivation edge. Verifying BEFORE journaling keeps the journal honest — no
+	// who-provenance event is committed for a qualification that cannot exist.
+	hasEdge, err := s.tr.db.HasDerivationEdge(source, target)
+	if err != nil {
+		return fmt.Errorf("provenance.Session.QualifyDerivation: %w", err)
+	}
+	if !hasEdge {
+		return fmt.Errorf(
+			"%w: Session.QualifyDerivation source=%q target=%q — add a derived_from or supersedes "+
+				"edge from source to target first, then qualify it",
+			ErrNoDerivationEdge, source.String(), target.String())
+	}
+
+	payload, err := json.Marshal(derivationQualifiedPayload{
+		Target:   target.String(),
+		Kind:     kind.String(),
+		Activity: activityIDString(activity),
+	})
+	if err != nil {
+		return fmt.Errorf("provenance.Session.QualifyDerivation: encode payload: %w", err)
+	}
+	// Journal the who-provenance first (authorization gate against the source task,
+	// §9.3), then project the qualifier.
+	activityCanonical := ""
+	if activity != nil {
+		activityCanonical = activity.String()
+	}
+	cfg := s.resolve(nil, "derivation-qualify", source.String(), target.String(),
+		fmt.Sprintf("k=%d", int(kind)), activityCanonical)
+	if _, err := s.applyOne(cfg, []Effect{{
+		Sort:      EffectTaskEvent,
+		TaskID:    source,
+		EventKind: EventKindDerivationQualified,
+		Payload:   payload,
+	}}); err != nil {
+		return fmt.Errorf("provenance.Session.QualifyDerivation: %w", err)
+	}
+	if err := s.tr.db.QualifyDerivation(source, target, kind, activity); err != nil {
+		return fmt.Errorf("provenance.Session.QualifyDerivation: %w", err)
+	}
+	return nil
+}
+
+// activityIDString renders an optional ActivityID for the JSON payload.
+func activityIDString(id *ActivityID) *string {
+	if id == nil {
+		return nil
+	}
+	s := id.String()
+	return &s
+}
+
+// ---------------------------------------------------------------------------
 // Atomic multi-effect composition (§9.3)
 // ---------------------------------------------------------------------------
 

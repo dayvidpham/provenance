@@ -313,6 +313,24 @@ func (db *DB) ensureSchema(models []ptypes.ModelEntry) error {
 		"CREATE TABLE IF NOT EXISTS comments (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), author_id TEXT NOT NULL REFERENCES agents(id), body TEXT NOT NULL, created_at INTEGER NOT NULL) STRICT",
 		"CREATE INDEX IF NOT EXISTS idx_comments_task ON comments (task_id)",
 		"CREATE INDEX IF NOT EXISTS idx_comments_author ON comments (author_id)",
+		// Plan layer (roadmap §3.1): plans reify the Phase enum. plan_steps orders one
+		// Phase per step. Both are direct-write projection tables (like activities),
+		// outside the §15 journal-convergence set.
+		"CREATE TABLE IF NOT EXISTS plans (id TEXT PRIMARY KEY, title TEXT NOT NULL, version TEXT NOT NULL DEFAULT '') STRICT",
+		"CREATE TABLE IF NOT EXISTS plan_steps (plan_id TEXT NOT NULL REFERENCES plans(id), ordinal INTEGER NOT NULL, phase_id INTEGER NOT NULL REFERENCES phases(id), title TEXT NOT NULL DEFAULT '', PRIMARY KEY (plan_id, ordinal)) STRICT, WITHOUT ROWID",
+		"CREATE INDEX IF NOT EXISTS idx_plan_steps_plan ON plan_steps (plan_id)",
+		// Derivation qualifier (roadmap §3.3): derivation_kinds is the seeded lookup of
+		// the paper's seven controlled-vocabulary values. derivation_qualifiers attaches
+		// exactly one typed reason to a derivation relationship — the composite FK onto
+		// edges plus the CHECK make a qualifier on a non-derivation edge structurally
+		// impossible (a qualifier can reference only a derived_from(1) or supersedes(2)
+		// edge that exists). ON DELETE CASCADE removes the qualifier when its edge is
+		// removed. Keyed by (source, target): one qualifier per derivation relationship,
+		// however it is expressed — so the SHACL DerivationShape's single-valued
+		// :derivationKind is satisfied.
+		"CREATE TABLE IF NOT EXISTS derivation_kinds (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT",
+		"CREATE TABLE IF NOT EXISTS derivation_qualifiers (source_id TEXT NOT NULL, target_id TEXT NOT NULL, edge_kind_id INTEGER NOT NULL, derivation_kind_id INTEGER NOT NULL REFERENCES derivation_kinds(id), activity_id TEXT REFERENCES activities(id), created_at INTEGER NOT NULL, PRIMARY KEY (source_id, target_id), FOREIGN KEY (source_id, target_id, edge_kind_id) REFERENCES edges(source_id, target_id, kind_id) ON DELETE CASCADE, CHECK (edge_kind_id IN (1, 2))) STRICT, WITHOUT ROWID",
+		"CREATE INDEX IF NOT EXISTS idx_derivation_qualifiers_target ON derivation_qualifiers (target_id)",
 	}
 
 	for _, stmt := range ddl {
@@ -320,7 +338,16 @@ func (db *DB) ensureSchema(models []ptypes.ModelEntry) error {
 			return fmt.Errorf("ensureSchema: statement %q: %w", stmt, err)
 		}
 	}
+	// Idempotent additive migration (roadmap §3.1): a pre-plan-layer database gets the
+	// nullable activities.plan_id FK column added (a no-op once present). Mirrors the
+	// established ensureTasksWatermarkColumnLocked column-add approach.
+	if err := db.ensureActivitiesPlanColumnLocked(); err != nil {
+		return err
+	}
 	if err := db.seedReferenceData(models); err != nil {
+		return err
+	}
+	if err := db.seedBuiltinPlanLocked(); err != nil {
 		return err
 	}
 	if err := db.ensureJournalSchema(); err != nil {
@@ -347,6 +374,7 @@ func (db *DB) seedReferenceData(models []ptypes.ModelEntry) error {
 		{seedRoles, []string{"human", "architect", "supervisor", "worker", "reviewer"}},
 		{seedPhases, []string{"request", "elicit", "propose", "review", "plan_uat", "ratify", "handoff", "impl_plan", "worker_slices", "code_review", "impl_uat", "landing", "unscoped"}},
 		{seedStages, []string{"not_started", "in_progress", "blocked", "complete"}},
+		{seedDerivationKinds, []string{"label_correction", "deduplication", "difficulty_filtering", "translation", "contamination_scrubbing", "adversarial_filtering", "verification_subset"}},
 	}
 	for _, seed := range seeds {
 		for id, name := range seed.names {
@@ -375,6 +403,7 @@ const (
 	seedRoles
 	seedPhases
 	seedStages
+	seedDerivationKinds
 )
 
 func (kind referenceSeedKind) query() string {
@@ -397,6 +426,8 @@ func (kind referenceSeedKind) query() string {
 		return "INSERT OR IGNORE INTO phases (id,name) VALUES (?1,?2)"
 	case seedStages:
 		return "INSERT OR IGNORE INTO stages (id,name) VALUES (?1,?2)"
+	case seedDerivationKinds:
+		return "INSERT OR IGNORE INTO derivation_kinds (id,name) VALUES (?1,?2)"
 	default:
 		panic("unknown reference seed kind")
 	}
@@ -487,9 +518,9 @@ func ScanTask(stmt *zs.Stmt) (ptypes.Task, error) {
 // ScanActivity converts a SQL result row into a ptypes.Activity.
 // The stmt must select:
 //
-//	id, agent_id, phase_id, stage_id, started_at, ended_at, notes
+//	id, agent_id, phase_id, stage_id, started_at, ended_at, notes, plan_id
 //
-// (7 columns, indexed 0–6).
+// (8 columns, indexed 0–7). plan_id is nullable (NULL = legacy/unplanned).
 func ScanActivity(stmt *zs.Stmt) (ptypes.Activity, error) {
 	idStr := stmt.ColumnText(0)
 	id, err := ptypes.ParseActivityID(idStr)
@@ -510,6 +541,15 @@ func ScanActivity(stmt *zs.Stmt) (ptypes.Activity, error) {
 		endedAt = &et
 	}
 
+	var planID *ptypes.PlanID
+	if !stmt.ColumnIsNull(7) {
+		pid, perr := ptypes.ParsePlanID(stmt.ColumnText(7))
+		if perr != nil {
+			return ptypes.Activity{}, fmt.Errorf("scanActivity: invalid plan_id %q: %w", stmt.ColumnText(7), perr)
+		}
+		planID = &pid
+	}
+
 	return ptypes.Activity{
 		ID:        id,
 		AgentID:   agentID,
@@ -518,6 +558,7 @@ func ScanActivity(stmt *zs.Stmt) (ptypes.Activity, error) {
 		StartedAt: startedAt,
 		EndedAt:   endedAt,
 		Notes:     stmt.ColumnText(6),
+		PlanID:    planID,
 	}, nil
 }
 

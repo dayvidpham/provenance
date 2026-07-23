@@ -19,15 +19,16 @@ import (
 
 // Enum types
 type (
-	Status    = ptypes.Status
-	Priority  = ptypes.Priority
-	TaskType  = ptypes.TaskType
-	EdgeKind  = ptypes.EdgeKind
-	AgentKind = ptypes.AgentKind
-	Provider  = ptypes.Provider
-	Role      = ptypes.Role
-	Phase     = ptypes.Phase
-	Stage     = ptypes.Stage
+	Status         = ptypes.Status
+	Priority       = ptypes.Priority
+	TaskType       = ptypes.TaskType
+	EdgeKind       = ptypes.EdgeKind
+	AgentKind      = ptypes.AgentKind
+	Provider       = ptypes.Provider
+	Role           = ptypes.Role
+	Phase          = ptypes.Phase
+	Stage          = ptypes.Stage
+	DerivationKind = ptypes.DerivationKind
 )
 
 // ID types
@@ -38,20 +39,24 @@ type (
 	AgentID    = ptypes.AgentID
 	ActivityID = ptypes.ActivityID
 	CommentID  = ptypes.CommentID
+	PlanID     = ptypes.PlanID
 )
 
 // Entity types
 type (
-	Task          = ptypes.Task
-	Agent         = ptypes.Agent
-	HumanAgent    = ptypes.HumanAgent
-	MLAgent       = ptypes.MLAgent
-	SoftwareAgent = ptypes.SoftwareAgent
-	MLModel       = ptypes.MLModel
-	Activity      = ptypes.Activity
-	Edge          = ptypes.Edge
-	Label         = ptypes.Label
-	Comment       = ptypes.Comment
+	Task                = ptypes.Task
+	Agent               = ptypes.Agent
+	HumanAgent          = ptypes.HumanAgent
+	MLAgent             = ptypes.MLAgent
+	SoftwareAgent       = ptypes.SoftwareAgent
+	MLModel             = ptypes.MLModel
+	Activity            = ptypes.Activity
+	Edge                = ptypes.Edge
+	Label               = ptypes.Label
+	Comment             = ptypes.Comment
+	Plan                = ptypes.Plan
+	PlanStep            = ptypes.PlanStep
+	DerivationQualifier = ptypes.DerivationQualifier
 )
 
 // Model registry types
@@ -155,6 +160,30 @@ const (
 	StageComplete   = ptypes.StageComplete
 )
 
+// DerivationKind constants (roadmap §3.3)
+const (
+	DerivationLabelCorrection        = ptypes.DerivationLabelCorrection
+	DerivationDeduplication          = ptypes.DerivationDeduplication
+	DerivationDifficultyFiltering    = ptypes.DerivationDifficultyFiltering
+	DerivationTranslation            = ptypes.DerivationTranslation
+	DerivationContaminationScrubbing = ptypes.DerivationContaminationScrubbing
+	DerivationAdversarialFiltering   = ptypes.DerivationAdversarialFiltering
+	DerivationVerificationSubset     = ptypes.DerivationVerificationSubset
+)
+
+// Built-in plan identity (roadmap §3.1)
+const (
+	BuiltinPlanNamespace = ptypes.BuiltinPlanNamespace
+	BuiltinPlanTitle     = ptypes.BuiltinPlanTitle
+	BuiltinPlanVersion   = ptypes.BuiltinPlanVersion
+)
+
+// BuiltinPlanID returns the deterministic PlanID of the seeded built-in plan.
+// See ptypes.BuiltinPlanID.
+func BuiltinPlanID() PlanID {
+	return ptypes.BuiltinPlanID()
+}
+
 // ---------------------------------------------------------------------------
 // Sentinel error re-exports
 // ---------------------------------------------------------------------------
@@ -166,6 +195,7 @@ var (
 	ErrInvalidID          = ptypes.ErrInvalidID
 	ErrAgentKindMismatch  = ptypes.ErrAgentKindMismatch
 	ErrAgentAlreadyExists = ptypes.ErrAgentAlreadyExists
+	ErrNoDerivationEdge   = ptypes.ErrNoDerivationEdge
 )
 
 // ---------------------------------------------------------------------------
@@ -200,6 +230,12 @@ func ParseActivityID(s string) (ActivityID, error) {
 // See ptypes.ParseCommentID for full documentation.
 func ParseCommentID(s string) (CommentID, error) {
 	return ptypes.ParseCommentID(s)
+}
+
+// ParsePlanID parses "namespace--uuid" into a PlanID.
+// See ptypes.ParsePlanID for full documentation.
+func ParsePlanID(s string) (PlanID, error) {
+	return ptypes.ParsePlanID(s)
 }
 
 // ---------------------------------------------------------------------------

@@ -316,18 +316,18 @@ func (b *borrowedTracker) SoftwareAgent(id AgentID) (SoftwareAgent, error) {
 	return b.inner.SoftwareAgent(id)
 }
 
-func (b *borrowedTracker) StartActivity(agentID AgentID, phase Phase, stage Stage, notes string) (Activity, error) {
+func (b *borrowedTracker) StartActivity(agentID AgentID, phase Phase, stage Stage, notes string, opts ...StartActivityOption) (Activity, error) {
 	if err := b.available("StartActivity"); err != nil {
 		return Activity{}, err
 	}
-	return b.inner.StartActivity(agentID, phase, stage, notes)
+	return b.inner.StartActivity(agentID, phase, stage, notes, opts...)
 }
 
-func (b *borrowedTracker) StartActivityWithID(id ActivityID, agentID AgentID, phase Phase, stage Stage, notes string) (Activity, error) {
+func (b *borrowedTracker) StartActivityWithID(id ActivityID, agentID AgentID, phase Phase, stage Stage, notes string, opts ...StartActivityOption) (Activity, error) {
 	if err := b.available("StartActivityWithID"); err != nil {
 		return Activity{}, err
 	}
-	return b.inner.StartActivityWithID(id, agentID, phase, stage, notes)
+	return b.inner.StartActivityWithID(id, agentID, phase, stage, notes, opts...)
 }
 
 func (b *borrowedTracker) EndActivity(id ActivityID) (Activity, error) {
@@ -342,6 +342,27 @@ func (b *borrowedTracker) Activities(agentID *AgentID) ([]Activity, error) {
 		return nil, err
 	}
 	return b.inner.Activities(agentID)
+}
+
+func (b *borrowedTracker) Plans() ([]Plan, error) {
+	if err := b.available("Plans"); err != nil {
+		return nil, err
+	}
+	return b.inner.Plans()
+}
+
+func (b *borrowedTracker) PlanSteps(id PlanID) ([]PlanStep, error) {
+	if err := b.available("PlanSteps"); err != nil {
+		return nil, err
+	}
+	return b.inner.PlanSteps(id)
+}
+
+func (b *borrowedTracker) DerivationQualifiers(id TaskID) ([]DerivationQualifier, error) {
+	if err := b.available("DerivationQualifiers"); err != nil {
+		return nil, err
+	}
+	return b.inner.DerivationQualifiers(id)
 }
 
 // ---------------------------------------------------------------------------

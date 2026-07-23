@@ -277,10 +277,12 @@ func snapshotSQLTables(t *testing.T, db *sql.DB, tables ...string) map[string][]
 var auditedDurableTables = []string{
 	"activities", "actor_namespace_claims", "agent_kinds", "agents", "agents_human", "agents_ml", "agents_software",
 	"application_versions", "assignment_slots", "assignment_transitions", "authority_kinds", "comments", "dbos_migrations",
+	"derivation_kinds", "derivation_qualifiers",
 	"edge_kinds", "edges", "event_dispatch_kv", "fixed_actor_manifest_entries", "journal", "journal_authorities",
 	"journal_authority_assignment_episodes", "journal_authority_assignment_transitions", "journal_authority_bootstraps",
 	"journal_decisions", "journal_evidence", "journal_kinds", "journal_operation_result_slots", "journal_operations",
 	"journal_task_event_contexts", "journal_task_events", "labels", "ml_models", "notifications", "operation_outputs", "phases",
+	"plan_steps", "plans",
 	"priorities", "providers", "queues", "roles", "sqlite_sequence", "stages", "statuses", "streams", "task_attributions",
 	"task_types", "tasks", "workflow_events", "workflow_events_history", "workflow_schedules", "workflow_status",
 }
