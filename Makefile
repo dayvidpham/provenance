@@ -8,7 +8,7 @@ fmt:
 
 lint:
 	go vet ./...
-	ast-grep scan --config sgconfig.yml .
+	ast-grep scan --config sgconfig.yml --globs '!vendor/**' --globs '!worktree/**' .
 
 test:
 	go test -count=1 -shuffle=on -fullpath -timeout=10m ./...

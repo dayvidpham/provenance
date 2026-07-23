@@ -6,6 +6,17 @@ Provenance tracks work products, their dependencies, and their provenance across
 
 Backed by SQLite (pure Go, no cgo). Uses [bestiary](https://github.com/dayvidpham/bestiary) as its ML model catalog (110+ models from [models.dev](https://models.dev)).
 
+## Capabilities
+
+- A globally ordered journal for typed task operations, authority assignments,
+  decisions, evidence, and event attribution.
+- An actor-and-authority-bound `Session` API, including atomic multi-effect
+  commits, deterministic replay, and legacy-store migration.
+- PROV-O entities, agents, activities, and relationships with fixed-ID software
+  agent registration for reproducible tool identities.
+- An optional DBOS durable-execution adapter that retries the same canonical
+  journal operation without creating a second commit ledger.
+
 ## Install
 
 ```bash
@@ -18,17 +29,37 @@ go get github.com/dayvidpham/provenance
 tr, _ := provenance.OpenMemory()
 defer tr.Close()
 
-// Create a task
-task, _ := tr.Create("my-project", "Implement feature X", "",
-    provenance.TaskTypeFeature, provenance.PriorityHigh, provenance.PhaseRequest)
+// Register the software actor that will commit task mutations.
+system, _ := tr.RegisterSoftwareAgent(
+    "my-project", "task-system", "1", "example")
+
+// Establish the initial authority and bind a journaled mutation session.
+genesis, _ := tr.Journal().Apply(provenance.OperationInput{
+    OperationID:    "example-genesis",
+    ActorID:        system.ID,
+    CommandDigest:  []byte("example-genesis-command"),
+    MutationDigest: []byte("example-genesis-mutation"),
+    Effects: []provenance.Effect{{
+        Sort:           provenance.EffectBootstrapAuthority,
+        BootstrapLabel: "task-system",
+        ResultSlot:     "authority",
+    }},
+})
+authority := genesis.ResultSlots[0].ProducedJournalID
+session := tr.As(system.ID, authority)
+
+// Create a task through the ordered journal.
+task, _ := session.Create("my-project", "Implement feature X", "",
+    provenance.TaskTypeFeature, provenance.PriorityHigh,
+    provenance.PhaseRequest)
 
 // Register an ML agent from the bestiary catalog
 agent, _ := tr.RegisterMLAgent("my-project",
     provenance.RoleArchitect, provenance.ProviderAnthropic,
     provenance.ModelID("claude-opus-4-6"))
 
-// Track provenance: task attributed to agent
-tr.AddEdge(task.ID, agent.ID.String(), provenance.EdgeAttributedTo)
+// Track provenance through the same authorized session.
+session.AddEdge(task.ID, agent.ID.String(), provenance.EdgeAttributedTo)
 ```
 
 ## Demo
@@ -49,7 +80,7 @@ Exercises the full stack: bestiary catalog exploration, multi-provider agent reg
 
 ## Development
 
-Requires Go 1.24+. [Nix](https://nixos.org/) optional for reproducible toolchain:
+Requires Go 1.25+. [Nix](https://nixos.org/) optional for reproducible toolchain:
 
 ```bash
 nix develop             # enters devshell with Go, gopls, ast-grep, delve

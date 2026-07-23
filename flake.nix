@@ -31,7 +31,7 @@
 
       # Package metadata
       pname = "provenance";
-      version = "0.1.0";
+      version = "0.0.3";
 
       # Go package attribute — null uses default from nixpkgs
       goAttr = null;
@@ -39,7 +39,7 @@
       # Vendor hash for buildGoModule. No vendor/ dir, so Nix
       # downloads deps and verifies against this hash.
       # Run `nix build` once with lib.fakeHash to get the real hash.
-      vendorHash = null; # TODO: replace with real hash from first `nix build`
+      vendorHash = "sha256-aZ7zfq0M1U4xRRWqakTwa5aKacKhlmkoIXc39DGf5jY=";
 
       # CLI tools available in the dev shell
       devTools = pkgs: with pkgs; [
@@ -56,7 +56,7 @@
       # Quality gates matching Makefile
       extraCheckPhase = ''
         go vet ./...
-        ast-grep scan --config sgconfig.yml .
+        ast-grep scan --config sgconfig.yml --globs '!vendor/**' --globs '!worktree/**' .
       '';
 
       # Library — no binary to install
