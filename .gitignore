@@ -20,8 +20,9 @@ coverage.*
 *.coverprofile
 profile.cov
 
-# Dependency directories (remove the comment below to include it)
-# vendor/
+# Generated dependency and linked-worktree directories
+vendor/
+/worktree/
 
 # Go workspace file
 go.work

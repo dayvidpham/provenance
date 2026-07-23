@@ -26,7 +26,7 @@ Before changing test fixtures, scheduling, or CI flags, read the measured
   **CGO-disabled mode is build-only:** a CGO0 test run is redundant and is not a
   supported gate. Never run any `go test` command with `CGO_ENABLED=0`, with or
   without `-race`.
-- Run `go vet ./...` and `ast-grep scan --config sgconfig.yml .`; the latter
+- Run `go vet ./...` and `ast-grep scan --config sgconfig.yml --globs '!vendor/**' --globs '!worktree/**' .`; the latter
   rejects production `time.Sleep`, keeping local contention waits in SQLite's
   `busy_timeout=5000` and durable retries in DBOS.
 - Run `nix flake check --no-build` for the Nix evaluation gate.

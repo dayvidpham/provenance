@@ -53,6 +53,7 @@ var excludedRepositoryTrees = map[string]struct{}{
 	"docs":             {},
 	"internal/archive": {},
 	"vendor":           {},
+	"worktree":         {},
 }
 
 func TestRepositoryTreeUsesEnduringVocabulary(t *testing.T) {
