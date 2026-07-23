@@ -7,58 +7,61 @@
 #   role is a property of the acting ML agent, not of the specific act; only
 #   ML-agent activities are typed p-plan:Activity (they can furnish the required
 #   agent+role association per the paper's AnnotationActShape).
-# NOTE (:derivationKind): NOT emitted here (roadmap §3.3 / M4). Qualified
-#   derivation nodes carry the fact of derivation and its time, but no typed reason.
+# NOTE (:derivationKind): a qualified derivation carries its typed reason
+#   (:derivationKind, roadmap §3.3 / M4) and, when recorded, prov:hadActivity;
+#   an unqualified derivation carries only the fact of derivation and its time.
 # NOTE (namespace): the ':' vocabulary namespace <https://example.org/data-labour-prov#> is a PLACEHOLDER pending w3id registration.
 
 @prefix :      <https://example.org/data-labour-prov#> .
 @prefix prov:  <http://www.w3.org/ns/prov#> .
 @prefix pplan: <http://purl.org/net/p-plan#> .
 @prefix rdfs:  <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix dct:   <http://purl.org/dc/terms/> .
 @prefix xsd:   <http://www.w3.org/2001/XMLSchema#> .
 
-# Built-in plan 'pasture-12-phase': the 12 protocol phases plus the 'unscoped'
-# catch-all, reified as one p-plan:Step per Phase enum value (13 steps total).
-<urn:provenance:plan/pasture-12-phase> a pplan:Plan ;
-    rdfs:label "pasture-12-phase" .
-<urn:provenance:plan/pasture-12-phase/step/request> a pplan:Step ;
-    pplan:isStepOfPlan <urn:provenance:plan/pasture-12-phase> ;
+# Plans (p-plan:Plan) and their steps (p-plan:Step), read from the tracker.
+# The built-in 'pasture-12-phase' plan reifies the Phase enum (one step per phase).
+<urn:provenance:provo--plan-pasture-12-phase> a pplan:Plan ;
+    dct:title "pasture-12-phase" ;
+    dct:hasVersion "1.0.0" .
+<urn:provenance:provo--plan-pasture-12-phase/step/request> a pplan:Step ;
+    pplan:isStepOfPlan <urn:provenance:provo--plan-pasture-12-phase> ;
     rdfs:label "request" .
-<urn:provenance:plan/pasture-12-phase/step/elicit> a pplan:Step ;
-    pplan:isStepOfPlan <urn:provenance:plan/pasture-12-phase> ;
+<urn:provenance:provo--plan-pasture-12-phase/step/elicit> a pplan:Step ;
+    pplan:isStepOfPlan <urn:provenance:provo--plan-pasture-12-phase> ;
     rdfs:label "elicit" .
-<urn:provenance:plan/pasture-12-phase/step/propose> a pplan:Step ;
-    pplan:isStepOfPlan <urn:provenance:plan/pasture-12-phase> ;
+<urn:provenance:provo--plan-pasture-12-phase/step/propose> a pplan:Step ;
+    pplan:isStepOfPlan <urn:provenance:provo--plan-pasture-12-phase> ;
     rdfs:label "propose" .
-<urn:provenance:plan/pasture-12-phase/step/review> a pplan:Step ;
-    pplan:isStepOfPlan <urn:provenance:plan/pasture-12-phase> ;
+<urn:provenance:provo--plan-pasture-12-phase/step/review> a pplan:Step ;
+    pplan:isStepOfPlan <urn:provenance:provo--plan-pasture-12-phase> ;
     rdfs:label "review" .
-<urn:provenance:plan/pasture-12-phase/step/plan_uat> a pplan:Step ;
-    pplan:isStepOfPlan <urn:provenance:plan/pasture-12-phase> ;
+<urn:provenance:provo--plan-pasture-12-phase/step/plan_uat> a pplan:Step ;
+    pplan:isStepOfPlan <urn:provenance:provo--plan-pasture-12-phase> ;
     rdfs:label "plan_uat" .
-<urn:provenance:plan/pasture-12-phase/step/ratify> a pplan:Step ;
-    pplan:isStepOfPlan <urn:provenance:plan/pasture-12-phase> ;
+<urn:provenance:provo--plan-pasture-12-phase/step/ratify> a pplan:Step ;
+    pplan:isStepOfPlan <urn:provenance:provo--plan-pasture-12-phase> ;
     rdfs:label "ratify" .
-<urn:provenance:plan/pasture-12-phase/step/handoff> a pplan:Step ;
-    pplan:isStepOfPlan <urn:provenance:plan/pasture-12-phase> ;
+<urn:provenance:provo--plan-pasture-12-phase/step/handoff> a pplan:Step ;
+    pplan:isStepOfPlan <urn:provenance:provo--plan-pasture-12-phase> ;
     rdfs:label "handoff" .
-<urn:provenance:plan/pasture-12-phase/step/impl_plan> a pplan:Step ;
-    pplan:isStepOfPlan <urn:provenance:plan/pasture-12-phase> ;
+<urn:provenance:provo--plan-pasture-12-phase/step/impl_plan> a pplan:Step ;
+    pplan:isStepOfPlan <urn:provenance:provo--plan-pasture-12-phase> ;
     rdfs:label "impl_plan" .
-<urn:provenance:plan/pasture-12-phase/step/worker_slices> a pplan:Step ;
-    pplan:isStepOfPlan <urn:provenance:plan/pasture-12-phase> ;
+<urn:provenance:provo--plan-pasture-12-phase/step/worker_slices> a pplan:Step ;
+    pplan:isStepOfPlan <urn:provenance:provo--plan-pasture-12-phase> ;
     rdfs:label "worker_slices" .
-<urn:provenance:plan/pasture-12-phase/step/code_review> a pplan:Step ;
-    pplan:isStepOfPlan <urn:provenance:plan/pasture-12-phase> ;
+<urn:provenance:provo--plan-pasture-12-phase/step/code_review> a pplan:Step ;
+    pplan:isStepOfPlan <urn:provenance:provo--plan-pasture-12-phase> ;
     rdfs:label "code_review" .
-<urn:provenance:plan/pasture-12-phase/step/impl_uat> a pplan:Step ;
-    pplan:isStepOfPlan <urn:provenance:plan/pasture-12-phase> ;
+<urn:provenance:provo--plan-pasture-12-phase/step/impl_uat> a pplan:Step ;
+    pplan:isStepOfPlan <urn:provenance:provo--plan-pasture-12-phase> ;
     rdfs:label "impl_uat" .
-<urn:provenance:plan/pasture-12-phase/step/landing> a pplan:Step ;
-    pplan:isStepOfPlan <urn:provenance:plan/pasture-12-phase> ;
+<urn:provenance:provo--plan-pasture-12-phase/step/landing> a pplan:Step ;
+    pplan:isStepOfPlan <urn:provenance:provo--plan-pasture-12-phase> ;
     rdfs:label "landing" .
-<urn:provenance:plan/pasture-12-phase/step/unscoped> a pplan:Step ;
-    pplan:isStepOfPlan <urn:provenance:plan/pasture-12-phase> ;
+<urn:provenance:provo--plan-pasture-12-phase/step/unscoped> a pplan:Step ;
+    pplan:isStepOfPlan <urn:provenance:provo--plan-pasture-12-phase> ;
     rdfs:label "unscoped" .
 
 # Agents (prov:Person / prov:SoftwareAgent / :LLMAgent).
@@ -76,7 +79,7 @@
 <urn:provenance:provo--act-ml> a prov:Activity, pplan:Activity ;
     prov:startedAtTime "TIMESTAMP"^^xsd:dateTime ;
     prov:endedAtTime "TIMESTAMP"^^xsd:dateTime ;
-    pplan:correspondsToStep <urn:provenance:plan/pasture-12-phase/step/propose> ;
+    pplan:correspondsToStep <urn:provenance:provo--plan-pasture-12-phase/step/propose> ;
     prov:wasAssociatedWith <urn:provenance:provo--agent-ml> ;
     prov:qualifiedAssociation [
         a prov:Association ;
@@ -86,7 +89,7 @@
     rdfs:comment "drafting the proposal" .
 <urn:provenance:provo--act-human> a prov:Activity ;
     prov:startedAtTime "TIMESTAMP"^^xsd:dateTime ;
-    pplan:correspondsToStep <urn:provenance:plan/pasture-12-phase/step/review> ;
+    pplan:correspondsToStep <urn:provenance:provo--plan-pasture-12-phase/step/review> ;
     prov:wasAssociatedWith <urn:provenance:provo--agent-human> ;
     rdfs:comment "review pass" .
 
@@ -103,7 +106,9 @@
     prov:qualifiedDerivation [
         a prov:Derivation ;
         prov:entity <urn:provenance:provo--task-request> ;
-        prov:atTime "TIMESTAMP"^^xsd:dateTime
+        prov:atTime "TIMESTAMP"^^xsd:dateTime ;
+        :derivationKind :Deduplication ;
+        prov:hadActivity <urn:provenance:provo--act-ml>
     ] .
 <urn:provenance:provo--task-proposal-2> a prov:Entity ;
     rdfs:label "PROPOSAL-2" ;

@@ -111,6 +111,13 @@ func buildFixture(t *testing.T) *fixture {
 	mustEdge(t, sess, req.ID, ml.ID.String(), provenance.EdgeAttributedTo)
 	mustEdge(t, sess, prop.ID, req.ID.String(), provenance.EdgeBlockedBy)
 
+	// Qualify the derived_from derivation (prop derived from req) with a typed kind
+	// and the ML activity that performed it: exercises :derivationKind +
+	// prov:hadActivity on the qualified-derivation node (roadmap §3.3).
+	if err := sess.QualifyDerivation(prop.ID, req.ID, provenance.DerivationDeduplication, &actML.ID); err != nil {
+		t.Fatalf("QualifyDerivation: %v", err)
+	}
+
 	// Stable alias map: every random UUIDv7 id.String() → a readable token, so the
 	// golden file is reproducible and human-reviewable.
 	pairs := []string{
@@ -124,6 +131,7 @@ func buildFixture(t *testing.T) *fixture {
 		bug.ID.String(), fixtureNS + "--task-bug",
 		actML.ID.String(), fixtureNS + "--act-ml",
 		actHuman.ID.String(), fixtureNS + "--act-human",
+		provenance.BuiltinPlanID().String(), fixtureNS + "--plan-pasture-12-phase",
 	}
 	return &fixture{tr: tr, replacer: strings.NewReplacer(pairs...)}
 }
@@ -349,6 +357,52 @@ func TestExportTurtle_Conformance(t *testing.T) {
 	}
 }
 
+// TestDerivationKindAttachment_NegativeFixture proves the vendored SHACL shapes
+// REJECT a malformed :derivationKind attachment — a kind attached to a node that is
+// NOT typed prov:Derivation (i.e. attached directly to an entity rather than inside a
+// prov:qualifiedDerivation reification). This is the adversarial counterpart to the
+// conforming graph the exporter emits: the DerivationKindAttachmentShape must fire.
+// Skips cleanly when the Apache Jena binaries are not on PATH.
+func TestDerivationKindAttachment_NegativeFixture(t *testing.T) {
+	riot, riotErr := exec.LookPath("riot")
+	shacl, shaclErr := exec.LookPath("shacl")
+	if riotErr != nil || shaclErr != nil {
+		t.Skip("riot and/or shacl not on PATH (Apache Jena); run inside `nix develop` to enable SHACL conformance")
+	}
+
+	dir := t.TempDir()
+	// A :derivationKind attached to a plain prov:Entity, NOT a prov:Derivation node:
+	// exactly what DerivationKindAttachmentShape (sh:targetSubjectsOf :derivationKind,
+	// sh:class prov:Derivation) forbids.
+	malformed := "@prefix :     <" + provo.DefaultVocabIRI + "> .\n" +
+		"@prefix prov: <http://www.w3.org/ns/prov#> .\n\n" +
+		"<urn:test:bad-attachment> a prov:Entity ;\n" +
+		"    :derivationKind :Deduplication .\n"
+	graphPath := filepath.Join(dir, "malformed.ttl")
+	if err := os.WriteFile(graphPath, []byte(malformed), 0o644); err != nil {
+		t.Fatalf("write malformed.ttl: %v", err)
+	}
+
+	// Sanity: the fixture is syntactically valid Turtle (the rejection must be a SHACL
+	// violation, not a parse error).
+	if out, err := exec.Command(riot, "--validate", graphPath).CombinedOutput(); err != nil {
+		t.Fatalf("riot --validate on the negative fixture failed (it must be valid Turtle): %v\n%s", err, out)
+	}
+
+	shapesPath := combineShapes(t, dir)
+	out, err := exec.Command(shacl, "validate", "--shapes", shapesPath, "--data", graphPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("shacl validate failed to run: %v\n%s", err, out)
+	}
+	report := string(out)
+	if !regexp.MustCompile(`sh:conforms\s+false`).MatchString(report) {
+		t.Fatalf("expected SHACL to REJECT the malformed :derivationKind attachment, but it conformed:\n%s", report)
+	}
+	if !strings.Contains(report, "DerivationKindAttachmentShape") && !strings.Contains(report, "prov:Derivation") {
+		t.Fatalf("SHACL rejected the fixture but not via the derivationKind attachment shape:\n%s", report)
+	}
+}
+
 // combineShapes writes vocab + shapes into one file under dir and returns its path.
 func combineShapes(t *testing.T, dir string) string {
 	t.Helper()
@@ -377,7 +431,7 @@ func TestFixtureAliasesUnique(t *testing.T) {
 	for _, tok := range []string{
 		"agent-system", "agent-human", "agent-software", "agent-ml",
 		"task-request", "task-proposal-1", "task-proposal-2", "task-bug",
-		"act-ml", "act-human",
+		"act-ml", "act-human", "plan-pasture-12-phase",
 	} {
 		full := fixtureNS + "--" + tok
 		if seen[full] {
@@ -394,7 +448,7 @@ func TestFixtureAliasesUnique(t *testing.T) {
 		sorted = append(sorted, k)
 	}
 	sort.Strings(sorted)
-	if len(sorted) != 10 {
-		t.Fatalf("expected 10 unique aliases, got %d", len(sorted))
+	if len(sorted) != 11 {
+		t.Fatalf("expected 11 unique aliases, got %d", len(sorted))
 	}
 }
