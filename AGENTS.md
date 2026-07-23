@@ -5,6 +5,8 @@ This project uses **bd** (beads) for issue tracking. Run `bd onboard` to get sta
 For the domain model and PROV-O/PROV-DM alignment, see [CONCEPTS.md](CONCEPTS.md).
 For test architecture, fixture rules, SQLite lifecycle rules, and performance
 measurement, see [TESTING.md](TESTING.md).
+Before changing test fixtures, scheduling, or CI flags, read the measured
+[test-performance regression traps](docs/test-performance.md#regression-traps-what-made-the-suite-roughly-four-times-slower).
 
 ## Quality Gates
 

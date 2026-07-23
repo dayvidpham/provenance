@@ -45,7 +45,7 @@ Exercises the full stack: bestiary catalog exploration, multi-provider agent reg
 - [CONTRIBUTING.md](CONTRIBUTING.md) -- development workflow, testing, commit conventions
 - [CLAUDE.md](CLAUDE.md) -- coding standards, directory structure, quality gates
 - [docs/architecture.md](docs/architecture.md) -- components, package boundaries, journal and SQLite design, graph model, and DBOS durability
-- [docs/test-performance.md](docs/test-performance.md) -- measured test costs and safe optimization experiments
+- [docs/test-performance.md](docs/test-performance.md) -- measured test costs, regression traps, and safe optimization experiments
 
 ## Development
 

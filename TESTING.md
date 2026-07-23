@@ -153,6 +153,10 @@ injection and private copies transfer; global cwd/environment overrides do not.
 
 ## Performance measurement
 
+Before changing test scheduling, fixture construction, DBOS polling, or CI
+flags, read [Regression traps: what made the suite roughly four times slower](docs/test-performance.md#regression-traps-what-made-the-suite-roughly-four-times-slower).
+That history is the checklist for avoiding previously measured regressions.
+
 Measure before and after on the same host and with `GOMAXPROCS` set to CI's core
 count. Use several runs and compare medians, not a single favorable result.
 

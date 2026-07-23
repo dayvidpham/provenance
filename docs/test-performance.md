@@ -223,6 +223,32 @@ go tool pprof -top -cum cpu.prof
 
 Profiles are local artifacts and must not be committed.
 
+## Regression traps: what made the suite roughly four times slower
+
+The historical race suite took about 230-257 seconds in single-pass runs and
+more than 600 seconds when the entire suite was repeated. The current
+default-runner race gate takes about 72 seconds on the same host. This is a
+roughly 3-4x comparison across several commits, not a controlled attribution to
+one change. The regressions were cumulative: repeated setup, unnecessary
+waiting, serialized independent cases, and accidentally repeated gates all
+contributed. Future contributors should avoid reintroducing these patterns.
+
+| Regression trap | Why it inflated runtime | Evidence observed here | Prevention rule |
+|---|---|---|---|
+| Treating `-count` as a CPU setting | `-count=N` executes every selected test N times; it does not allocate N CPUs. | `-count=2` race runs exceeded 560-650 seconds, and the proposed `-count=16` command would have repeated the complete suite sixteen times. | Keep authoritative gates at `-count=1`. Leave `-cpu`, `-p`, and `-parallel` unset unless a documented experiment needs them. |
+| DBOS's one-second default result polling in test harnesses | Every durable-result observation paid coarse polling latency even when the local result was already available. | The two main retry families took about 19 seconds each at one second, versus 4-6 seconds with 50 ms polling. | Keep Provenance's validated zero-value `ResultPollingInterval` default at 50 ms. Use explicit intervals only when testing the interval contract, and do not replace polling with sleeps. |
+| Rebuilding and reopening a complete valid SQLite fixture for every corruption case | Schema creation, migrations, fixture writes, integrity verification, WAL handling, and production reopen were repeated before each one-row mutation. | The startup corruption family repeatedly appeared as a 53-63 second race hotspot before validated baseline copying; raw per-copy mutation reduced its focused repeated race measurement by 73.51%. | Build, production-validate, checkpoint, close, and digest one immutable baseline; byte-copy it to a private path per case. Never use the baseline for tests whose contract is creation, migration, crash recovery, or shared-WAL behavior. |
+| Recreating a tracker and schema inside every iteration of one race scenario | Forty race attempts paid full `OpenMemory`, schema, actor, and bootstrap setup forty times. | The two authority races fell to 4.412 seconds together after reusing one tracker with unique per-iteration identities. | Reuse setup only within one test when every iteration uses distinct task, assignment, and operation IDs and accumulated state cannot alter the invariant. Keep independent tests isolated. |
+| Serializing independent matrix and corpus cases | Private databases and immutable inputs waited behind unrelated cases despite having no shared mutable state. | Partitioning all 325 create combinations reduced focused race package time from 10.677 to 2.705 seconds; parallel private startup copies reduced that focused family to 5.300 seconds. | Use `t.Parallel()` only after proving private paths, no package globals, no cwd/environment mutation, safe cleanup, and bounded peak RSS. Preserve exact membership/count checks. |
+| Constructing the full bestiary model registry in non-ML fixtures | Unrelated task, journal, corruption, and concurrency tests repeatedly allocated and seeded model data they never queried. | Profiling attributed roughly 208 MB of aggregate allocation to repeated default-registry construction; it was not the race wall-time critical path, but was avoidable setup. | Inject `NewRegistry(nil)` into non-ML harnesses. Keep explicit default-registry fixtures for every test that registers or validates ML models. |
+| Assuming more parallelism always improves wall time | SQLite writers, filesystem work, race shadow memory, and production-sized fixtures contend when too many heavy tests overlap. | Moving the create matrix and concurrent-create stress test to the serial phase regressed the full race gate from about 76 to 89 seconds; broad parallel runs also inflated individual tests by 4-10x under load. | Compare the full uncached gate, not only focused timings. Retain parallelism when overlap is net-positive, but do not add nested or broad parallelism without race, RSS, and full-suite measurements. |
+| Repeating an identical full race gate in multiple jobs or local commands | Every duplicate invocation pays the complete schema, DBOS, corruption, and race-detector cost again without covering another configuration. | Historical repeated-suite commands approximately doubled already-expensive single-pass measurements. | Run one authoritative uncached race gate per configuration. Use focused cached runs for iteration and reserve another full run for materially different targets. |
+
+Do not “fix” a regression by lowering exact corpus membership, corruption cases,
+race iterations, concurrent operation counts, production reopen checks, or
+integrity assertions. Optimize fixture construction and scheduling first, then
+record both focused and full-gate evidence in this document.
+
 ## Candidate optimizations
 
 Apply these in order. Each step should have an isolated benchmark commit or
