@@ -149,6 +149,7 @@ func (s *retryTerminalStack) operation(id string) OperationInput {
 }
 
 func TestDBOSRegisteredBorrowedJournalRetryAndTerminalSemantics(t *testing.T) {
+	t.Parallel()
 	defaultRetry := newRetryTerminalStack(t, "retry-default-shared", DBOSStepOptions{})
 	maxOneRetry := newRetryTerminalStack(t, "retry-max-one-shared", DBOSStepOptions{MaxRetries: 1, BaseInterval: time.Millisecond, BackoffFactor: 1})
 

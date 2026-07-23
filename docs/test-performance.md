@@ -6,15 +6,51 @@ complements the comprehensive [test-infrastructure guide](../TESTING.md). The
 authoritative test gates remain:
 
 ```bash
-go test -count=2 ./...
-CGO_ENABLED=1 go test -race -count=2 -timeout=20m ./...
+go test -p=16 -cpu=1,16 -parallel=16 -count=1 -shuffle=on -fullpath -timeout=10m ./...
+CGO_ENABLED=1 go test -race -p=16 -cpu=16 -parallel=16 -count=1 -shuffle=on -fullpath -timeout=20m ./...
 ```
+
+Local iteration normally uses cached `go test ./...`. `-count=1` means one
+uncached execution; it does not select CPUs. Historical measurements below keep
+their original commands for comparability.
 
 Performance work must preserve the production code paths, SQLite durability
 checks, corruption-byte invariants, concurrent-writer coverage, and uncached
 race run.
 
 ## Recorded baseline
+
+### Proposal 54 CPU and result-polling correction: 2026-07-22
+
+`-count=16` was rejected because it repeats every test sixteen times; it does
+not allocate sixteen CPUs. A corrected full run at `-p=16 -cpu=16
+-parallel=16 -count=1` took `80.44s` normal and `280.91s` under race before
+parallelization. Isolated top-level DBOS matrices and retry families were then
+marked parallel while state-sharing subtests and the process-wide goroutine leak
+check remained serial. The root package fell to `30.228s` normal and `180.095s`
+race before result-polling optimization.
+
+The two longest families were measured independently under race with
+`-cpu=2 -count=1` and no explicit `-parallel`:
+
+| Result polling interval | Retry/terminal | Canonical-family retry |
+|---|---:|---:|
+| 50 ms | `4.18s` | `5.79s` |
+| 100 ms | `4.89s` | `6.35s` |
+| 200 ms | `6.41s` | `7.62s` |
+| DBOS 1 s default, earlier 16-CPU measurement | `19.13s` | `19.18s` |
+
+The package default is 50 ms. `DBOSAdapterConfig.ResultPollingInterval`
+accepts explicit values from 10 ms through 5 s. These are single same-host runs
+from a dirty PR14 worktree, useful for relative selection rather than general CI
+claims.
+
+After selecting 50 ms and restoring zero-value harness configuration, the full
+strict normal scheduler matrix (`-cpu=1,16`) passed in `37.06s` wall and the
+full race gate (`-cpu=16`) passed in `182.88s` wall. The race gate remained near
+the earlier `183.18s` because the shortened DBOS families overlap another race
+critical path; isolated family latency, not full race wall time, is the measured
+gain from result polling.
 
 ### Raw per-case corruption preparation: 2026-07-22
 
@@ -105,7 +141,7 @@ adding a newer baseline.
 
 ### Earlier hotspot samples
 
-Earlier uncached race measurements on the same Proposal 50 journal branch did
+Earlier uncached race measurements on the same Proposal 54 journal branch did
 not record an exact commit or controlled host-load snapshot. They are retained
 for prioritization, not precise before/after claims. Repeated runs showed a
 stable ordering of costs:
@@ -133,31 +169,31 @@ time and retain the uncached full-suite result.
 
 ```bash
 # Authoritative wall clock and correctness gates.
-time go test -count=2 ./...
-time CGO_ENABLED=1 go test -race -count=2 -timeout=20m ./...
+time go test -p=16 -cpu=1,16 -parallel=16 -count=1 -shuffle=on -fullpath -timeout=10m ./...
+time CGO_ENABLED=1 go test -race -p=16 -cpu=16 -parallel=16 -count=1 -shuffle=on -fullpath -timeout=20m ./...
 
 # Package-level attribution.
-time CGO_ENABLED=1 go test -race -count=2 -timeout=20m .
-time CGO_ENABLED=1 go test -race -count=2 -timeout=20m ./internal/sqlite
+time CGO_ENABLED=1 go test -race -cpu=2 -count=1 -timeout=20m .
+time CGO_ENABLED=1 go test -race -cpu=2 -count=1 -timeout=20m ./internal/sqlite
 
 # Representative root-package costs.
-time CGO_ENABLED=1 go test -race -count=2 -timeout=20m . \
+time CGO_ENABLED=1 go test -race -cpu=2 -count=1 -timeout=20m . \
   -run '^TestStartupCorruptionMatrixLeavesBytesUnchanged$'
-time CGO_ENABLED=1 go test -race -count=2 -timeout=20m . \
+time CGO_ENABLED=1 go test -race -cpu=2 -count=1 -timeout=20m . \
   -run '^TestContractCorpus'
-time CGO_ENABLED=1 go test -race -count=2 -timeout=20m . \
+time CGO_ENABLED=1 go test -race -cpu=2 -count=1 -timeout=20m . \
   -run 'Authority.*Race|Concurrent.*Operation|Concurrent.*Session'
-time CGO_ENABLED=1 go test -race -count=2 -timeout=20m . \
+time CGO_ENABLED=1 go test -race -cpu=2 -count=1 -timeout=20m . \
   -run '^TestDBOS'
 ```
 
-Use `go test -race -count=2 -timeout=20m -v` when comparing individual test durations to
+Use `go test -race -cpu=2 -count=1 -timeout=20m -v` when comparing individual test durations to
 wall time. Similar totals indicate a serial critical path; a much larger sum
 indicates useful overlap. Use CPU profiles to attribute setup cost rather than
 assuming SQLite itself is the bottleneck:
 
 ```bash
-CGO_ENABLED=1 go test -count=2 -cpuprofile=cpu.prof .
+CGO_ENABLED=1 go test -cpu=2 -count=1 -cpuprofile=cpu.prof .
 go tool pprof -top -cum cpu.prof
 ```
 
@@ -214,7 +250,7 @@ borrowed attempt per DBOS callback without elapsed-time or sleep-sequence checks
 
 Run the full uncached race suite once per authoritative gate. Local workflows
 may use narrow package runs while iterating, but a narrow run does not replace
-the final `go test -race -count=2 -timeout=20m ./...` result. CI jobs should not repeat an
+the final configured `go test -race ... -count=1 ... ./...` result. CI jobs should not repeat an
 identical full race invocation unless they run on a materially different target
 or configuration.
 

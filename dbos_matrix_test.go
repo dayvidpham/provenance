@@ -85,6 +85,7 @@ func stackWithJournalUnlaunched(t *testing.T, c *counters, lookup func(provenanc
 // Row 1: absent (DBOS) | absent (Provenance) → execute once, commit, checkpoint,
 // post-validate, succeed.
 func TestMatrix_AbsentAbsent_Succeeds(t *testing.T) {
+	t.Parallel()
 	var c counters
 	s := stackWithJournal(t, &c, nil)
 	res, err := s.adapter.Apply(context.Background(), s.createTaskOp("op-r1", "aura", "r1"))
@@ -103,6 +104,7 @@ func TestMatrix_AbsentAbsent_Succeeds(t *testing.T) {
 // checkpoint, post-validate, succeed. The operation is committed directly first, so
 // the adapter's step folds onto an already-committed operation (§9.4).
 func TestMatrix_AbsentExact_ReplaySucceeds(t *testing.T) {
+	t.Parallel()
 	var c counters
 	s := stackWithJournalUnlaunched(t, &c, nil)
 	op := s.createTaskOp("op-r2", "aura", "r2")
@@ -132,6 +134,7 @@ func TestMatrix_AbsentExact_ReplaySucceeds(t *testing.T) {
 // Row 3: absent (DBOS) | conflict (Provenance) → typed conflict; no new domain/
 // checkpoint success. Same OperationID committed first with different digests.
 func TestMatrix_AbsentConflict_TypedConflict(t *testing.T) {
+	t.Parallel()
 	s := stackWithJournalUnlaunched(t, nil, nil)
 	op := s.createTaskOp("op-r3", "aura", "r3")
 	if _, err := s.tracker.Journal().Apply(op); err != nil {
@@ -156,6 +159,7 @@ func TestMatrix_AbsentConflict_TypedConflict(t *testing.T) {
 // replay preflight runs once, then DBOS returns the completed workflow without
 // re-running its step callback.
 func TestMatrix_PresentSuccessExact_ZeroCallback(t *testing.T) {
+	t.Parallel()
 	var c counters
 	s := stackWithJournal(t, &c, nil)
 	op := s.createTaskOp("op-r4", "aura", "r4")
@@ -184,6 +188,7 @@ func TestMatrix_PresentSuccessExact_ZeroCallback(t *testing.T) {
 }
 
 func TestMatrix_PresentSuccessChangedCanonicalOperand_ConflictsBeforeWorkflow(t *testing.T) {
+	t.Parallel()
 	var c counters
 	s := stackWithJournal(t, &c, nil)
 	op := s.createTaskOp("op-canonical-conflict", "aura", "original")
@@ -224,6 +229,7 @@ func TestMatrix_PresentSuccessChangedCanonicalOperand_ConflictsBeforeWorkflow(t 
 }
 
 func TestMatrix_AllocatedCreateChangedProvisionalUUIDReturnsOriginal(t *testing.T) {
+	t.Parallel()
 	var c counters
 	s := stackWithJournal(t, &c, nil)
 	op := s.createTaskOp("op-allocated-retry", "aura", "allocated")
@@ -305,6 +311,7 @@ func TestMatrix_AllocatedCreateChangedProvisionalUUIDReturnsOriginal(t *testing.
 }
 
 func TestMatrix_TimestampOnlyRetryAttachesCompletedWorkflow(t *testing.T) {
+	t.Parallel()
 	var c counters
 	s := stackWithJournal(t, &c, nil)
 	op := s.createTaskOp("op-timestamp-retry", "aura", "timestamp")
@@ -329,6 +336,7 @@ func TestMatrix_TimestampOnlyRetryAttachesCompletedWorkflow(t *testing.T) {
 
 // Row 5: present-success (DBOS) | absent (Provenance) → typed divergence; no writes.
 func TestMatrix_PresentSuccessAbsent_Divergence(t *testing.T) {
+	t.Parallel()
 	lookup := func(real provenance.CommittedResult, err error) (provenance.CommittedResult, error) {
 		return provenance.CommittedResult{Kind: provenance.CommittedAbsent}, nil
 	}
@@ -339,6 +347,7 @@ func TestMatrix_PresentSuccessAbsent_Divergence(t *testing.T) {
 
 // Row 6: present-success (DBOS) | conflict (Provenance) → typed divergence.
 func TestMatrix_PresentSuccessConflict_Divergence(t *testing.T) {
+	t.Parallel()
 	lookup := func(real provenance.CommittedResult, err error) (provenance.CommittedResult, error) {
 		return provenance.CommittedResult{Kind: provenance.CommittedConflict}, nil
 	}
@@ -349,6 +358,7 @@ func TestMatrix_PresentSuccessConflict_Divergence(t *testing.T) {
 
 // Row 7: present-success (DBOS) | exact digest/result mismatch → typed divergence.
 func TestMatrix_PresentSuccessMismatch_Divergence(t *testing.T) {
+	t.Parallel()
 	lookup := func(real provenance.CommittedResult, err error) (provenance.CommittedResult, error) {
 		real.AnchorJournalID += 9999 // perturb the journal-anchored result
 		return real, err
@@ -362,6 +372,7 @@ func TestMatrix_PresentSuccessMismatch_Divergence(t *testing.T) {
 // typed failure with errors.As; no writes. Re-Apply proves the failure is permanent
 // for the same OperationID.
 func TestMatrix_PresentFailureOutcome_TypedFailurePermanent(t *testing.T) {
+	t.Parallel()
 	var c counters
 	s := stackWithJournal(t, &c, nil)
 	// A second genesis (nil authority + bootstrap effect) against a non-empty
@@ -394,6 +405,7 @@ func TestMatrix_PresentFailureOutcome_TypedFailurePermanent(t *testing.T) {
 
 // Row 9: unknown outcome/lookup variant → fail closed actionably; no writes.
 func TestMatrix_UnknownLookupVariant_FailClosed(t *testing.T) {
+	t.Parallel()
 	lookup := func(real provenance.CommittedResult, err error) (provenance.CommittedResult, error) {
 		return provenance.CommittedResult{Kind: provenance.CommittedResultKind(99)}, nil
 	}

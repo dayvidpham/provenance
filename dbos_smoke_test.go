@@ -11,6 +11,7 @@ import (
 // DBOS root, a borrowed tracker over the shared file, one Apply of a task-create
 // operation, and a read-back through the same shared database.
 func TestDBOSSmoke_ApplyCreatesTask(t *testing.T) {
+	t.Parallel()
 	s := newDBOSStack(t, nil)
 
 	op := s.createTaskOp("op-smoke-1", "aura", "REQUEST: smoke")

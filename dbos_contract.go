@@ -51,8 +51,9 @@ type DBOSStepOptions struct {
 // Package-level defaults per Proposal 54 UAT verbatim:
 // "should be 3 retries by default, base interval would be 50ms."
 const (
-	dbosDefaultMaxRetries   = 3
-	dbosDefaultBaseInterval = 50 * time.Millisecond
+	dbosDefaultMaxRetries            = 3
+	dbosDefaultBaseInterval          = 50 * time.Millisecond
+	dbosDefaultResultPollingInterval = 50 * time.Millisecond
 )
 
 const dbosDefaultBackoffFactor = float64(2)
@@ -116,6 +117,23 @@ func resolveDBOSStepOptions(opts DBOSStepOptions) (resolvedDBOSStepOptions, erro
 		baseInterval:  baseInterval,
 		backoffFactor: backoffFactor,
 	}, nil
+}
+
+func resolveDBOSResultPollingInterval(interval time.Duration) (time.Duration, error) {
+	if interval == 0 {
+		return dbosDefaultResultPollingInterval, nil
+	}
+	if interval < 10*time.Millisecond || interval > 5*time.Second {
+		return 0, &DBOSDiagnosticError{
+			Class: DBOSDiagClassConfig, Field: DBOSDiagFieldResultPollingInterval,
+			Value:  interval.String(),
+			Reason: "must be 0 (use default 50 ms) or between 10 ms and 5 s inclusive",
+			Stage:  DBOSDiagStageAdapterConstruction,
+			Impact: "nothing is registered or written",
+			Fix:    "set ResultPollingInterval between 10 ms and 5 s, or leave it 0 to accept the default of 50 ms",
+		}
+	}
+	return interval, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -200,25 +218,26 @@ const (
 type DBOSDiagnosticField string
 
 const (
-	DBOSDiagFieldMaxRetries      DBOSDiagnosticField = "MaxRetries"
-	DBOSDiagFieldBaseInterval    DBOSDiagnosticField = "BaseInterval"
-	DBOSDiagFieldBackoffFactor   DBOSDiagnosticField = "BackoffFactor"
-	DBOSDiagFieldOperation       DBOSDiagnosticField = "operation"
-	DBOSDiagFieldContextVersion  DBOSDiagnosticField = "context_version"
-	DBOSDiagFieldActor           DBOSDiagnosticField = "actor"
-	DBOSDiagFieldCommand         DBOSDiagnosticField = "command"
-	DBOSDiagFieldAuthority       DBOSDiagnosticField = "authority"
-	DBOSDiagFieldSchema          DBOSDiagnosticField = "schema"
-	DBOSDiagFieldTrailing        DBOSDiagnosticField = "trailing"
-	DBOSDiagFieldKind            DBOSDiagnosticField = "kind"
-	DBOSDiagFieldNestedOpID      DBOSDiagnosticField = "nested_operation_id"
-	DBOSDiagFieldSuccessFailure  DBOSDiagnosticField = "success_failure"
-	DBOSDiagFieldMessage         DBOSDiagnosticField = "message"
-	DBOSDiagFieldConflictField   DBOSDiagnosticField = "conflict_field"
-	DBOSDiagFieldDescriptorMatch DBOSDiagnosticField = "descriptor_match"
-	DBOSDiagFieldWorkflow        DBOSDiagnosticField = "workflow"
-	DBOSDiagFieldContext         DBOSDiagnosticField = "context"
-	DBOSDiagFieldRecordedAt      DBOSDiagnosticField = "recorded_at"
+	DBOSDiagFieldMaxRetries            DBOSDiagnosticField = "MaxRetries"
+	DBOSDiagFieldBaseInterval          DBOSDiagnosticField = "BaseInterval"
+	DBOSDiagFieldBackoffFactor         DBOSDiagnosticField = "BackoffFactor"
+	DBOSDiagFieldResultPollingInterval DBOSDiagnosticField = "ResultPollingInterval"
+	DBOSDiagFieldOperation             DBOSDiagnosticField = "operation"
+	DBOSDiagFieldContextVersion        DBOSDiagnosticField = "context_version"
+	DBOSDiagFieldActor                 DBOSDiagnosticField = "actor"
+	DBOSDiagFieldCommand               DBOSDiagnosticField = "command"
+	DBOSDiagFieldAuthority             DBOSDiagnosticField = "authority"
+	DBOSDiagFieldSchema                DBOSDiagnosticField = "schema"
+	DBOSDiagFieldTrailing              DBOSDiagnosticField = "trailing"
+	DBOSDiagFieldKind                  DBOSDiagnosticField = "kind"
+	DBOSDiagFieldNestedOpID            DBOSDiagnosticField = "nested_operation_id"
+	DBOSDiagFieldSuccessFailure        DBOSDiagnosticField = "success_failure"
+	DBOSDiagFieldMessage               DBOSDiagnosticField = "message"
+	DBOSDiagFieldConflictField         DBOSDiagnosticField = "conflict_field"
+	DBOSDiagFieldDescriptorMatch       DBOSDiagnosticField = "descriptor_match"
+	DBOSDiagFieldWorkflow              DBOSDiagnosticField = "workflow"
+	DBOSDiagFieldContext               DBOSDiagnosticField = "context"
+	DBOSDiagFieldRecordedAt            DBOSDiagnosticField = "recorded_at"
 )
 
 // DBOSDiagnosticStage identifies the step/operation during which a failure occurred.

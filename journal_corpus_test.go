@@ -132,6 +132,7 @@ func TestContractCorpusPartitionIsComplete(t *testing.T) {
 // TestContractCorpusExecutesImplementedPartitions executes every behavior area
 // against real production code.
 func TestContractCorpusExecutesImplementedPartitions(t *testing.T) {
+	t.Parallel()
 	scope := loadScope(t)
 
 	executedJournal := 0

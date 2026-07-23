@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	dbos "github.com/dbos-inc/dbos-transact-golang/dbos"
 
@@ -39,6 +40,9 @@ type DBOSAdapterConfig struct {
 	// atomic domain fold. Zero fields use package defaults (3 retries, 50 ms,
 	// factor 2). Nonzero fields are validated and copied before registration.
 	StepOptions DBOSStepOptions
+	// ResultPollingInterval controls how often a waiting Apply checks DBOS for a
+	// workflow result. Zero uses 50 ms. Valid nonzero range: 10 ms through 5 s.
+	ResultPollingInterval time.Duration
 }
 
 // applyTestHooks are unexported, no-op-by-default seams the crash-gap subprocess
@@ -68,12 +72,13 @@ func defaultApplyTestHooks() applyTestHooks {
 // The adapter captures its contract snapshot once at construction; no paths
 // rebuild or mutate the identity after registration.
 type DBOSAdapter struct {
-	root               dbos.DBOSContext
-	tracker            Tracker
-	applicationVersion string
-	contract           dbosContractSnapshot
-	stepOptions        resolvedDBOSStepOptions
-	testHooks          applyTestHooks
+	root                  dbos.DBOSContext
+	tracker               Tracker
+	applicationVersion    string
+	contract              dbosContractSnapshot
+	stepOptions           resolvedDBOSStepOptions
+	resultPollingInterval time.Duration
+	testHooks             applyTestHooks
 }
 
 // NewDBOSAdapter validates the root and tracker, resolves step options (applying
@@ -103,6 +108,10 @@ func NewDBOSAdapter(root dbos.DBOSContext, tracker Tracker, config DBOSAdapterCo
 	if err != nil {
 		return nil, err
 	}
+	resultPollingInterval, err := resolveDBOSResultPollingInterval(config.ResultPollingInterval)
+	if err != nil {
+		return nil, err
+	}
 
 	actual := root.GetApplicationVersion()
 	if config.ExpectedApplicationVersion != "" && config.ExpectedApplicationVersion != actual {
@@ -118,12 +127,13 @@ func NewDBOSAdapter(root dbos.DBOSContext, tracker Tracker, config DBOSAdapterCo
 	contract := newDBOSContractSnapshot()
 
 	a := &DBOSAdapter{
-		root:               root,
-		tracker:            tracker,
-		applicationVersion: actual,
-		contract:           contract,
-		stepOptions:        resolved,
-		testHooks:          defaultApplyTestHooks(),
+		root:                  root,
+		tracker:               tracker,
+		applicationVersion:    actual,
+		contract:              contract,
+		stepOptions:           resolved,
+		resultPollingInterval: resultPollingInterval,
+		testHooks:             defaultApplyTestHooks(),
 	}
 	dbos.RegisterWorkflow(root, a.applyWorkflow)
 	return a, nil
@@ -204,7 +214,7 @@ func (a *DBOSAdapter) Apply(ctx context.Context, in journal.OperationInput) (Com
 	// updates workflow_status.updated_at even when it executes zero callbacks.
 	var outcome DBOSStepOutcome
 	if exists {
-		outcome, err = awaitWorkflowResult[DBOSStepOutcome](ctx, a.root, workflowID, normalized.OperationID)
+		outcome, err = awaitWorkflowResult[DBOSStepOutcome](ctx, a.root, workflowID, normalized.OperationID, a.resultPollingInterval)
 		if err != nil {
 			return CommittedResult{}, err
 		}
@@ -231,7 +241,7 @@ func (a *DBOSAdapter) Apply(ctx context.Context, in journal.OperationInput) (Com
 		return CommittedResult{}, identityErr
 	}
 
-	outcome, err = awaitWorkflowResult[DBOSStepOutcome](ctx, a.root, workflowID, normalized.OperationID)
+	outcome, err = awaitWorkflowResult[DBOSStepOutcome](ctx, a.root, workflowID, normalized.OperationID, a.resultPollingInterval)
 	if err != nil {
 		return CommittedResult{}, err
 	}
@@ -642,6 +652,7 @@ func awaitWorkflowResult[T any](
 	root dbos.DBOSContext,
 	workflowID string,
 	operation OperationID,
+	pollingInterval time.Duration,
 ) (T, error) {
 	waitBase, cancelWait := context.WithCancelCause(root)
 	stop := context.AfterFunc(caller, func() {
@@ -666,7 +677,7 @@ func awaitWorkflowResult[T any](
 			"DBOS could not retrieve the durable workflow handle", "no domain callback or write is started by retrieval",
 			"repair DBOS storage availability, then retry the same OperationID", err)
 	}
-	result, err := handle.GetResult()
+	result, err := handle.GetResult(dbos.WithHandlePollingInterval(pollingInterval))
 	if err != nil && caller.Err() != nil {
 		return *new(T), &ApplyWaitCanceledError{
 			Operation: operation,

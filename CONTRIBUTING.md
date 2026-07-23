@@ -268,18 +268,18 @@ func TestTrackerCreateTask(t *testing.T) {
 ### Running Tests
 
 ```bash
-# Run both authoritative repeated suites
-go test -count=2 ./...
-CGO_ENABLED=1 go test -race -count=2 -timeout=20m ./...
+# Run both authoritative uncached suites
+go test -p=16 -cpu=1,16 -parallel=16 -count=1 -shuffle=on -fullpath -timeout=10m ./...
+CGO_ENABLED=1 go test -race -p=16 -cpu=16 -parallel=16 -count=1 -shuffle=on -fullpath -timeout=20m ./...
 
-# Run a specific test
-CGO_ENABLED=1 go test -race -count=2 -timeout=20m ./... -run TestTrackerCreateTask
+# Cached local iteration
+go test ./... -run TestTrackerCreateTask
 
-# Run tests with verbose output
-CGO_ENABLED=1 go test -race -count=2 -timeout=20m -v ./...
+# Run local race tests with verbose output
+CGO_ENABLED=1 go test -race -timeout=20m -v ./...
 
-# Run tests with coverage
-CGO_ENABLED=1 go test -race -count=2 -timeout=20m -cover ./...
+# Run local tests with coverage
+go test -cover ./...
 ```
 
 ## Build Targets
@@ -289,7 +289,8 @@ All build targets are defined in the `Makefile`:
 ```bash
 make fmt    # Format all Go files with gofmt
 make lint   # go vet ./... + ast-grep scan
-make test   # go test -count=2 + CGO1 race -count=2 -timeout=20m
+make test   # strict normal scheduler matrix + CGO1 race gate
+make test-local # cached local iteration
 make build  # CGO_ENABLED=0 go build ./...
 make clean  # Remove bin/ directory
 ```

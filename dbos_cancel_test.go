@@ -138,6 +138,7 @@ func TestCancel_WhileGated_DurableWorkContinues(t *testing.T) {
 }
 
 func TestCancel_DeadlineWhileGated(t *testing.T) {
+	t.Parallel()
 	var bj *blockingJournal
 	s := newDBOSStack(t, func(real provenance.Tracker) provenance.Tracker {
 		bj = &blockingJournal{
@@ -161,6 +162,7 @@ func TestCancel_DeadlineWhileGated(t *testing.T) {
 }
 
 func TestNewDBOSAdapter_VersionMismatch(t *testing.T) {
+	t.Parallel()
 	// A mismatch rejects before registration/write (fresh root, unregistered).
 	rootA, trackerA := newUnlaunchedRoot(t, "app-v1")
 	if _, err := provenance.NewDBOSAdapter(rootA, trackerA, provenance.DBOSAdapterConfig{

@@ -74,6 +74,35 @@ func TestResolveDBOSStepOptions(t *testing.T) {
 	}
 }
 
+func TestResolveDBOSResultPollingInterval(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		in   time.Duration
+		want time.Duration
+	}{
+		{"default", 0, 50 * time.Millisecond},
+		{"lower boundary", 10 * time.Millisecond, 10 * time.Millisecond},
+		{"measured 50 ms", 50 * time.Millisecond, 50 * time.Millisecond},
+		{"measured 200 ms", 200 * time.Millisecond, 200 * time.Millisecond},
+		{"upper boundary", 5 * time.Second, 5 * time.Second},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := resolveDBOSResultPollingInterval(test.in)
+			if err != nil || got != test.want {
+				t.Fatalf("resolve=%v err=%v, want %v", got, err, test.want)
+			}
+		})
+	}
+
+	for _, interval := range []time.Duration{-time.Millisecond, time.Millisecond, 5*time.Second + time.Nanosecond} {
+		_, err := resolveDBOSResultPollingInterval(interval)
+		var cfgErr *DBOSConfigError
+		if !errors.As(err, &cfgErr) || cfgErr.Field != DBOSDiagFieldResultPollingInterval || cfgErr.Stage != DBOSDiagStageAdapterConstruction || cfgErr.Value == "" || cfgErr.Reason == "" || cfgErr.Impact == "" || cfgErr.Fix == "" {
+			t.Fatalf("interval %v diagnostic=%#v err=%v", interval, cfgErr, err)
+		}
+	}
+}
+
 func TestNewDBOSAdapterRejectsInvalidConfigBeforeRegistration(t *testing.T) {
 	db, err := openSharedSQL(t.TempDir() + "/config.db")
 	if err != nil {
@@ -94,11 +123,18 @@ func TestNewDBOSAdapterRejectsInvalidConfigBeforeRegistration(t *testing.T) {
 	if !errors.As(err, &cfgErr) || cfgErr.Field != DBOSDiagFieldMaxRetries {
 		t.Fatalf("invalid adapter config error=%#v, want typed MaxRetries diagnostic", err)
 	}
-	adapter, err := NewDBOSAdapter(root, tracker, DBOSAdapterConfig{StepOptions: DBOSStepOptions{MaxRetries: 1, BaseInterval: time.Millisecond, BackoffFactor: 1}})
+	_, err = NewDBOSAdapter(root, tracker, DBOSAdapterConfig{ResultPollingInterval: time.Millisecond})
+	if !errors.As(err, &cfgErr) || cfgErr.Field != DBOSDiagFieldResultPollingInterval {
+		t.Fatalf("invalid adapter config error=%#v, want typed ResultPollingInterval diagnostic", err)
+	}
+	adapter, err := NewDBOSAdapter(root, tracker, DBOSAdapterConfig{StepOptions: DBOSStepOptions{MaxRetries: 1, BaseInterval: time.Millisecond, BackoffFactor: 1}, ResultPollingInterval: 200 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("valid registration after rejected config: %v", err)
 	}
 	if adapter.stepOptions != (resolvedDBOSStepOptions{1, time.Millisecond, 1}) {
 		t.Fatalf("registered step options=%+v", adapter.stepOptions)
+	}
+	if adapter.resultPollingInterval != 200*time.Millisecond {
+		t.Fatalf("registered result polling interval=%v", adapter.resultPollingInterval)
 	}
 }

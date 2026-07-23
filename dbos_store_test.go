@@ -95,6 +95,7 @@ func TestOpenBorrowedSQLite_PreservesCallerPoolLimits(t *testing.T) {
 }
 
 func TestDBOSBorrowedSQLitePool16SupportsConcurrentOperations(t *testing.T) {
+	t.Parallel()
 	s := newDBOSStack(t, nil)
 	if got := s.db.Stats().MaxOpenConnections; got != dbosTestPoolSize {
 		t.Fatalf("DBOS test pool limit = %d, want %d", got, dbosTestPoolSize)
@@ -281,6 +282,7 @@ func TestBorrowed_MigrationsCoexist_FreshExistingRepeat(t *testing.T) {
 }
 
 func TestBorrowed_ReadOnlyQueriesCreateNoEvent(t *testing.T) {
+	t.Parallel()
 	s := newDBOSStack(t, nil)
 	if _, err := s.adapter.Apply(context.Background(), s.createTaskOp("op-ro", "aura", "ro")); err != nil {
 		t.Fatalf("seed Apply: %v", err)

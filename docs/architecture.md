@@ -289,6 +289,12 @@ bounded retry policy: zero fields resolve to 3 retries, 50 ms base interval,
 and factor 2. Valid nonzero overrides are validated and translated to the pinned
 v0.16 options before registration.
 
+`DBOSAdapterConfig.ResultPollingInterval` controls synchronous workflow-result
+polling. Zero resolves to 50 ms; valid nonzero values range from 10 ms through
+5 s. The adapter validates and copies the value before registration. Lower
+values reduce `Apply` response latency while increasing workflow-status query
+frequency for each waiting caller.
+
 Each DBOS step callback makes one borrowed journal attempt. SQLite first owns
 its bounded local wait through `busy_timeout=5000`; if `BUSY` or `LOCKED` still
 escapes, the adapter leaves it on the Go-error channel and DBOS consumes one

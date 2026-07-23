@@ -328,6 +328,7 @@ func corruptCanonicalWire(t *testing.T, handle *startupCorruptionHandle, anchor 
 }
 
 func TestStartupCorruptionMatrixLeavesBytesUnchanged(t *testing.T) {
+	t.Parallel()
 	cases := map[string]startupCorruptionCase{
 		"task-namespace": func(t *testing.T, tr *startupCorruptionHandle, f startupFixture) {
 			corruptStartupSQL(t, tr, `UPDATE tasks SET namespace='wrong' WHERE id=?1`, f.task.String())

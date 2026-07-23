@@ -56,7 +56,8 @@ nix develop             # enters devshell with Go, gopls, ast-grep, delve
 
 make fmt                # gofmt
 make lint               # go vet + ast-grep
-make test               # go test -count=2 + CGO1 race -count=2 -timeout=20m
+make test               # strict normal scheduler matrix + CGO1 race gate
+make test-local         # cached local iteration
 make build              # CGO_ENABLED=0 go build ./...
 ```
 

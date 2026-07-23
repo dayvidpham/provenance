@@ -87,6 +87,7 @@ func assertCanonicalStartupActionable(t *testing.T, err error, category string) 
 }
 
 func TestCanonicalColumnPreflightErrorsAreTypedActionableAndReadOnly(t *testing.T) {
+	t.Parallel()
 	tests := map[string]struct {
 		mutate       func(*testing.T, Tracker)
 		category     string

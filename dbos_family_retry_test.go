@@ -267,6 +267,7 @@ func familyOperation(env *dbosFamilyEnv, name string, effects ...Effect) Operati
 }
 
 func TestDBOSCompletedRetryUsesOneValidBaselineAndOneFieldChangePerFamily(t *testing.T) {
+	t.Parallel()
 	bootstrapEnv := newDBOSFamilyEnv(t, "family-bootstrap", false)
 	launchDBOSFamilyEnv(t, bootstrapEnv)
 	at := int64(700)

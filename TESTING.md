@@ -7,11 +7,16 @@ optimization experiments live in [docs/test-performance.md](docs/test-performanc
 
 ## Authoritative gates
 
-Run every Go test gate with `-count=2`. The supported gates are:
+Local iteration normally uses `go test ./...`, allowing Go's successful-result
+cache. Use `-run` for focused iteration and `-count=1` only to request one
+explicitly uncached execution.
+
+CI-readiness and landing gates use explicit resource, scheduling, freshness,
+order-independence, path, and timeout controls:
 
 ```bash
-go test -count=2 ./...
-CGO_ENABLED=1 go test -race -count=2 -timeout=20m ./...
+go test -p=16 -cpu=1,16 -parallel=16 -count=1 -shuffle=on -fullpath -timeout=10m ./...
+CGO_ENABLED=1 go test -race -p=16 -cpu=16 -parallel=16 -count=1 -shuffle=on -fullpath -timeout=20m ./...
 go vet ./...
 ast-grep scan --config sgconfig.yml .
 CGO_ENABLED=0 go build ./...
@@ -20,8 +25,15 @@ nix flake check --no-build
 
 `CGO_ENABLED=0` is a build-only compatibility gate. There is no CGO-disabled
 test mode and no CGO-disabled race mode: do not run focused, package, full, or
-race tests with `CGO_ENABLED=0`. Focused iteration may narrow `-run` or the
-package list, but still uses `-count=2` and does not replace either full suite.
+race tests with `CGO_ENABLED=0`. Focused local iteration may narrow `-run` or
+the package list. A focused diagnostic does not replace either full CI/landing
+suite.
+
+`-cpu=1,16` runs the normal suite once at each `GOMAXPROCS` value. `-p=16`
+limits package-level build/test concurrency, while `-parallel=16` limits only
+tests that call `t.Parallel` inside one test binary. `-count=1` disables cached
+results without repeating tests. `-shuffle=on` reports a seed; reproduce an
+order failure with `-shuffle=<reported-seed>`.
 
 ## Test map
 
@@ -146,8 +158,8 @@ Measure before and after on the same host and with `GOMAXPROCS` set to CI's core
 count. Use several runs and compare medians, not a single favorable result.
 
 ```bash
-time CGO_ENABLED=1 go test -race -count=2 -timeout=20m -v . -run '^TestName$'
-CGO_ENABLED=1 go test -count=2 -cpuprofile=cpu.prof .
+time CGO_ENABLED=1 go test -race -cpu=2 -count=1 -timeout=20m -v . -run '^TestName$'
+CGO_ENABLED=1 go test -cpu=2 -count=1 -cpuprofile=cpu.prof .
 go tool pprof -top -cum cpu.prof
 ```
 
@@ -158,6 +170,21 @@ memory cost. Capture `/proc/<pid>/status` `VmHWM` (or an equivalent process-tree
 peak-RSS measurement); Go heap profiles omit C allocations, SQLite, and race
 shadow memory. Report command, commit/worktree state, Go version, CPU, memory,
 `GOMAXPROCS`, wall/user/system time, package/test time, and before/after medians.
+
+Use one diagnostic profile at a time to minimize instrumentation distortion:
+
+```bash
+go test -count=1 -run '^TestName$' -cpuprofile=cpu.out .
+go test -count=1 -run '^TestName$' -memprofile=mem.out .
+go test -count=1 -run '^TestName$' -blockprofile=block.out .
+go test -count=1 -run '^TestName$' -mutexprofile=mutex.out .
+go test -count=1 -run '^TestName$' -trace=trace.out .
+```
+
+For debugging, add `-v` for human-readable events or `-json` for machine
+processing. Use `-failfast` only during local diagnosis because it suppresses
+later failures. Reproduce an order-dependent failure with the reported
+`-shuffle=<seed>`, and use `-fullpath` when logs need actionable source paths.
 
 ## Waiting and retries
 

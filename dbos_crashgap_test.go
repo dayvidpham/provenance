@@ -303,6 +303,7 @@ func asExitError(err error, target **exec.ExitError) bool {
 }
 
 func TestCrashGap1_DomainCommitBeforeCheckpoint(t *testing.T) {
+	t.Parallel()
 	if testing.Short() {
 		t.Skip("subprocess crash-recovery test")
 	}
@@ -310,6 +311,7 @@ func TestCrashGap1_DomainCommitBeforeCheckpoint(t *testing.T) {
 }
 
 func TestCrashGap0_BeforeDomainCommit(t *testing.T) {
+	t.Parallel()
 	if testing.Short() {
 		t.Skip("subprocess crash-recovery test")
 	}
@@ -317,6 +319,7 @@ func TestCrashGap0_BeforeDomainCommit(t *testing.T) {
 }
 
 func TestCrashGap2_StepCheckpointBeforeCompletion(t *testing.T) {
+	t.Parallel()
 	if testing.Short() {
 		t.Skip("subprocess crash-recovery test")
 	}

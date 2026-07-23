@@ -202,12 +202,18 @@ func (id TaskID) Hash() string {
 
 ### Mandatory flags
 ```bash
-go test -count=2 ./...
-CGO_ENABLED=1 go test -race -count=2 -timeout=20m ./...
+# Cached local iteration
+go test ./...
+
+# CI readiness / landing evidence
+go test -p=16 -cpu=1,16 -parallel=16 -count=1 -shuffle=on -fullpath -timeout=10m ./...
+CGO_ENABLED=1 go test -race -p=16 -cpu=16 -parallel=16 -count=1 -shuffle=on -fullpath -timeout=20m ./...
 ```
-Both repeated suites are mandatory. The second uses `CGO_ENABLED=1` and `-race`
-to detect concurrent access issues. Production builds use `CGO_ENABLED=0`; do
-not run full tests or race tests with `CGO_ENABLED=0`.
+Both suites are mandatory for CI readiness and landing. `-count=1` requests one
+uncached execution; it does not select CPUs. `-cpu`, `-p`, and `-parallel`
+control scheduler, package, and `t.Parallel` concurrency respectively. The race
+gate uses `CGO_ENABLED=1` and `-race` to detect concurrent access issues.
+Production builds use `CGO_ENABLED=0`; do not run tests with `CGO_ENABLED=0`.
 
 ### Test file conventions
 - Test files: `*_test.go` using `package foo_test` (black-box) or `package foo` (white-box).
@@ -219,7 +225,7 @@ not run full tests or race tests with `CGO_ENABLED=0`.
 ```bash
 make fmt    # gofmt — fails if any file needs formatting
 make lint   # go vet ./... + ast-grep scan
-make test   # go test -count=2, then CGO_ENABLED=1 race -count=2 -timeout=20m
+make test   # strict normal scheduler matrix, then CGO_ENABLED=1 race gate
 make build  # CGO_ENABLED=0 go build ./...
 ```
 

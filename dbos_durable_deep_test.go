@@ -81,6 +81,7 @@ func (s *internalDBOSStack) operation(id string) OperationInput {
 }
 
 func TestDBOSExplicitResponseLossRetrievesCompleteResult(t *testing.T) {
+	t.Parallel()
 	s := newInternalDBOSStack(t, "response-loss")
 	op := s.operation("response-loss-operation")
 	input, normalized, err := encodeApplyInput(s.adapter.contract, op)
@@ -183,6 +184,7 @@ func TestDBOSApplyRejectsDuplicateStoredInputBeforeCallbacksOrWrites(t *testing.
 }
 
 func TestDBOSSimultaneousExactAndChangedMutationRaces(t *testing.T) {
+	t.Parallel()
 	s := newInternalDBOSStack(t, "adapter-race")
 	op := s.operation("adapter-race-operation")
 	const observers = 16

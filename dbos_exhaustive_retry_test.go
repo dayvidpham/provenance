@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -270,7 +269,7 @@ func snapshotSQLTables(t *testing.T, db *sql.DB, tables ...string) map[string][]
 		if err := rows.Close(); err != nil {
 			t.Fatal(err)
 		}
-		sort.Slice(out[table], func(i, j int) bool { return fmt.Sprint(out[table][i]) < fmt.Sprint(out[table][j]) })
+		slices.SortFunc(out[table], slices.Compare)
 	}
 	return out
 }
@@ -313,6 +312,7 @@ func auditedSnapshotTableNames(t *testing.T, db *sql.DB) []string {
 }
 
 func TestDBOSCompletedRetryEveryCanonicalOperandHasZeroCallbackAndWrites(t *testing.T) {
+	t.Parallel()
 	dbPath := t.TempDir() + "/exhaustive.db"
 	db, err := openSharedSQL(dbPath)
 	if err != nil {
