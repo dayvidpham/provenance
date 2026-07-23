@@ -17,7 +17,8 @@
 @prefix rdfs:  <http://www.w3.org/2000/01/rdf-schema#> .
 @prefix xsd:   <http://www.w3.org/2001/XMLSchema#> .
 
-# Built-in plan: the 13-value Phase enum reified as p-plan:Step-per-phase.
+# Built-in plan 'pasture-12-phase': the 12 protocol phases plus the 'unscoped'
+# catch-all, reified as one p-plan:Step per Phase enum value (13 steps total).
 <urn:provenance:plan/pasture-12-phase> a pplan:Plan ;
     rdfs:label "pasture-12-phase" .
 <urn:provenance:plan/pasture-12-phase/step/request> a pplan:Step ;
@@ -80,7 +81,7 @@
     prov:qualifiedAssociation [
         a prov:Association ;
         prov:agent <urn:provenance:provo--agent-ml> ;
-        prov:hadRole "worker"
+        prov:hadRole <urn:provenance:role/worker>
     ] ;
     rdfs:comment "drafting the proposal" .
 <urn:provenance:provo--act-human> a prov:Activity ;
