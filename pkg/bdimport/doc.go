@@ -92,4 +92,28 @@
 // the importer preserves the assignment as a "bd:assignee:<slot>" label on the task
 // rather than as an agent identity. The only attributed agent is the issue's human
 // creator (EdgeAttributedTo), which the data supports truthfully.
+//
+// # Known limitations
+//
+// These are deliberate, documented gaps — stated here so they are known rather than
+// discovered downstream:
+//
+//   - Exported Turtle is NOT byte-reproducible across stores. Human agents are registered
+//     with UUIDv7 ids (RegisterHumanAgent mints them; there is no fixed-id human path), so
+//     a fresh store assigns different agent IRIs, and each lifecycle Activity's
+//     prov:startedAtTime is the import wall-clock (StartActivityWithID takes no caller
+//     timestamp). The IMPORT is idempotent within a store — the same store re-imported is a
+//     no-op — but two independent stores built from identical bd input yield graphs that
+//     differ in human-agent IRIs and activity timestamps. Task/edge/comment identity is
+//     stable (deterministic UUIDv5), so the graph is semantically equivalent, not
+//     byte-identical. The committed testdata/dogfood/graph.ttl is therefore a one-time
+//     conformance witness, not a byte-golden the exporter is re-diffed against.
+//
+//   - Historical bd timestamps are NOT preserved. The journaled Session verbs (Create,
+//     AddComment) and StartActivityWithID accept no caller-supplied time, so bd's
+//     created_at / updated_at / closed_at and each comment's created_at are dropped: the
+//     provenance timeline reflects IMPORT time, not the original bd history time. Faithful
+//     historical timelines would need timestamp-carrying write verbs upstream (a provenance
+//     library change out of scope for M6); until then the imported graph answers "who /
+//     what / how", not "exactly when in bd history".
 package bdimport

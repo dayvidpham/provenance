@@ -5,6 +5,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/dayvidpham/provenance"
@@ -158,6 +160,86 @@ func TestImport_DryRun(t *testing.T) {
 	// dangling dep = 5.
 	if len(res.Warnings) != 5 {
 		t.Fatalf("warnings = %d, want 5:\n%v", len(res.Warnings), res.Warnings)
+	}
+}
+
+// TestImport_WarningParity proves the primary write path surfaces exactly the same
+// coercion/clamp/skip warnings as the dry-run plan for a degenerate fixture — no silent
+// coercion asymmetry between them.
+func TestImport_WarningParity(t *testing.T) {
+	src := FileSource{Path: "testdata/fixture-basic.json"}
+
+	dry, err := Import(nil, src, Options{Namespace: "t", DryRun: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := openMem(t)
+	real, err := Import(tr, src, Options{Namespace: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d, r := sortedCopy(dry.Warnings), sortedCopy(real.Warnings); !equalStrings(d, r) {
+		t.Fatalf("warning parity broken:\n dry-run (%d): %v\n import  (%d): %v", len(d), d, len(r), r)
+	}
+	if len(real.Warnings) == 0 {
+		t.Fatal("expected the degenerate fixture to produce warnings")
+	}
+}
+
+// TestImport_CycleWarnAndSkip proves a cycle-inducing dependency (2-cycle + self-dep)
+// does not abort the import: the offending edges are warned and skipped, and every other
+// task, label, comment, and edge still lands. Also covers the orphan-comment warning.
+func TestImport_CycleWarnAndSkip(t *testing.T) {
+	tr := openMem(t)
+	res, err := Import(tr, FileSource{Path: "testdata/fixture-cycle.json"}, Options{Namespace: "t"})
+	if err != nil {
+		t.Fatalf("import must complete despite cycles, got: %v", err)
+	}
+
+	// Two cycle rejections (b→a closes the 2-cycle; x→x self-loop) + one orphan comment.
+	var rejected, orphans int
+	for _, w := range res.Warnings {
+		if strings.Contains(w, "rejected") {
+			rejected++
+		}
+		if strings.Contains(w, "not in dump (skipped)") {
+			orphans++
+		}
+	}
+	if rejected != 2 {
+		t.Fatalf("expected 2 rejected cycle edges, got %d: %v", rejected, res.Warnings)
+	}
+	if orphans != 1 {
+		t.Fatalf("expected 1 orphan-comment warning, got %d: %v", orphans, res.Warnings)
+	}
+
+	// The first edge of the 2-cycle landed; the closing edge did not.
+	a, b := TaskID("t", "cyc-a"), TaskID("t", "cyc-b")
+	if !hasEdge(t, tr, a, b, provenance.EdgeBlockedBy) {
+		t.Error("cyc-a → cyc-b (first edge) should have landed")
+	}
+	if hasEdge(t, tr, b, a, provenance.EdgeBlockedBy) {
+		t.Error("cyc-b → cyc-a (cycle-closing edge) must have been skipped")
+	}
+	// The self-dep produced no self edge.
+	if hasEdge(t, tr, TaskID("t", "cyc-x"), TaskID("t", "cyc-x"), provenance.EdgeBlockedBy) {
+		t.Error("cyc-x self-edge must have been skipped")
+	}
+
+	// All other content intact: cyc-c task, its label, and its comment.
+	c := TaskID("t", "cyc-c")
+	if _, err := tr.Show(c); err != nil {
+		t.Fatalf("clean task cyc-c missing: %v", err)
+	}
+	if labels, _ := tr.Labels(c); !contains(labels, "clean") {
+		t.Errorf("cyc-c label missing: %v", labels)
+	}
+	if cs, _ := tr.Comments(c); len(cs) != 1 {
+		t.Errorf("cyc-c comment count = %d, want 1", len(cs))
+	}
+	// All four tasks present.
+	if tasks, _ := tr.List(provenance.ListFilter{}); len(tasks) != 4 {
+		t.Errorf("task count = %d, want 4", len(tasks))
 	}
 }
 
@@ -374,6 +456,24 @@ func assertEq(t *testing.T, name string, got, want int) {
 	if got != want {
 		t.Errorf("%s = %d, want %d", name, got, want)
 	}
+}
+
+func sortedCopy(xs []string) []string {
+	out := append([]string(nil), xs...)
+	sort.Strings(out)
+	return out
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func contains(xs []string, x string) bool {
