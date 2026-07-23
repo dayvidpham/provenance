@@ -67,6 +67,7 @@ func testFixedSoftwareAgentRegistration() FixedSoftwareAgentRegistration {
 }
 
 func TestRegisterFixedSoftwareAgentValidationCorpus(t *testing.T) {
+	t.Parallel()
 	fixture := loadFixedAgentFixture(t)
 	for _, tc := range fixture.ValidationCases {
 		t.Run(tc.Name, func(t *testing.T) {
@@ -91,7 +92,7 @@ func TestRegisterFixedSoftwareAgentValidationCorpus(t *testing.T) {
 				t.Fatalf("unknown fixture mutation %q", tc.Mutation)
 			}
 
-			tr, err := OpenMemory()
+			tr, err := OpenMemory(WithModelRegistry(NewRegistry(nil)))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -130,9 +131,10 @@ func fixedAgentSentinel(name string) error {
 }
 
 func TestRegisterFixedSoftwareAgentErrorsAreActionable(t *testing.T) {
+	t.Parallel()
 	for _, tc := range loadFixedAgentFixture(t).ActionableErrorCases {
 		t.Run(tc.Name, func(t *testing.T) {
-			tr, err := OpenMemory()
+			tr, err := OpenMemory(WithModelRegistry(NewRegistry(nil)))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -184,7 +186,8 @@ func TestRegisterFixedSoftwareAgentErrorsAreActionable(t *testing.T) {
 }
 
 func TestRegisterFixedSoftwareAgentOverlapIsActionableOnce(t *testing.T) {
-	tr, err := OpenMemory()
+	t.Parallel()
+	tr, err := OpenMemory(WithModelRegistry(NewRegistry(nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +223,8 @@ func TestRegisterFixedSoftwareAgentOverlapIsActionableOnce(t *testing.T) {
 }
 
 func TestRegisterFixedSoftwareAgentManifestConflictIsActionableOnce(t *testing.T) {
-	tr, err := OpenMemory()
+	t.Parallel()
+	tr, err := OpenMemory(WithModelRegistry(NewRegistry(nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,7 +256,8 @@ func TestRegisterFixedSoftwareAgentManifestConflictIsActionableOnce(t *testing.T
 }
 
 func TestRegisterFixedSoftwareAgentReplayRepairAndDrift(t *testing.T) {
-	tr, err := OpenMemory()
+	t.Parallel()
+	tr, err := OpenMemory(WithModelRegistry(NewRegistry(nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,7 +298,8 @@ func TestRegisterFixedSoftwareAgentReplayRepairAndDrift(t *testing.T) {
 }
 
 func TestRegisterFixedSoftwareAgentRejectsPreClaimActor(t *testing.T) {
-	tr, err := OpenMemory()
+	t.Parallel()
+	tr, err := OpenMemory(WithModelRegistry(NewRegistry(nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,7 +325,8 @@ func TestRegisterFixedSoftwareAgentRejectsPreClaimActor(t *testing.T) {
 }
 
 func TestRegisterSoftwareAgentRandomIDPathUnchanged(t *testing.T) {
-	tr, err := OpenMemory()
+	t.Parallel()
+	tr, err := OpenMemory(WithModelRegistry(NewRegistry(nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,9 +341,10 @@ func TestRegisterSoftwareAgentRandomIDPathUnchanged(t *testing.T) {
 }
 
 func TestRegisterFixedSoftwareAgentRollsBackEveryInsertBoundary(t *testing.T) {
+	t.Parallel()
 	for _, tc := range loadFixedAgentFixture(t).RollbackCases {
 		t.Run(tc.Name, func(t *testing.T) {
-			tr, err := OpenMemory()
+			tr, err := OpenMemory(WithModelRegistry(NewRegistry(nil)))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -402,11 +410,12 @@ func assertFixedAgentRowCounts(t *testing.T, tr Tracker, want [4]int) {
 }
 
 func TestRegisterFixedSoftwareAgentConcurrentStartup(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "fixed-agent.db")
 	const writers = 8
 	trackers := make([]Tracker, writers)
 	for i := range trackers {
-		tr, err := OpenSQLite(path)
+		tr, err := OpenSQLite(path, WithModelRegistry(NewRegistry(nil)))
 		if err != nil {
 			t.Fatalf("open writer %d: %v", i, err)
 		}

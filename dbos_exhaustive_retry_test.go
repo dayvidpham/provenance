@@ -496,6 +496,7 @@ func dbosAllOperandOperationFromFixture(t *testing.T, fixture retryMatrixFixture
 }
 
 func TestDBOSRetryYAMLValuesAreAuthoritative(t *testing.T) {
+	t.Parallel()
 	baseline := loadDBOSRetryFixture(t)
 	fixture := retryMatrixFixture{actor: testActorID(t), authority: 7}
 	target := newCorpusTaskID()

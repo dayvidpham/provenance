@@ -206,13 +206,14 @@ func (id TaskID) Hash() string {
 go test ./...
 
 # CI readiness / landing evidence
-go test -p=16 -cpu=1,16 -parallel=16 -count=1 -shuffle=on -fullpath -timeout=10m ./...
-CGO_ENABLED=1 go test -race -p=16 -cpu=16 -parallel=16 -count=1 -shuffle=on -fullpath -timeout=20m ./...
+go test -count=1 -shuffle=on -fullpath -timeout=10m ./...
+CGO_ENABLED=1 go test -race -count=1 -shuffle=on -fullpath -timeout=20m ./...
 ```
 Both suites are mandatory for CI readiness and landing. `-count=1` requests one
 uncached execution; it does not select CPUs. `-cpu`, `-p`, and `-parallel`
-control scheduler, package, and `t.Parallel` concurrency respectively. The race
-gate uses `CGO_ENABLED=1` and `-race` to detect concurrent access issues.
+control scheduler, package, and `t.Parallel` concurrency respectively; CI leaves
+them unset to use the runner's available processors. The race gate uses
+`CGO_ENABLED=1` and `-race` to detect concurrent access issues.
 Production builds use `CGO_ENABLED=0`; do not run tests with `CGO_ENABLED=0`.
 
 ### Test file conventions

@@ -36,6 +36,7 @@ func openFileDB(t *testing.T) (*sql.DB, string) {
 }
 
 func TestOpenBorrowedSQLite_NilHandle(t *testing.T) {
+	t.Parallel()
 	_, err := provenance.OpenBorrowedSQLite(nil)
 	if err == nil || !strings.Contains(err.Error(), "nil") {
 		t.Fatalf("err = %v, want a nil-handle rejection", err)
@@ -43,6 +44,7 @@ func TestOpenBorrowedSQLite_NilHandle(t *testing.T) {
 }
 
 func TestOpenBorrowedSQLite_InMemoryRejected(t *testing.T) {
+	t.Parallel()
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
@@ -60,6 +62,7 @@ func TestOpenBorrowedSQLite_InMemoryRejected(t *testing.T) {
 }
 
 func TestOpenBorrowedSQLite_PreservesCallerPoolLimits(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		name    string
 		maxOpen int
@@ -142,6 +145,7 @@ func TestDBOSBorrowedSQLitePool16SupportsConcurrentOperations(t *testing.T) {
 }
 
 func TestOpenBorrowedSQLite_SharesFileWithCaller(t *testing.T) {
+	t.Parallel()
 	db, path := openFileDB(t)
 	tr, err := provenance.OpenBorrowedSQLite(db)
 	if err != nil {
@@ -165,6 +169,7 @@ func TestOpenBorrowedSQLite_SharesFileWithCaller(t *testing.T) {
 }
 
 func TestBorrowed_PostShutdown_StoreUnavailable(t *testing.T) {
+	t.Parallel()
 	db, _ := openFileDB(t)
 	tr, err := provenance.OpenBorrowedSQLite(db)
 	if err != nil {
@@ -203,6 +208,7 @@ func TestBorrowed_PostShutdown_StoreUnavailable(t *testing.T) {
 // per the relational contract Session is the PRIMARY mutation path, so this is the
 // primary write surface, not a niche escape hatch.
 func TestBorrowed_PostShutdown_SessionGated(t *testing.T) {
+	t.Parallel()
 	db, _ := openFileDB(t)
 	tr, err := provenance.OpenBorrowedSQLite(db)
 	if err != nil {
@@ -257,6 +263,7 @@ func TestBorrowed_PostShutdown_SessionGated(t *testing.T) {
 }
 
 func TestBorrowed_MigrationsCoexist_FreshExistingRepeat(t *testing.T) {
+	t.Parallel()
 	db, _ := openFileDB(t)
 	// Fresh open applies the schema.
 	tr1, err := provenance.OpenBorrowedSQLite(db)
@@ -306,6 +313,7 @@ func TestBorrowed_ReadOnlyQueriesCreateNoEvent(t *testing.T) {
 }
 
 func TestStandalone_OpenSQLiteMemory_SourceCompatible(t *testing.T) {
+	t.Parallel()
 	mem, err := provenance.OpenMemory()
 	if err != nil {
 		t.Fatalf("OpenMemory: %v", err)

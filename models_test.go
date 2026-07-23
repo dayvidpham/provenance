@@ -15,6 +15,7 @@ import (
 // ---------------------------------------------------------------------------
 
 func TestDefaultModelRegistry_Models(t *testing.T) {
+	t.Parallel()
 	reg := provenance.DefaultModelRegistry()
 	models := reg.Models()
 
@@ -39,6 +40,7 @@ func TestDefaultModelRegistry_Models(t *testing.T) {
 }
 
 func TestDefaultModelRegistry_ModelsReturnsCopy(t *testing.T) {
+	t.Parallel()
 	reg := provenance.DefaultModelRegistry()
 	a := reg.Models()
 	b := reg.Models()
@@ -55,6 +57,7 @@ func TestDefaultModelRegistry_ModelsReturnsCopy(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDefaultModelRegistry_Lookup(t *testing.T) {
+	t.Parallel()
 	reg := provenance.DefaultModelRegistry()
 
 	// Known model
@@ -84,6 +87,7 @@ func TestDefaultModelRegistry_Lookup(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDefaultModelRegistry_ModelsByProvider(t *testing.T) {
+	t.Parallel()
 	reg := provenance.DefaultModelRegistry()
 
 	anthropic := reg.ModelsByProvider(provenance.ProviderAnthropic)
@@ -133,6 +137,7 @@ func TestDefaultModelRegistry_ModelsByProvider(t *testing.T) {
 // asserts that ModelsByProvider returns exactly the expected entries — proving
 // the adapter has no closed-enum rejection and works for all 110+ providers.
 func TestRegistryFromBestiary_SyntheticProviders(t *testing.T) {
+	t.Parallel()
 	syntheticProviders := []string{
 		"amazon-bedrock",
 		"azure-openai",
@@ -209,6 +214,7 @@ func (r *testRegistry) ModelsByProvider(provider provenance.Provider) []ptypes.M
 }
 
 func TestWithModelRegistry_CustomRegistry(t *testing.T) {
+	t.Parallel()
 	custom := &testRegistry{
 		entries: []ptypes.ModelEntry{
 			{Provider: provenance.ProviderGoogle, Name: "gemini-2.0-flash", DisplayName: "Gemini 2.0 Flash", Family: "gemini-flash"},
@@ -238,6 +244,7 @@ func TestWithModelRegistry_CustomRegistry(t *testing.T) {
 }
 
 func TestWithModelRegistry_EmptyRegistry(t *testing.T) {
+	t.Parallel()
 	empty := &testRegistry{entries: nil}
 
 	tr, err := provenance.OpenMemory(provenance.WithModelRegistry(empty))
@@ -258,6 +265,7 @@ func TestWithModelRegistry_EmptyRegistry(t *testing.T) {
 // registry (backed by bestiary) must reject a local model with a nonexistent
 // name via the registry's Lookup — returning ErrNotFound — without touching the DB.
 func TestDefaultRegistry_LookupRejectsBeforeDB(t *testing.T) {
+	t.Parallel()
 	tr, err := provenance.OpenMemory()
 	if err != nil {
 		t.Fatalf("OpenMemory: %v", err)
@@ -272,6 +280,7 @@ func TestDefaultRegistry_LookupRejectsBeforeDB(t *testing.T) {
 }
 
 func TestWithModelRegistry_NilRegistry(t *testing.T) {
+	t.Parallel()
 	// Passing untyped nil must not panic — the default registry is preserved.
 	tr, err := provenance.OpenMemory(provenance.WithModelRegistry(nil))
 	if err != nil {
@@ -294,6 +303,7 @@ func TestWithModelRegistry_NilRegistry(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestRegistryFromBestiary_RoundTrip(t *testing.T) {
+	t.Parallel()
 	reg := provenance.RegistryFromBestiary(bestiary.Models())
 	models := reg.Models()
 	if len(models) == 0 {

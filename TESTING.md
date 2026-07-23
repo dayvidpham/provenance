@@ -15,8 +15,8 @@ CI-readiness and landing gates use explicit resource, scheduling, freshness,
 order-independence, path, and timeout controls:
 
 ```bash
-go test -p=16 -cpu=1,16 -parallel=16 -count=1 -shuffle=on -fullpath -timeout=10m ./...
-CGO_ENABLED=1 go test -race -p=16 -cpu=16 -parallel=16 -count=1 -shuffle=on -fullpath -timeout=20m ./...
+go test -count=1 -shuffle=on -fullpath -timeout=10m ./...
+CGO_ENABLED=1 go test -race -count=1 -shuffle=on -fullpath -timeout=20m ./...
 go vet ./...
 ast-grep scan --config sgconfig.yml .
 CGO_ENABLED=0 go build ./...
@@ -29,9 +29,8 @@ race tests with `CGO_ENABLED=0`. Focused local iteration may narrow `-run` or
 the package list. A focused diagnostic does not replace either full CI/landing
 suite.
 
-`-cpu=1,16` runs the normal suite once at each `GOMAXPROCS` value. `-p=16`
-limits package-level build/test concurrency, while `-parallel=16` limits only
-tests that call `t.Parallel` inside one test binary. `-count=1` disables cached
+CI leaves `-cpu`, `-p`, and `-parallel` unset so Go uses the runner's available
+processors and default package/test concurrency. `-count=1` disables cached
 results without repeating tests. `-shuffle=on` reports a seed; reproduce an
 order failure with `-shuffle=<reported-seed>`.
 

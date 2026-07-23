@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"zombiezen.com/go/sqlite"
@@ -36,7 +37,7 @@ type startupCorruptionCase func(*testing.T, *startupCorruptionHandle, startupFix
 
 func buildStartupFixture(t *testing.T, path string) (Tracker, startupFixture) {
 	t.Helper()
-	tr, err := OpenSQLite(path)
+	tr, err := OpenSQLite(path, WithModelRegistry(NewRegistry(nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,7 +157,7 @@ func buildValidatedStartupBaseline(t *testing.T, path string, builds *int) start
 	checkpointAndCloseStartupFixture(t, tr)
 	requireNoSQLiteSidecars(t, path)
 
-	validated, err := OpenSQLite(path)
+	validated, err := OpenSQLite(path, WithModelRegistry(NewRegistry(nil)))
 	if err != nil {
 		t.Fatalf("production validation rejected closed startup baseline: %v", err)
 	}
@@ -174,7 +175,7 @@ func buildValidatedStartupBaseline(t *testing.T, path string, builds *int) start
 
 	copyPath := filepath.Join(t.TempDir(), "validation-copy.sqlite")
 	writeStartupBaselineCopy(t, baseline, copyPath)
-	copied, err := OpenSQLite(copyPath)
+	copied, err := OpenSQLite(copyPath, WithModelRegistry(NewRegistry(nil)))
 	if err != nil {
 		t.Fatalf("production validation rejected copied startup baseline: %v", err)
 	}
@@ -642,69 +643,76 @@ func TestStartupCorruptionMatrixLeavesBytesUnchanged(t *testing.T) {
 	if baselineBuilds != 1 {
 		t.Fatalf("startup corruption baseline built %d times, want exactly one", baselineBuilds)
 	}
-	copyPaths := make(map[string]struct{}, expectedCorruptionCases)
-	for name, mutate := range cases {
-		t.Run(name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "db.sqlite")
-			if _, duplicate := copyPaths[path]; duplicate {
-				t.Fatalf("startup corruption case reused private copy path %q", path)
-			}
-			copyPaths[path] = struct{}{}
-			writeStartupBaselineCopy(t, baseline, path)
-			handle := openStartupCorruptionHandle(t, path)
-			mutate(t, handle, baseline.fixture)
-			closeStartupCorruptionHandle(t, handle)
-			requireNoSQLiteSidecars(t, path)
-			before, err := os.ReadFile(path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if bytes.Equal(before, baseline.bytes) {
-				t.Fatal("raw corruption left private main database bytes equal to pristine baseline")
-			}
-			opened, openErr := OpenSQLite(path)
-			if opened != nil {
-				_ = opened.Close()
-				t.Fatal("corrupt database returned a non-nil tracker")
-			}
-			if openErr == nil {
-				t.Fatal("corrupt database opened")
-			}
-			projectionCase := strings.HasPrefix(name, "task-") || strings.HasPrefix(name, "edge-") || strings.HasPrefix(name, "label-") || strings.HasPrefix(name, "comment-") || strings.HasPrefix(name, "attribution")
-			if projectionCase {
-				var divergence *ProjectionDivergenceError
-				if !errors.As(openErr, &divergence) && !errors.Is(openErr, ErrProjectionDivergence) && !errors.Is(openErr, ErrSubtypeIntegrity) {
-					t.Fatalf("projection corruption returned %T, want typed divergence/topology error: %v", openErr, openErr)
+	var copyPaths sync.Map
+	t.Run("cases", func(t *testing.T) {
+		for name, mutate := range cases {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+				path := filepath.Join(t.TempDir(), "db.sqlite")
+				if _, duplicate := copyPaths.LoadOrStore(path, struct{}{}); duplicate {
+					t.Fatalf("startup corruption case reused private copy path %q", path)
 				}
-			}
-			supportCase := strings.HasPrefix(name, "result-slot") || strings.HasPrefix(name, "context-") || strings.HasPrefix(name, "effect-") || name == "missing-subtype" || strings.HasPrefix(name, "task-event") || strings.HasPrefix(name, "operation-") || strings.HasPrefix(name, "authority-") || strings.HasPrefix(name, "bootstrap-") || strings.HasPrefix(name, "assignment-") || strings.HasPrefix(name, "decision-") || strings.HasPrefix(name, "evidence-")
-			if supportCase && !errors.Is(openErr, ErrProjectionDivergence) && !errors.Is(openErr, ErrSubtypeIntegrity) {
-				t.Fatalf("support corruption returned untyped error: %T %v", openErr, openErr)
-			}
-			token := strings.Split(name, "-")[0]
-			if strings.HasPrefix(name, "result-slot") {
-				token = "result slot"
-			}
-			if name == "missing-subtype" {
-				token = "subtype"
-			}
-			if !strings.Contains(strings.ToLower(openErr.Error()), strings.ReplaceAll(token, "_", " ")) {
-				t.Fatalf("error does not identify %q corruption: %v", token, openErr)
-			}
-			after, err := os.ReadFile(path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !bytes.Equal(before, after) {
-				t.Fatal("failed Open changed corrupt database bytes")
-			}
-		})
-	}
+				writeStartupBaselineCopy(t, baseline, path)
+				handle := openStartupCorruptionHandle(t, path)
+				mutate(t, handle, baseline.fixture)
+				closeStartupCorruptionHandle(t, handle)
+				requireNoSQLiteSidecars(t, path)
+				before, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if bytes.Equal(before, baseline.bytes) {
+					t.Fatal("raw corruption left private main database bytes equal to pristine baseline")
+				}
+				opened, openErr := OpenSQLite(path, WithModelRegistry(NewRegistry(nil)))
+				if opened != nil {
+					_ = opened.Close()
+					t.Fatal("corrupt database returned a non-nil tracker")
+				}
+				if openErr == nil {
+					t.Fatal("corrupt database opened")
+				}
+				projectionCase := strings.HasPrefix(name, "task-") || strings.HasPrefix(name, "edge-") || strings.HasPrefix(name, "label-") || strings.HasPrefix(name, "comment-") || strings.HasPrefix(name, "attribution")
+				if projectionCase {
+					var divergence *ProjectionDivergenceError
+					if !errors.As(openErr, &divergence) && !errors.Is(openErr, ErrProjectionDivergence) && !errors.Is(openErr, ErrSubtypeIntegrity) {
+						t.Fatalf("projection corruption returned %T, want typed divergence/topology error: %v", openErr, openErr)
+					}
+				}
+				supportCase := strings.HasPrefix(name, "result-slot") || strings.HasPrefix(name, "context-") || strings.HasPrefix(name, "effect-") || name == "missing-subtype" || strings.HasPrefix(name, "task-event") || strings.HasPrefix(name, "operation-") || strings.HasPrefix(name, "authority-") || strings.HasPrefix(name, "bootstrap-") || strings.HasPrefix(name, "assignment-") || strings.HasPrefix(name, "decision-") || strings.HasPrefix(name, "evidence-")
+				if supportCase && !errors.Is(openErr, ErrProjectionDivergence) && !errors.Is(openErr, ErrSubtypeIntegrity) {
+					t.Fatalf("support corruption returned untyped error: %T %v", openErr, openErr)
+				}
+				token := strings.Split(name, "-")[0]
+				if strings.HasPrefix(name, "result-slot") {
+					token = "result slot"
+				}
+				if name == "missing-subtype" {
+					token = "subtype"
+				}
+				if !strings.Contains(strings.ToLower(openErr.Error()), strings.ReplaceAll(token, "_", " ")) {
+					t.Fatalf("error does not identify %q corruption: %v", token, openErr)
+				}
+				after, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(before, after) {
+					t.Fatal("failed Open changed corrupt database bytes")
+				}
+			})
+		}
+	})
 	if baselineBuilds != 1 {
 		t.Fatalf("startup corruption baseline built %d times after cases, want exactly one", baselineBuilds)
 	}
-	if len(copyPaths) != expectedCorruptionCases {
-		t.Fatalf("startup corruption matrix used %d private copy paths, want exactly %d", len(copyPaths), expectedCorruptionCases)
+	copyPathCount := 0
+	copyPaths.Range(func(_, _ any) bool {
+		copyPathCount++
+		return true
+	})
+	if copyPathCount != expectedCorruptionCases {
+		t.Fatalf("startup corruption matrix used %d private copy paths, want exactly %d", copyPathCount, expectedCorruptionCases)
 	}
 	baselineBytes, err := os.ReadFile(baseline.path)
 	if err != nil {

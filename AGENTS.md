@@ -12,12 +12,14 @@ measurement, see [TESTING.md](TESTING.md).
   use Go's test cache. Use `-run` to narrow the scope and `-count=1` only when an
   explicitly uncached run is needed.
 - For CI readiness and landing evidence, run
-  `go test -p=16 -cpu=1,16 -parallel=16 -count=1 -shuffle=on -fullpath -timeout=10m ./...`.
+  `go test -count=1 -shuffle=on -fullpath -timeout=10m ./...`.
 - Run the race gate with
-  `CGO_ENABLED=1 go test -race -p=16 -cpu=16 -parallel=16 -count=1 -shuffle=on -fullpath -timeout=20m ./...`.
+  `CGO_ENABLED=1 go test -race -count=1 -shuffle=on -fullpath -timeout=20m ./...`.
 - `-cpu` selects `GOMAXPROCS` values and reruns once per listed value; `-p`
   limits concurrently built/tested packages; `-parallel` limits tests that call
   `t.Parallel`; `-count` repeats tests and does not allocate CPUs.
+- CI intentionally leaves `-cpu`, `-p`, and `-parallel` unset so Go uses the
+  runner's available processors and default concurrency.
 - Verify pure-Go/static compatibility with `CGO_ENABLED=0 go build ./...`.
   **CGO-disabled mode is build-only:** a CGO0 test run is redundant and is not a
   supported gate. Never run any `go test` command with `CGO_ENABLED=0`, with or

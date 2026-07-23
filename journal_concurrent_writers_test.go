@@ -30,7 +30,7 @@ type raceTracker struct {
 
 func newRaceTracker(t *testing.T) *raceTracker {
 	t.Helper()
-	tr, err := OpenMemory()
+	tr, err := OpenMemory(WithModelRegistry(NewRegistry(nil)))
 	if err != nil {
 		t.Fatalf("OpenMemory: %v", err)
 	}
@@ -111,6 +111,7 @@ func (r *raceTracker) assertConverged(t *testing.T) {
 // every other Apply short-circuits (§9.4) to that same committed anchor. No second
 // anchor, caller-digest conflict, or duplicate task_event is ever produced.
 func TestConcurrentSameOperationIDSingleWinner(t *testing.T) {
+	t.Parallel()
 	r := newRaceTracker(t)
 	task := r.createTask(t, "single-winner")
 
@@ -178,6 +179,7 @@ func TestConcurrentSameOperationIDSingleWinner(t *testing.T) {
 // ErrOperationConflict with the closed CommittedConflict variant, and nothing extra is
 // committed.
 func TestConcurrentSameOperationIDConflictingIdentityLoserGetsTypedConflict(t *testing.T) {
+	t.Parallel()
 	r := newRaceTracker(t)
 	task := r.createTask(t, "conflict")
 
@@ -233,6 +235,7 @@ func TestConcurrentSameOperationIDConflictingIdentityLoserGetsTypedConflict(t *t
 // path, §9.5), no interleaving loses or duplicates a fold, and the post-race database
 // converges under the production reducer.
 func TestConcurrentTwoSessionsDistinctOpsConverge(t *testing.T) {
+	t.Parallel()
 	r := newRaceTracker(t)
 	task := r.createTask(t, "distinct-ops")
 	sessionA := r.tr.As(r.actorA, r.boot)
@@ -294,6 +297,7 @@ func TestConcurrentTwoSessionsDistinctOpsConverge(t *testing.T) {
 // the same assignment CAS-A), and general fold-loop atomicity-under-fault is covered by
 // the sequential AdversarialApplyWithFault corpus cases (§8.1).
 func TestConcurrentAtomicOpsNoPartialFold(t *testing.T) {
+	t.Parallel()
 	r := newRaceTracker(t)
 	taskA := r.createTask(t, "atomic-a")
 	taskB := r.createTask(t, "atomic-b")
@@ -342,6 +346,7 @@ func TestConcurrentAtomicOpsNoPartialFold(t *testing.T) {
 // migrated task are journal-anchored and the whole database converges — a live mutation
 // and a migration interleave without corrupting each other's spine.
 func TestConcurrentSessionVsMigrationRace(t *testing.T) {
+	t.Parallel()
 	r := newRaceTracker(t)
 
 	// Seed a pre-journal legacy task for the migration arm.

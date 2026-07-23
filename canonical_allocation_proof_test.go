@@ -118,6 +118,7 @@ func assertSameCompleteResult(t *testing.T, first, retry CommittedResult) {
 }
 
 func TestAllocatedCreateApplyReturnsCompleteResultAcrossRetryModes(t *testing.T) {
+	t.Parallel()
 	t.Run("same-process-arbitrary-operation-id", func(t *testing.T) {
 		tr, actor, boot := newAllocationApplyTracker(t, filepath.Join(t.TempDir(), "same.sqlite"))
 		defer tr.Close()
@@ -282,6 +283,7 @@ func corruptAllocationFamily(t *testing.T, tr Tracker, anchor JournalID, replace
 }
 
 func TestAllocatedCreateCorruptionFailsLiveAndOnOpenWithoutDrift(t *testing.T) {
+	t.Parallel()
 	cases := map[string]struct {
 		mutate  func(*testing.T, Tracker, allocationCorruptionFixture)
 		liveErr error

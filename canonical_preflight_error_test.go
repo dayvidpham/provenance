@@ -16,7 +16,7 @@ const canonicalPreflightOperationID = "canonical-preflight-operation"
 
 func buildCanonicalPreflightErrorFixture(t *testing.T, path string) Tracker {
 	t.Helper()
-	tr, err := OpenSQLite(path)
+	tr, err := OpenSQLite(path, WithModelRegistry(NewRegistry(nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +177,7 @@ func TestCanonicalColumnPreflightErrorsAreTypedActionableAndReadOnly(t *testing.
 			if err != nil {
 				t.Fatal(err)
 			}
-			opened, openErr := OpenSQLite(path)
+			opened, openErr := OpenSQLite(path, WithModelRegistry(NewRegistry(nil)))
 			if opened != nil {
 				_ = opened.Close()
 			}

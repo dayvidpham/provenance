@@ -16,6 +16,7 @@ import (
 // ---------------------------------------------------------------------------
 
 func TestDemo_CoreWorkflow(t *testing.T) {
+	t.Parallel()
 	tr := openTestTracker(t)
 
 	// Create
@@ -74,6 +75,7 @@ func TestDemo_CoreWorkflow(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDemo_DependencyGraph(t *testing.T) {
+	t.Parallel()
 	tr := openTestTracker(t)
 
 	request := mustCreate(t, tr, "proj", "REQUEST", "", provenance.TaskTypeFeature, provenance.PriorityHigh, provenance.PhaseRequest)
@@ -129,6 +131,7 @@ func TestDemo_DependencyGraph(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDemo_CycleDetection(t *testing.T) {
+	t.Parallel()
 	tr := openTestTracker(t)
 
 	a := mustCreate(t, tr, "proj", "Task A", "", provenance.TaskTypeTask, provenance.PriorityMedium, provenance.PhaseUnscoped)
@@ -161,6 +164,7 @@ func TestDemo_CycleDetection(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDemo_ProvenanceEdges(t *testing.T) {
+	t.Parallel()
 	tr := openTestTracker(t)
 
 	prop1 := mustCreate(t, tr, "proj", "PROPOSAL-1", "Initial", provenance.TaskTypeTask, provenance.PriorityHigh, provenance.PhasePropose)
@@ -200,7 +204,8 @@ func TestDemo_ProvenanceEdges(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDemo_PROVOAgents(t *testing.T) {
-	tr := openTestTracker(t)
+	t.Parallel()
+	tr := openTestTrackerWithDefaultModels(t)
 
 	// Human agent
 	human, err := tr.RegisterHumanAgent("aura", "David Pham", "dayvidpham@gmail.com")
@@ -249,7 +254,8 @@ func TestDemo_PROVOAgents(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDemo_PROVOActivities(t *testing.T) {
-	tr := openTestTracker(t)
+	t.Parallel()
+	tr := openTestTrackerWithDefaultModels(t)
 
 	agent := mustRegisterMLAgent(t, tr, "aura", provenance.RoleSupervisor, provenance.ProviderAnthropic, provenance.ModelID("claude-opus-4-6"))
 
@@ -291,7 +297,8 @@ func TestDemo_PROVOActivities(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDemo_LabelsAndComments(t *testing.T) {
-	tr := openTestTracker(t)
+	t.Parallel()
+	tr := openTestTrackerWithDefaultModels(t)
 
 	agent := mustRegisterMLAgent(t, tr, "aura", provenance.RoleReviewer, provenance.ProviderAnthropic, provenance.ModelID("claude-opus-4-6"))
 	task := mustCreate(t, tr, "proj", "SLICE-1", "", provenance.TaskTypeTask, provenance.PriorityMedium, provenance.PhaseWorkerSlices)
@@ -332,6 +339,7 @@ func TestDemo_LabelsAndComments(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDemo_Persistence(t *testing.T) {
+	t.Parallel()
 	dbPath := filepath.Join(t.TempDir(), "provenance-demo.db")
 
 	// Session 1: create data
@@ -374,7 +382,8 @@ func TestDemo_Persistence(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDemo_FullEpochSimulation(t *testing.T) {
-	tr := openTestTracker(t)
+	t.Parallel()
+	tr := openTestTrackerWithDefaultModels(t)
 
 	// --- Register agents ---
 	human := mustRegisterHumanAgent(t, tr, "aura", "David Pham", "dayvidpham@gmail.com")
@@ -519,6 +528,7 @@ func TestDemo_FullEpochSimulation(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDemo_MultiProviderAgentsFromBestiary(t *testing.T) {
+	t.Parallel()
 	dbPath := filepath.Join(t.TempDir(), "bestiary-multi-provider.db")
 
 	// Open tracker — default registry backed by bestiary.Models()

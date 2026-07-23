@@ -259,6 +259,7 @@ func assertBootstrapRetryMatrix(t *testing.T, tr Tracker, f retryMatrixFixture) 
 }
 
 func TestCanonicalRetryMatrixSameProcessAndReopen(t *testing.T) {
+	t.Parallel()
 	tr, f := buildRetryMatrixFixture(t)
 	assertBootstrapRetryMatrix(t, tr, f)
 	assertExactRetry(t, tr, f)
@@ -277,6 +278,7 @@ func TestCanonicalRetryMatrixSameProcessAndReopen(t *testing.T) {
 }
 
 func TestCanonicalRetryMatrixSimultaneousIndependentHandles(t *testing.T) {
+	t.Parallel()
 	first, f := buildRetryMatrixFixture(t)
 	defer first.Close()
 	second, err := OpenSQLite(f.path)
@@ -323,6 +325,7 @@ func TestCanonicalRetryMatrixSimultaneousIndependentHandles(t *testing.T) {
 }
 
 func TestInvalidDecisionEvidenceKindsFailBeforeJournalWrites(t *testing.T) {
+	t.Parallel()
 	tr, f := buildRetryMatrixFixture(t)
 	defer tr.Close()
 	before := readOperationCounts(t, tr)

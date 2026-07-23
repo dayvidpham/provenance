@@ -1165,6 +1165,7 @@ func countSuccessorEpisodes(env *opsEnv, task TaskID) (int, error) {
 // corpus case for this (reuse-operationid-different-mutation-digest) is scoped to
 // Recovery behavior has separate coverage, so this test targets the write path.
 func TestApplyRejectsOperationIDReuseWithDifferentIdentity(t *testing.T) {
+	t.Parallel()
 	env := newOpsEnv(t)
 	boot := env.genesis(t, "op-genesis")
 	task := env.taskFor(t, "t1")
@@ -1203,6 +1204,7 @@ func TestApplyRejectsOperationIDReuseWithDifferentIdentity(t *testing.T) {
 // ErrOperationConflict and errors.As-extracts the *OperationConflict — no dead
 // enum variant, no stringified-only payload.
 func TestApplyConflictProducesTypedClosedSumAndErrorsAs(t *testing.T) {
+	t.Parallel()
 	env := newOpsEnv(t)
 	boot := env.genesis(t, "op-genesis")
 	task := env.taskFor(t, "t1")
@@ -1254,6 +1256,7 @@ func TestApplyConflictProducesTypedClosedSumAndErrorsAs(t *testing.T) {
 // rejected under an authority that does not govern the named task (zero writes),
 // accepted under one that does, and an untasked decision skips the check (§6.1).
 func TestFoldDecisionEnforcesAuthorityGovernance(t *testing.T) {
+	t.Parallel()
 	env := newOpsEnv(t)
 	boot := env.genesis(t, "op-genesis")
 	governed := env.taskFor(t, "t-governed")
@@ -1302,6 +1305,7 @@ func TestFoldDecisionEnforcesAuthorityGovernance(t *testing.T) {
 // TestFoldEvidenceEnforcesAuthorityGovernance is the §9.3 per-effect authority
 // checkpoint for journal_evidence, mirroring the decision case.
 func TestFoldEvidenceEnforcesAuthorityGovernance(t *testing.T) {
+	t.Parallel()
 	env := newOpsEnv(t)
 	boot := env.genesis(t, "op-genesis")
 	governed := env.taskFor(t, "t-governed")
@@ -1355,6 +1359,7 @@ func TestFoldEvidenceEnforcesAuthorityGovernance(t *testing.T) {
 // raw SQLite constraint error. Under the in-process db.mu the live path is
 // unreachable, so the translation is driven through the adversarial seam.
 func TestResolveOperationIDInsertRaceTranslatesToTypedOutcome(t *testing.T) {
+	t.Parallel()
 	env := newOpsEnv(t)
 	boot := env.genesis(t, "op-genesis")
 	task := env.taskFor(t, "t1")

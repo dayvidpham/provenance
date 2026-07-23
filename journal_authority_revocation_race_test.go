@@ -49,24 +49,27 @@ func (r *raceTracker) startEpisodeAuthority(t *testing.T, opID string, task Task
 // authorization is decided at the effect's own JournalID against committed state, not
 // snapshotted at operation entry.
 func TestRevokeVsInFlightCitationNoTOCTOU(t *testing.T) {
+	t.Parallel()
 	const iterations = 40
 	committedWins, rejectedWins := 0, 0
+	r := newRaceTracker(t)
 
 	for i := 0; i < iterations; i++ {
-		r := newRaceTracker(t)
-		task := r.createTask(t, "toctou")
+		suffix := fmt.Sprintf("-%d", i)
+		task := r.createTask(t, "toctou"+suffix)
 		occ := r.actorB
-		auth := r.startEpisodeAuthority(t, "op-auth-start", task, "AUTH", occ)
+		assignment := AssignmentID("AUTH" + suffix)
+		auth := r.startEpisodeAuthority(t, "op-auth-start"+suffix, task, assignment, occ)
 
 		citeOp := OperationInput{
-			OperationID: "op-cite-authority", ActorID: r.actorA, AuthorityJournalID: &auth,
-			CommandDigest: []byte("cite-c"), MutationDigest: []byte("cite-m"),
+			OperationID: OperationID("op-cite-authority" + suffix), ActorID: r.actorA, AuthorityJournalID: &auth,
+			CommandDigest: []byte("cite-c" + suffix), MutationDigest: []byte("cite-m" + suffix),
 			Effects: []Effect{{Sort: EffectTaskEvent, TaskID: task, EventKind: EventKind("provenance.review.recorded")}},
 		}
 		revokeOp := OperationInput{
-			OperationID: "op-revoke-authority", ActorID: r.actorA, AuthorityJournalID: &r.boot,
-			CommandDigest: []byte("revoke-c"), MutationDigest: []byte("revoke-m"),
-			Effects: []Effect{{Sort: EffectAssignmentEnd, AssignmentID: "AUTH", TaskID: task, SlotID: SlotOwnerResponsibility}},
+			OperationID: OperationID("op-revoke-authority" + suffix), ActorID: r.actorA, AuthorityJournalID: &r.boot,
+			CommandDigest: []byte("revoke-c" + suffix), MutationDigest: []byte("revoke-m" + suffix),
+			Effects: []Effect{{Sort: EffectAssignmentEnd, AssignmentID: assignment, TaskID: task, SlotID: SlotOwnerResponsibility}},
 		}
 
 		var (
@@ -123,6 +126,7 @@ func TestRevokeVsInFlightCitationNoTOCTOU(t *testing.T) {
 // with ErrAuthorityScope. This is the deterministic complement to
 // TestRevokeVsInFlightCitationNoTOCTOU's concurrent invariant.
 func TestRevokeAndCitationBothOrderingsDeterministic(t *testing.T) {
+	t.Parallel()
 	cite := func(r *raceTracker, task TaskID, auth JournalID) (CommittedResult, error) {
 		return r.tr.Journal().Apply(OperationInput{
 			OperationID: "op-cite", ActorID: r.actorA, AuthorityJournalID: &auth,
@@ -176,26 +180,30 @@ func TestRevokeAndCitationBothOrderingsDeterministic(t *testing.T) {
 // the loser observes A already ended and is rejected with a typed ErrStaleEpisode,
 // writing nothing. The surviving state is single-valued and converges.
 func TestRevocationVsTransferCASSingleWinner(t *testing.T) {
+	t.Parallel()
 	const iterations = 40
 	revokeWins, transferWins := 0, 0
+	r := newRaceTracker(t)
 
 	for i := 0; i < iterations; i++ {
-		r := newRaceTracker(t)
-		task := r.createTask(t, "cas")
+		suffix := fmt.Sprintf("-%d", i)
+		task := r.createTask(t, "cas"+suffix)
 		occ := r.actorB
-		r.startEpisodeAuthority(t, "op-cas-start", task, "CAS-A", occ)
+		assignmentA := AssignmentID("CAS-A" + suffix)
+		assignmentB := AssignmentID("CAS-B" + suffix)
+		r.startEpisodeAuthority(t, "op-cas-start"+suffix, task, assignmentA, occ)
 
 		revokeOp := OperationInput{
-			OperationID: "op-cas-revoke", ActorID: r.actorA, AuthorityJournalID: &r.boot,
-			CommandDigest: []byte("cas-rev-c"), MutationDigest: []byte("cas-rev-m"),
-			Effects: []Effect{{Sort: EffectAssignmentEnd, AssignmentID: "CAS-A", TaskID: task, SlotID: SlotOwnerResponsibility}},
+			OperationID: OperationID("op-cas-revoke" + suffix), ActorID: r.actorA, AuthorityJournalID: &r.boot,
+			CommandDigest: []byte("cas-rev-c" + suffix), MutationDigest: []byte("cas-rev-m" + suffix),
+			Effects: []Effect{{Sort: EffectAssignmentEnd, AssignmentID: assignmentA, TaskID: task, SlotID: SlotOwnerResponsibility}},
 		}
 		transferOp := OperationInput{
-			OperationID: "op-cas-transfer", ActorID: r.actorA, AuthorityJournalID: &r.boot,
-			CommandDigest: []byte("cas-xfer-c"), MutationDigest: []byte("cas-xfer-m"),
+			OperationID: OperationID("op-cas-transfer" + suffix), ActorID: r.actorA, AuthorityJournalID: &r.boot,
+			CommandDigest: []byte("cas-xfer-c" + suffix), MutationDigest: []byte("cas-xfer-m" + suffix),
 			Effects: []Effect{
-				{Sort: EffectAssignmentEnd, AssignmentID: "CAS-A", TaskID: task, SlotID: SlotOwnerResponsibility},
-				{Sort: EffectAssignmentStart, AssignmentID: "CAS-B", TaskID: task, SlotID: SlotOwnerResponsibility, Occupant: occ, Predecessor: "CAS-A"},
+				{Sort: EffectAssignmentEnd, AssignmentID: assignmentA, TaskID: task, SlotID: SlotOwnerResponsibility},
+				{Sort: EffectAssignmentStart, AssignmentID: assignmentB, TaskID: task, SlotID: SlotOwnerResponsibility, Occupant: occ, Predecessor: assignmentA},
 			},
 		}
 

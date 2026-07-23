@@ -6,8 +6,8 @@ complements the comprehensive [test-infrastructure guide](../TESTING.md). The
 authoritative test gates remain:
 
 ```bash
-go test -p=16 -cpu=1,16 -parallel=16 -count=1 -shuffle=on -fullpath -timeout=10m ./...
-CGO_ENABLED=1 go test -race -p=16 -cpu=16 -parallel=16 -count=1 -shuffle=on -fullpath -timeout=20m ./...
+go test -count=1 -shuffle=on -fullpath -timeout=10m ./...
+CGO_ENABLED=1 go test -race -count=1 -shuffle=on -fullpath -timeout=20m ./...
 ```
 
 Local iteration normally uses cached `go test ./...`. `-count=1` means one
@@ -51,6 +51,30 @@ full race gate (`-cpu=16`) passed in `182.88s` wall. The race gate remained near
 the earlier `183.18s` because the shortened DBOS families overlap another race
 critical path; isolated family latency, not full race wall time, is the measured
 gain from result polling.
+
+The subsequent default-runner pass removed explicit `-cpu`, `-parallel`, and
+`-p` settings from the authoritative gates, parallelized isolated fixtures, and
+used empty model registries only in harnesses that do not exercise ML models.
+The authority race loops now reuse one tracker with unique task, assignment, and
+operation identities per iteration. The 325-case create matrix runs five
+isolated task-type partitions, and the 98-case startup corruption matrix runs
+against parallel private copies of one immutable baseline. Coverage counts,
+production SQLite opens, corruption-byte checks, and race iteration counts are
+unchanged.
+
+| Current default-runner gate | Wall time | Root package |
+|---|---:|---:|
+| Normal | `10.485s` | `9.070s` |
+| Race | `72.46s` | `70.570s` |
+
+The full race wall time fell from the initial `120.46s` default-runner baseline
+to `72.46s` (`-48.00s`, `-39.85%`). Focused race package times were `4.412s` for
+the two authority races together, `2.705s` for all create permutations, and
+`5.300s` for the startup corruption matrix. Under the full workload, those same
+tests still report contention-inflated elapsed times, so isolated timings must
+not be summed or presented as end-to-end savings. The exploratory sub-60-second
+goal was not reached without reducing stress counts or required production-path
+coverage; neither compromise was accepted.
 
 ### Raw per-case corruption preparation: 2026-07-22
 
@@ -169,8 +193,8 @@ time and retain the uncached full-suite result.
 
 ```bash
 # Authoritative wall clock and correctness gates.
-time go test -p=16 -cpu=1,16 -parallel=16 -count=1 -shuffle=on -fullpath -timeout=10m ./...
-time CGO_ENABLED=1 go test -race -p=16 -cpu=16 -parallel=16 -count=1 -shuffle=on -fullpath -timeout=20m ./...
+time go test -count=1 -shuffle=on -fullpath -timeout=10m ./...
+time CGO_ENABLED=1 go test -race -count=1 -shuffle=on -fullpath -timeout=20m ./...
 
 # Package-level attribution.
 time CGO_ENABLED=1 go test -race -cpu=2 -count=1 -timeout=20m .

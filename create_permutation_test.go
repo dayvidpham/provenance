@@ -62,81 +62,84 @@ func loadCreateFixtures(t *testing.T) CreateFixtures {
 // TaskType × Priority × Phase, verifying that Create returns a well-formed
 // Task with Status=StatusOpen and correctly round-tripped enum fields.
 func TestCreate_Permutations(t *testing.T) {
+	t.Parallel()
 	fix := loadCreateFixtures(t)
 	suite := fix.Create
 
-	tr := openTestTracker(t)
-
 	count := 0
 	for _, tt := range suite.TaskTypes {
-		for _, pr := range suite.Priorities {
-			for _, ph := range suite.Phases {
-				taskType := provenance.TaskType(tt.Value)
-				priority := provenance.Priority(pr.Value)
-				phase := provenance.Phase(ph.Value)
+		count += len(suite.Priorities) * len(suite.Phases)
+		t.Run(tt.Name, func(t *testing.T) {
+			t.Parallel()
+			tr := openTestTrackerWithOptions(t, provenance.WithModelRegistry(provenance.NewRegistry(nil)))
+			taskType := provenance.TaskType(tt.Value)
 
-				testName := fmt.Sprintf("%s/%s/%s", tt.Name, pr.Name, ph.Name)
-				t.Run(testName, func(t *testing.T) {
-					task, err := tr.Create(
-						"test-ns",
-						"Permutation title",
-						"Permutation description",
-						taskType,
-						priority,
-						phase,
-					)
-					if err != nil {
-						t.Fatalf(
-							"Create(task_type=%s, priority=%s, phase=%s) returned unexpected error: %v — "+
-								"each valid enum combination must succeed without error",
-							tt.Name, pr.Name, ph.Name, err,
-						)
-					}
+			for _, pr := range suite.Priorities {
+				for _, ph := range suite.Phases {
+					priority := provenance.Priority(pr.Value)
+					phase := provenance.Phase(ph.Value)
 
-					// Status must always be StatusOpen on creation.
-					if task.Status != provenance.StatusOpen {
-						t.Errorf(
-							"Status = %v, want StatusOpen — "+
-								"Create must initialize all tasks with Status=StatusOpen",
-							task.Status,
+					t.Run(fmt.Sprintf("%s/%s", pr.Name, ph.Name), func(t *testing.T) {
+						task, err := tr.Create(
+							"test-ns",
+							"Permutation title",
+							"Permutation description",
+							taskType,
+							priority,
+							phase,
 						)
-					}
+						if err != nil {
+							t.Fatalf(
+								"Create(task_type=%s, priority=%s, phase=%s) returned unexpected error: %v — "+
+									"each valid enum combination must succeed without error",
+								tt.Name, pr.Name, ph.Name, err,
+							)
+						}
 
-					// ID namespace must match the argument.
-					if task.ID.Namespace != "test-ns" {
-						t.Errorf(
-							"ID.Namespace = %q, want %q — "+
-								"Create must preserve the namespace argument in the returned Task.ID",
-							task.ID.Namespace, "test-ns",
-						)
-					}
+						// Status must always be StatusOpen on creation.
+						if task.Status != provenance.StatusOpen {
+							t.Errorf(
+								"Status = %v, want StatusOpen — "+
+									"Create must initialize all tasks with Status=StatusOpen",
+								task.Status,
+							)
+						}
 
-					// Enum fields must round-trip exactly.
-					if task.Type != taskType {
-						t.Errorf(
-							"Type = %v (%d), want %v (%d) — "+
-								"Create must store and return the TaskType argument unchanged",
-							task.Type, int(task.Type), taskType, int(taskType),
-						)
-					}
-					if task.Priority != priority {
-						t.Errorf(
-							"Priority = %v (%d), want %v (%d) — "+
-								"Create must store and return the Priority argument unchanged",
-							task.Priority, int(task.Priority), priority, int(priority),
-						)
-					}
-					if task.Phase != phase {
-						t.Errorf(
-							"Phase = %v (%d), want %v (%d) — "+
-								"Create must store and return the Phase argument unchanged",
-							task.Phase, int(task.Phase), phase, int(phase),
-						)
-					}
-				})
-				count++
+						// ID namespace must match the argument.
+						if task.ID.Namespace != "test-ns" {
+							t.Errorf(
+								"ID.Namespace = %q, want %q — "+
+									"Create must preserve the namespace argument in the returned Task.ID",
+								task.ID.Namespace, "test-ns",
+							)
+						}
+
+						// Enum fields must round-trip exactly.
+						if task.Type != taskType {
+							t.Errorf(
+								"Type = %v (%d), want %v (%d) — "+
+									"Create must store and return the TaskType argument unchanged",
+								task.Type, int(task.Type), taskType, int(taskType),
+							)
+						}
+						if task.Priority != priority {
+							t.Errorf(
+								"Priority = %v (%d), want %v (%d) — "+
+									"Create must store and return the Priority argument unchanged",
+								task.Priority, int(task.Priority), priority, int(priority),
+							)
+						}
+						if task.Phase != phase {
+							t.Errorf(
+								"Phase = %v (%d), want %v (%d) — "+
+									"Create must store and return the Phase argument unchanged",
+								task.Phase, int(task.Phase), phase, int(phase),
+							)
+						}
+					})
+				}
 			}
-		}
+		})
 	}
 
 	t.Logf(

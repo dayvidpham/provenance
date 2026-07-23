@@ -52,6 +52,7 @@ func establishGenesis(t *testing.T, tr provenance.Tracker, actor provenance.Acto
 }
 
 func TestSession_CreateJournalsBirth(t *testing.T) {
+	t.Parallel()
 	tr, actor := newSessionTracker(t)
 	boot := establishGenesis(t, tr, actor)
 	s := tr.As(actor, boot)
@@ -77,6 +78,7 @@ func TestSession_CreateJournalsBirth(t *testing.T) {
 }
 
 func TestSession_CreateEmptyNamespaceRejected(t *testing.T) {
+	t.Parallel()
 	tr, actor := newSessionTracker(t)
 	boot := establishGenesis(t, tr, actor)
 	_, err := tr.As(actor, boot).Create("", "t", "", provenance.TaskTypeTask, provenance.PriorityMedium, provenance.PhaseUnscoped)
@@ -86,6 +88,7 @@ func TestSession_CreateEmptyNamespaceRejected(t *testing.T) {
 }
 
 func TestSession_JournaledVerbsRequireGenesis(t *testing.T) {
+	t.Parallel()
 	tr, actor := newSessionTracker(t)
 	// No genesis established: the journal is empty.
 	_, err := tr.As(actor, 0).Create("aura", "t", "", provenance.TaskTypeTask, provenance.PriorityMedium, provenance.PhaseUnscoped)
@@ -95,6 +98,7 @@ func TestSession_JournaledVerbsRequireGenesis(t *testing.T) {
 }
 
 func TestSession_UpdateMetadataMaterializesAndJournals(t *testing.T) {
+	t.Parallel()
 	tr, actor := newSessionTracker(t)
 	boot := establishGenesis(t, tr, actor)
 	s := tr.As(actor, boot)
@@ -119,6 +123,7 @@ func TestSession_UpdateMetadataMaterializesAndJournals(t *testing.T) {
 }
 
 func TestSession_StartJournalsStarted(t *testing.T) {
+	t.Parallel()
 	tr, actor := newSessionTracker(t)
 	boot := establishGenesis(t, tr, actor)
 	s := tr.As(actor, boot)
@@ -142,6 +147,7 @@ func TestSession_StartJournalsStarted(t *testing.T) {
 // TestSession_StopHaltsInProgress covers the in_progress → open transition (Session.Stop,
 // provenance.task.stopped): an FSM arrow with no pre-tightening analogue.
 func TestSession_StopHaltsInProgress(t *testing.T) {
+	t.Parallel()
 	tr, actor := newSessionTracker(t)
 	boot := establishGenesis(t, tr, actor)
 	s := tr.As(actor, boot)
@@ -168,6 +174,7 @@ func TestSession_StopHaltsInProgress(t *testing.T) {
 // the direct closed → in_progress jump are rejected with the typed ErrStatusTransition,
 // and WithForce coerces the illegal transition while keeping the journal reproducible.
 func TestSession_IllegalTransitionRejected(t *testing.T) {
+	t.Parallel()
 	tr, actor := newSessionTracker(t)
 	boot := establishGenesis(t, tr, actor)
 	s := tr.As(actor, boot)
@@ -209,6 +216,7 @@ func TestSession_IllegalTransitionRejected(t *testing.T) {
 // TestSession_IllegalTransitionRejected only forces under the all-governing bootstrap
 // authority, so it never proves this negative (force + wrong authority => still rejected).
 func TestSession_ForcedTransitionUnderNonGoverningAuthorityRejected(t *testing.T) {
+	t.Parallel()
 	tr, actor := newSessionTracker(t)
 	boot := establishGenesis(t, tr, actor)
 	sBoot := tr.As(actor, boot)
@@ -294,6 +302,7 @@ func startAssignmentAuthority(t *testing.T, tr provenance.Tracker, actor provena
 }
 
 func TestSession_UpdateEmptyIsNoOp(t *testing.T) {
+	t.Parallel()
 	tr, actor := newSessionTracker(t)
 	boot := establishGenesis(t, tr, actor)
 	s := tr.As(actor, boot)
@@ -320,6 +329,7 @@ func TestSession_UpdateEmptyIsNoOp(t *testing.T) {
 }
 
 func TestSession_UpdateOwnerRejected(t *testing.T) {
+	t.Parallel()
 	tr, actor := newSessionTracker(t)
 	boot := establishGenesis(t, tr, actor)
 	s := tr.As(actor, boot)
@@ -334,6 +344,7 @@ func TestSession_UpdateOwnerRejected(t *testing.T) {
 }
 
 func TestSession_CloseTaskJournalsClosure(t *testing.T) {
+	t.Parallel()
 	tr, actor := newSessionTracker(t)
 	boot := establishGenesis(t, tr, actor)
 	s := tr.As(actor, boot)
@@ -361,6 +372,7 @@ func TestSession_CloseTaskJournalsClosure(t *testing.T) {
 }
 
 func TestSession_CloseThenReopenConverges(t *testing.T) {
+	t.Parallel()
 	tr, actor := newSessionTracker(t)
 	boot := establishGenesis(t, tr, actor)
 	s := tr.As(actor, boot)
@@ -384,6 +396,7 @@ func TestSession_CloseThenReopenConverges(t *testing.T) {
 }
 
 func TestSession_PinnedOperationIDIsIdempotent(t *testing.T) {
+	t.Parallel()
 	tr, actor := newSessionTracker(t)
 	boot := establishGenesis(t, tr, actor)
 	s := tr.As(actor, boot)
@@ -417,6 +430,7 @@ func TestSession_PinnedOperationIDIsIdempotent(t *testing.T) {
 // verbs journal one mutation-family event each (who-provenance), the domain projections
 // take effect, and the whole history replays from empty (convergence).
 func TestSession_RelationshipVerbsAreJournaled(t *testing.T) {
+	t.Parallel()
 	tr, actor := newSessionTracker(t)
 	boot := establishGenesis(t, tr, actor)
 	s := tr.As(actor, boot)
@@ -495,6 +509,7 @@ func TestSession_RelationshipVerbsAreJournaled(t *testing.T) {
 }
 
 func TestSession_AtomicStartEpisodeSetsOwner(t *testing.T) {
+	t.Parallel()
 	tr, actor := newSessionTracker(t)
 	boot := establishGenesis(t, tr, actor)
 	s := tr.As(actor, boot)
@@ -520,6 +535,7 @@ func TestSession_AtomicStartEpisodeSetsOwner(t *testing.T) {
 }
 
 func TestSession_AtomicEmptyRejected(t *testing.T) {
+	t.Parallel()
 	tr, actor := newSessionTracker(t)
 	boot := establishGenesis(t, tr, actor)
 	if _, err := tr.As(actor, boot).Atomic(func(op *provenance.Operation) {}); err == nil {

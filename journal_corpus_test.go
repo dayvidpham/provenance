@@ -161,6 +161,7 @@ func TestContractCorpusExecutesImplementedPartitions(t *testing.T) {
 				t.Fatalf("%s/%s: %s operator %q has no registered handler", file, c.Name, area, c.Mutation.Operator)
 			}
 			t.Run(file+"/"+c.Name, func(t *testing.T) {
+				t.Parallel()
 				if err := op(t, c.Input, c.Expected, c.Classification); err != nil {
 					t.Fatalf("execute %q: %v", c.Mutation.Operator, err)
 				}
@@ -209,7 +210,7 @@ type journalEnv struct {
 
 func newJournalEnv(t *testing.T) *journalEnv {
 	t.Helper()
-	tr, err := OpenMemory()
+	tr, err := OpenMemory(WithModelRegistry(NewRegistry(nil)))
 	if err != nil {
 		t.Fatalf("OpenMemory: %v", err)
 	}

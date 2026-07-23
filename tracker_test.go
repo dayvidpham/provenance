@@ -18,8 +18,16 @@ import (
 // journaled production path (Tracker.As). The tracker is closed automatically when
 // the test ends.
 func openTestTracker(t *testing.T) *testTracker {
+	return openTestTrackerWithOptions(t, provenance.WithModelRegistry(provenance.NewRegistry(nil)))
+}
+
+func openTestTrackerWithDefaultModels(t *testing.T) *testTracker {
+	return openTestTrackerWithOptions(t)
+}
+
+func openTestTrackerWithOptions(t *testing.T, opts ...provenance.Option) *testTracker {
 	t.Helper()
-	tr, err := provenance.OpenMemory()
+	tr, err := provenance.OpenMemory(opts...)
 	if err != nil {
 		t.Fatalf("OpenMemory() failed: %v", err)
 	}
@@ -43,6 +51,7 @@ func mustCreateTask(t *testing.T, tr *testTracker, namespace string) provenance.
 }
 
 func TestOpenMemory(t *testing.T) {
+	t.Parallel()
 	tr, err := provenance.OpenMemory()
 	if err != nil {
 		t.Fatalf("OpenMemory() returned error: %v", err)
@@ -53,6 +62,7 @@ func TestOpenMemory(t *testing.T) {
 }
 
 func TestCreateAndShow(t *testing.T) {
+	t.Parallel()
 	tr := openTestTracker(t)
 
 	task, err := tr.Create("test-ns", "My Task", "A description", provenance.TaskTypeTask, provenance.PriorityMedium, provenance.PhaseUnscoped)
@@ -96,6 +106,7 @@ func TestCreateAndShow(t *testing.T) {
 }
 
 func TestCreateGeneratesUUIDv7(t *testing.T) {
+	t.Parallel()
 	tr := openTestTracker(t)
 
 	a, err := tr.Create("ns", "Task A", "", provenance.TaskTypeTask, provenance.PriorityMedium, provenance.PhaseUnscoped)
@@ -113,6 +124,7 @@ func TestCreateGeneratesUUIDv7(t *testing.T) {
 }
 
 func TestShowNotFound(t *testing.T) {
+	t.Parallel()
 	tr := openTestTracker(t)
 
 	fakeID, err := provenance.ParseTaskID("ns--00000000-0000-7000-8000-000000000000")
@@ -127,6 +139,7 @@ func TestShowNotFound(t *testing.T) {
 }
 
 func TestUpdateTask(t *testing.T) {
+	t.Parallel()
 	tr := openTestTracker(t)
 
 	task, err := tr.Create("ns", "Old Title", "", provenance.TaskTypeTask, provenance.PriorityMedium, provenance.PhaseUnscoped)
@@ -152,6 +165,7 @@ func TestUpdateTask(t *testing.T) {
 }
 
 func TestCloseTask(t *testing.T) {
+	t.Parallel()
 	tr := openTestTracker(t)
 
 	task, err := tr.Create("ns", "Close Me", "", provenance.TaskTypeTask, provenance.PriorityMedium, provenance.PhaseUnscoped)
@@ -175,6 +189,7 @@ func TestCloseTask(t *testing.T) {
 }
 
 func TestCloseTaskAlreadyClosed(t *testing.T) {
+	t.Parallel()
 	tr := openTestTracker(t)
 
 	task, err := tr.Create("ns", "Double Close", "", provenance.TaskTypeTask, provenance.PriorityMedium, provenance.PhaseUnscoped)
@@ -195,6 +210,7 @@ func TestCloseTaskAlreadyClosed(t *testing.T) {
 }
 
 func TestAddEdgeBlockedBy(t *testing.T) {
+	t.Parallel()
 	tr := openTestTracker(t)
 
 	parent, err := tr.Create("ns", "Parent", "", provenance.TaskTypeTask, provenance.PriorityMedium, provenance.PhaseUnscoped)
@@ -225,6 +241,7 @@ func TestAddEdgeBlockedBy(t *testing.T) {
 }
 
 func TestAddEdgeCycleDetected(t *testing.T) {
+	t.Parallel()
 	tr := openTestTracker(t)
 
 	a, err := tr.Create("ns", "A", "", provenance.TaskTypeTask, provenance.PriorityMedium, provenance.PhaseUnscoped)
@@ -249,6 +266,7 @@ func TestAddEdgeCycleDetected(t *testing.T) {
 }
 
 func TestReadyAndBlocked(t *testing.T) {
+	t.Parallel()
 	tr := openTestTracker(t)
 
 	parent, err := tr.Create("ns", "Parent", "", provenance.TaskTypeTask, provenance.PriorityMedium, provenance.PhaseUnscoped)
@@ -312,6 +330,7 @@ func TestReadyAndBlocked(t *testing.T) {
 }
 
 func TestAddLabel(t *testing.T) {
+	t.Parallel()
 	tr := openTestTracker(t)
 
 	task, err := tr.Create("ns", "Task", "", provenance.TaskTypeTask, provenance.PriorityMedium, provenance.PhaseUnscoped)
@@ -349,6 +368,7 @@ func TestAddLabel(t *testing.T) {
 }
 
 func TestAddComment(t *testing.T) {
+	t.Parallel()
 	tr := openTestTracker(t)
 
 	agent, err := tr.RegisterHumanAgent("ns", "Alice", "alice@example.com")
@@ -388,6 +408,7 @@ func TestAddComment(t *testing.T) {
 }
 
 func TestRegisterHumanAgent(t *testing.T) {
+	t.Parallel()
 	tr := openTestTracker(t)
 
 	agent, err := tr.RegisterHumanAgent("ns", "Bob", "bob@example.com")
@@ -418,7 +439,8 @@ func TestRegisterHumanAgent(t *testing.T) {
 }
 
 func TestRegisterMLAgent(t *testing.T) {
-	tr := openTestTracker(t)
+	t.Parallel()
+	tr := openTestTrackerWithDefaultModels(t)
 
 	// "claude-sonnet-4-6" is a model seeded in the schema at database creation time.
 	agent, err := tr.RegisterMLAgent("ns", provenance.RoleWorker, provenance.ProviderAnthropic, provenance.ModelID("claude-sonnet-4-6"))
@@ -452,6 +474,7 @@ func TestRegisterMLAgent(t *testing.T) {
 }
 
 func TestStartAndEndActivity(t *testing.T) {
+	t.Parallel()
 	tr := openTestTracker(t)
 
 	agent, err := tr.RegisterHumanAgent("ns", "Worker", "")
@@ -489,6 +512,7 @@ func TestStartAndEndActivity(t *testing.T) {
 }
 
 func TestAncestorsAndDescendants(t *testing.T) {
+	t.Parallel()
 	tr := openTestTracker(t)
 
 	// Chain: A blocked by B blocked by C.
@@ -554,6 +578,7 @@ func TestAncestorsAndDescendants(t *testing.T) {
 }
 
 func TestDepTree(t *testing.T) {
+	t.Parallel()
 	tr := openTestTracker(t)
 
 	root, err := tr.Create("ns", "Root", "", provenance.TaskTypeTask, provenance.PriorityMedium, provenance.PhaseUnscoped)
@@ -594,6 +619,7 @@ func TestDepTree(t *testing.T) {
 }
 
 func TestList(t *testing.T) {
+	t.Parallel()
 	tr := openTestTracker(t)
 
 	_, err := tr.Create("ns", "Open Task", "", provenance.TaskTypeTask, provenance.PriorityMedium, provenance.PhaseUnscoped)
@@ -649,6 +675,7 @@ func TestList(t *testing.T) {
 // TestRegisterSoftwareAgent registers a software agent, retrieves it via
 // SoftwareAgent(), and verifies all fields match.
 func TestRegisterSoftwareAgent(t *testing.T) {
+	t.Parallel()
 	tr := openTestTracker(t)
 
 	sa, err := tr.RegisterSoftwareAgent("ns", "provenance-cli", "v0.1.0", "https://github.com/dayvidpham/provenance")
@@ -695,7 +722,8 @@ func TestRegisterSoftwareAgent(t *testing.T) {
 // TestAgent registers agents of each kind and verifies the base Agent()
 // method returns the correct AgentKind.
 func TestAgent(t *testing.T) {
-	tr := openTestTracker(t)
+	t.Parallel()
+	tr := openTestTrackerWithDefaultModels(t)
 
 	// Register one of each kind.
 	human, err := tr.RegisterHumanAgent("ns", "Alice", "alice@example.com")
@@ -740,6 +768,7 @@ func TestAgent(t *testing.T) {
 // TestActivities starts and ends an activity, then calls Activities() to list
 // activities and verifies the returned list contains the activity.
 func TestActivities(t *testing.T) {
+	t.Parallel()
 	tr := openTestTracker(t)
 
 	agent, err := tr.RegisterHumanAgent("ns", "Worker", "")
@@ -796,6 +825,7 @@ func TestActivities(t *testing.T) {
 // TestRemoveEdge creates two tasks, adds a blocked-by edge, verifies it exists,
 // removes it, and verifies it is gone.
 func TestRemoveEdge(t *testing.T) {
+	t.Parallel()
 	tr := openTestTracker(t)
 
 	parent := mustCreateTask(t, tr, "ns")
@@ -839,6 +869,7 @@ func TestRemoveEdge(t *testing.T) {
 // TestNonBlockedByEdges verifies that non-BlockedBy edge kinds (EdgeDerivedFrom,
 // EdgeSupersedes) do NOT affect task readiness queries (Blocked/Ready).
 func TestNonBlockedByEdges(t *testing.T) {
+	t.Parallel()
 	tr := openTestTracker(t)
 
 	taskA := mustCreateTask(t, tr, "ns")
@@ -907,6 +938,7 @@ func TestNonBlockedByEdges(t *testing.T) {
 // TestRemoveLabel verifies AddLabel → Labels → RemoveLabel → Labels round-trip,
 // and that RemoveLabel is idempotent (no error on double-remove).
 func TestRemoveLabel(t *testing.T) {
+	t.Parallel()
 	tr := openTestTracker(t)
 	task := mustCreateTask(t, tr, "ns")
 
@@ -965,6 +997,7 @@ func TestRemoveLabel(t *testing.T) {
 
 // TestCreateEmptyNamespace verifies that Create rejects an empty namespace (M3).
 func TestCreateEmptyNamespace(t *testing.T) {
+	t.Parallel()
 	tr := openTestTracker(t)
 
 	_, err := tr.Create("", "Title", "Desc", provenance.TaskTypeTask, provenance.PriorityMedium, provenance.PhaseUnscoped)
@@ -979,6 +1012,7 @@ func TestCreateEmptyNamespace(t *testing.T) {
 // TestConcurrentCreate verifies that 10 goroutines each doing 20 Create
 // operations do not race and all 200 tasks are created successfully (M4).
 func TestConcurrentCreate(t *testing.T) {
+	t.Parallel()
 	tr := openTestTracker(t)
 
 	const goroutines = 10
@@ -1021,6 +1055,7 @@ func TestConcurrentCreate(t *testing.T) {
 
 // TestListFilterByLabel verifies that ListFilter.Label filters correctly (M6).
 func TestListFilterByLabel(t *testing.T) {
+	t.Parallel()
 	tr := openTestTracker(t)
 
 	taskA := mustCreateTask(t, tr, "label-ns")
@@ -1067,6 +1102,7 @@ func TestListFilterByLabel(t *testing.T) {
 
 // TestListFilterByNamespace verifies that ListFilter.Namespace filters correctly (M6).
 func TestListFilterByNamespace(t *testing.T) {
+	t.Parallel()
 	tr := openTestTracker(t)
 
 	_ = mustCreateTask(t, tr, "alpha")

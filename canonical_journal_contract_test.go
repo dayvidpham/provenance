@@ -26,6 +26,7 @@ func isSQLiteContentionError(err error) bool {
 }
 
 func TestCanonicalRetryIgnoresCallerMutationDigestButRejectsEffectChange(t *testing.T) {
+	t.Parallel()
 	env := newOpsEnv(t)
 	boot := env.genesis(t, "canonical-retry-genesis")
 	task := env.taskFor(t, "canonical-retry-task")
@@ -101,6 +102,7 @@ func journalRowCount(t *testing.T, tr Tracker) int64 {
 }
 
 func TestCanonicalRetryAcrossIndependentHandles(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "independent.sqlite")
 	firstTracker, err := OpenSQLite(path)
 	if err != nil {
@@ -169,6 +171,7 @@ func TestCanonicalRetryAcrossIndependentHandles(t *testing.T) {
 }
 
 func TestCanonicalExactRetryAfterReopenReturnsCompleteResult(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "retry-reopen.sqlite")
 	tr, err := OpenSQLite(path)
 	if err != nil {
@@ -215,6 +218,7 @@ func TestCanonicalExactRetryAfterReopenReturnsCompleteResult(t *testing.T) {
 }
 
 func TestPinnedSessionCreateAcrossIndependentHandles(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "pinned-create.sqlite")
 	first, err := OpenSQLite(path)
 	if err != nil {
@@ -295,6 +299,7 @@ func TestPinnedSessionCreateAcrossIndependentHandles(t *testing.T) {
 }
 
 func TestPinnedSessionCreateSameProcessAndReopenUUIDv7(t *testing.T) {
+	t.Parallel()
 	for name, opID := range map[string]OperationID{"arbitrary": "pinned-create-reopen", "typed-v7": pinnedCreateOperationID(8)} {
 		t.Run(name, func(t *testing.T) { assertPinnedCreateSameProcessAndReopen(t, opID) })
 	}
@@ -360,6 +365,7 @@ func assertPinnedCreateSameProcessAndReopen(t *testing.T, opID OperationID) {
 }
 
 func TestPinnedSessionCreatePreservesOperationIDContract(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "pinned-create-invalid.sqlite")
 	tr, err := OpenSQLite(path)
 	if err != nil {
@@ -411,6 +417,7 @@ func assertPinnedTaskV7(t *testing.T, task Task) {
 }
 
 func TestAllocatedCreateReconcilesOnlyProvisionalUUID(t *testing.T) {
+	t.Parallel()
 	env := newOpsEnv(t)
 	boot := env.genesis(t, "allocated-create-genesis")
 	opID := OperationID("allocated-create-retry")
@@ -494,6 +501,7 @@ func TestAllocatedCreateReconcilesOnlyProvisionalUUID(t *testing.T) {
 }
 
 func TestFixedTaskCreateDoesNotReconcileCallerSuppliedID(t *testing.T) {
+	t.Parallel()
 	env := newOpsEnv(t)
 	boot := env.genesis(t, "fixed-create-genesis")
 	firstID := newCorpusTaskID()
@@ -537,6 +545,7 @@ func TestFixedTaskCreateDoesNotReconcileCallerSuppliedID(t *testing.T) {
 }
 
 func TestStartupCanonicalValidationFailsClosedWithoutByteDrift(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "corrupt.sqlite")
 	tracker, err := OpenSQLite(path)
 	if err != nil {
@@ -586,6 +595,7 @@ func TestStartupCanonicalValidationFailsClosedWithoutByteDrift(t *testing.T) {
 }
 
 func TestCanonicalTaskStateSurvivesRestartAndReplay(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "restart.sqlite")
 	tracker, err := OpenSQLite(path)
 	if err != nil {
@@ -640,6 +650,7 @@ func TestCanonicalTaskStateSurvivesRestartAndReplay(t *testing.T) {
 }
 
 func TestCanonicalSchemaMigrationAndMixedLegacyRowsAreIdempotent(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "migration.sqlite")
 	tracker, err := OpenSQLite(path)
 	if err != nil {
@@ -739,6 +750,7 @@ func makeOperationsSchemaLegacy(t *testing.T, tracker Tracker) {
 }
 
 func TestCorruptLegacySchemaStartupRollsBackWithoutByteDrift(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "legacy-corrupt.sqlite")
 	tr, err := OpenSQLite(path)
 	if err != nil {
@@ -782,6 +794,7 @@ func TestCorruptLegacySchemaStartupRollsBackWithoutByteDrift(t *testing.T) {
 }
 
 func TestMixedLegacyCanonicalMalformedPairsFailWithoutByteDrift(t *testing.T) {
+	t.Parallel()
 	for name, statement := range map[string]string{
 		"version-only":    `UPDATE journal_operations SET canonical_mutation=NULL WHERE operation_id='mixed-pair-new'`,
 		"bytes-only":      `UPDATE journal_operations SET mutation_encoding_version=NULL WHERE operation_id='mixed-pair-new'`,
@@ -842,6 +855,7 @@ func TestMixedLegacyCanonicalMalformedPairsFailWithoutByteDrift(t *testing.T) {
 }
 
 func TestDeleteModeCorruptionPreflightIsByteAndModeReadOnly(t *testing.T) {
+	t.Parallel()
 	for _, legacy := range []bool{false, true} {
 		name := "current"
 		if legacy {
@@ -909,6 +923,7 @@ func TestDeleteModeCorruptionPreflightIsByteAndModeReadOnly(t *testing.T) {
 }
 
 func TestDeleteModeActivationSchemaFailureDoesNotPersistWAL(t *testing.T) {
+	t.Parallel()
 	for name, statements := range map[string][]string{
 		"index-name-is-table": {`DROP INDEX idx_tasks_namespace`, `CREATE TABLE idx_tasks_namespace(value TEXT)`},
 		"index-name-is-view":  {`DROP INDEX idx_edges_source`, `CREATE VIEW idx_edges_source AS SELECT 1 AS value`},
@@ -989,6 +1004,7 @@ func sqliteJournalMode(t *testing.T, path string) string {
 }
 
 func TestMissingJournalOperationFKMigrationIsComposableAndIdempotent(t *testing.T) {
+	t.Parallel()
 	for _, corrupt := range []bool{false, true} {
 		name := "valid"
 		if corrupt {
@@ -1056,6 +1072,7 @@ func TestMissingJournalOperationFKMigrationIsComposableAndIdempotent(t *testing.
 }
 
 func TestCanonicalSQLConstraintsAreVersionAgnostic(t *testing.T) {
+	t.Parallel()
 	tr, err := OpenSQLite(filepath.Join(t.TempDir(), "generic-codec-schema.sqlite"))
 	if err != nil {
 		t.Fatal(err)
@@ -1079,6 +1096,7 @@ func TestCanonicalSQLConstraintsAreVersionAgnostic(t *testing.T) {
 }
 
 func TestV1SpecificSQLAuthorityMigratesOnce(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "v1-schema.sqlite")
 	tr, _ := buildStartupFixture(t, path)
 	if err := tr.(*sqliteTracker).db.AdversarialInstallV1OperationConstraint(); err != nil {

@@ -33,6 +33,7 @@ func (e *opsEnv) applyCreate(boot JournalID, id TaskID, title string, tt TaskTyp
 }
 
 func TestEffectTaskCreate_JournalsBirth(t *testing.T) {
+	t.Parallel()
 	env := newOpsEnv(t)
 	boot := env.genesis(t, "op-genesis")
 	id := newTaskID()
@@ -94,6 +95,7 @@ func TestEffectTaskCreate_JournalsBirth(t *testing.T) {
 }
 
 func TestEffectTaskCreate_ShadowReplayConverges(t *testing.T) {
+	t.Parallel()
 	env := newOpsEnv(t)
 	boot := env.genesis(t, "op-genesis")
 
@@ -135,6 +137,7 @@ func TestEffectTaskCreate_ShadowReplayConverges(t *testing.T) {
 }
 
 func TestEffectTaskCreate_RejectsDuplicateAndInvalid(t *testing.T) {
+	t.Parallel()
 	env := newOpsEnv(t)
 	boot := env.genesis(t, "op-genesis")
 	id := newTaskID()
@@ -161,6 +164,7 @@ func TestEffectTaskCreate_RejectsDuplicateAndInvalid(t *testing.T) {
 }
 
 func TestEffectTaskCreate_RejectsNonGoverningAuthority(t *testing.T) {
+	t.Parallel()
 	env := newOpsEnv(t)
 	boot := env.genesis(t, "op-genesis")
 	// A task and an owner-responsibility episode whose (assignment) authority governs
