@@ -1,0 +1,503 @@
+{
+  "issues": [
+    {
+      "id": "taxonomy-of-benchmarks-01j",
+      "title": "task taxonomy-of-benchmarks-01j (task)",
+      "description": "(redacted: neutral public fixture; structure preserved)",
+      "status": "open",
+      "priority": 2,
+      "issue_type": "task",
+      "owner": "dayvidpham@gmail.com",
+      "created_by": "David Huu Pham",
+      "assignee": "",
+      "labels": [
+        "aura:p4-plan:s4-review"
+      ],
+      "created_at": "2026-03-09T22:09:53Z",
+      "updated_at": "2026-03-09T22:11:19Z",
+      "closed_at": null,
+      "close_reason": "",
+      "dependencies": null
+    },
+    {
+      "id": "taxonomy-of-benchmarks-0pk1",
+      "title": "task taxonomy-of-benchmarks-0pk1 (feature)",
+      "description": "(redacted: neutral public fixture; structure preserved)",
+      "status": "closed",
+      "priority": 2,
+      "issue_type": "feature",
+      "owner": "dayvidpham@gmail.com",
+      "created_by": "David Huu Pham",
+      "assignee": "David Huu Pham",
+      "labels": null,
+      "created_at": "2026-07-18T07:15:12Z",
+      "updated_at": "2026-07-23T09:43:00Z",
+      "closed_at": "2026-07-23T09:43:00Z",
+      "close_reason": "closed (reason redacted)",
+      "dependencies": [
+        {
+          "issue_id": "taxonomy-of-benchmarks-0pk1",
+          "depends_on_id": "taxonomy-of-benchmarks-5eo",
+          "type": "discovered-from",
+          "created_at": "2026-07-18T00:15:11Z"
+        },
+        {
+          "issue_id": "taxonomy-of-benchmarks-0pk1",
+          "depends_on_id": "taxonomy-of-benchmarks-kxdv",
+          "type": "blocks",
+          "created_at": "2026-07-21T14:26:41Z"
+        }
+      ]
+    },
+    {
+      "id": "taxonomy-of-benchmarks-0psd",
+      "title": "task taxonomy-of-benchmarks-0psd (bug)",
+      "description": "(redacted: neutral public fixture; structure preserved)",
+      "status": "open",
+      "priority": 3,
+      "issue_type": "bug",
+      "owner": "dayvidpham@gmail.com",
+      "created_by": "David Huu Pham",
+      "assignee": "",
+      "labels": null,
+      "created_at": "2026-07-17T22:36:56Z",
+      "updated_at": "2026-07-17T22:36:56Z",
+      "closed_at": null,
+      "close_reason": "",
+      "dependencies": null
+    },
+    {
+      "id": "taxonomy-of-benchmarks-2htg",
+      "title": "task taxonomy-of-benchmarks-2htg (task)",
+      "description": "(redacted: neutral public fixture; structure preserved)",
+      "status": "closed",
+      "priority": 1,
+      "issue_type": "task",
+      "owner": "dayvidpham@gmail.com",
+      "created_by": "David Huu Pham",
+      "assignee": "",
+      "labels": null,
+      "created_at": "2026-07-22T04:29:02Z",
+      "updated_at": "2026-07-23T07:01:51Z",
+      "closed_at": "2026-07-23T07:01:51Z",
+      "close_reason": "closed (reason redacted)",
+      "dependencies": [
+        {
+          "issue_id": "taxonomy-of-benchmarks-2htg",
+          "depends_on_id": "taxonomy-of-benchmarks-5eo",
+          "type": "discovered-from",
+          "created_at": "2026-07-21T21:29:02Z"
+        }
+      ]
+    },
+    {
+      "id": "taxonomy-of-benchmarks-36s",
+      "title": "task taxonomy-of-benchmarks-36s (task)",
+      "description": "(redacted: neutral public fixture; structure preserved)",
+      "status": "open",
+      "priority": 1,
+      "issue_type": "task",
+      "owner": "dayvidpham@gmail.com",
+      "created_by": "David Huu Pham",
+      "assignee": "",
+      "labels": null,
+      "created_at": "2026-07-11T17:15:24Z",
+      "updated_at": "2026-07-11T17:15:24Z",
+      "closed_at": null,
+      "close_reason": "",
+      "dependencies": null
+    },
+    {
+      "id": "taxonomy-of-benchmarks-5eo",
+      "title": "task taxonomy-of-benchmarks-5eo (feature)",
+      "description": "(redacted: neutral public fixture; structure preserved)",
+      "status": "in_progress",
+      "priority": 2,
+      "issue_type": "feature",
+      "owner": "dayvidpham@gmail.com",
+      "created_by": "David Huu Pham",
+      "assignee": "David Huu Pham",
+      "labels": null,
+      "created_at": "2026-07-12T22:21:26Z",
+      "updated_at": "2026-07-18T07:07:56Z",
+      "closed_at": null,
+      "close_reason": "",
+      "dependencies": [
+        {
+          "issue_id": "taxonomy-of-benchmarks-5eo",
+          "depends_on_id": "taxonomy-of-benchmarks-0pk1",
+          "type": "blocks",
+          "created_at": "2026-07-18T00:15:12Z"
+        },
+        {
+          "issue_id": "taxonomy-of-benchmarks-5eo",
+          "depends_on_id": "taxonomy-of-benchmarks-dmzo",
+          "type": "blocks",
+          "created_at": "2026-07-18T00:15:12Z"
+        },
+        {
+          "issue_id": "taxonomy-of-benchmarks-5eo",
+          "depends_on_id": "taxonomy-of-benchmarks-gpy3",
+          "type": "blocks",
+          "created_at": "2026-07-18T00:15:12Z"
+        },
+        {
+          "issue_id": "taxonomy-of-benchmarks-5eo",
+          "depends_on_id": "taxonomy-of-benchmarks-grt0",
+          "type": "blocks",
+          "created_at": "2026-07-18T00:15:12Z"
+        }
+      ]
+    },
+    {
+      "id": "taxonomy-of-benchmarks-dmzo",
+      "title": "task taxonomy-of-benchmarks-dmzo (feature)",
+      "description": "(redacted: neutral public fixture; structure preserved)",
+      "status": "closed",
+      "priority": 2,
+      "issue_type": "feature",
+      "owner": "dayvidpham@gmail.com",
+      "created_by": "David Huu Pham",
+      "assignee": "David Huu Pham",
+      "labels": null,
+      "created_at": "2026-07-18T07:15:12Z",
+      "updated_at": "2026-07-23T10:46:53Z",
+      "closed_at": "2026-07-23T10:46:53Z",
+      "close_reason": "closed (reason redacted)",
+      "dependencies": [
+        {
+          "issue_id": "taxonomy-of-benchmarks-dmzo",
+          "depends_on_id": "taxonomy-of-benchmarks-5eo",
+          "type": "discovered-from",
+          "created_at": "2026-07-18T00:15:12Z"
+        },
+        {
+          "issue_id": "taxonomy-of-benchmarks-dmzo",
+          "depends_on_id": "taxonomy-of-benchmarks-kxdv",
+          "type": "blocks",
+          "created_at": "2026-07-21T14:26:41Z"
+        }
+      ]
+    },
+    {
+      "id": "taxonomy-of-benchmarks-gpy3",
+      "title": "task taxonomy-of-benchmarks-gpy3 (feature)",
+      "description": "(redacted: neutral public fixture; structure preserved)",
+      "status": "closed",
+      "priority": 2,
+      "issue_type": "feature",
+      "owner": "dayvidpham@gmail.com",
+      "created_by": "David Huu Pham",
+      "assignee": "",
+      "labels": null,
+      "created_at": "2026-07-18T07:15:12Z",
+      "updated_at": "2026-07-23T09:09:15Z",
+      "closed_at": "2026-07-23T09:09:15Z",
+      "close_reason": "closed (reason redacted)",
+      "dependencies": [
+        {
+          "issue_id": "taxonomy-of-benchmarks-gpy3",
+          "depends_on_id": "taxonomy-of-benchmarks-5eo",
+          "type": "discovered-from",
+          "created_at": "2026-07-18T00:15:11Z"
+        },
+        {
+          "issue_id": "taxonomy-of-benchmarks-gpy3",
+          "depends_on_id": "taxonomy-of-benchmarks-kxdv",
+          "type": "blocks",
+          "created_at": "2026-07-21T14:26:41Z"
+        }
+      ]
+    },
+    {
+      "id": "taxonomy-of-benchmarks-grt0",
+      "title": "task taxonomy-of-benchmarks-grt0 (feature)",
+      "description": "(redacted: neutral public fixture; structure preserved)",
+      "status": "in_progress",
+      "priority": 2,
+      "issue_type": "feature",
+      "owner": "dayvidpham@gmail.com",
+      "created_by": "David Huu Pham",
+      "assignee": "David Huu Pham",
+      "labels": null,
+      "created_at": "2026-07-18T07:15:12Z",
+      "updated_at": "2026-07-23T10:37:56Z",
+      "closed_at": null,
+      "close_reason": "",
+      "dependencies": [
+        {
+          "issue_id": "taxonomy-of-benchmarks-grt0",
+          "depends_on_id": "taxonomy-of-benchmarks-0pk1",
+          "type": "blocks",
+          "created_at": "2026-07-18T00:15:12Z"
+        },
+        {
+          "issue_id": "taxonomy-of-benchmarks-grt0",
+          "depends_on_id": "taxonomy-of-benchmarks-5eo",
+          "type": "discovered-from",
+          "created_at": "2026-07-18T00:15:12Z"
+        }
+      ]
+    },
+    {
+      "id": "taxonomy-of-benchmarks-kxdv",
+      "title": "task taxonomy-of-benchmarks-kxdv (task)",
+      "description": "(redacted: neutral public fixture; structure preserved)",
+      "status": "closed",
+      "priority": 2,
+      "issue_type": "task",
+      "owner": "dayvidpham@gmail.com",
+      "created_by": "David Huu Pham",
+      "assignee": "David Huu Pham",
+      "labels": null,
+      "created_at": "2026-07-21T21:26:42Z",
+      "updated_at": "2026-07-23T09:09:15Z",
+      "closed_at": "2026-07-23T09:09:15Z",
+      "close_reason": "closed (reason redacted)",
+      "dependencies": [
+        {
+          "issue_id": "taxonomy-of-benchmarks-kxdv",
+          "depends_on_id": "taxonomy-of-benchmarks-5eo",
+          "type": "discovered-from",
+          "created_at": "2026-07-21T14:26:41Z"
+        }
+      ]
+    },
+    {
+      "id": "taxonomy-of-benchmarks-rdyb",
+      "title": "task taxonomy-of-benchmarks-rdyb (task)",
+      "description": "(redacted: neutral public fixture; structure preserved)",
+      "status": "open",
+      "priority": 2,
+      "issue_type": "task",
+      "owner": "dayvidpham@gmail.com",
+      "created_by": "David Huu Pham",
+      "assignee": "",
+      "labels": null,
+      "created_at": "2026-07-23T07:01:51Z",
+      "updated_at": "2026-07-23T07:01:51Z",
+      "closed_at": null,
+      "close_reason": "",
+      "dependencies": [
+        {
+          "issue_id": "taxonomy-of-benchmarks-rdyb",
+          "depends_on_id": "taxonomy-of-benchmarks-2htg",
+          "type": "discovered-from",
+          "created_at": "2026-07-23T00:01:50Z"
+        }
+      ]
+    }
+  ],
+  "comments": [
+    {
+      "id": 542,
+      "issue_id": "taxonomy-of-benchmarks-0pk1",
+      "author": "David Huu Pham",
+      "text": "(redacted comment 542 on taxonomy-of-benchmarks-0pk1)",
+      "created_at": "2026-07-18T16:46:03Z"
+    },
+    {
+      "id": 547,
+      "issue_id": "taxonomy-of-benchmarks-0pk1",
+      "author": "David Huu Pham",
+      "text": "(redacted comment 547 on taxonomy-of-benchmarks-0pk1)",
+      "created_at": "2026-07-18T17:52:10Z"
+    },
+    {
+      "id": 563,
+      "issue_id": "taxonomy-of-benchmarks-0pk1",
+      "author": "David Huu Pham",
+      "text": "(redacted comment 563 on taxonomy-of-benchmarks-0pk1)",
+      "created_at": "2026-07-23T09:09:15Z"
+    },
+    {
+      "id": 564,
+      "issue_id": "taxonomy-of-benchmarks-0pk1",
+      "author": "David Huu Pham",
+      "text": "(redacted comment 564 on taxonomy-of-benchmarks-0pk1)",
+      "created_at": "2026-07-23T09:32:31Z"
+    },
+    {
+      "id": 509,
+      "issue_id": "taxonomy-of-benchmarks-0psd",
+      "author": "David Huu Pham",
+      "text": "(redacted comment 509 on taxonomy-of-benchmarks-0psd)",
+      "created_at": "2026-07-17T23:02:28Z"
+    },
+    {
+      "id": 552,
+      "issue_id": "taxonomy-of-benchmarks-2htg",
+      "author": "David Huu Pham",
+      "text": "(redacted comment 552 on taxonomy-of-benchmarks-2htg)",
+      "created_at": "2026-07-22T04:31:56Z"
+    },
+    {
+      "id": 553,
+      "issue_id": "taxonomy-of-benchmarks-2htg",
+      "author": "David Huu Pham",
+      "text": "(redacted comment 553 on taxonomy-of-benchmarks-2htg)",
+      "created_at": "2026-07-22T04:41:33Z"
+    },
+    {
+      "id": 554,
+      "issue_id": "taxonomy-of-benchmarks-2htg",
+      "author": "David Huu Pham",
+      "text": "(redacted comment 554 on taxonomy-of-benchmarks-2htg)",
+      "created_at": "2026-07-22T04:49:30Z"
+    },
+    {
+      "id": 555,
+      "issue_id": "taxonomy-of-benchmarks-2htg",
+      "author": "David Huu Pham",
+      "text": "(redacted comment 555 on taxonomy-of-benchmarks-2htg)",
+      "created_at": "2026-07-22T21:24:36Z"
+    },
+    {
+      "id": 556,
+      "issue_id": "taxonomy-of-benchmarks-2htg",
+      "author": "David Huu Pham",
+      "text": "(redacted comment 556 on taxonomy-of-benchmarks-2htg)",
+      "created_at": "2026-07-22T21:38:31Z"
+    },
+    {
+      "id": 557,
+      "issue_id": "taxonomy-of-benchmarks-2htg",
+      "author": "David Huu Pham",
+      "text": "(redacted comment 557 on taxonomy-of-benchmarks-2htg)",
+      "created_at": "2026-07-22T22:03:19Z"
+    },
+    {
+      "id": 558,
+      "issue_id": "taxonomy-of-benchmarks-2htg",
+      "author": "David Huu Pham",
+      "text": "(redacted comment 558 on taxonomy-of-benchmarks-2htg)",
+      "created_at": "2026-07-22T22:12:51Z"
+    },
+    {
+      "id": 559,
+      "issue_id": "taxonomy-of-benchmarks-2htg",
+      "author": "David Huu Pham",
+      "text": "(redacted comment 559 on taxonomy-of-benchmarks-2htg)",
+      "created_at": "2026-07-23T02:00:06Z"
+    },
+    {
+      "id": 560,
+      "issue_id": "taxonomy-of-benchmarks-2htg",
+      "author": "David Huu Pham",
+      "text": "(redacted comment 560 on taxonomy-of-benchmarks-2htg)",
+      "created_at": "2026-07-23T03:08:08Z"
+    },
+    {
+      "id": 561,
+      "issue_id": "taxonomy-of-benchmarks-2htg",
+      "author": "David Huu Pham",
+      "text": "(redacted comment 561 on taxonomy-of-benchmarks-2htg)",
+      "created_at": "2026-07-23T06:55:36Z"
+    },
+    {
+      "id": 34,
+      "issue_id": "taxonomy-of-benchmarks-36s",
+      "author": "David Huu Pham",
+      "text": "(redacted comment 34 on taxonomy-of-benchmarks-36s)",
+      "created_at": "2026-07-12T00:50:13Z"
+    },
+    {
+      "id": 67,
+      "issue_id": "taxonomy-of-benchmarks-36s",
+      "author": "David Huu Pham",
+      "text": "(redacted comment 67 on taxonomy-of-benchmarks-36s)",
+      "created_at": "2026-07-12T17:47:19Z"
+    },
+    {
+      "id": 540,
+      "issue_id": "taxonomy-of-benchmarks-5eo",
+      "author": "David Huu Pham",
+      "text": "(redacted comment 540 on taxonomy-of-benchmarks-5eo)",
+      "created_at": "2026-07-18T07:15:12Z"
+    },
+    {
+      "id": 545,
+      "issue_id": "taxonomy-of-benchmarks-5eo",
+      "author": "David Huu Pham",
+      "text": "(redacted comment 545 on taxonomy-of-benchmarks-5eo)",
+      "created_at": "2026-07-18T16:46:04Z"
+    },
+    {
+      "id": 550,
+      "issue_id": "taxonomy-of-benchmarks-5eo",
+      "author": "David Huu Pham",
+      "text": "(redacted comment 550 on taxonomy-of-benchmarks-5eo)",
+      "created_at": "2026-07-18T17:52:10Z"
+    },
+    {
+      "id": 543,
+      "issue_id": "taxonomy-of-benchmarks-dmzo",
+      "author": "David Huu Pham",
+      "text": "(redacted comment 543 on taxonomy-of-benchmarks-dmzo)",
+      "created_at": "2026-07-18T16:46:03Z"
+    },
+    {
+      "id": 548,
+      "issue_id": "taxonomy-of-benchmarks-dmzo",
+      "author": "David Huu Pham",
+      "text": "(redacted comment 548 on taxonomy-of-benchmarks-dmzo)",
+      "created_at": "2026-07-18T17:52:10Z"
+    },
+    {
+      "id": 565,
+      "issue_id": "taxonomy-of-benchmarks-dmzo",
+      "author": "David Huu Pham",
+      "text": "(redacted comment 565 on taxonomy-of-benchmarks-dmzo)",
+      "created_at": "2026-07-23T10:20:41Z"
+    },
+    {
+      "id": 566,
+      "issue_id": "taxonomy-of-benchmarks-dmzo",
+      "author": "David Huu Pham",
+      "text": "(redacted comment 566 on taxonomy-of-benchmarks-dmzo)",
+      "created_at": "2026-07-23T10:32:53Z"
+    },
+    {
+      "id": 567,
+      "issue_id": "taxonomy-of-benchmarks-dmzo",
+      "author": "David Huu Pham",
+      "text": "(redacted comment 567 on taxonomy-of-benchmarks-dmzo)",
+      "created_at": "2026-07-23T10:37:51Z"
+    },
+    {
+      "id": 541,
+      "issue_id": "taxonomy-of-benchmarks-gpy3",
+      "author": "David Huu Pham",
+      "text": "(redacted comment 541 on taxonomy-of-benchmarks-gpy3)",
+      "created_at": "2026-07-18T16:46:03Z"
+    },
+    {
+      "id": 546,
+      "issue_id": "taxonomy-of-benchmarks-gpy3",
+      "author": "David Huu Pham",
+      "text": "(redacted comment 546 on taxonomy-of-benchmarks-gpy3)",
+      "created_at": "2026-07-18T17:52:10Z"
+    },
+    {
+      "id": 544,
+      "issue_id": "taxonomy-of-benchmarks-grt0",
+      "author": "David Huu Pham",
+      "text": "(redacted comment 544 on taxonomy-of-benchmarks-grt0)",
+      "created_at": "2026-07-18T16:46:04Z"
+    },
+    {
+      "id": 549,
+      "issue_id": "taxonomy-of-benchmarks-grt0",
+      "author": "David Huu Pham",
+      "text": "(redacted comment 549 on taxonomy-of-benchmarks-grt0)",
+      "created_at": "2026-07-18T17:52:10Z"
+    },
+    {
+      "id": 562,
+      "issue_id": "taxonomy-of-benchmarks-kxdv",
+      "author": "David Huu Pham",
+      "text": "(redacted comment 562 on taxonomy-of-benchmarks-kxdv)",
+      "created_at": "2026-07-23T09:04:22Z"
+    }
+  ]
+}
