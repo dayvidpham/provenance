@@ -142,6 +142,33 @@ func (db *DB) GetAgent(id ptypes.AgentID) (ptypes.Agent, error) {
 	return agent, nil
 }
 
+// GetAllAgents returns every agent as a base row (id + kind only); callers use
+// the kind-specific getters (GetHumanAgent/GetMLAgent/GetSoftwareAgent) to
+// dereference detail. Rows are ordered deterministically by id so callers that
+// require reproducible output (e.g. a golden-file exporter) get a stable order.
+// Acquires the DB mutex.
+func (db *DB) GetAllAgents() ([]ptypes.Agent, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	var agents []ptypes.Agent
+	err := sqlitex.Execute(db.conn, "SELECT id, kind_id FROM agents ORDER BY id ASC", &sqlitex.ExecOptions{
+		ResultFunc: func(stmt *zs.Stmt) error {
+			idStr := stmt.ColumnText(0)
+			id, err := ptypes.ParseActorID(idStr)
+			if err != nil {
+				return fmt.Errorf("sqlite.GetAllAgents: invalid actor id %q: %w", idStr, err)
+			}
+			agents = append(agents, ptypes.Agent{ID: id, Kind: ptypes.AgentKind(stmt.ColumnInt(1))})
+			return nil
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("sqlite.GetAllAgents: %w", err)
+	}
+	return agents, nil
+}
+
 // GetHumanAgent returns the human agent by ID.
 // Returns ptypes.ErrNotFound if not found or if the agent is a different kind.
 // Acquires the DB mutex.

@@ -197,6 +197,20 @@ func (b *borrowedTracker) Edges(id TaskID, kind *EdgeKind) ([]Edge, error) {
 	return b.inner.Edges(id, kind)
 }
 
+func (b *borrowedTracker) AllEdges() ([]Edge, error) {
+	if err := b.available("AllEdges"); err != nil {
+		return nil, err
+	}
+	return b.inner.AllEdges()
+}
+
+func (b *borrowedTracker) AllActors() ([]Agent, error) {
+	if err := b.available("AllActors"); err != nil {
+		return nil, err
+	}
+	return b.inner.AllActors()
+}
+
 func (b *borrowedTracker) Blocked() ([]Task, error) {
 	if err := b.available("Blocked"); err != nil {
 		return nil, err

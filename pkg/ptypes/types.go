@@ -238,6 +238,12 @@ type Edge struct {
 	SourceID string   `json:"sourceId"` // Task ID (always)
 	TargetID string   `json:"targetId"` // Task, Agent, or Activity ID
 	Kind     EdgeKind `json:"kind"`
+	// CreatedAt is the edge's creation timestamp, sourced from the edges.created_at
+	// column. It is the zero Time for edges materialized by graph-traversal helpers
+	// that do not select created_at (e.g. DepTree), and is populated by the row-reading
+	// paths GetEdges, GetBlockedByEdges, and GetAllEdges. Carrying it lets a PROV-O
+	// exporter emit prov:atTime on qualified derivation nodes without a second query.
+	CreatedAt time.Time `json:"createdAt,omitempty"`
 }
 
 // Label is a string tag attached to a task.
