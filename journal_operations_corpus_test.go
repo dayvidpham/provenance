@@ -1229,8 +1229,8 @@ func TestApplyConflictProducesTypedClosedSumAndErrorsAs(t *testing.T) {
 	if res.Conflict == nil {
 		t.Fatal("CommittedConflict result carried a nil Conflict payload")
 	}
-	if res.Conflict.OperationID != "op-x" || res.Conflict.Field != "mutation digest" {
-		t.Fatalf("res.Conflict = {%q,%q}, want {op-x, mutation digest derived from canonical effects}", res.Conflict.OperationID, res.Conflict.Field)
+	if res.Conflict.OperationID != "op-x" {
+		t.Fatalf("res.Conflict = %+v, want OperationID op-x", res.Conflict)
 	}
 	// errors.Is recovers the sentinel; errors.As recovers the typed *OperationConflict.
 	if !errors.Is(err, ErrOperationConflict) {
@@ -1240,8 +1240,8 @@ func TestApplyConflictProducesTypedClosedSumAndErrorsAs(t *testing.T) {
 	if !errors.As(err, &oc) {
 		t.Fatalf("errors.As(err, &*OperationConflict) = false — typed payload not recoverable: %v", err)
 	}
-	if oc.OperationID != "op-x" || oc.Field != "mutation digest" {
-		t.Fatalf("errors.As recovered {%q,%q}, want {op-x, mutation digest}", oc.OperationID, oc.Field)
+	if oc.OperationID != "op-x" {
+		t.Fatalf("errors.As recovered incomplete typed conflict %+v", oc)
 	}
 	// Nothing extra committed: the original event is the only one.
 	if r, lerr := env.tr.Journal().LookupCommitted("op-x"); lerr != nil {

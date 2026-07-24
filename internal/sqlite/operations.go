@@ -378,14 +378,18 @@ func (db *DB) JournalIsEmpty() (bool, error) {
 // subtype-integrity and close-ends-assignment gates before commit.
 func (db *DB) Apply(in journal.OperationInput) (journal.CommittedResult, error) {
 	callerMutationDigest := append([]byte(nil), in.MutationDigest...)
-	prepared, err := journal.PrepareMutationV1(in.Effects)
+	prepared, err := journal.Canonicalize(in)
 	if err != nil {
 		return journal.CommittedResult{}, fmt.Errorf("Apply: prepare canonical mutation before any write: %w", err)
 	}
-	// Canonical bytes, not a caller assertion, define mutation identity. Execute the
-	// decoded normalized effects so identity and behavior cannot drift.
+	// Canonical bytes, not caller assertions, define mutation identity. Execute the
+	// decoded normalized values so identity and behavior cannot drift.
+	in.Conditions = prepared.NormalizedConditions()
 	in.Effects = prepared.NormalizedEffects()
 	in.MutationDigest = prepared.DerivedDigest()
+	if len(in.Conditions) != 0 {
+		return journal.CommittedResult{}, fmt.Errorf("Apply: operation %q has %d canonical conditions, but transaction-local condition evaluation is not available yet -- where: Apply preparation; when: before opening a transaction or writing; impact: nothing was committed; fix: omit Conditions until atomic condition evaluation is enabled", in.OperationID, len(in.Conditions))
+	}
 	if err := validateApplyInput(in); err != nil {
 		return journal.CommittedResult{}, err
 	}
@@ -422,12 +426,16 @@ func validateApplyInput(in journal.OperationInput) error {
 // operation, committing nothing.
 func (db *DB) applyLocked(in journal.OperationInput, faultHook func(effectIndex int) error) (journal.CommittedResult, error) {
 	callerMutationDigest := append([]byte(nil), in.MutationDigest...)
-	prepared, err := journal.PrepareMutationV1(in.Effects)
+	prepared, err := journal.Canonicalize(in)
 	if err != nil {
 		return journal.CommittedResult{}, fmt.Errorf("Apply: prepare canonical mutation before any write: %w", err)
 	}
+	in.Conditions = prepared.NormalizedConditions()
 	in.Effects = prepared.NormalizedEffects()
 	in.MutationDigest = prepared.DerivedDigest()
+	if len(in.Conditions) != 0 {
+		return journal.CommittedResult{}, fmt.Errorf("Apply: operation %q has %d canonical conditions, but transaction-local condition evaluation is not available yet -- where: nested Apply preparation; when: before opening a savepoint or writing; impact: nothing was committed; fix: omit Conditions until atomic condition evaluation is enabled", in.OperationID, len(in.Conditions))
+	}
 	return db.applyPreparedLocked(in, prepared, callerMutationDigest, faultHook)
 }
 

@@ -7,7 +7,7 @@ cases:
     expected:
       kind: operation_conflict
       json: |-
-        {"schema":"provenance.dbos-step-outcome","operation_id":"fixture-operation","mutation_digest":"bQ==","failure":{"kind":"operation_conflict","message":"fixture failure: provenance: operation identity conflict\nprovenance: OperationID \"fixture-operation\" reused with a different mutation digest than the committed operation — where: Apply replay short-circuit (§9.4/§11); when: before any write; impact: nothing was committed; fix: retry with the identical actor, authority, command digest, and canonical effects, or issue a new OperationID for a genuinely different operation","conflict_field":"mutation digest","operation_id":"fixture-operation"}}
+        {"schema":"provenance.dbos-step-outcome","operation_id":"fixture-operation","mutation_digest":"bQ==","failure":{"kind":"operation_conflict","message":"fixture failure: provenance: operation identity conflict\nprovenance: operation identity conflict: OperationID \"fixture-operation\" differs on Effect[0] — where: Apply exact replay comparison; when: before writes; impact: nothing was committed; fix: retry with the identical actor, authority, command digest, and canonical mutation, or use a new OperationID for a different operation","conflict_axis":5,"conflict_index":0,"operation_id":"fixture-operation"}}
   - name: genesis
     classification: must-pass
     provenance: {source: requirement, ref: "DBOS typed failure contract"}
@@ -202,110 +202,118 @@ cases:
     provenance: {source: requirement, ref: "DBOS shared failure envelope"}
     mutation: {description: "Clears only conflict-owned metadata.", operator: malformed-missing-conflict-field}
     input:
-      control: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: operation_conflict, message: failure, conflictField: mutation, nestedOperationID: fixture-operation, arms: failure}
-      malformed: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: operation_conflict, message: failure, conflictField: '', nestedOperationID: fixture-operation, arms: failure}
-    expected: {class: outcome-decode, field: conflict_field, stage: outcome-decode}
+      control: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: operation_conflict, message: failure, conflictAxis: 5, conflictIndex: 0, nestedOperationID: fixture-operation, arms: failure}
+      malformed: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: operation_conflict, message: failure, conflictIndex: 0, nestedOperationID: fixture-operation, arms: failure}
+    expected: {class: outcome-decode, field: conflict_axis, stage: outcome-decode}
+  - name: malformed-missing-conflict-index
+    classification: must-fail
+    provenance: {source: requirement, ref: "DBOS typed conflict metadata"}
+    mutation: {description: "Clears only conflict_index.", operator: malformed-missing-conflict-index}
+    input:
+      control: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: operation_conflict, message: failure, conflictAxis: 5, conflictIndex: 0, nestedOperationID: fixture-operation, arms: failure}
+      malformed: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: operation_conflict, message: failure, conflictAxis: 5, nestedOperationID: fixture-operation, arms: failure}
+    expected: {class: outcome-decode, field: conflict_index, stage: outcome-decode}
   - name: malformed-forbidden-conflict-field-genesis
     classification: must-fail
     provenance: {source: requirement, ref: "DBOS shared failure envelope"}
     mutation: {description: "Adds only conflict-owned metadata to genesis.", operator: malformed-forbidden-conflict-field-genesis}
     input:
       control: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: genesis, message: failure, nestedOperationID: fixture-operation, arms: failure}
-      malformed: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: genesis, message: failure, conflictField: forbidden, nestedOperationID: fixture-operation, arms: failure}
-    expected: {class: outcome-decode, field: conflict_field, stage: outcome-decode}
+      malformed: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: genesis, message: failure, conflictAxis: 5, nestedOperationID: fixture-operation, arms: failure}
+    expected: {class: outcome-decode, field: conflict_axis, stage: outcome-decode}
   - name: malformed-forbidden-conflict-field-authority-scope
     classification: must-fail
     provenance: {source: requirement, ref: "DBOS shared failure envelope"}
     mutation: {description: "Adds only conflict-owned metadata to authority scope.", operator: malformed-forbidden-conflict-field-authority-scope}
     input:
       control: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: authority_scope, message: failure, nestedOperationID: fixture-operation, arms: failure}
-      malformed: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: authority_scope, message: failure, conflictField: forbidden, nestedOperationID: fixture-operation, arms: failure}
-    expected: {class: outcome-decode, field: conflict_field, stage: outcome-decode}
+      malformed: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: authority_scope, message: failure, conflictAxis: 5, nestedOperationID: fixture-operation, arms: failure}
+    expected: {class: outcome-decode, field: conflict_axis, stage: outcome-decode}
   - name: malformed-forbidden-conflict-field-assignment-lifecycle
     classification: must-fail
     provenance: {source: requirement, ref: "DBOS shared failure envelope"}
     mutation: {description: "Adds only conflict-owned metadata to assignment lifecycle.", operator: malformed-forbidden-conflict-field-assignment-lifecycle}
     input:
       control: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: assignment_lifecycle, message: failure, nestedOperationID: fixture-operation, arms: failure}
-      malformed: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: assignment_lifecycle, message: failure, conflictField: forbidden, nestedOperationID: fixture-operation, arms: failure}
-    expected: {class: outcome-decode, field: conflict_field, stage: outcome-decode}
+      malformed: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: assignment_lifecycle, message: failure, conflictAxis: 5, nestedOperationID: fixture-operation, arms: failure}
+    expected: {class: outcome-decode, field: conflict_axis, stage: outcome-decode}
   - name: malformed-forbidden-conflict-field-orphaned-evidence
     classification: must-fail
     provenance: {source: requirement, ref: "DBOS shared failure envelope"}
     mutation: {description: "Adds only conflict-owned metadata to orphaned evidence.", operator: malformed-forbidden-conflict-field-orphaned-evidence}
     input:
       control: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: orphaned_evidence, message: failure, nestedOperationID: fixture-operation, arms: failure}
-      malformed: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: orphaned_evidence, message: failure, conflictField: forbidden, nestedOperationID: fixture-operation, arms: failure}
-    expected: {class: outcome-decode, field: conflict_field, stage: outcome-decode}
+      malformed: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: orphaned_evidence, message: failure, conflictAxis: 5, nestedOperationID: fixture-operation, arms: failure}
+    expected: {class: outcome-decode, field: conflict_axis, stage: outcome-decode}
   - name: malformed-forbidden-conflict-field-stale-episode
     classification: must-fail
     provenance: {source: requirement, ref: "DBOS shared failure envelope"}
     mutation: {description: "Adds only conflict-owned metadata to stale episode.", operator: malformed-forbidden-conflict-field-stale-episode}
     input:
       control: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: stale_episode, message: failure, nestedOperationID: fixture-operation, arms: failure}
-      malformed: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: stale_episode, message: failure, conflictField: forbidden, nestedOperationID: fixture-operation, arms: failure}
-    expected: {class: outcome-decode, field: conflict_field, stage: outcome-decode}
+      malformed: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: stale_episode, message: failure, conflictAxis: 5, nestedOperationID: fixture-operation, arms: failure}
+    expected: {class: outcome-decode, field: conflict_axis, stage: outcome-decode}
   - name: malformed-forbidden-conflict-field-result-slot-integrity
     classification: must-fail
     provenance: {source: requirement, ref: "DBOS shared failure envelope"}
     mutation: {description: "Adds only conflict-owned metadata to result slot integrity.", operator: malformed-forbidden-conflict-field-result-slot-integrity}
     input:
       control: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: result_slot_integrity, message: failure, nestedOperationID: fixture-operation, arms: failure}
-      malformed: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: result_slot_integrity, message: failure, conflictField: forbidden, nestedOperationID: fixture-operation, arms: failure}
-    expected: {class: outcome-decode, field: conflict_field, stage: outcome-decode}
+      malformed: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: result_slot_integrity, message: failure, conflictAxis: 5, nestedOperationID: fixture-operation, arms: failure}
+    expected: {class: outcome-decode, field: conflict_axis, stage: outcome-decode}
   - name: malformed-forbidden-conflict-field-close-without-ending
     classification: must-fail
     provenance: {source: requirement, ref: "DBOS shared failure envelope"}
     mutation: {description: "Adds only conflict-owned metadata to close without ending.", operator: malformed-forbidden-conflict-field-close-without-ending}
     input:
       control: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: close_without_ending, message: failure, nestedOperationID: fixture-operation, arms: failure}
-      malformed: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: close_without_ending, message: failure, conflictField: forbidden, nestedOperationID: fixture-operation, arms: failure}
-    expected: {class: outcome-decode, field: conflict_field, stage: outcome-decode}
+      malformed: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: close_without_ending, message: failure, conflictAxis: 5, nestedOperationID: fixture-operation, arms: failure}
+    expected: {class: outcome-decode, field: conflict_axis, stage: outcome-decode}
   - name: malformed-forbidden-conflict-field-parent-citation
     classification: must-fail
     provenance: {source: requirement, ref: "DBOS shared failure envelope"}
     mutation: {description: "Adds only conflict-owned metadata to parent citation.", operator: malformed-forbidden-conflict-field-parent-citation}
     input:
       control: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: parent_citation, message: failure, nestedOperationID: fixture-operation, arms: failure}
-      malformed: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: parent_citation, message: failure, conflictField: forbidden, nestedOperationID: fixture-operation, arms: failure}
-    expected: {class: outcome-decode, field: conflict_field, stage: outcome-decode}
+      malformed: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: parent_citation, message: failure, conflictAxis: 5, nestedOperationID: fixture-operation, arms: failure}
+    expected: {class: outcome-decode, field: conflict_axis, stage: outcome-decode}
   - name: malformed-forbidden-conflict-field-corrupt-parent-chain
     classification: must-fail
     provenance: {source: requirement, ref: "DBOS shared failure envelope"}
     mutation: {description: "Adds only conflict-owned metadata to corrupt parent chain.", operator: malformed-forbidden-conflict-field-corrupt-parent-chain}
     input:
       control: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: corrupt_parent_chain, message: failure, nestedOperationID: fixture-operation, arms: failure}
-      malformed: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: corrupt_parent_chain, message: failure, conflictField: forbidden, nestedOperationID: fixture-operation, arms: failure}
-    expected: {class: outcome-decode, field: conflict_field, stage: outcome-decode}
+      malformed: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: corrupt_parent_chain, message: failure, conflictAxis: 5, nestedOperationID: fixture-operation, arms: failure}
+    expected: {class: outcome-decode, field: conflict_axis, stage: outcome-decode}
   - name: malformed-forbidden-conflict-field-invalid-id
     classification: must-fail
     provenance: {source: requirement, ref: "DBOS shared failure envelope"}
     mutation: {description: "Adds only conflict-owned metadata to invalid ID.", operator: malformed-forbidden-conflict-field-invalid-id}
     input:
       control: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: invalid_id, message: failure, nestedOperationID: fixture-operation, arms: failure}
-      malformed: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: invalid_id, message: failure, conflictField: forbidden, nestedOperationID: fixture-operation, arms: failure}
-    expected: {class: outcome-decode, field: conflict_field, stage: outcome-decode}
+      malformed: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: invalid_id, message: failure, conflictAxis: 5, nestedOperationID: fixture-operation, arms: failure}
+    expected: {class: outcome-decode, field: conflict_axis, stage: outcome-decode}
   - name: malformed-forbidden-conflict-field-not-found
     classification: must-fail
     provenance: {source: requirement, ref: "DBOS shared failure envelope"}
     mutation: {description: "Adds only conflict-owned metadata to not found.", operator: malformed-forbidden-conflict-field-not-found}
     input:
       control: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: not_found, message: failure, nestedOperationID: fixture-operation, arms: failure}
-      malformed: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: not_found, message: failure, conflictField: forbidden, nestedOperationID: fixture-operation, arms: failure}
-    expected: {class: outcome-decode, field: conflict_field, stage: outcome-decode}
+      malformed: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: not_found, message: failure, conflictAxis: 5, nestedOperationID: fixture-operation, arms: failure}
+    expected: {class: outcome-decode, field: conflict_axis, stage: outcome-decode}
   - name: malformed-forbidden-conflict-field-already-closed
     classification: must-fail
     provenance: {source: requirement, ref: "DBOS shared failure envelope"}
     mutation: {description: "Adds only conflict-owned metadata to already closed.", operator: malformed-forbidden-conflict-field-already-closed}
     input:
       control: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: already_closed, message: failure, nestedOperationID: fixture-operation, arms: failure}
-      malformed: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: already_closed, message: failure, conflictField: forbidden, nestedOperationID: fixture-operation, arms: failure}
-    expected: {class: outcome-decode, field: conflict_field, stage: outcome-decode}
+      malformed: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: already_closed, message: failure, conflictAxis: 5, nestedOperationID: fixture-operation, arms: failure}
+    expected: {class: outcome-decode, field: conflict_axis, stage: outcome-decode}
   - name: malformed-forbidden-conflict-field-genesis-required
     classification: must-fail
     provenance: {source: requirement, ref: "DBOS shared failure envelope"}
     mutation: {description: "Adds only conflict-owned metadata to genesis required.", operator: malformed-forbidden-conflict-field-genesis-required}
     input:
       control: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: genesis_required, message: failure, nestedOperationID: fixture-operation, arms: failure}
-      malformed: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: genesis_required, message: failure, conflictField: forbidden, nestedOperationID: fixture-operation, arms: failure}
-    expected: {class: outcome-decode, field: conflict_field, stage: outcome-decode}
+      malformed: {schema: provenance.dbos-step-outcome, operationID: fixture-operation, kind: genesis_required, message: failure, conflictAxis: 5, nestedOperationID: fixture-operation, arms: failure}
+    expected: {class: outcome-decode, field: conflict_axis, stage: outcome-decode}

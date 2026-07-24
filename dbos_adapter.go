@@ -602,8 +602,13 @@ func (a *DBOSAdapter) postValidate(in journal.OperationInput, outcome DBOSStepOu
 	case journal.CommittedExact:
 		got, encErr := encodeDBOSApplySuccess(a.contract, in.OperationID, in.MutationDigest, looked)
 		if encErr != nil {
-			return CommittedResult{}, fmt.Errorf(
-				"provenance.DBOSAdapter.Apply: re-encode looked-up result for operation %q: %w", in.OperationID, encErr)
+			return CommittedResult{}, &CheckpointDivergenceError{
+				Operation: in.OperationID,
+				Stage:     DBOSDiagStageCheckpointValidation,
+				Impact:    "the journal returned malformed result-slot metadata; the checkpoint is not trusted",
+				Fix:       "restore the operation and result-slot rows from the same committed backup",
+				Cause:     encErr,
+			}
 		}
 		if !canonicalResultsEqual(*got.Success, success) {
 			return CommittedResult{}, &CheckpointDivergenceError{
@@ -719,6 +724,9 @@ func terminalDBOSCause(err error, workflowID string) error {
 // struct's own == -- never spuriously diverges a legitimate replay against its own
 // committed record.
 func canonicalResultsEqual(a, b CanonicalMutationResult) bool {
+	if validateCanonicalResultSlots(a.ResultSlots) != nil || validateCanonicalResultSlots(b.ResultSlots) != nil {
+		return false
+	}
 	if a.AnchorJournalID != b.AnchorJournalID {
 		return false
 	}

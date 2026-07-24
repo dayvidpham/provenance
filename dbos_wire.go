@@ -55,10 +55,11 @@ type DBOSApplyInput struct {
 }
 
 func encodeApplyInput(contract dbosContractSnapshot, in journal.OperationInput) (DBOSApplyInput, journal.OperationInput, error) {
-	prepared, err := journal.PrepareMutationV1(in.Effects)
+	prepared, err := journal.Canonicalize(in)
 	if err != nil {
 		return DBOSApplyInput{}, journal.OperationInput{}, err
 	}
+	in.Conditions = prepared.NormalizedConditions()
 	in.Effects = prepared.NormalizedEffects()
 	in.MutationDigest = prepared.DerivedDigest()
 	contextBytes, err := encodeDBOSContext(contract, in)

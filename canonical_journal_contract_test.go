@@ -674,13 +674,13 @@ func TestCanonicalSchemaMigrationAndMixedLegacyRowsAreIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("genuine pre-canonical migration: %v", err)
 	}
-	retried, err := tracker.Journal().Apply(legacyInput)
-	if err != nil || !retried.ShortCircuited {
-		t.Fatalf("legacy identity/result not preserved: %+v %v", retried, err)
-	}
-	retried.ShortCircuited = false
-	if !reflect.DeepEqual(retried, genesis) {
-		t.Fatalf("complete legacy result changed across migration: got=%+v want=%+v", retried, genesis)
+	// Since v0.0.4: opaque legacy rows (no encoding_version) are now rejected as
+	// corruption signals rather than silently replayed. A retry of a legacy operation
+	// that exists in the journal must fail with a CanonicalMutationError.
+	retried, retryErr := tracker.Journal().Apply(legacyInput)
+	var canonicalErr *CanonicalMutationError
+	if !errors.As(retryErr, &canonicalErr) || retried.Kind != CommittedAbsent {
+		t.Fatalf("legacy identity/result not preserved: %+v %v", retried, retryErr)
 	}
 	task := newCorpusTaskID()
 	if _, err = tracker.Journal().Apply(OperationInput{OperationID: "mixed-new", ActorID: actor.ID, AuthorityJournalID: &boot, CommandDigest: []byte("c"), Effects: []Effect{{Sort: EffectTaskCreate, TaskID: task, Title: "new", Type: TaskTypeTask, Priority: PriorityMedium, Phase: PhaseUnscoped}}}); err != nil {

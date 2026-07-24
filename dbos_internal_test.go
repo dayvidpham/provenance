@@ -133,9 +133,9 @@ func TestWire_WrongSchemaFailsClosed(t *testing.T) {
 
 func TestWire_TransportsCanonicalBytesAndRejectsMalformedFrames(t *testing.T) {
 	in := richOperationInput(t)
-	prepared, err := journal.PrepareMutationV1(in.Effects)
+	prepared, err := journal.Canonicalize(journal.OperationInput{Effects: in.Effects})
 	if err != nil {
-		t.Fatalf("PrepareMutationV1: %v", err)
+		t.Fatalf("Canonicalize: %v", err)
 	}
 	contract := newDBOSContractSnapshot()
 	encoded, normalized, err := encodeApplyInput(contract, in)
@@ -395,7 +395,7 @@ func TestOutcome_RejectsUnknownKindAndMismatchedNestedOperation(t *testing.T) {
 }
 
 func TestOutcome_ConflictReExposesTypedConflict(t *testing.T) {
-	conflict := &journal.OperationConflict{OperationID: "op-c", Field: "mutation digest"}
+	conflict := &journal.OperationConflict{OperationID: "op-c", Axis: journal.ConflictCommand, Index: -1}
 	wrapped := errors.Join(journal.ErrOperationConflict, conflict)
 	contract := newDBOSContractSnapshot()
 	outcome, _ := encodeDBOSApplyFailure(contract, "op-c", []byte("m"), wrapped)
@@ -407,7 +407,7 @@ func TestOutcome_ConflictReExposesTypedConflict(t *testing.T) {
 	if !errors.As(decErr, &oc) {
 		t.Fatalf("decoded conflict not errors.As-discoverable: %v", decErr)
 	}
-	if oc.Field != "mutation digest" {
-		t.Errorf("conflict field drifted: %q", oc.Field)
+	if oc.Axis != journal.ConflictCommand || oc.Index != -1 {
+		t.Errorf("conflict axis/index drifted: axis=%s index=%d", oc.Axis, oc.Index)
 	}
 }

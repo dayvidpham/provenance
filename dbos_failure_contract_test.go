@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"testing"
 
 	"github.com/dayvidpham/provenance/internal/journal"
@@ -27,7 +28,8 @@ type dbosMalformedOutcomeInput struct {
 	OperationID       string           `yaml:"operationID"`
 	Kind              ApplyFailureKind `yaml:"kind"`
 	Message           string           `yaml:"message"`
-	ConflictField     string           `yaml:"conflictField"`
+	ConflictAxis      *int             `yaml:"conflictAxis"`
+	ConflictIndex     *int             `yaml:"conflictIndex"`
 	NestedOperationID string           `yaml:"nestedOperationID"`
 	Arms              string           `yaml:"arms"`
 }
@@ -48,13 +50,13 @@ func TestDBOSFailureWireCorpus(t *testing.T) {
 	if err := corpus.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	const malformedCases = 23
+	const malformedCases = 24
 	descriptors := canonicalApplyFailureDescriptors()
 	if err := corpus.CheckExact(len(descriptors) + malformedCases); err != nil {
 		t.Fatal(err)
 	}
 	sentinels := map[string]error{
-		"operation-conflict": errors.Join(journal.ErrOperationConflict, &journal.OperationConflict{OperationID: "fixture-operation", Field: "mutation digest"}),
+		"operation-conflict": errors.Join(journal.ErrOperationConflict, &journal.OperationConflict{OperationID: "fixture-operation", Axis: journal.ConflictEffect, Index: 0}),
 		"genesis":            journal.ErrGenesis, "authority-scope": journal.ErrAuthorityScope,
 		"assignment-lifecycle": journal.ErrAssignmentLifecycle, "orphaned-evidence": journal.ErrOrphanedEvidence,
 		"stale-episode": journal.ErrStaleEpisode, "result-slot-integrity": journal.ErrResultSlotIntegrity,
@@ -128,7 +130,15 @@ func assertMalformedDBOSOutcome(t *testing.T, c testcorpus.Case[dbosOutcomeInput
 func materializeMalformedOutcome(t *testing.T, name string, source *dbosMalformedOutcomeInput) DBOSStepOutcome {
 	t.Helper()
 	outcome := DBOSStepOutcome{Schema: source.Schema, OperationID: source.OperationID}
-	failure := &CanonicalApplyFailure{Kind: source.Kind, Message: source.Message, ConflictField: source.ConflictField, OperationID: source.NestedOperationID}
+	failure := &CanonicalApplyFailure{Kind: source.Kind, Message: source.Message, OperationID: source.NestedOperationID}
+	if source.ConflictAxis != nil {
+		value := journal.ConflictAxis(*source.ConflictAxis)
+		failure.ConflictAxis = &value
+	}
+	if source.ConflictIndex != nil {
+		value := *source.ConflictIndex
+		failure.ConflictIndex = &value
+	}
 	switch source.Arms {
 	case "failure":
 		outcome.Failure = failure
@@ -164,9 +174,13 @@ func diffDBOSOutcomeFields(control, malformed DBOSStepOutcome) []DBOSDiagnosticF
 		if control.Failure.OperationID != malformed.Failure.OperationID {
 			diffs = append(diffs, DBOSDiagFieldNestedOpID)
 		}
-		if control.Failure.ConflictField != malformed.Failure.ConflictField {
-			diffs = append(diffs, DBOSDiagFieldConflictField)
+		if !reflect.DeepEqual(control.Failure.ConflictAxis, malformed.Failure.ConflictAxis) {
+			diffs = append(diffs, DBOSDiagFieldConflictAxis)
 		}
+		if !reflect.DeepEqual(control.Failure.ConflictIndex, malformed.Failure.ConflictIndex) {
+			diffs = append(diffs, DBOSDiagFieldConflictIndex)
+		}
+// ConflictOperand removed in corrected 5-axis model
 	}
 	return diffs
 }
@@ -219,7 +233,7 @@ func TestDBOSOnlyKnownDomainFailuresAreCheckpointable(t *testing.T) {
 	if ambiguous.MatchedKinds()[0] != FailureGenesis {
 		t.Fatal("MatchedKinds exposed mutable internal evidence")
 	}
-	typedConflict := &journal.OperationConflict{OperationID: "multi", Field: "command digest"}
+	typedConflict := &journal.OperationConflict{OperationID: "multi", Axis: journal.ConflictCommand, Index: -1}
 	joinedTyped := errors.Join(errors.Join(journal.ErrOperationConflict, typedConflict), journal.ErrGenesis)
 	_, typedErr := classifyDomainFailure(joinedTyped)
 	var recoveredConflict *journal.OperationConflict

@@ -21,8 +21,8 @@ func mkActor(t *testing.T) ActorID {
 
 func TestJournalKindClosedSetRoundTrips(t *testing.T) {
 	kinds := JournalKinds()
-	if len(kinds) != 5 {
-		t.Fatalf("expected 5 journal kinds, got %d", len(kinds))
+	if len(kinds) != 6 {
+		t.Fatalf("expected 6 journal kinds, got %d", len(kinds))
 	}
 	for _, k := range kinds {
 		if !k.IsValid() {
@@ -105,6 +105,34 @@ func TestJournalQueryValidateRejectsNonJournalIDOrder(t *testing.T) {
 	}
 	if err := (JournalQueryV1{OrderBy: OrderByJournalID, Limit: -1}).Validate(); !errors.Is(err, ErrInvalidQuery) {
 		t.Errorf("negative limit: got %v, want ErrInvalidQuery", err)
+	}
+}
+
+func TestFactQueryResourceBoundaries(t *testing.T) {
+	decisionKinds := make([]DecisionKind, MaxFactQueryKinds)
+	for i := range decisionKinds {
+		decisionKinds[i] = "fixture.decision"
+	}
+	evidenceKinds := make([]EvidenceKind, MaxFactQueryKinds)
+	for i := range evidenceKinds {
+		evidenceKinds[i] = "fixture.evidence"
+	}
+	if err := (DecisionQuery{Kinds: decisionKinds, Page: FactPageRequest{Limit: MaxFactPageSize}}).Validate(); err != nil {
+		t.Fatalf("decision exact limits: %v", err)
+	}
+	if err := (EvidenceQuery{Kinds: evidenceKinds, Page: FactPageRequest{Limit: MaxFactPageSize}}).Validate(); err != nil {
+		t.Fatalf("evidence exact limits: %v", err)
+	}
+	if err := (DecisionQuery{Kinds: append(decisionKinds, "fixture.decision"), Page: FactPageRequest{Limit: MaxFactPageSize}}).Validate(); !errors.Is(err, ErrInvalidQuery) {
+		t.Fatalf("query kinds limit+1: %v", err)
+	}
+	for _, page := range []FactPageRequest{{Limit: MaxFactPageSize + 1}, {Limit: 0}, {Limit: 1, AfterJournalID: 1}, {Limit: 1, SnapshotMaxJournalID: 1, AfterJournalID: 2}, {Limit: 1, SnapshotMaxJournalID: -1}, {Limit: 1, AfterJournalID: -1}} {
+		if err := page.Validate(); !errors.Is(err, ErrInvalidQuery) {
+			t.Fatalf("invalid page %+v: %v", page, err)
+		}
+	}
+	if err := (FactPageRequest{Limit: MaxFactPageSize, SnapshotMaxJournalID: 2, AfterJournalID: 2}).Validate(); err != nil {
+		t.Fatalf("exact cursor boundary: %v", err)
 	}
 }
 

@@ -1,7 +1,6 @@
 package sqlite
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 
@@ -616,29 +615,30 @@ func (db *DB) validateClosesEndAssignmentsLocked(anchor int64, effects []journal
 // ---------------------------------------------------------------------------
 
 type storedOperation struct {
-	anchor            int64
-	identity          journal.StoredOperationIdentity
-	encodingVersion   string
-	canonicalMutation []byte
+	anchor   int64
+	identity storedOperationReplayIdentity
 }
 
 func (db *DB) lookupOperationLocked(op journal.OperationID) (storedOperation, bool, error) {
-	var out storedOperation
+	out := storedOperation{}
+	var authority *journal.JournalID
+	var commandDigest, mutationDigest, canonicalMutation []byte
+	var encodingVersion string
 	found := false
 	if err := sqlitex.Execute(db.conn, "SELECT journal_id, authority_journal_id, command_digest, mutation_digest,\n\t\t        mutation_encoding_version, canonical_mutation\n\t\t FROM journal_operations WHERE operation_id = ?1", &sqlitex.ExecOptions{Args: []any{string(op)}, ResultFunc: func(stmt *zs.Stmt) error {
 		found = true
 		out.anchor = stmt.ColumnInt64(0)
 		if stmt.ColumnType(1) != zs.TypeNull {
 			a := journal.JournalID(stmt.ColumnInt64(1))
-			out.identity.AuthorityJournalID = &a
+			authority = &a
 		}
-		out.identity.CommandDigest = readBlob(stmt, 2)
-		out.identity.MutationDigest = readBlob(stmt, 3)
+		commandDigest = readBlob(stmt, 2)
+		mutationDigest = readBlob(stmt, 3)
 		if stmt.ColumnType(4) != zs.TypeNull {
-			out.encodingVersion = stmt.ColumnText(4)
+			encodingVersion = stmt.ColumnText(4)
 		}
 		if stmt.ColumnType(5) != zs.TypeNull {
-			out.canonicalMutation = readBlob(stmt, 5)
+			canonicalMutation = readBlob(stmt, 5)
 		}
 		return nil
 	}}); err != nil {
@@ -648,42 +648,19 @@ func (db *DB) lookupOperationLocked(op journal.OperationID) (storedOperation, bo
 		return storedOperation{}, false, nil
 	}
 	// The committing actor lives on the anchor journal row.
+	var actor journal.ActorID
 	if err := sqlitex.Execute(db.conn, "SELECT actor_id FROM journal WHERE journal_id = ?1", &sqlitex.ExecOptions{Args: []any{out.anchor}, ResultFunc: func(stmt *zs.Stmt) error {
-		actor, err := journalParseActor(stmt.ColumnText(0))
+		parsed, err := journalParseActor(stmt.ColumnText(0))
 		if err != nil {
 			return err
 		}
-		out.identity.ActorID = actor
+		actor = parsed
 		return nil
 	}}); err != nil {
 		return storedOperation{}, false, fmt.Errorf("lookup operation actor %q: %w", op, err)
 	}
+	out.identity = newStoredOperationReplayIdentity(op, actor, authority, commandDigest, mutationDigest, encodingVersion, canonicalMutation)
 	return out, true, nil
-}
-
-// identityMismatch compares the stored and proposed four-field replay identities
-// (§9.4). It returns the first differing field name and ok=false on mismatch.
-func identityMismatch(stored, proposed journal.StoredOperationIdentity) (string, bool) {
-	if stored.ActorID != proposed.ActorID {
-		return "actor", false
-	}
-	if !journalIDPtrEqual(stored.AuthorityJournalID, proposed.AuthorityJournalID) {
-		return "authority", false
-	}
-	if !bytes.Equal(stored.CommandDigest, proposed.CommandDigest) {
-		return "command digest", false
-	}
-	if !bytes.Equal(stored.MutationDigest, proposed.MutationDigest) {
-		return "mutation digest", false
-	}
-	return "", true
-}
-
-func journalIDPtrEqual(a, b *journal.JournalID) bool {
-	if a == nil || b == nil {
-		return a == b
-	}
-	return *a == *b
 }
 
 // reconcileAllocatedTaskCreatesLocked resolves only explicitly allocated-create
@@ -701,7 +678,7 @@ func (db *DB) reconcileAllocatedTaskCreatesLocked(in journal.OperationInput, exi
 	if !hasAllocation {
 		return in, nil
 	}
-	committedMutation, err := journal.DecodeCanonicalMutation(existing.canonicalMutation)
+	committedMutation, err := decodeStoredOperationMutation(existing.identity)
 	if err != nil {
 		return journal.OperationInput{}, fmt.Errorf("reconcile allocated create for operation %q: decode committed mutation: %w", in.OperationID, err)
 	}
@@ -757,42 +734,15 @@ func (db *DB) reconcileAllocatedTaskCreatesLocked(in journal.OperationInput, exi
 // CommittedConflict (§11, §9.6). Shared by the Apply short-circuit and the
 // concurrent-insert race translation so both surface the identical typed shape.
 func (db *DB) committedOutcomeForExistingLocked(in journal.OperationInput, existing storedOperation, callerMutationDigest []byte) (journal.CommittedResult, error) {
-	var prepared journal.CanonicalMutation
-	if existing.encodingVersion != "" {
-		var err error
-		in, err = db.reconcileAllocatedTaskCreatesLocked(in, existing)
-		if err != nil {
-			return journal.CommittedResult{}, err
+	err := compareStoredOperationIdentity(existing.identity, in, func(candidate journal.OperationInput) (journal.OperationInput, error) {
+		return db.reconcileAllocatedTaskCreatesLocked(candidate, existing)
+	})
+	if err != nil {
+		var conflict *journal.OperationConflict
+		if errors.As(err, &conflict) {
+			return journal.CommittedResult{Kind: journal.CommittedConflict, Conflict: conflict}, err
 		}
-		prepared, err = journal.PrepareMutationV1(in.Effects)
-		if err != nil {
-			return journal.CommittedResult{}, err
-		}
-		in.MutationDigest = prepared.DerivedDigest()
-	}
-	proposedMutationDigest := in.MutationDigest
-	if existing.encodingVersion == "" {
-		proposedMutationDigest = callerMutationDigest
-		if len(proposedMutationDigest) == 0 {
-			proposedMutationDigest = in.MutationDigest
-		}
-	}
-	if field, ok := identityMismatch(existing.identity, journal.StoredOperationIdentity{
-		ActorID:            in.ActorID,
-		AuthorityJournalID: in.AuthorityJournalID,
-		CommandDigest:      in.CommandDigest,
-		MutationDigest:     proposedMutationDigest,
-	}); !ok {
-		conflict := &journal.OperationConflict{OperationID: in.OperationID, Field: field}
-		return journal.CommittedResult{Kind: journal.CommittedConflict, Conflict: conflict},
-			fmt.Errorf("%w: %w", journal.ErrOperationConflict, conflict)
-	}
-	if existing.encodingVersion != "" {
-		if existing.encodingVersion != prepared.EncodingVersion().String() || !bytes.Equal(existing.canonicalMutation, prepared.CanonicalBytes()) {
-			conflict := &journal.OperationConflict{OperationID: in.OperationID, Field: "canonical effects"}
-			return journal.CommittedResult{Kind: journal.CommittedConflict, Conflict: conflict},
-				fmt.Errorf("%w: %w", journal.ErrOperationConflict, conflict)
-		}
+		return journal.CommittedResult{}, err
 	}
 	res, err := db.reconstructCommittedLocked(existing.anchor)
 	if err != nil {
@@ -819,11 +769,10 @@ func (db *DB) resolveOperationIDInsertRaceLocked(in journal.OperationInput, call
 	if !found {
 		// The UNIQUE violation proved a row exists, but this transaction's read
 		// snapshot cannot see it (the winning writer committed on another
-		// connection after this transaction's snapshot began). Surface a typed
-		// conflict rather than the raw SQLite constraint error (§9.6).
-		conflict := &journal.OperationConflict{OperationID: in.OperationID, Field: "operation id (lost a concurrent insert)"}
-		return journal.CommittedResult{Kind: journal.CommittedConflict, Conflict: conflict},
-			fmt.Errorf("%w: %w", journal.ErrOperationConflict, conflict)
+		// connection after this transaction's snapshot began). Surface an actionable
+		// integrity error rather than inventing an operand location that could not
+		// be observed from this transaction's snapshot.
+		return journal.CommittedResult{}, fmt.Errorf("%w: OperationID %q lost a concurrent insert but the winning row is not visible — where: insert-race structural replay; when: after UNIQUE rejection; impact: no caller conflict axis can be classified and nothing additional is committed; fix: retry after opening a fresh transaction so the winning canonical row can be compared", journal.ErrProjectionDivergence, in.OperationID)
 	}
 	return db.committedOutcomeForExistingLocked(in, existing, callerMutationDigest)
 }

@@ -489,7 +489,7 @@ func (db *DB) AdversarialInsertSpuriousAttribution(task journal.TaskID, actor jo
 // SQLite constraint error. It writes nothing. Callers pass an input whose
 // OperationID is already committed (simulating the winner's row).
 func (db *DB) AdversarialResolveOperationIDInsertRace(in journal.OperationInput) (journal.CommittedResult, error) {
-	prepared, err := journal.PrepareMutationV1(in.Effects)
+	prepared, err := journal.Canonicalize(in)
 	if err != nil {
 		return journal.CommittedResult{}, err
 	}

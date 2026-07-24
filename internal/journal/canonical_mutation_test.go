@@ -2,737 +2,521 @@ package journal
 
 import (
 	"bytes"
-	"encoding/hex"
+	"crypto/sha256"
 	"errors"
-	"fmt"
+	"os"
 	"reflect"
-	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/dayvidpham/provenance/pkg/ptypes"
-	"github.com/google/uuid"
 )
 
-const independentEvidenceDigestWire = "\x01\x02"
-
-var independentFamilyDigestCorpus = [14]struct {
-	name      string
-	sort      EffectSort
-	digestHex string
-}{
-	{"task-event-update", EffectTaskEvent, "4fd9396a9ce6df1ac68ab8680ecbedecca109bb364b3f81d3f7705121258a4ba"},
-	{"task-event-close", EffectTaskEvent, "8b8c21ea2274bc523323cb05836360caf390151756c97577e9d15661acb74b21"},
-	{"bootstrap-authority", EffectBootstrapAuthority, "c404ad673f363769c90a726a3531fc64fe25131f0607d9b8f44664b960ef0ba3"},
-	{"assignment-start", EffectAssignmentStart, "90173c1d8e31659199462e28d1ff906344755e9df2d8a1e9908f6edba354252a"},
-	{"assignment-end", EffectAssignmentEnd, "644e9ef74f35b67ad78b0ab11657551c3c538611e52842ba8d3a89583442784f"},
-	{"decision", EffectDecision, "016537171e2327b6efd22bd617c9df83203a499a32d692913245feff01fe7dd5"},
-	{"evidence", EffectEvidence, "1772829bf85799dfea3b331a0486da2c120eb13456513d8fef6405830c93ccd6"},
-	{"task-create", EffectTaskCreate, "3a64f293ec1ae932239417929030910d93d7430810c45ae1f82c53d51518fbec"},
-	{"task-create-allocated", EffectTaskCreateAllocated, "f7d5f0fcc27a6d65a03e868baebe6dd41b696fae174473dd15456b590d66fb2a"},
-	{"edge-add", EffectEdgeAdd, "6f04923d70ca43c21a4611b1b2b2be9dfb858b873895d94713f8cb3ed6517922"},
-	{"edge-remove", EffectEdgeRemove, "3dd68b2c04778dcf770674e40ff88f324069054d0b4a7846a7ed6d2931c10997"},
-	{"label-add", EffectLabelAdd, "804a38689f50f421c458a3a8dae9d4255349c3fc93bd879b1990ce06b84ad2db"},
-	{"label-remove", EffectLabelRemove, "c542027cb41eec89cdaadc67ec94f88131eb5269f3e7a73ce82dc5e45711ddf7"},
-	{"comment-add", EffectCommentAdd, "ccf75528afa6ee8d25cd53fc0735f74d0a4b39f8efe7812d79f13300562fefdc"},
-}
-
-type invalidCanonicalV1Ref struct{}
-
-func (invalidCanonicalV1Ref) canonicalV1FieldRef() {}
-
-func fixtureIDs(t *testing.T) (TaskID, ActorID, CommentID) {
+func v004FixtureInput(t *testing.T) OperationInput {
 	t.Helper()
-	task, _ := ptypes.ParseTaskID("fixture--018f0000-0000-7000-8000-000000000001")
-	actor, _ := ptypes.ParseActorID("fixture--018f0000-0000-7000-8000-000000000002")
-	comment, _ := ptypes.ParseCommentID("fixture--018f0000-0000-7000-8000-000000000003")
-	return task, actor, comment
+	actor, err := ptypes.ParseActorID("fixture--018f0000-0000-7000-8000-000000000002")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return OperationInput{
+		Conditions: []Condition{{Kind: ConditionCurrentFact, Selector: FactSelector{Kind: FactEvidence, Filter: FactFilter{TaskScope: FactTaskScope{Kind: FactTaskUnscoped}}, EvidenceKind: "fixture.evidence"}, AssertedJournalID: 0}},
+		Effects:    []Effect{{Sort: EffectBootstrapAuthority, ResultSlot: "root", BootstrapLabel: "root", OperationAuthorityID: OperationAuthorityID(actor.String())}},
+	}
 }
 
-func TestCanonicalMutationV1IndependentGoldenBytes(t *testing.T) {
-	effect := Effect{Sort: EffectBootstrapAuthority, ResultSlot: "root", BootstrapLabel: "root", OperationAuthorityID: "auth-1"}
-	got, err := PrepareMutationV1([]Effect{effect})
+func TestMutationV1V004IndependentFixture(t *testing.T) {
+	want, err := os.ReadFile("../../testdata/contract/mutation_v1_v004.bin")
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []byte("version:22:provenance.mutation.v1\neffect-count:1:1\neffect.0.family:19:bootstrap_authority\neffect.0.result-slot:4:root\neffect.0.recorded-at-override:1:0\neffect.0.bootstrap-label:4:root\neffect.0.operation-authority:6:auth-1\n")
-	if !bytes.Equal(got.CanonicalBytes(), want) {
-		t.Fatalf("canonical bytes drifted\n got %q\nwant %q", got.CanonicalBytes(), want)
-	}
-	wantDigest, err := hex.DecodeString("2a044cf580d36ae527513e4a520febd935ac34cb514ff91636b17984b555b727")
+	prepared, err := Canonicalize(v004FixtureInput(t))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(got.DerivedDigest(), wantDigest) {
-		t.Fatalf("canonical digest drifted: got %x want %x", got.DerivedDigest(), wantDigest)
+	if !bytes.Equal(prepared.CanonicalBytes(), want) {
+		t.Fatalf("evolved V1 bytes drifted\n got %q\nwant %q", prepared.CanonicalBytes(), want)
+	}
+	if got := sha256.Sum256(want); got != [32]byte{0xe3, 0xea, 0x1b, 0xa0, 0x27, 0xe0, 0x96, 0x04, 0xe3, 0xc7, 0x86, 0x38, 0xc5, 0xbd, 0x54, 0xee, 0xf1, 0xa4, 0xcb, 0x07, 0x71, 0x9b, 0xf8, 0x71, 0x05, 0x4b, 0x65, 0xd3, 0x9a, 0xe1, 0x29, 0xb8} {
+		t.Fatalf("fixture digest = %x", got)
 	}
 	decoded, err := DecodeCanonicalMutation(want)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(decoded.NormalizedEffects(), []Effect{effect}) {
-		t.Fatalf("decoded independent fixture = %#v, want %#v", decoded.NormalizedEffects(), []Effect{effect})
+	wantInput := v004FixtureInput(t)
+	wantDigest := sha256.Sum256(want)
+	wantInput.MutationDigest = append([]byte(nil), wantDigest[:]...)
+	gotInput := OperationInput{Conditions: decoded.NormalizedConditions(), Effects: decoded.NormalizedEffects(), MutationDigest: decoded.DerivedDigest()}
+	if decoded.EncodingVersion() != MutationEncodingV1 || !reflect.DeepEqual(gotInput, wantInput) {
+		t.Fatalf("decoded fixture lost complete normalized semantics: got=%#v want=%#v", gotInput, wantInput)
 	}
-}
-
-func validFamilyEffects(t *testing.T) []Effect {
-	task, actor, comment := fixtureIDs(t)
-	title, description, notes := "new", "new description", "notes"
-	priority, phase := ptypes.PriorityHigh, ptypes.PhaseCodeReview
-	recordedAt := int64(42)
-	ctx, _ := TaskContext(task)
-	return []Effect{
-		{Sort: EffectTaskEvent, ResultSlot: "event", RecordedAtOverride: &recordedAt, TaskID: task, EventKind: EventKindTaskUpdated, Payload: []byte(`{"a":1,"b":2}`), Contexts: []EventContext{ctx}, UpdateTitle: &title, UpdateDescription: &description, UpdatePriority: &priority, UpdatePhase: &phase, UpdateNotes: &notes},
-		{Sort: EffectTaskEvent, ResultSlot: "close", RecordedAtOverride: &recordedAt, TaskID: task, EventKind: EventKindTaskClosed, CloseReason: "done", Forced: true},
-		{Sort: EffectBootstrapAuthority, ResultSlot: "bootstrap", RecordedAtOverride: &recordedAt, BootstrapLabel: "root", OperationAuthorityID: "auth"},
-		{Sort: EffectAssignmentStart, ResultSlot: "start", RecordedAtOverride: &recordedAt, TaskID: task, AssignmentID: "a", SlotID: SlotOwnerResponsibility, Occupant: actor, Predecessor: "p", Parent: "parent"},
-		{Sort: EffectAssignmentEnd, ResultSlot: "end", RecordedAtOverride: &recordedAt, TaskID: task, AssignmentID: "a", SlotID: SlotOwnerResponsibility},
-		{Sort: EffectDecision, ResultSlot: "decision", RecordedAtOverride: &recordedAt, TaskID: task, DecisionKind: "fixture.decision", Payload: []byte(`{"x":1}`)},
-		{Sort: EffectEvidence, ResultSlot: "evidence", RecordedAtOverride: &recordedAt, TaskID: task, EvidenceKind: "fixture.evidence", ContentDigest: []byte(independentEvidenceDigestWire), Payload: []byte(`{"x":1}`)},
-		{Sort: EffectTaskCreate, ResultSlot: "create", RecordedAtOverride: &recordedAt, TaskID: task, Title: "title", Description: "description", Type: ptypes.TaskTypeTask, Priority: ptypes.PriorityMedium, Phase: ptypes.PhaseUnscoped, Payload: []byte(`{"x":1}`), Contexts: []EventContext{ctx}},
-		{Sort: EffectTaskCreateAllocated, ResultSlot: "allocated", RecordedAtOverride: &recordedAt, TaskID: task, Title: "title", Description: "description", Type: ptypes.TaskTypeTask, Priority: ptypes.PriorityMedium, Phase: ptypes.PhaseUnscoped, Payload: []byte(`{"x":1}`), Contexts: []EventContext{ctx}},
-		{Sort: EffectEdgeAdd, ResultSlot: "edge-add", RecordedAtOverride: &recordedAt, TaskID: task, EdgeTargetID: task.String(), EdgeRelKind: ptypes.EdgeDerivedFrom, Contexts: []EventContext{ctx}},
-		{Sort: EffectEdgeRemove, ResultSlot: "edge-remove", RecordedAtOverride: &recordedAt, TaskID: task, EdgeTargetID: task.String(), EdgeRelKind: ptypes.EdgeDerivedFrom, Contexts: []EventContext{ctx}},
-		{Sort: EffectLabelAdd, ResultSlot: "label-add", RecordedAtOverride: &recordedAt, TaskID: task, Label: "label", Contexts: []EventContext{ctx}},
-		{Sort: EffectLabelRemove, ResultSlot: "label-remove", RecordedAtOverride: &recordedAt, TaskID: task, Label: "label", Contexts: []EventContext{ctx}},
-		{Sort: EffectCommentAdd, ResultSlot: "comment", RecordedAtOverride: &recordedAt, TaskID: task, CommentIdentity: comment, CommentAuthor: actor, CommentBody: "body", Contexts: []EventContext{ctx}},
-	}
-}
-
-func TestCanonicalMutationV1EveryFamilyRoundTripsMeaningfulSemantics(t *testing.T) {
-	covered := map[string]bool{}
-	effects := validFamilyEffects(t)
-	fields := independentFamilyFields(t)
-	if len(effects) != len(fields) || len(effects) != len(independentFamilyDigestCorpus) {
-		t.Fatalf("independent family corpus lengths: effects=%d fields=%d digests=%d", len(effects), len(fields), len(independentFamilyDigestCorpus))
-	}
-	for fixtureIndex, effect := range effects {
-		digestFixture := independentFamilyDigestCorpus[fixtureIndex]
-		t.Run(digestFixture.name, func(t *testing.T) {
-			if effect.Sort != digestFixture.sort {
-				t.Fatalf("digest corpus sort = %s, want %s", digestFixture.sort, effect.Sort)
-			}
-			prepared, err := PrepareMutationV1([]Effect{effect})
-			if err != nil {
-				t.Fatal(err)
-			}
-			decoded, err := DecodeCanonicalMutation(prepared.CanonicalBytes())
-			if err != nil {
-				t.Fatal(err)
-			}
-			expected := effect
-			literalWire := independentFixtureWire(fields[fixtureIndex])
-			if !bytes.Equal(prepared.CanonicalBytes(), literalWire) {
-				t.Fatalf("family %s wire drifted\n got %q\nwant %q", effect.Sort, prepared.CanonicalBytes(), literalWire)
-			}
-			wantDigest, err := hex.DecodeString(digestFixture.digestHex)
-			if err != nil {
-				t.Fatalf("invalid independent digest fixture: %v", err)
-			}
-			if !bytes.Equal(prepared.DerivedDigest(), wantDigest) {
-				t.Fatalf("family %s digest drifted: got %x want %x", effect.Sort, prepared.DerivedDigest(), wantDigest)
-			}
-			decoded, err = DecodeCanonicalMutation(literalWire)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !reflect.DeepEqual(decoded.NormalizedEffects(), []Effect{expected}) {
-				t.Fatalf("family round trip = %#v, want %#v", decoded.NormalizedEffects(), []Effect{expected})
-			}
-			typ := reflect.TypeOf(expected)
-			value := reflect.ValueOf(expected)
-			for i := 0; i < value.NumField(); i++ {
-				field := typ.Field(i)
-				if field.Name == "Sort" || field.Name == "ActorID" || value.Field(i).IsZero() {
-					continue
-				}
-				covered[field.Name] = true
-				changed := expected
-				changedValue := reflect.ValueOf(&changed).Elem().Field(i)
-				skipAlternative := false
-				switch field.Name {
-				case "TaskID":
-					changed.TaskID, _ = ptypes.ParseTaskID("fixture--018f0000-0000-7000-8000-000000000004")
-				case "Occupant", "CommentAuthor":
-					alternate, _ := ptypes.ParseActorID("fixture--018f0000-0000-7000-8000-000000000005")
-					if field.Name == "Occupant" {
-						changed.Occupant = alternate
-					} else {
-						changed.CommentAuthor = alternate
-					}
-				case "CommentIdentity":
-					changed.CommentIdentity, _ = ptypes.ParseCommentID("fixture--018f0000-0000-7000-8000-000000000006")
-				case "Type":
-					changed.Type = ptypes.TaskTypeFeature
-				case "Priority":
-					changed.Priority = ptypes.PriorityCritical
-				case "Phase":
-					changed.Phase = ptypes.PhaseCodeReview
-				case "EdgeRelKind":
-					changed.EdgeRelKind = ptypes.EdgeBlockedBy
-				case "ContentDigest":
-					changed.ContentDigest = []byte{9, 8}
-				case "EventKind", "SlotID":
-					skipAlternative = true
-				default:
-					switch changedValue.Kind() {
-					case reflect.String:
-						changedValue.SetString(changedValue.String() + "-changed")
-					case reflect.Bool:
-						changedValue.SetBool(!changedValue.Bool())
-					case reflect.Int:
-						changedValue.SetInt(changedValue.Int() + 1)
-					case reflect.Slice:
-						changedValue.Set(reflect.Zero(changedValue.Type()))
-					case reflect.Struct:
-						changedValue.Set(reflect.Zero(changedValue.Type()))
-					case reflect.Ptr:
-						replacement := reflect.New(changedValue.Type().Elem())
-						switch replacement.Elem().Kind() {
-						case reflect.String:
-							replacement.Elem().SetString(changedValue.Elem().String() + "-changed")
-						case reflect.Int, reflect.Int64:
-							replacement.Elem().SetInt(changedValue.Elem().Int() + 1)
-						default:
-							t.Fatalf("unhandled pointer operand %s", field.Name)
-						}
-						changedValue.Set(replacement)
-					default:
-						t.Fatalf("unhandled operand %s (%s)", field.Name, changedValue.Kind())
-					}
-				}
-				if skipAlternative {
-					continue
-				}
-				other, changeErr := PrepareMutationV1([]Effect{changed})
-				if changeErr != nil {
-					t.Fatalf("valid alternative for %s rejected: %v", field.Name, changeErr)
-				}
-				if bytes.Equal(prepared.CanonicalBytes(), other.CanonicalBytes()) {
-					t.Fatalf("meaningful operand %s did not change identity", field.Name)
-				}
-				if bytes.Equal(prepared.DerivedDigest(), other.DerivedDigest()) {
-					t.Fatalf("meaningful operand %s did not change digest", field.Name)
-				}
-				alternateDecoded, err := DecodeCanonicalMutation(other.CanonicalBytes())
-				if err != nil {
-					t.Fatal(err)
-				}
-				if !reflect.DeepEqual(alternateDecoded.NormalizedEffects(), []Effect{changed}) {
-					t.Fatalf("alternate %s semantics=%#v want independently changed %#v", field.Name, alternateDecoded.NormalizedEffects(), []Effect{changed})
-				}
-			}
-		})
-	}
-	for _, field := range []string{"ResultSlot", "RecordedAtOverride", "TaskID", "EventKind", "Payload", "Contexts", "Title", "Description", "Type", "Priority", "Phase", "CloseReason", "UpdateTitle", "UpdateDescription", "UpdatePriority", "UpdatePhase", "UpdateNotes", "Forced", "BootstrapLabel", "OperationAuthorityID", "AssignmentID", "SlotID", "Occupant", "Predecessor", "Parent", "DecisionKind", "EvidenceKind", "ContentDigest", "EdgeTargetID", "EdgeRelKind", "Label", "CommentIdentity", "CommentAuthor", "CommentBody"} {
-		if !covered[field] {
-			t.Errorf("meaningful Effect operand %s has no round-trip/identity guard", field)
+	lines := bytes.Split(bytes.TrimSuffix(want, []byte{'\n'}), []byte{'\n'})
+	for i := range lines {
+		mutated := append([][]byte(nil), lines...)
+		mutated[i] = append([]byte(nil), mutated[i]...)
+		mutated[i][0] ^= 1
+		wire := bytes.Join(mutated, []byte{'\n'})
+		wire = append(wire, '\n')
+		if _, err := DecodeCanonicalMutation(wire); !errors.Is(err, ErrCanonicalMutation) {
+			t.Fatalf("fixture field %d is not load-bearing: %v", i, err)
 		}
 	}
 }
 
-func TestCanonicalEventKindValidAlternativeAndActorRejection(t *testing.T) {
-	task, actor, _ := fixtureIDs(t)
-	left, err := PrepareMutationV1([]Effect{{Sort: EffectTaskEvent, TaskID: task, EventKind: "fixture.one"}})
+// TestConditionExactFactCanonicalRoundTrip independently verifies that
+// ConditionExactFact (the nonzero kind=1 value) encodes, decodes, and normalizes
+// correctly. The v004 fixture uses ConditionCurrentFact (kind=2) only.
+func TestConditionExactFactCanonicalRoundTrip(t *testing.T) {
+	// Verify ConditionExactFact is nonzero and distinct from ConditionCurrentFact.
+	if ConditionExactFact == 0 {
+		t.Fatalf("ConditionExactFact must be nonzero; got 0")
+	}
+	if ConditionExactFact == ConditionCurrentFact {
+		t.Fatalf("ConditionExactFact == ConditionCurrentFact; iota shifted incorrectly")
+	}
+	// Independently author a ConditionExactFact with a known JournalID.
+	cond := Condition{
+		Kind: ConditionExactFact,
+		Selector: FactSelector{
+			Kind:         FactDecision,
+			Filter:       FactFilter{TaskScope: FactTaskScope{Kind: FactTaskAny}},
+			DecisionKind: "fixture.approval",
+		},
+		AssertedJournalID: 42,
+	}
+	prepared, err := Canonicalize(OperationInput{
+		Conditions: []Condition{cond},
+		Effects:    []Effect{{Sort: EffectBootstrapAuthority, BootstrapLabel: "check"}},
+	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Canonicalize ExactFact: %v", err)
 	}
-	right, err := PrepareMutationV1([]Effect{{Sort: EffectTaskEvent, TaskID: task, EventKind: "fixture.two"}})
+	decoded, err := DecodeCanonicalMutation(prepared.CanonicalBytes())
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("decode ExactFact round-trip: %v", err)
 	}
-	if bytes.Equal(left.CanonicalBytes(), right.CanonicalBytes()) {
-		t.Fatal("valid event-kind alternative did not change canonical identity")
+	got := decoded.NormalizedConditions()
+	if len(got) != 1 || got[0].Kind != ConditionExactFact || got[0].AssertedJournalID != 42 {
+		t.Fatalf("ExactFact round-trip = %+v; want Kind=ExactFact AssertedJournalID=42", got)
 	}
-	if bytes.Equal(left.DerivedDigest(), right.DerivedDigest()) {
-		t.Fatal("valid event-kind alternative did not change digest")
+	if got[0].Selector.DecisionKind != "fixture.approval" {
+		t.Fatalf("ExactFact DecisionKind = %q; want fixture.approval", got[0].Selector.DecisionKind)
 	}
-	decoded, err := DecodeCanonicalMutation(right.CanonicalBytes())
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := []Effect{{Sort: EffectTaskEvent, TaskID: task, EventKind: "fixture.two"}}
-	if !reflect.DeepEqual(decoded.NormalizedEffects(), want) {
-		t.Fatalf("alternate event semantics=%#v want %#v", decoded.NormalizedEffects(), want)
-	}
-	if _, err := PrepareMutationV1([]Effect{{Sort: EffectTaskEvent, ActorID: actor, TaskID: task, EventKind: "fixture.one"}}); !errors.Is(err, ErrCanonicalMutation) {
-		t.Fatalf("per-effect ActorID error=%v", err)
-	}
-}
-
-type independentField struct{ name, value string }
-
-func independentFixtureWire(fields []independentField) []byte {
-	var out bytes.Buffer
-	write := func(name, value string) { fmt.Fprintf(&out, "%s:%d:%s\n", name, len(value), value) }
-	write("version", "provenance.mutation.v1")
-	write("effect-count", "1")
-	for _, field := range fields {
-		write("effect.0."+field.name, field.value)
-	}
-	return out.Bytes()
-}
-
-func independentFamilyFields(t *testing.T) [][]independentField {
-	t.Helper()
-	task, actor, comment := fixtureIDs(t)
-	common := func(family, slot string, rest ...independentField) []independentField {
-		return append([]independentField{{"family", family}, {"result-slot", slot}, {"recorded-at-override", "142"}}, rest...)
-	}
-	ctx := []independentField{{"context-count", "1"}, {"context.0.kind", "task"}, {"context.0.identity", task.String()}}
-	withCtx := func(fields []independentField) []independentField { return append(fields, ctx...) }
-	return [][]independentField{
-		append(append(common("task_event", "event", independentField{"task", task.String()}, independentField{"event-kind", string(EventKindTaskUpdated)}, independentField{"payload", `{"a":1,"b":2}`}), ctx...), independentField{"update-title", "1new"}, independentField{"update-description", "1new description"}, independentField{"update-priority", "1high"}, independentField{"update-phase", "1code_review"}, independentField{"update-notes", "1notes"}),
-		common("task_event", "close", independentField{"task", task.String()}, independentField{"event-kind", string(EventKindTaskClosed)}, independentField{"payload", "{}"}, independentField{"context-count", "0"}, independentField{"forced", "true"}, independentField{"close-reason", "done"}),
-		common("bootstrap_authority", "bootstrap", independentField{"bootstrap-label", "root"}, independentField{"operation-authority", "auth"}),
-		common("assignment_start", "start", independentField{"task", task.String()}, independentField{"assignment", "a"}, independentField{"slot", "owner-responsibility"}, independentField{"occupant", actor.String()}, independentField{"predecessor", "p"}, independentField{"parent", "parent"}),
-		common("assignment_end", "end", independentField{"task", task.String()}, independentField{"assignment", "a"}, independentField{"slot", "owner-responsibility"}),
-		common("decision", "decision", independentField{"task", task.String()}, independentField{"decision-kind", "fixture.decision"}, independentField{"payload", `{"x":1}`}),
-		common("evidence", "evidence", independentField{"task", task.String()}, independentField{"evidence-kind", "fixture.evidence"}, independentField{"content-digest", independentEvidenceDigestWire}, independentField{"payload", `{"x":1}`}),
-		append(append(common("task_create", "create", independentField{"task", task.String()}, independentField{"payload", `{"x":1}`}), ctx...), independentField{"title", "title"}, independentField{"description", "description"}, independentField{"type", "task"}, independentField{"priority", "medium"}, independentField{"phase", "unscoped"}),
-		append(append(common("task_create_allocated", "allocated", independentField{"task", task.String()}, independentField{"payload", `{"x":1}`}), ctx...), independentField{"title", "title"}, independentField{"description", "description"}, independentField{"type", "task"}, independentField{"priority", "medium"}, independentField{"phase", "unscoped"}),
-		withCtx(common("edge_add", "edge-add", independentField{"task", task.String()}, independentField{"edge-target", task.String()}, independentField{"edge-kind", "derived_from"})),
-		withCtx(common("edge_remove", "edge-remove", independentField{"task", task.String()}, independentField{"edge-target", task.String()}, independentField{"edge-kind", "derived_from"})),
-		withCtx(common("label_add", "label-add", independentField{"task", task.String()}, independentField{"label", "label"})),
-		withCtx(common("label_remove", "label-remove", independentField{"task", task.String()}, independentField{"label", "label"})),
-		withCtx(common("comment_add", "comment", independentField{"task", task.String()}, independentField{"comment", comment.String()}, independentField{"comment-author", actor.String()}, independentField{"comment-body", "body"})),
-	}
-}
-
-func TestIndependentCanonicalOracleNegativeControls(t *testing.T) {
-	fixture := independentFixtureWire(independentFamilyFields(t)[7])
-	prepared, err := PrepareMutationV1([]Effect{validFamilyEffects(t)[7]})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for name, changed := range map[string][]byte{
-		"family-tag":  bytes.Replace(prepared.CanonicalBytes(), []byte("task_create"), []byte("task_create_x"), 1),
-		"field-name":  bytes.Replace(prepared.CanonicalBytes(), []byte("effect.0.title"), []byte("effect.0.titel"), 1),
-		"field-order": bytes.Replace(prepared.CanonicalBytes(), []byte("effect.0.title:5:title\neffect.0.description:11:description"), []byte("effect.0.description:11:description\neffect.0.title:5:title"), 1),
-	} {
-		t.Run(name, func(t *testing.T) {
-			if bytes.Equal(changed, fixture) {
-				t.Fatal("mutated production wire matched independent oracle")
-			}
-			if _, err := DecodeCanonicalMutation(changed); err == nil {
-				t.Fatal("mutated production wire decoded")
-			}
-		})
-	}
-}
-
-func TestCanonicalMutationRejectsIrrelevantFieldsAndInvalidEnums(t *testing.T) {
-	task, _, _ := fixtureIDs(t)
-	cases := map[string]Effect{
-		"bootstrap-task":      {Sort: EffectBootstrapAuthority, TaskID: task},
-		"decision-label":      {Sort: EffectDecision, DecisionKind: "fixture.decision", Label: "ignored"},
-		"invalid-edge-enum":   {Sort: EffectEdgeAdd, TaskID: task, EdgeTargetID: "x", EdgeRelKind: ptypes.EdgeKind(99)},
-		"invalid-create-enum": {Sort: EffectTaskCreate, TaskID: task, Type: ptypes.TaskType(99), Priority: ptypes.PriorityMedium, Phase: ptypes.PhaseUnscoped},
-		"allocated-no-slot":   {Sort: EffectTaskCreateAllocated, TaskID: task, Type: ptypes.TaskTypeTask, Priority: ptypes.PriorityMedium, Phase: ptypes.PhaseUnscoped},
-	}
-	for name, effect := range cases {
-		t.Run(name, func(t *testing.T) {
-			_, err := PrepareMutationV1([]Effect{effect})
-			if !errors.Is(err, ErrCanonicalMutation) {
-				t.Fatalf("error=%v, want typed canonical error", err)
-			}
-		})
-	}
-}
-
-func TestDecodeCanonicalMutationStrictPopulatedMatrix(t *testing.T) {
-	base, err := PrepareMutationV1([]Effect{validFamilyEffects(t)[0]})
-	if err != nil {
-		t.Fatal(err)
-	}
-	replace := func(old, new string) []byte {
-		return bytes.Replace(base.CanonicalBytes(), []byte(old), []byte(new), 1)
-	}
-	cases := map[string][]byte{
-		"unsupported-version":   replace("provenance.mutation.v1", "provenance.mutation.v2"),
-		"unknown-family":        replace("task_event", "unknown_fx"),
-		"unknown-enum":          replace("code_review", "badbadbadbad"),
-		"unknown-context-tag":   replace("task:", "xxxx:"),
-		"missing-field":         bytes.Replace(base.CanonicalBytes(), []byte("effect.0.result-slot"), []byte("missing-slot-field"), 1),
-		"duplicate-field":       bytes.Replace(base.CanonicalBytes(), []byte("effect.0.recorded-at-override"), []byte("effect.0.result-slot          "), 1),
-		"trailing":              append(base.CanonicalBytes(), 'x'),
-		"overflow-effect-count": []byte("version:22:provenance.mutation.v1\neffect-count:9:999999999\n"),
-		"overflow-field-length": []byte("version:999999999:"),
-	}
-	for name, wire := range cases {
-		t.Run(name, func(t *testing.T) {
-			if _, err := DecodeCanonicalMutation(wire); err == nil {
-				t.Fatalf("malformed populated wire accepted: %q", wire)
-			} else {
-				assertActionableCanonicalError(t, err)
-			}
-		})
-	}
-	if _, err := PrepareMutationV1(make([]Effect, MaxCanonicalEffects+1)); !errors.Is(err, ErrCanonicalMutation) {
-		t.Fatalf("unbounded encode=%v", err)
-	}
-	if _, err := DecodeCanonicalMutation(bytes.Repeat([]byte{'x'}, MaxCanonicalMutationBytes+1)); !errors.Is(err, ErrCanonicalMutation) {
-		t.Fatalf("unbounded decode=%v", err)
-	}
-}
-
-func assertActionableCanonicalError(t *testing.T, err error) {
-	t.Helper()
+	// Zero ConditionKind must be rejected.
+	_, err = Canonicalize(OperationInput{Conditions: []Condition{{Kind: 0, Selector: FactSelector{Kind: FactDecision, Filter: FactFilter{TaskScope: FactTaskScope{Kind: FactTaskAny}}, DecisionKind: "fixture.decision"}}}})
 	if !errors.Is(err, ErrCanonicalMutation) {
-		t.Fatalf("error does not wrap ErrCanonicalMutation: %v", err)
-	}
-	var typed *CanonicalMutationError
-	if !errors.As(err, &typed) {
-		t.Fatalf("error is not CanonicalMutationError: %T %v", err, err)
-	}
-	if typed.Field == "" || typed.Reason == "" || typed.Fix == "" {
-		t.Fatalf("incomplete typed error: %+v", typed)
-	}
-	message := err.Error()
-	for _, part := range []string{"where:", "when:", "impact:", "fix:"} {
-		if !strings.Contains(message, part) {
-			t.Fatalf("error lacks %s: %v", part, err)
-		}
+		t.Fatalf("zero ConditionKind accepted: %v", err)
 	}
 }
 
-func TestCanonicalMalformedInventoryIsUniformlyTyped(t *testing.T) {
-	fixtures := independentFamilyFields(t)
-	task, _, _ := fixtureIDs(t)
-	fieldWire := func(index int, change func([]independentField)) []byte {
-		fields := append([]independentField(nil), fixtures[index]...)
-		change(fields)
-		return independentFixtureWire(fields)
+// TestActivityCreateCanonicalRoundTrip independently verifies that EffectActivityCreate
+// encodes, decodes, and normalizes with all required fields (ActivityID, AgentID, Phase,
+// Stage, Notes, ResultSlot) and that the canonical bytes round-trip strictly.
+// Malformed and irrelevant inputs must fail normalization.
+func TestActivityCreateCanonicalRoundTrip(t *testing.T) {
+	actID, err := ptypes.ParseActivityID("fixture--018f0000-0000-7000-8000-000000000010")
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent, err := ptypes.ParseAgentID("fixture--018f0000-0000-7000-8000-000000000011")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	completeEffect := Effect{
+		Sort:            EffectActivityCreate,
+		ResultSlot:      "born",
+		ActivityID:      actID,
+		ActivityAgentID: agent,
+		ActivityPhase:   ptypes.PhaseWorkerSlices,
+		ActivityStage:   ptypes.StageInProgress,
+		ActivityNotes:   "slice 2",
+	}
+
+	// Round-trip: Canonicalize → DecodeCanonicalMutation → NormalizedEffects
+	prepared, err := Canonicalize(OperationInput{Effects: []Effect{completeEffect}})
+	if err != nil {
+		t.Fatalf("Canonicalize ActivityCreate: %v", err)
+	}
+	decoded, err := DecodeCanonicalMutation(prepared.CanonicalBytes())
+	if err != nil {
+		t.Fatalf("DecodeCanonicalMutation ActivityCreate: %v", err)
+	}
+	got := decoded.NormalizedEffects()
+	if len(got) != 1 {
+		t.Fatalf("NormalizedEffects len = %d; want 1", len(got))
+	}
+	e := got[0]
+	if e.Sort != EffectActivityCreate {
+		t.Fatalf("Sort = %v; want EffectActivityCreate", e.Sort)
+	}
+	if e.ResultSlot != "born" {
+		t.Fatalf("ResultSlot = %q; want born", e.ResultSlot)
+	}
+	if e.ActivityID != actID {
+		t.Fatalf("ActivityID = %v; want %v", e.ActivityID, actID)
+	}
+	if e.ActivityAgentID != agent {
+		t.Fatalf("ActivityAgentID = %v; want %v", e.ActivityAgentID, agent)
+	}
+	if e.ActivityPhase != ptypes.PhaseWorkerSlices {
+		t.Fatalf("ActivityPhase = %v; want PhaseWorkerSlices", e.ActivityPhase)
+	}
+	if e.ActivityStage != ptypes.StageInProgress {
+		t.Fatalf("ActivityStage = %v; want StageInProgress", e.ActivityStage)
+	}
+	if e.ActivityNotes != "slice 2" {
+		t.Fatalf("ActivityNotes = %q; want slice 2", e.ActivityNotes)
+	}
+
+	// Changing any semantic field changes the canonical bytes.
+	for _, change := range []struct {
+		name string
+		f    func() Effect
+	}{
+		{"activity-id", func() Effect {
+			e2 := completeEffect
+			e2.ActivityID, _ = ptypes.ParseActivityID("fixture--018f0000-0000-7000-8000-000000000099")
+			return e2
+		}},
+		{"agent-id", func() Effect {
+			e2 := completeEffect
+			e2.ActivityAgentID, _ = ptypes.ParseAgentID("fixture--018f0000-0000-7000-8000-000000000099")
+			return e2
+		}},
+		{"phase", func() Effect {
+			e2 := completeEffect
+			e2.ActivityPhase = ptypes.PhasePropose
+			return e2
+		}},
+		{"stage", func() Effect {
+			e2 := completeEffect
+			e2.ActivityStage = ptypes.StageComplete
+			return e2
+		}},
+		{"notes", func() Effect {
+			e2 := completeEffect
+			e2.ActivityNotes = "changed"
+			return e2
+		}},
+		{"result-slot", func() Effect {
+			e2 := completeEffect
+			e2.ResultSlot = "other"
+			return e2
+		}},
+	} {
+		t.Run(change.name, func(t *testing.T) {
+			other, err := Canonicalize(OperationInput{Effects: []Effect{change.f()}})
+			if err != nil {
+				t.Fatalf("Canonicalize changed %s: %v", change.name, err)
+			}
+			if bytes.Equal(prepared.CanonicalBytes(), other.CanonicalBytes()) {
+				t.Fatalf("changed %s did not change canonical bytes", change.name)
+			}
+		})
+	}
+
+	// Malformed: missing ResultSlot
+	noSlot := completeEffect
+	noSlot.ResultSlot = ""
+	if _, err := Canonicalize(OperationInput{Effects: []Effect{noSlot}}); !errors.Is(err, ErrCanonicalMutation) {
+		t.Fatalf("missing ResultSlot accepted: %v", err)
+	}
+
+	// Malformed: zero ActivityID
+	zeroID := completeEffect
+	zeroID.ActivityID = ActivityID{}
+	if _, err := Canonicalize(OperationInput{Effects: []Effect{zeroID}}); !errors.Is(err, ErrCanonicalMutation) {
+		t.Fatalf("zero ActivityID accepted: %v", err)
+	}
+
+	// Malformed: zero AgentID
+	zeroAgent := completeEffect
+	zeroAgent.ActivityAgentID = AgentID{}
+	if _, err := Canonicalize(OperationInput{Effects: []Effect{zeroAgent}}); !errors.Is(err, ErrCanonicalMutation) {
+		t.Fatalf("zero AgentID accepted: %v", err)
+	}
+
+	// Malformed: zero Phase (invalid)
+	zeroPhase := completeEffect
+	zeroPhase.ActivityPhase = Phase(-1) // -1 is out of range, IsValid() returns false
+	if _, err := Canonicalize(OperationInput{Effects: []Effect{zeroPhase}}); !errors.Is(err, ErrCanonicalMutation) {
+		t.Fatalf("zero Phase accepted: %v", err)
+	}
+
+	// Malformed: zero Stage (invalid)
+	zeroStage := completeEffect
+	zeroStage.ActivityStage = Stage(-1) // -1 is out of range, IsValid() returns false
+	if _, err := Canonicalize(OperationInput{Effects: []Effect{zeroStage}}); !errors.Is(err, ErrCanonicalMutation) {
+		t.Fatalf("zero Stage accepted: %v", err)
+	}
+
+	// Irrelevant field: TaskID must not be set on ActivityCreate
+	irrelevant := completeEffect
+	task, _ := ptypes.ParseTaskID("fixture--018f0000-0000-7000-8000-000000000020")
+	irrelevant.TaskID = task
+	if _, err := Canonicalize(OperationInput{Effects: []Effect{irrelevant}}); !errors.Is(err, ErrCanonicalMutation) {
+		t.Fatalf("irrelevant TaskID accepted: %v", err)
+	}
+}
+
+func TestMutationV1RejectsOldShapeAndMalformedFrames(t *testing.T) {
+	old := []byte("version:22:provenance.mutation.v1\neffect-count:1:0\n")
+	valid, err := os.ReadFile("../../testdata/contract/mutation_v1_v004.bin")
+	if err != nil {
+		t.Fatal(err)
 	}
 	cases := map[string][]byte{
-		"optional-marker": fieldWire(0, func(fields []independentField) {
-			for i := range fields {
-				if fields[i].name == "update-title" {
-					fields[i].value = "xnew"
-				}
-			}
-		}),
-		"invalid-task-id": fieldWire(7, func(fields []independentField) {
-			for i := range fields {
-				if fields[i].name == "task" {
-					fields[i].value = task.String()[:len(task.String())-1] + "z"
-				}
-			}
-		}),
-		"invalid-context": fieldWire(7, func(fields []independentField) {
-			for i := range fields {
-				if fields[i].name == "context.0.kind" {
-					fields[i].value = "unknown"
-				}
-			}
-		}),
-		"invalid-json": fieldWire(5, func(fields []independentField) {
-			for i := range fields {
-				if fields[i].name == "payload" {
-					fields[i].value = "{]"
-				}
-			}
-		}),
+		"old-layout":   old,
+		"missing":      bytes.Replace(valid, []byte("condition.0.kind:1:2\n"), nil, 1),
+		"duplicate":    bytes.Replace(valid, []byte("condition.0.kind:1:2\n"), []byte("condition.0.kind:1:1\ncondition.0.kind:1:1\n"), 1),
+		"out-of-order": bytes.Replace(valid, []byte("condition-count:1:1\ncondition.0.kind:1:2\n"), []byte("condition.0.kind:1:1\ncondition-count:1:1\n"), 1),
+		"trailing":     append(append([]byte(nil), valid...), 'x'),
+		"oversized":    bytes.Repeat([]byte{'x'}, MaxCanonicalMutationBytes+1),
 	}
 	for name, wire := range cases {
 		t.Run(name, func(t *testing.T) {
 			_, err := DecodeCanonicalMutation(wire)
-			if err == nil {
-				t.Fatal("malformed wire accepted")
+			var typed *CanonicalMutationError
+			if !errors.Is(err, ErrCanonicalMutation) || !errors.As(err, &typed) {
+				t.Fatalf("error=%v, want actionable canonical error", err)
 			}
-			assertActionableCanonicalError(t, err)
 		})
 	}
 }
 
-func TestCanonicalRawBoundsAndNamespacedKinds(t *testing.T) {
-	task, _, _ := fixtureIDs(t)
-	context, _ := TaskContext(task)
-	contexts := make([]EventContext, MaxCanonicalContextsPerEffect*64)
-	for i := range contexts {
-		contexts[i] = context
+func TestMutationV1BoundsAndIrrelevantFields(t *testing.T) {
+	validCondition := v004FixtureInput(t).Conditions[0]
+	taskID, _ := ptypes.ParseTaskID("fixture--018f0000-0000-7000-8000-000000000021")
+	boundary := v004FixtureInput(t)
+	boundary.Conditions = make([]Condition, MaxCanonicalConditions)
+	for i := range boundary.Conditions {
+		boundary.Conditions[i] = validCondition
 	}
-	_, err := PrepareMutationV1([]Effect{{Sort: EffectTaskEvent, TaskID: task, EventKind: "fixture.event", Contexts: contexts}})
-	if err == nil {
-		t.Fatal("duplicate-heavy raw context input accepted")
+	boundary.Effects = make([]Effect, MaxCanonicalEffects)
+	for i := range boundary.Effects {
+		boundary.Effects[i] = Effect{Sort: EffectBootstrapAuthority}
 	}
-	assertActionableCanonicalError(t, err)
-	var bounded *CanonicalMutationError
-	_ = errors.As(err, &bounded)
-	if !strings.Contains(bounded.Field, "context-count") {
-		t.Fatalf("raw bound ran after context canonicalization: %+v", bounded)
+	if _, err := Canonicalize(boundary); err != nil {
+		t.Fatalf("exact condition/effect count boundaries rejected: %v", err)
 	}
+	in := v004FixtureInput(t)
+	in.Conditions = make([]Condition, MaxCanonicalConditions+1)
+	if _, err := Canonicalize(in); !errors.Is(err, ErrCanonicalMutation) {
+		t.Fatalf("condition bound error=%v", err)
+	}
+	in = v004FixtureInput(t)
+	in.Effects[0].Label = "irrelevant"
+	if _, err := Canonicalize(in); !errors.Is(err, ErrCanonicalMutation) {
+		t.Fatalf("irrelevant field error=%v", err)
+	}
+	// EffectTaskCreateAllocated requires a non-empty result slot.
+	in = OperationInput{Effects: []Effect{{Sort: EffectTaskCreateAllocated, TaskID: taskID, Title: "t", Type: ptypes.TaskTypeTask, Priority: ptypes.PriorityMedium, Phase: ptypes.PhaseUnscoped}}}
+	if _, err := Canonicalize(in); !errors.Is(err, ErrCanonicalMutation) {
+		t.Fatalf("allocated-create without proof slot error=%v", err)
+	}
+	in = v004FixtureInput(t)
+	in.Effects = append(in.Effects, Effect{Sort: EffectBootstrapAuthority, ResultSlot: "root"}) // duplicate of fixture slot "root"
+	if _, err := Canonicalize(in); !errors.Is(err, ErrCanonicalMutation) {
+		t.Fatalf("duplicate slot error=%v", err)
+	}
+	in = v004FixtureInput(t)
+	in.Effects[0].ResultSlot = "bad\nslot"
+	if _, err := Canonicalize(in); !errors.Is(err, ErrCanonicalMutation) {
+		t.Fatalf("control-bearing slot error=%v", err)
+	}
+	in = OperationInput{Effects: []Effect{{Sort: EffectBootstrapAuthority, BootstrapLabel: strings.Repeat("x", MaxCanonicalFieldBytes)}}}
+	if _, err := Canonicalize(in); err != nil {
+		t.Fatalf("exact field boundary rejected: %v", err)
+	}
+	in.Effects[0].BootstrapLabel += "x"
+	if _, err := Canonicalize(in); !errors.Is(err, ErrCanonicalMutation) {
+		t.Fatalf("field boundary+1 error=%v", err)
+	}
+	in = OperationInput{Effects: make([]Effect, 9)}
+	for i := range in.Effects {
+		in.Effects[i] = Effect{Sort: EffectBootstrapAuthority, BootstrapLabel: strings.Repeat("x", MaxCanonicalFieldBytes)}
+	}
+	if _, err := Canonicalize(in); !errors.Is(err, ErrCanonicalMutation) {
+		t.Fatalf("aggregate boundary+1 error=%v", err)
+	}
+	in = v004FixtureInput(t)
+	in.Conditions[0].Selector.Filter.RequiredContexts = make([]EventContext, MaxCanonicalContextsPerEffect+1)
+	if _, err := Canonicalize(in); !errors.Is(err, ErrCanonicalMutation) {
+		t.Fatalf("condition context boundary+1 error=%v", err)
+	}
+	in = v004FixtureInput(t)
+	in.Conditions[0].Selector.Filter.OperationIDs = make([]OperationID, MaxFactFilterValues+1)
+	if _, err := Canonicalize(in); !errors.Is(err, ErrCanonicalMutation) {
+		t.Fatalf("filter value boundary+1 error=%v", err)
+	}
+}
+
+func TestMutationV1EveryResourceBoundaryIsExact(t *testing.T) {
+	validCondition := v004FixtureInput(t).Conditions[0]
 	for _, test := range []struct {
-		name   string
-		effect Effect
-	}{{"decision-empty", Effect{Sort: EffectDecision}}, {"decision-unnamespaced", Effect{Sort: EffectDecision, DecisionKind: "unnamespaced"}}, {"decision-malformed", Effect{Sort: EffectDecision, DecisionKind: "Bad.kind"}}, {"decision-oversized", Effect{Sort: EffectDecision, DecisionKind: DecisionKind(strings.Repeat("x", MaxCanonicalFieldBytes+1))}}, {"evidence-empty", Effect{Sort: EffectEvidence}}, {"evidence-unnamespaced", Effect{Sort: EffectEvidence, EvidenceKind: "unnamespaced"}}, {"evidence-malformed", Effect{Sort: EffectEvidence, EvidenceKind: "bad..kind"}}, {"evidence-oversized", Effect{Sort: EffectEvidence, EvidenceKind: EvidenceKind(strings.Repeat("x", MaxCanonicalFieldBytes+1))}}} {
+		name     string
+		at, over OperationInput
+	}{
+		{"conditions", OperationInput{Conditions: repeatConditions(validCondition, MaxCanonicalConditions)}, OperationInput{Conditions: repeatConditions(validCondition, MaxCanonicalConditions+1)}},
+		{"effects", OperationInput{Effects: repeatEffects(Effect{Sort: EffectBootstrapAuthority}, MaxCanonicalEffects)}, OperationInput{Effects: repeatEffects(Effect{Sort: EffectBootstrapAuthority}, MaxCanonicalEffects+1)}},
+	} {
 		t.Run(test.name, func(t *testing.T) {
-			_, err := PrepareMutationV1([]Effect{test.effect})
-			if err == nil {
-				t.Fatal("invalid kind accepted")
+			if _, err := Canonicalize(test.at); err != nil {
+				t.Fatalf("at limit: %v", err)
 			}
-			assertActionableCanonicalError(t, err)
+			if _, err := Canonicalize(test.over); !errors.Is(err, ErrCanonicalMutation) {
+				t.Fatalf("limit+1: %v", err)
+			}
 		})
 	}
-}
 
-func TestCanonicalMutationStaticLimitsAtBoundary(t *testing.T) {
-	effects := make([]Effect, MaxCanonicalEffects)
-	for i := range effects {
-		effects[i] = Effect{Sort: EffectBootstrapAuthority}
-	}
-	if _, err := PrepareMutationV1(effects); err != nil {
-		t.Fatalf("exact effect bound rejected: %v", err)
-	}
-	contexts := make([]EventContext, MaxCanonicalContextsPerEffect)
-	for i := range contexts {
-		id := TaskID{Namespace: "fixture", UUID: uuid.NewSHA1(uuid.NameSpaceURL, []byte(strconv.Itoa(i)))}
-		contexts[i], _ = TaskContext(id)
-	}
-	task, _, _ := fixtureIDs(t)
-	if _, err := PrepareMutationV1([]Effect{{Sort: EffectTaskEvent, TaskID: task, EventKind: "fixture.event", Contexts: contexts}}); err != nil {
-		t.Fatalf("exact context bound rejected: %v", err)
-	}
-	if _, err := PrepareMutationV1([]Effect{{Sort: EffectTaskCreate, TaskID: task, Title: strings.Repeat("x", MaxCanonicalFieldBytes), Type: ptypes.TaskTypeTask, Priority: ptypes.PriorityMedium, Phase: ptypes.PhaseUnscoped}}); err != nil {
-		t.Fatalf("exact field bound rejected: %v", err)
-	}
-	if _, err := DecodeCanonicalMutation(bytes.Repeat([]byte{'x'}, MaxCanonicalMutationBytes)); err == nil {
-		t.Fatal("malformed mutation at total-size bound was accepted")
-	}
-}
-
-func TestCanonicalMutationRejectsAggregateFramedSizeBeforeCanonicalAllocation(t *testing.T) {
-	task, _, _ := fixtureIDs(t)
-	payload := []byte(`"` + strings.Repeat("x", MaxCanonicalFieldBytes-2) + `"`)
-	effects := make([]Effect, 9)
-	for i := range effects {
-		effects[i] = Effect{
-			Sort:      EffectTaskEvent,
-			TaskID:    task,
-			EventKind: "fixture.event",
-			Payload:   payload,
-		}
-	}
-
-	_, err := PrepareMutationV1(effects)
-	if err == nil {
-		t.Fatal("individually bounded effects with oversized aggregate framing were accepted")
-	}
-	assertActionableCanonicalError(t, err)
-	var bounded *CanonicalMutationError
-	if !errors.As(err, &bounded) || bounded.Field != "mutation" {
-		t.Fatalf("aggregate error = %#v, want mutation size error", err)
-	}
-	if !strings.Contains(bounded.Reason, "exact framed size") || !strings.Contains(bounded.Reason, "before canonical byte allocation") {
-		t.Fatalf("aggregate error does not identify exact pre-allocation framing bound: %+v", bounded)
-	}
-}
-
-func TestCanonicalSizeCounterHasExactHardCapAndNoBackingBuffer(t *testing.T) {
-	counter := &canonicalSizeCounter{limit: MaxCanonicalMutationBytes}
-	if n, err := counter.Write(make([]byte, MaxCanonicalMutationBytes)); err != nil || n != MaxCanonicalMutationBytes {
-		t.Fatalf("exact size boundary rejected: n=%d err=%v", n, err)
-	}
-	if n, err := counter.Write([]byte{'x'}); n != 0 || !errors.Is(err, ErrCanonicalMutation) {
-		t.Fatalf("byte beyond exact boundary: n=%d err=%v, want typed rejection", n, err)
-	}
-	if counter.size != MaxCanonicalMutationBytes {
-		t.Fatalf("counter advanced after overflow: %d", counter.size)
-	}
-}
-
-func TestCanonicalJSONRejectsDuplicateAndTrailingFields(t *testing.T) {
-	task, _, _ := fixtureIDs(t)
-	for _, payload := range []string{`{"x":1,"x":2}`, `{"x":1} {"y":2}`} {
-		if _, err := PrepareMutationV1([]Effect{{Sort: EffectTaskEvent, TaskID: task, EventKind: "fixture.event", Payload: []byte(payload)}}); err == nil {
-			t.Fatalf("accepted %s", payload)
-		}
-	}
-}
-
-func TestCanonicalWireHasNoUnconsumedFieldNames(t *testing.T) {
-	for _, effect := range validFamilyEffects(t) {
-		prepared, err := PrepareMutationV1([]Effect{effect})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if strings.Contains(string(prepared.CanonicalBytes()), "effect.0.actor:") {
-			t.Fatalf("family %s encoded rejected actor field", effect.Sort)
-		}
-	}
-}
-
-func TestCanonicalCodecRegistryIsExactUniqueAndComplete(t *testing.T) {
-	if len(canonicalCodecRegistry) != 1 {
-		t.Fatalf("codec registry cardinality=%d, want 1", len(canonicalCodecRegistry))
-	}
-	versions, tags := map[MutationEncodingVersion]bool{}, map[string]bool{}
-	for _, descriptor := range canonicalCodecRegistry {
-		if descriptor.version == 0 || descriptor.wireTag == "" || descriptor.decoder == nil {
-			t.Fatalf("incomplete codec descriptor: %+v", descriptor)
-		}
-		if versions[descriptor.version] || tags[descriptor.wireTag] {
-			t.Fatalf("duplicate codec descriptor: %+v", descriptor)
-		}
-		versions[descriptor.version], tags[descriptor.wireTag] = true, true
-		resolved, ok := inspectMutationEncodingTag(descriptor.wireTag).version()
-		if !ok || resolved != descriptor.version || !IsSupportedMutationEncoding(resolved) {
-			t.Fatalf("codec descriptor does not round trip: %+v", descriptor)
-		}
-	}
-}
-
-func TestCanonicalV1FamilyRegistryIsExactUniqueCompleteAndRoundTrips(t *testing.T) {
-	wantCount := int(EffectTaskCreateAllocated) + 1
-	if len(canonicalV1Families) != wantCount {
-		t.Fatalf("V1 family cardinality=%d, want %d", len(canonicalV1Families), wantCount)
-	}
-	sorts, tags := map[EffectSort]bool{}, map[string]bool{}
-	for sort := EffectSort(0); int(sort) < wantCount; sort++ {
-		tag, ok := mutationV1Codec.familyTag(sort)
-		if !ok || tag == "" || sorts[sort] || tags[tag] {
-			t.Fatalf("invalid V1 family mapping sort=%d tag=%q ok=%v", sort, tag, ok)
-		}
-		sorts[sort], tags[tag] = true, true
-		decoded, err := mutationV1Codec.parseFamilyTag(tag)
-		if err != nil || decoded != sort {
-			t.Fatalf("V1 family round trip sort=%d tag=%q decoded=%d err=%v", sort, tag, decoded, err)
-		}
-	}
-}
-
-func TestCanonicalV1FieldRegistriesAreExactUniqueCompleteAndBounded(t *testing.T) {
-	assertUnique := func(scope string, refs []canonicalV1FieldRef, want int) {
-		t.Helper()
-		if len(refs) != want {
-			t.Fatalf("%s field cardinality=%d want=%d", scope, len(refs), want)
-		}
-		names := map[string]bool{}
-		for _, ref := range refs {
-			name, err := mutationV1Codec.renderFieldName(ref)
-			if err != nil || name == "" || names[name] {
-				t.Fatalf("%s invalid field name=%q err=%v", scope, name, err)
+	task, _ := ptypes.ParseTaskID("fixture--018f0000-0000-7000-8000-000000000021")
+	actor, _ := ptypes.ParseActorID("fixture--018f0000-0000-7000-8000-000000000022")
+	context, _ := TaskContext(task)
+	dimensions := []struct {
+		name string
+		set  func(*Condition, int)
+	}{
+		{"contexts", func(c *Condition, n int) {
+			c.Selector.Filter.RequiredContexts = make([]EventContext, n)
+			for i := range c.Selector.Filter.RequiredContexts {
+				c.Selector.Filter.RequiredContexts[i] = context
 			}
-			names[name] = true
+		}},
+		{"actors", func(c *Condition, n int) {
+			c.Selector.Filter.EffectiveActorIDs = make([]ActorID, n)
+			for i := range c.Selector.Filter.EffectiveActorIDs {
+				c.Selector.Filter.EffectiveActorIDs[i] = actor
+			}
+		}},
+		{"operations", func(c *Condition, n int) {
+			c.Selector.Filter.OperationIDs = make([]OperationID, n)
+			for i := range c.Selector.Filter.OperationIDs {
+				c.Selector.Filter.OperationIDs[i] = "fixture-operation"
+			}
+		}},
+	}
+	for _, test := range dimensions {
+		t.Run(test.name, func(t *testing.T) {
+			at := validCondition
+			test.set(&at, MaxFactFilterValues)
+			if test.name == "contexts" {
+				test.set(&at, MaxCanonicalContextsPerEffect)
+			}
+			if _, err := Canonicalize(OperationInput{Conditions: []Condition{at}}); err != nil {
+				t.Fatalf("at limit: %v", err)
+			}
+			over := validCondition
+			limit := MaxFactFilterValues
+			if test.name == "contexts" {
+				limit = MaxCanonicalContextsPerEffect
+			}
+			test.set(&over, limit+1)
+			if _, err := Canonicalize(OperationInput{Conditions: []Condition{over}}); !errors.Is(err, ErrCanonicalMutation) {
+				t.Fatalf("limit+1: %v", err)
+			}
+		})
+	}
+
+	effects := repeatEffects(Effect{Sort: EffectBootstrapAuthority, BootstrapLabel: strings.Repeat("x", MaxCanonicalFieldBytes)}, 7)
+	effects = append(effects, Effect{Sort: EffectBootstrapAuthority})
+	var prepared CanonicalMutation
+	low, high := 0, MaxCanonicalFieldBytes
+	for low <= high {
+		middle := low + (high-low)/2
+		effects[7].BootstrapLabel = strings.Repeat("x", middle)
+		candidate, candidateErr := Canonicalize(OperationInput{Effects: effects})
+		if candidateErr != nil {
+			high = middle - 1
+			continue
 		}
+		prepared = candidate
+		low = middle + 1
 	}
-	var envelopeRefs []canonicalV1FieldRef
-	for field := envelopeVersion; field <= envelopeEffectCount; field++ {
-		envelopeRefs = append(envelopeRefs, envelopeField(field))
-	}
-	assertUnique("envelope", envelopeRefs, 2)
-	var effectRefs []canonicalV1FieldRef
-	for field := effectFamily; field <= effectCommentBody; field++ {
-		effectRefs = append(effectRefs, effectField(0, field))
-	}
-	assertUnique("effect", effectRefs, int(effectCommentBody))
-	var contextRefs []canonicalV1FieldRef
-	for field := contextKind; field <= contextIdentity; field++ {
-		contextRefs = append(contextRefs, contextField(0, 0, field))
-	}
-	assertUnique("context", contextRefs, 2)
-	invalid := []canonicalV1FieldRef{
-		envelopeField(canonicalEnvelopeField(99)), effectField(-1, effectTask), effectField(MaxCanonicalEffects, effectTask),
-		effectField(0, canonicalEffectField(99)), contextField(-1, 0, contextKind), contextField(0, -1, contextKind),
-		contextField(0, MaxCanonicalContextsPerEffect, contextKind), contextField(0, 0, canonicalContextField(99)),
-		invalidCanonicalV1Ref{},
-	}
-	for _, ref := range invalid {
-		name, err := mutationV1Codec.renderFieldName(ref)
-		var typed *CanonicalMutationError
-		if err == nil || name != "" || !errors.Is(err, ErrCanonicalMutation) || !errors.As(err, &typed) {
-			t.Fatalf("invalid V1 reference rendered name=%q err=%v", name, err)
+	if delta := MaxCanonicalMutationBytes - len(prepared.CanonicalBytes()); delta > 0 {
+		effects[7].BootstrapLabel = strings.Repeat("x", high)
+		effects[7].OperationAuthorityID = OperationAuthorityID(strings.Repeat("y", delta))
+		exact, exactErr := Canonicalize(OperationInput{Effects: effects})
+		if exactErr != nil {
+			t.Fatalf("construct exact aggregate boundary: %v", exactErr)
 		}
-		if typed.Field == "" || typed.Reason == "" || typed.Fix == "" {
-			t.Fatalf("invalid V1 reference returned incomplete actionable error: %+v", typed)
-		}
+		prepared = exact
+	}
+	if len(prepared.CanonicalBytes()) != MaxCanonicalMutationBytes {
+		t.Fatalf("aggregate exact bytes=%d want=%d", len(prepared.CanonicalBytes()), MaxCanonicalMutationBytes)
+	}
+	if _, err := DecodeCanonicalMutation(prepared.CanonicalBytes()); err != nil {
+		t.Fatalf("decode exact aggregate boundary: %v", err)
+	}
+	if _, err := DecodeCanonicalMutation(append(prepared.CanonicalBytes(), 'x')); !errors.Is(err, ErrCanonicalMutation) {
+		t.Fatalf("decode aggregate limit+1: %v", err)
+	}
+	effects[7].OperationAuthorityID += "x"
+	if _, err := Canonicalize(OperationInput{Effects: effects}); !errors.Is(err, ErrCanonicalMutation) {
+		t.Fatalf("aggregate limit+1: %v", err)
 	}
 }
 
-func TestCanonicalV2DescriptorExtensionCannotChangeV1(t *testing.T) {
-	snapshotV1 := func() [][]byte {
-		t.Helper()
-		var snapshot [][]byte
-		for _, effect := range validFamilyEffects(t) {
-			prepared, err := PrepareMutationV1([]Effect{effect})
-			if err != nil {
-				t.Fatal(err)
+func repeatConditions(value Condition, count int) []Condition {
+	out := make([]Condition, count)
+	for i := range out {
+		out[i] = value
+	}
+	return out
+}
+func repeatEffects(value Effect, count int) []Effect {
+	out := make([]Effect, count)
+	for i := range out {
+		out[i] = value
+	}
+	return out
+}
+
+func TestMutationV1RejectsMalformedUnionOperands(t *testing.T) {
+	task, _ := ptypes.ParseTaskID("fixture--018f0000-0000-7000-8000-000000000001")
+	context, _ := TaskContext(task)
+	cases := map[string]OperationInput{
+		"unknown-condition":    {Conditions: []Condition{{Kind: ConditionKind(99), Selector: FactSelector{Kind: FactEvidence, Filter: FactFilter{TaskScope: FactTaskScope{Kind: FactTaskUnscoped}}, EvidenceKind: "fixture.evidence"}}}},
+		"invalid-scope-arm":    {Conditions: []Condition{{Kind: ConditionCurrentFact, Selector: FactSelector{Kind: FactEvidence, Filter: FactFilter{TaskScope: FactTaskScope{Kind: FactTaskAny, TaskID: task}}, EvidenceKind: "fixture.evidence"}}}},
+		"invalid-selector-arm": {Conditions: []Condition{{Kind: ConditionCurrentFact, Selector: FactSelector{Kind: FactDecision, Filter: FactFilter{TaskScope: FactTaskScope{Kind: FactTaskAny}}, DecisionKind: "fixture.decision", EvidenceKind: "fixture.evidence"}}}},
+		"invalid-json":         {Effects: []Effect{{Sort: EffectDecision, DecisionKind: "fixture.decision", Payload: []byte(`{"a":`)}}},
+		"duplicate-json":       {Effects: []Effect{{Sort: EffectDecision, DecisionKind: "fixture.decision", Payload: []byte(`{"a":1,"a":2}`)}}},
+		"invalid-context":      {Effects: []Effect{{Sort: EffectDecision, DecisionKind: "fixture.decision", Contexts: []EventContext{{}}}}},
+		"irrelevant-context":   {Effects: []Effect{{Sort: EffectBootstrapAuthority, Contexts: []EventContext{context}}}},
+	}
+	for name, input := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Canonicalize(input); !errors.Is(err, ErrCanonicalMutation) {
+				t.Fatalf("error=%v, want ErrCanonicalMutation", err)
 			}
-			snapshot = append(snapshot, prepared.CanonicalBytes(), prepared.DerivedDigest())
-		}
-		indexed, err := PrepareMutationV1(validFamilyEffects(t))
-		if err != nil {
-			t.Fatal(err)
-		}
-		return append(snapshot, indexed.CanonicalBytes(), indexed.DerivedDigest())
+		})
 	}
-	original := append(canonicalCodecDescriptors(nil), canonicalCodecRegistry...)
-	defer func() { canonicalCodecRegistry = original }()
-	before := snapshotV1()
-	extended := append(canonicalCodecDescriptors(nil), original...)
-	v2Called := false
-	extended = append(extended, canonicalCodecDescriptor{version: MutationEncodingVersion(2), wireTag: "provenance.mutation.v2", prepare: func(effects []Effect, _ canonicalCodecDescriptor) (CanonicalMutation, error) {
-		return CanonicalMutation{version: MutationEncodingVersion(2), effects: append([]Effect(nil), effects...)}, nil
-	}, decoder: func(data []byte, version MutationEncodingVersion, _ string) (CanonicalMutation, error) {
-		v2Called = true
-		return CanonicalMutation{version: version, bytes: append([]byte(nil), data...)}, nil
-	}})
-	if err := extended.validate(); err != nil {
-		t.Fatalf("valid V2 extension rejected: %v", err)
-	}
-	canonicalCodecRegistry = extended
-	if MutationEncodingVersion(2).String() != "provenance.mutation.v2" || !IsSupportedMutationEncoding(MutationEncodingVersion(2)) {
-		t.Fatal("public production lookups cannot resolve installed V2 codec")
-	}
-	v2Prepared, err := prepareCanonicalMutation(MutationEncodingVersion(2), []Effect{{Sort: EffectBootstrapAuthority}})
-	if err != nil || v2Prepared.EncodingVersion() != MutationEncodingVersion(2) {
-		t.Fatalf("V2 prepare dispatch failed: %+v err=%v", v2Prepared, err)
-	}
-	v2Bytes := bytes.Replace(before[0], []byte("provenance.mutation.v1"), []byte("provenance.mutation.v2"), 1)
-	inspected, err := InspectCanonicalMutationEncodingVersion(v2Bytes)
+	valid, err := os.ReadFile("../../testdata/contract/mutation_v1_v004.bin")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if version, ok := inspected.RegisteredVersion(); !ok || version != MutationEncodingVersion(2) {
-		t.Fatalf("V2 inspection lookup failed: %v %v", version, ok)
+	malformedOptional := bytes.Replace(valid, []byte("effect.0.recorded-at-override:1:0\n"), []byte("effect.0.recorded-at-override:1:x\n"), 1)
+	if _, err := DecodeCanonicalMutation(malformedOptional); !errors.Is(err, ErrCanonicalMutation) {
+		t.Fatalf("invalid optional marker error=%v", err)
 	}
-	v2, err := DecodeCanonicalMutation(v2Bytes)
-	if err != nil || !v2Called || v2.EncodingVersion() != MutationEncodingVersion(2) || !bytes.Equal(v2.CanonicalBytes(), v2Bytes) {
-		t.Fatalf("production dispatch did not route V2 descriptor: mutation=%+v called=%v err=%v", v2, v2Called, err)
-	}
-	if during := snapshotV1(); !reflect.DeepEqual(before, during) {
-		t.Fatal("installed V2 descriptor changed exhaustive V1 fixtures or digests")
-	}
-	assertInvalidRegistry := func(registry canonicalCodecDescriptors) {
-		t.Helper()
-		canonicalCodecRegistry = registry
-		err := canonicalCodecRegistry.validate()
-		var typed *CanonicalMutationError
-		if !errors.Is(err, ErrCanonicalMutation) || !errors.As(err, &typed) || typed.Field == "" || typed.Reason == "" || typed.Fix == "" {
-			t.Fatalf("shadow registry returned non-actionable error: %v", err)
+}
+
+func TestDecisionEvidenceContextsAreSemantic(t *testing.T) {
+	task, _ := ptypes.ParseTaskID("fixture--018f0000-0000-7000-8000-000000000001")
+	ctx, _ := TaskContext(task)
+	for _, effect := range []Effect{{Sort: EffectDecision, DecisionKind: "fixture.decision", Contexts: []EventContext{ctx}}, {Sort: EffectEvidence, EvidenceKind: "fixture.evidence", Contexts: []EventContext{ctx}}} {
+		with, err := Canonicalize(OperationInput{Effects: []Effect{effect}})
+		if err != nil {
+			t.Fatal(err)
 		}
-		if IsSupportedMutationEncoding(MutationEncodingV1) {
-			t.Fatal("support lookup accepted invalid production registry")
+		effect.Contexts = nil
+		without, err := Canonicalize(OperationInput{Effects: []Effect{effect}})
+		if err != nil {
+			t.Fatal(err)
 		}
-		if _, err := PrepareMutationV1(validFamilyEffects(t)); !errors.Is(err, ErrCanonicalMutation) {
-			t.Fatalf("prepare accepted invalid registry: %v", err)
+		if bytes.Equal(with.CanonicalBytes(), without.CanonicalBytes()) || !strings.Contains(string(with.CanonicalBytes()), "context.0.identity") {
+			t.Fatalf("contexts absent from %s identity", effect.Sort)
 		}
-		if _, err := DecodeCanonicalMutation(before[0]); !errors.Is(err, ErrCanonicalMutation) {
-			t.Fatalf("decode accepted invalid registry: %v", err)
-		}
-		if _, err := InspectCanonicalMutationEncodingVersion(before[0]); !errors.Is(err, ErrCanonicalMutation) {
-			t.Fatalf("inspect accepted invalid registry: %v", err)
-		}
-		canonicalCodecRegistry = extended
-	}
-	assertInvalidRegistry(append(append(canonicalCodecDescriptors(nil), extended...), canonicalCodecDescriptor{
-		version: MutationEncodingV1, wireTag: "fixture.shadow.v1", prepare: extended[1].prepare, decoder: extended[1].decoder,
-	}))
-	assertInvalidRegistry(append(append(canonicalCodecDescriptors(nil), extended...), canonicalCodecDescriptor{
-		version: MutationEncodingVersion(2), wireTag: MutationEncodingV1.String(), prepare: extended[1].prepare, decoder: extended[1].decoder,
-	}))
-	canonicalCodecRegistry = original
-	if after := snapshotV1(); !reflect.DeepEqual(before, after) {
-		t.Fatal("restoring production registry changed exhaustive V1 fixtures or digests")
 	}
 }

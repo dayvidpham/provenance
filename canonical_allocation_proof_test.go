@@ -323,7 +323,7 @@ func TestAllocatedCreateCorruptionFailsLiveAndOnOpenWithoutDrift(t *testing.T) {
 		"canonical-family": {
 			mutate: func(t *testing.T, tr Tracker, f allocationCorruptionFixture) {
 				corruptAllocationFamily(t, tr, f.anchor, []byte("effect.0.family:11:task_create\n"))
-			}, liveErr: ErrOperationConflict, openErr: ErrProjectionDivergence, token: "mutation digest",
+			}, liveErr: ErrCanonicalMutation, openErr: ErrProjectionDivergence, token: "mutation digest",
 		},
 	}
 	for name, test := range cases {
@@ -368,11 +368,11 @@ func TestAllocatedCreateCorruptionFailsLiveAndOnOpenWithoutDrift(t *testing.T) {
 }
 
 func TestAllocatedCreateMarkerIsStableCanonicalRelation(t *testing.T) {
-	prepared, err := PrepareMutationV1([]Effect{{
+	prepared, err := Canonicalize(OperationInput{Effects: []Effect{{
 		Sort: EffectTaskCreateAllocated, ResultSlot: "task",
 		TaskID: TaskID{Namespace: "allocation", UUID: uuid.Must(uuid.NewV7())},
 		Title:  "task", Type: TaskTypeTask, Priority: PriorityMedium, Phase: PhaseUnscoped,
-	}})
+	}}})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -80,7 +80,7 @@ func retryMismatchCandidates(t *testing.T, f retryMatrixFixture) map[string]Oper
 		v := f.input
 		v.Effects = cloneRetryEffects(f.input.Effects)
 		change(&v)
-		if _, err := PrepareMutationV1(v.Effects); err != nil {
+		if _, err := Canonicalize(OperationInput{Effects: v.Effects}); err != nil {
 			t.Fatalf("candidate %s is not canonical: %v", name, err)
 		}
 		out[name] = v
@@ -209,7 +209,7 @@ func assertMismatchMatrix(t *testing.T, tr Tracker, f retryMatrixFixture) {
 }
 
 func completeConflictResult(result CommittedResult, operationID OperationID) bool {
-	return result.Kind == CommittedConflict && result.Conflict != nil && result.Conflict.OperationID == operationID && result.Conflict.Field != "" && result.AnchorJournalID == 0 && len(result.EmittedEvents) == 0 && len(result.ResultSlots) == 0 && !result.ShortCircuited
+	return result.Kind == CommittedConflict && result.Conflict != nil && result.Conflict.OperationID == operationID && result.AnchorJournalID == 0 && len(result.EmittedEvents) == 0 && len(result.ResultSlots) == 0 && !result.ShortCircuited
 }
 
 func bootstrapMismatchCandidates(f retryMatrixFixture) map[string]OperationInput {

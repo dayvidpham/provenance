@@ -9,6 +9,7 @@ package provenance_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"testing"
 
@@ -225,6 +226,62 @@ func TestMatrix_PresentSuccessChangedCanonicalOperand_ConflictsBeforeWorkflow(t 
 	}
 	if len(tasksAfter) != len(tasksBefore) || looked.AnchorJournalID != first.AnchorJournalID || len(looked.EmittedEvents) != len(first.EmittedEvents) || len(looked.ResultSlots) != len(first.ResultSlots) {
 		t.Fatalf("conflicting retry changed durable state: tasks %d->%d, first=%+v looked=%+v", len(tasksBefore), len(tasksAfter), first, looked)
+	}
+}
+
+func TestMatrix_SuccessCheckpointRejectsResultSlotDivergence(t *testing.T) {
+
+	tests := map[string]func(*provenance.CommittedResult){
+		"over-limit": func(result *provenance.CommittedResult) {
+			result.ResultSlots = make([]provenance.ResultSlotBinding, provenance.MaxCanonicalResultSlots+1)
+			for i := range result.ResultSlots {
+				result.ResultSlots[i] = provenance.ResultSlotBinding{Slot: provenance.ResultSlotID(fmt.Sprintf("slot-%03d", i)), ProducedJournalID: provenance.JournalID(i + 1), Kind: provenance.JournalKindAuthority}
+			}
+		},
+		// Activity slots reserved for later vertical; test non-entity wrong-arm instead.
+		"wrong-arm-decision": func(result *provenance.CommittedResult) {
+			result.ResultSlots[0].Kind = provenance.JournalKindDecision
+			result.ResultSlots[0].TaskID = nil
+		},
+		"missing": func(result *provenance.CommittedResult) {
+			result.ResultSlots = nil
+		},
+		"extra": func(result *provenance.CommittedResult) {
+			result.ResultSlots = append(result.ResultSlots, provenance.ResultSlotBinding{
+				Slot: "zz-extra", ProducedJournalID: result.AnchorJournalID, Kind: provenance.JournalKindAuthority,
+			})
+		},
+		"duplicate": func(result *provenance.CommittedResult) {
+			result.ResultSlots = append(result.ResultSlots, result.ResultSlots[0])
+		},
+		"wrong-kind": func(result *provenance.CommittedResult) {
+			result.ResultSlots[0].Kind = provenance.JournalKindAuthority
+			result.ResultSlots[0].TaskID = nil
+		},
+		"wrong-arm": func(result *provenance.CommittedResult) {
+			result.ResultSlots[0].Kind = provenance.JournalKindEvidence
+			result.ResultSlots[0].TaskID = nil
+		},
+		"foreign-row": func(result *provenance.CommittedResult) {
+			result.ResultSlots[0].ProducedJournalID++
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			lookup := func(result provenance.CommittedResult, err error) (provenance.CommittedResult, error) {
+				if err == nil && result.Kind == provenance.CommittedExact {
+					result.ResultSlots = append([]provenance.ResultSlotBinding(nil), result.ResultSlots...)
+					mutate(&result)
+				}
+				return result, err
+			}
+			s := stackWithJournal(t, nil, lookup)
+			_, err := s.adapter.Apply(context.Background(), s.createTaskOp("slot-divergence-"+name, "matrix", name))
+			var divergence *provenance.CheckpointDivergenceError
+			if !errors.As(err, &divergence) || divergence.Stage == "" || divergence.Impact == "" || divergence.Fix == "" || divergence.Cause == nil {
+				t.Fatalf("slot divergence err=%v, want actionable CheckpointDivergenceError", err)
+			}
+		})
 	}
 }
 
