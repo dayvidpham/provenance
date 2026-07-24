@@ -239,11 +239,13 @@ type Edge struct {
 	TargetID string   `json:"targetId"` // Task, Agent, or Activity ID
 	Kind     EdgeKind `json:"kind"`
 	// CreatedAt is the edge's creation timestamp, sourced from the edges.created_at
-	// column. It is the zero Time for edges materialized by graph-traversal helpers
-	// that do not select created_at (e.g. DepTree), and is populated by the row-reading
-	// paths GetEdges, GetBlockedByEdges, and GetAllEdges. Carrying it lets a PROV-O
-	// exporter emit prov:atTime on qualified derivation nodes without a second query.
-	CreatedAt time.Time `json:"createdAt,omitempty"`
+	// column. The ZERO Time means unknown / not-loaded: graph-traversal helpers that
+	// do not select created_at (e.g. DepTree) leave it zero, while the row-reading
+	// paths GetEdges, GetBlockedByEdges, and GetAllEdges populate it. Carrying it lets
+	// a PROV-O exporter emit prov:atTime on qualified derivation nodes without a second
+	// query. No `omitempty`: it is ineffective on time.Time (a zero Time is a non-empty
+	// struct), and the zero value is meaningful (unknown), so it is always serialized.
+	CreatedAt time.Time `json:"createdAt"`
 }
 
 // Label is a string tag attached to a task.

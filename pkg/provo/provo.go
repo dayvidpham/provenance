@@ -239,7 +239,8 @@ func (e *encoder) header() {
 func (e *encoder) plan() {
 	p := &e.buf
 	planIRI := e.rawIRI(planLocalName)
-	fmt.Fprintln(p, "# Built-in plan: the 13-value Phase enum reified as p-plan:Step-per-phase.")
+	fmt.Fprintln(p, "# Built-in plan 'pasture-12-phase': the 12 protocol phases plus the 'unscoped'")
+	fmt.Fprintln(p, "# catch-all, reified as one p-plan:Step per Phase enum value (13 steps total).")
 	fmt.Fprintf(p, "%s a pplan:Plan ;\n", planIRI)
 	fmt.Fprintf(p, "    rdfs:label %s .\n", literal("pasture-12-phase"))
 	for _, ph := range allPhases {
@@ -310,7 +311,7 @@ func (e *encoder) activitiesSection() {
 			fmt.Fprintf(p, " ;\n    prov:qualifiedAssociation [\n")
 			fmt.Fprintf(p, "        a prov:Association ;\n")
 			fmt.Fprintf(p, "        prov:agent %s ;\n", e.iri(agentID))
-			fmt.Fprintf(p, "        prov:hadRole %s\n", literal(roleToken(mla.Role)))
+			fmt.Fprintf(p, "        prov:hadRole %s\n", e.roleIRI(roleToken(mla.Role)))
 			fmt.Fprintf(p, "    ]")
 		}
 		if act.Notes != "" {
@@ -400,11 +401,25 @@ func (e *encoder) stepIRI(phaseToken string) string {
 	return e.rawIRI(planLocalName + "/step/" + phaseToken)
 }
 
+// roleIRI mints a role RESOURCE IRI (not a string literal) for a role wire token, so
+// prov:hadRole's object is a resource per prov:Role's range. The wire token is the
+// escaped local name under BaseIRI. Roles are graph-instance resources, not vocabulary
+// individuals, so they live under BaseIRI rather than the ':' vocabulary namespace.
+func (e *encoder) roleIRI(roleToken string) string {
+	return "<" + e.opts.BaseIRI + "role/" + url.PathEscape(roleToken) + ">"
+}
+
 // modelID builds the :LLMAgent :modelId value from the registry-joined model,
 // provider-scoped as "<provider>/<name>". The run-provenance side
 // (which hosted instance judged) should carry the provider-scoped canonical form.
 // The value is built from typed ptypes values (Provider, ModelID), never string
 // literals, so it does not trip the repo's provider/model-name ast-grep rules.
+//
+// SIMPLIFIED FORM: "<provider>/<name>" is a stand-in. The RECOMMENDED value space is
+// bestiary's full SchemeCanonical grammar (canonical grammar:
+// <provider>/<family>[/<variant>][/<version>][@<date>]{identity-mods}[attributes]);
+// emitting it requires consuming bestiary's EntityRef/ModelRef IRI minting, which
+// lands with the bestiary integration — provenance's MLAgent.Model carries only (Provider, ModelID) today.
 func (e *encoder) modelID(mla ptypes.MLAgent) string {
 	provider := mla.Model.Provider
 	name := mla.Model.Name
