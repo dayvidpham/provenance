@@ -11,7 +11,7 @@ import (
 
 // operations_helpers.go holds the low-level reducer steps and read-path
 // reconstruction that Apply (operations.go) composes. Every function assumes the
-// DB mutex is held and runs inside Apply's single transaction (§9.5), so it
+// caller exclusively owns db.conn and runs inside Apply's single transaction (§9.5), so it
 // observes the state produced by all earlier effects of the same operation
 // (§9.3). LookupCommitted and the pure authorization predicate are the public
 // read surfaces.
@@ -686,7 +686,7 @@ func (db *DB) reconcileAllocatedTaskCreatesLocked(in journal.OperationInput, exi
 	if len(committedEffects) != len(in.Effects) {
 		return in, nil
 	}
-	result, err := db.reconstructCommittedLocked(existing.anchor)
+	result, err := db.reconstructAndValidateCommittedLocked(existing.anchor)
 	if err != nil {
 		return journal.OperationInput{}, err
 	}
@@ -744,7 +744,7 @@ func (db *DB) committedOutcomeForExistingLocked(in journal.OperationInput, exist
 		}
 		return journal.CommittedResult{}, err
 	}
-	res, err := db.reconstructCommittedLocked(existing.anchor)
+	res, err := db.reconstructAndValidateCommittedLocked(existing.anchor)
 	if err != nil {
 		return journal.CommittedResult{}, err
 	}
@@ -757,10 +757,10 @@ func (db *DB) committedOutcomeForExistingLocked(in journal.OperationInput, exist
 // concurrent writer committed the same new OperationID first, the reducer catches
 // that violation and re-runs the §9.4 idempotent-replay comparison against the
 // now-committed row, returning the typed idempotent result or the typed
-// CommittedConflict — never the raw SQLite constraint error. Under the in-process
-// db.mu this is unreachable (Apply's §9.4 lookup observes the committed row before
-// ever reaching the insert); it is the defense-in-depth path for a future
-// multi-connection/multi-process writer.
+// CommittedConflict — never the raw SQLite constraint error. BEGIN IMMEDIATE makes
+// this unreachable for cooperating Apply callers because the §9.4 lookup runs
+// after write ownership is acquired; it remains defense in depth for a writer
+// that bypasses that protocol.
 func (db *DB) resolveOperationIDInsertRaceLocked(in journal.OperationInput, callerMutationDigest []byte) (journal.CommittedResult, error) {
 	existing, found, err := db.lookupOperationLocked(in.OperationID)
 	if err != nil {
@@ -775,13 +775,6 @@ func (db *DB) resolveOperationIDInsertRaceLocked(in journal.OperationInput, call
 		return journal.CommittedResult{}, fmt.Errorf("%w: OperationID %q lost a concurrent insert but the winning row is not visible — where: insert-race structural replay; when: after UNIQUE rejection; impact: no caller conflict axis can be classified and nothing additional is committed; fix: retry after opening a fresh transaction so the winning canonical row can be compared", journal.ErrProjectionDivergence, in.OperationID)
 	}
 	return db.committedOutcomeForExistingLocked(in, existing, callerMutationDigest)
-}
-
-// reconstructCommittedLocked delegates to reconstructAndValidateCommittedLocked
-// (result_slots.go), which resolves ActivityID slots and validates all bindings.
-// Kept for backward-compatible call sites inside this file.
-func (db *DB) reconstructCommittedLocked(anchor int64) (journal.CommittedResult, error) {
-	return db.reconstructAndValidateCommittedLocked(anchor)
 }
 
 // LookupCommitted returns the committed result for an OperationID (§9.4): the
@@ -800,7 +793,7 @@ func (db *DB) LookupCommitted(op journal.OperationID) (journal.CommittedResult, 
 	if !found {
 		return journal.CommittedResult{Kind: journal.CommittedAbsent}, nil
 	}
-	return db.reconstructCommittedLocked(stored.anchor)
+	return db.reconstructAndValidateCommittedLocked(stored.anchor)
 }
 
 // AuthorityGovernsTaskAt is the pure authorization predicate (§9.3, §14.1),

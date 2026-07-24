@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -379,7 +380,7 @@ func (db *DB) JournalIsEmpty() (bool, error) {
 // discipline (§4.6), inserts its anchor, folds its effects in order with
 // per-effect authorization (§9.3), persists result slots (§3.2), and runs the
 // subtype-integrity and close-ends-assignment gates before commit.
-func (db *DB) Apply(in journal.OperationInput) (journal.CommittedResult, error) {
+func (db *DB) Apply(in journal.OperationInput) (res journal.CommittedResult, err error) {
 	// Canonicalize before acquiring write ownership or allocating (§9.1).
 	// This validates and normalizes conditions and effects; a failure here is a
 	// pure input error and nothing has been written.
@@ -396,36 +397,40 @@ func (db *DB) Apply(in journal.OperationInput) (journal.CommittedResult, error) 
 	if err := validateApplyInput(in); err != nil {
 		return journal.CommittedResult{}, err
 	}
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	scope, err := db.bindConn(context.Background())
+	if err != nil {
+		return journal.CommittedResult{}, fmt.Errorf("Apply: lease pooled connection before write transaction: %w", err)
+	}
+	defer scope.release()
+	txDB := &DB{conn: scope.conn, projectionTarget: db.projectionTarget}
 	// BEGIN IMMEDIATE acquires SQLite write ownership before the OperationID
 	// lookup and condition reads. This prevents check-then-act races: two
 	// concurrent contenders on a CurrentFact condition both serialize here;
 	// the loser observes the winner's committed fact and receives ConditionFailure
 	// (not BUSY_SNAPSHOT). Initial BUSY/LOCKED while acquiring this lock is
 	// transient infrastructure — the 5 s busy_timeout (set in Open) retries it.
-	if err := db.beginWriteOwnershipLocked(); err != nil {
+	if err := txDB.beginWriteOwnershipLocked(); err != nil {
 		return journal.CommittedResult{}, err
 	}
-	var commitErr error
 	defer func() {
-		if commitErr != nil {
-			_ = sqlitex.ExecuteTransient(db.conn, "ROLLBACK", nil)
+		if err != nil {
+			_ = sqlitex.ExecuteTransient(scope.conn, "ROLLBACK", nil)
 		} else {
-			commitErr = sqlitex.ExecuteTransient(db.conn, "COMMIT", nil)
+			commitErr := sqlitex.ExecuteTransient(scope.conn, "COMMIT", nil)
 			if commitErr != nil {
-				_ = sqlitex.ExecuteTransient(db.conn, "ROLLBACK", nil)
-				commitErr = fmt.Errorf("Apply: commit standalone write transaction: %w", commitErr)
+				_ = sqlitex.ExecuteTransient(scope.conn, "ROLLBACK", nil)
+				res = journal.CommittedResult{}
+				err = fmt.Errorf("Apply: commit pooled write transaction before returning lease: %w", commitErr)
 			}
 		}
 	}()
-	res, commitErr := db.applyPreparedLocked(in, prepared, callerMutationDigest, nil)
-	return res, commitErr
+	res, err = txDB.applyPreparedLocked(in, prepared, callerMutationDigest, nil)
+	return res, err
 }
 
 // beginWriteOwnershipLocked executes BEGIN IMMEDIATE on the held connection,
 // acquiring SQLite write ownership before any read or write in the Apply
-// transaction. The caller must hold db.mu.
+// transaction. The caller must own db.conn for the full transaction.
 func (db *DB) beginWriteOwnershipLocked() error {
 	if err := sqlitex.ExecuteTransient(db.conn, "BEGIN IMMEDIATE", nil); err != nil {
 		return fmt.Errorf(
@@ -457,9 +462,10 @@ func validateApplyInput(in journal.OperationInput) error {
 	return nil
 }
 
-// applyLocked is the lock-free core of Apply: it assumes db.mu is held and folds
-// one operation as a nested SQLite savepoint transaction (§9.5). It is reused by
-// migration (which spans many per-task operations in one outer transaction) and
+// applyLocked is the lock-free core of Apply: it assumes the caller exclusively
+// owns db.conn, either as a pooled scope or through the legacy migration seam,
+// and folds one operation as a nested SQLite savepoint transaction (§9.5). It is
+// reused by migration (which spans many per-task operations in one outer transaction) and
 // exposes an optional faultHook so the adversarial corpus can inject a
 // crash/cancellation between effects and observe the fail-closed rollback (§9.5) —
 // production callers pass nil. faultHook, when non-nil, is invoked after each
@@ -537,10 +543,9 @@ func (db *DB) applyPreparedLocked(in journal.OperationInput, prepared journal.Ca
 			// new OperationID first, so the anchor insert violates
 			// journal_operations.OperationID UNIQUE. Translate the raw constraint
 			// error into the typed idempotent/conflict outcome the caller is
-			// promised — never a raw SQLite error. Unreachable under the in-process
-			// db.mu (which serializes Apply end-to-end so the §9.4 lookup above
-			// always observes a concurrent writer's committed row first), but
-			// honoured for a future multi-connection/multi-process writer.
+			// promised — never a raw SQLite error. BEGIN IMMEDIATE serializes SQLite
+			// writers before the §9.4 lookup, while each caller retains its own pool
+			// lease for the complete transaction.
 			res, rErr := db.resolveOperationIDInsertRaceLocked(in, callerMutationDigest)
 			txErr = rErr
 			return res, rErr
