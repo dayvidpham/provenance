@@ -28,12 +28,8 @@ type activityStorageCounts struct {
 	births      int64
 }
 
-func activityCounts(t *testing.T, tr Tracker) activityStorageCounts {
+func activityCounts(t *testing.T, path string) activityStorageCounts {
 	t.Helper()
-	db := tr.(*sqliteTracker).db
-	db.Lock()
-	defer db.Unlock()
-
 	var counts activityStorageCounts
 	queries := []struct {
 		sql   string
@@ -45,27 +41,30 @@ func activityCounts(t *testing.T, tr Tracker) activityStorageCounts {
 		{`SELECT count(*) FROM main.activities`, &counts.activities},
 		{`SELECT count(*) FROM main.journal_activity_creations`, &counts.births},
 	}
-	for _, query := range queries {
-		if err := sqlitex.Execute(db.Conn(), query.sql, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error {
-			*query.count = stmt.ColumnInt64(0)
-			return nil
-		}}); err != nil {
-			t.Fatalf("count ActivityCreate storage for %q: %v", query.sql, err)
+	withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
+		for _, query := range queries {
+			if err := sqlitex.Execute(conn, query.sql, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error {
+				*query.count = stmt.ColumnInt64(0)
+				return nil
+			}}); err != nil {
+				t.Fatalf("count ActivityCreate storage for %q: %v", query.sql, err)
+			}
 		}
-	}
+	})
 	return counts
 }
 
-func requireActivityCountsUnchanged(t *testing.T, before activityStorageCounts, tr Tracker) {
+func requireActivityCountsUnchanged(t *testing.T, before activityStorageCounts, path string) {
 	t.Helper()
-	if after := activityCounts(t, tr); after != before {
+	if after := activityCounts(t, path); after != before {
 		t.Fatalf("ActivityCreate failure changed durable rows: before=%+v after=%+v", before, after)
 	}
 }
 
-func newFileActivityOpsEnv(t *testing.T) *opsEnv {
+func newFileActivityOpsEnv(t *testing.T) (*opsEnv, string) {
 	t.Helper()
-	tr, err := OpenSQLite(filepath.Join(t.TempDir(), "activity-fault.sqlite"))
+	path := filepath.Join(t.TempDir(), "activity-fault.sqlite")
+	tr, err := OpenSQLite(path)
 	if err != nil {
 		t.Fatalf("open file-backed ActivityCreate test database: %v", err)
 	}
@@ -84,7 +83,7 @@ func newFileActivityOpsEnv(t *testing.T) *opsEnv {
 		journalEnv: &journalEnv{tr: tr, actor: agent.ID},
 		actors:     map[string]ActorID{},
 		tasks:      map[string]TaskID{},
-	}
+	}, path
 }
 
 // TestActivityCreate_JournalsBirth verifies that EffectActivityCreate commits
@@ -142,7 +141,7 @@ func TestActivityCreate_JournalsBirth(t *testing.T) {
 // operation returns the original result short-circuited.
 func TestActivityCreate_ExactReplay(t *testing.T) {
 	t.Parallel()
-	env := newOpsEnv(t)
+	env, path := newFileActivityOpsEnv(t)
 	boot := env.genesis(t, "op-genesis-replay")
 
 	actID := newActivityID()
@@ -167,7 +166,7 @@ func TestActivityCreate_ExactReplay(t *testing.T) {
 	}
 
 	// Exact replay must return the same result.
-	before := activityCounts(t, env.tr)
+	before := activityCounts(t, path)
 	res2, err2 := env.tr.Journal().Apply(in)
 	if err2 != nil || res2.Kind != CommittedExact {
 		t.Fatalf("replay Apply: err=%v kind=%v", err2, res2.Kind)
@@ -182,7 +181,7 @@ func TestActivityCreate_ExactReplay(t *testing.T) {
 	if len(res2.ResultSlots) == 0 || res2.ResultSlots[0].ActivityID == nil || *res2.ResultSlots[0].ActivityID != actID {
 		t.Fatalf("replay Apply: result slot mismatch: %+v", res2.ResultSlots)
 	}
-	requireActivityCountsUnchanged(t, before, env.tr)
+	requireActivityCountsUnchanged(t, before, path)
 }
 
 // TestActivityCreate_ForeignOperationCollisionRollsBack verifies that an
@@ -190,7 +189,7 @@ func TestActivityCreate_ExactReplay(t *testing.T) {
 // returns typed ActivityConflict and rolls back the whole operation.
 func TestActivityCreate_ForeignOperationCollisionRollsBack(t *testing.T) {
 	t.Parallel()
-	env := newOpsEnv(t)
+	env, path := newFileActivityOpsEnv(t)
 	boot := env.genesis(t, "op-genesis-collision")
 
 	actID := newActivityID()
@@ -213,7 +212,7 @@ func TestActivityCreate_ForeignOperationCollisionRollsBack(t *testing.T) {
 
 	// Second operation uses the SAME ActivityID (foreign collision).
 	opB := OperationID("activity-collision-B")
-	before := activityCounts(t, env.tr)
+	before := activityCounts(t, path)
 	_, err := env.tr.Journal().Apply(OperationInput{
 		OperationID:        opB,
 		ActorID:            env.actor,
@@ -241,7 +240,7 @@ func TestActivityCreate_ForeignOperationCollisionRollsBack(t *testing.T) {
 	if ac.ExistingJournalID <= 0 {
 		t.Fatalf("ActivityID collision: ActivityConflict.ExistingJournalID=%d, want >0", ac.ExistingJournalID)
 	}
-	requireActivityCountsUnchanged(t, before, env.tr)
+	requireActivityCountsUnchanged(t, before, path)
 
 	// opB must not be persisted.
 	result, _ := env.tr.Journal().LookupCommitted(opB)
@@ -277,11 +276,11 @@ func TestActivityCreate_NonJournaledCollisionRejectsMatchingAndDifferingAttribut
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			env := newOpsEnv(t)
+			env, path := newFileActivityOpsEnv(t)
 			boot := env.genesis(t, "op-genesis-non-journaled-collision")
 			actID := newActivityID()
 			test.seed(t, env, actID)
-			before := activityCounts(t, env.tr)
+			before := activityCounts(t, path)
 
 			_, err := env.tr.Journal().Apply(OperationInput{
 				OperationID:        OperationID("activity-non-journaled-collision-" + test.name),
@@ -302,7 +301,7 @@ func TestActivityCreate_NonJournaledCollisionRejectsMatchingAndDifferingAttribut
 			if conflict.ActivityID != actID || conflict.ExistingJournalID != 0 {
 				t.Fatalf("non-journaled collision: conflict=%+v, want ActivityID=%v ExistingJournalID=0", conflict, actID)
 			}
-			requireActivityCountsUnchanged(t, before, env.tr)
+			requireActivityCountsUnchanged(t, before, path)
 		})
 	}
 }
@@ -319,7 +318,7 @@ func TestActivityCreate_ChangedPhaseOrStageConflictsWithoutWrites(t *testing.T) 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			env := newOpsEnv(t)
+			env, path := newFileActivityOpsEnv(t)
 			boot := env.genesis(t, "op-genesis-activity-field-conflict")
 			in := OperationInput{
 				OperationID:        OperationID("activity-field-conflict-" + test.name),
@@ -335,7 +334,7 @@ func TestActivityCreate_ChangedPhaseOrStageConflictsWithoutWrites(t *testing.T) 
 			if result, err := env.tr.Journal().Apply(in); err != nil || result.Kind != CommittedExact {
 				t.Fatalf("initial Apply: result=%+v err=%v", result, err)
 			}
-			before := activityCounts(t, env.tr)
+			before := activityCounts(t, path)
 			changed := in
 			changed.Effects = append([]Effect(nil), in.Effects...)
 			test.mutate(&changed.Effects[0])
@@ -348,40 +347,38 @@ func TestActivityCreate_ChangedPhaseOrStageConflictsWithoutWrites(t *testing.T) 
 			if result.Kind != CommittedConflict || conflict.Axis != ConflictEffect || conflict.Index != 0 {
 				t.Fatalf("changed %s: result=%+v conflict=%+v, want ConflictEffect index 0", test.name, result, conflict)
 			}
-			requireActivityCountsUnchanged(t, before, env.tr)
+			requireActivityCountsUnchanged(t, before, path)
 		})
 	}
 }
 
 func TestActivityCreate_BirthMappingFailureRollsBackActivity(t *testing.T) {
 	t.Parallel()
-	env := newFileActivityOpsEnv(t)
+	env, path := newFileActivityOpsEnv(t)
 	boot := env.genesis(t, "op-genesis-birth-mapping-rollback")
-	db := env.tr.(*sqliteTracker).db
-	db.Lock()
-	if err := sqlitex.ExecuteTransient(db.Conn(), `CREATE TRIGGER main.reject_activity_birth BEFORE INSERT ON journal_activity_creations BEGIN SELECT RAISE(ABORT, 'forced birth mapping failure'); END`, nil); err != nil {
-		db.Unlock()
-		t.Fatalf("create birth-mapping failure trigger: %v", err)
-	}
-	db.Unlock()
-	t.Cleanup(func() {
-		db.Lock()
-		defer db.Unlock()
-		if err := sqlitex.ExecuteTransient(db.Conn(), `DROP TRIGGER main.reject_activity_birth`, nil); err != nil {
-			t.Errorf("drop birth-mapping failure trigger before tracker Close: %v", err)
-			return
-		}
-		var remaining int64
-		if err := sqlitex.Execute(db.Conn(), `SELECT count(*) FROM main.sqlite_schema WHERE type = 'trigger' AND name = 'reject_activity_birth'`, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error {
-			remaining = stmt.ColumnInt64(0)
-			return nil
-		}}); err != nil {
-			t.Errorf("verify birth-mapping failure trigger cleanup before tracker Close: %v", err)
-		} else if remaining != 0 {
-			t.Errorf("verify birth-mapping failure trigger cleanup before tracker Close: remaining=%d, want 0", remaining)
+	withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
+		if err := sqlitex.ExecuteTransient(conn, `CREATE TRIGGER main.reject_activity_birth BEFORE INSERT ON journal_activity_creations BEGIN SELECT RAISE(ABORT, 'forced birth mapping failure'); END`, nil); err != nil {
+			t.Fatalf("create birth-mapping failure trigger: %v", err)
 		}
 	})
-	before := activityCounts(t, env.tr)
+	t.Cleanup(func() {
+		withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
+			if err := sqlitex.ExecuteTransient(conn, `DROP TRIGGER main.reject_activity_birth`, nil); err != nil {
+				t.Errorf("drop birth-mapping failure trigger before tracker Close: %v", err)
+				return
+			}
+			var remaining int64
+			if err := sqlitex.Execute(conn, `SELECT count(*) FROM main.sqlite_schema WHERE type = 'trigger' AND name = 'reject_activity_birth'`, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error {
+				remaining = stmt.ColumnInt64(0)
+				return nil
+			}}); err != nil {
+				t.Errorf("verify birth-mapping failure trigger cleanup before tracker Close: %v", err)
+			} else if remaining != 0 {
+				t.Errorf("verify birth-mapping failure trigger cleanup before tracker Close: remaining=%d, want 0", remaining)
+			}
+		})
+	})
+	before := activityCounts(t, path)
 
 	_, err := env.tr.Journal().Apply(OperationInput{
 		OperationID:        "activity-birth-mapping-rollback",
@@ -397,36 +394,34 @@ func TestActivityCreate_BirthMappingFailureRollsBackActivity(t *testing.T) {
 	if err == nil || errors.Is(err, ErrActivityConflict) {
 		t.Fatalf("forced birth-mapping failure: err=%v, want non-conflict error", err)
 	}
-	requireActivityCountsUnchanged(t, before, env.tr)
+	requireActivityCountsUnchanged(t, before, path)
 }
 
 func TestActivityCreate_CollisionAttributionLookupErrorPropagates(t *testing.T) {
 	t.Parallel()
-	env := newFileActivityOpsEnv(t)
+	env, path := newFileActivityOpsEnv(t)
 	boot := env.genesis(t, "op-genesis-collision-attribution-error")
 	actID := newActivityID()
 	if _, err := env.tr.StartActivityWithID(actID, env.actor, PhaseWorkerSlices, StageInProgress, "non-journaled"); err != nil {
 		t.Fatalf("seed non-journaled activity: %v", err)
 	}
-	db := env.tr.(*sqliteTracker).db
-	db.Lock()
-	if err := sqlitex.ExecuteTransient(db.Conn(), `ALTER TABLE main.journal_activity_creations RENAME COLUMN journal_id TO invalid_test_journal_id`, nil); err != nil {
-		db.Unlock()
-		t.Fatalf("rename attribution column for lookup failure: %v", err)
-	}
-	db.Unlock()
-	t.Cleanup(func() {
-		db.Lock()
-		defer db.Unlock()
-		if err := sqlitex.ExecuteTransient(db.Conn(), `ALTER TABLE main.journal_activity_creations RENAME COLUMN invalid_test_journal_id TO journal_id`, nil); err != nil {
-			t.Errorf("restore attribution column before tracker Close: %v", err)
-			return
-		}
-		if err := sqlitex.ExecuteTransient(db.Conn(), `SELECT journal_id FROM main.journal_activity_creations LIMIT 0`, nil); err != nil {
-			t.Errorf("verify attribution column restoration before tracker Close: %v", err)
+	withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
+		if err := sqlitex.ExecuteTransient(conn, `ALTER TABLE main.journal_activity_creations RENAME COLUMN journal_id TO invalid_test_journal_id`, nil); err != nil {
+			t.Fatalf("rename attribution column for lookup failure: %v", err)
 		}
 	})
-	before := activityCounts(t, env.tr)
+	t.Cleanup(func() {
+		withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
+			if err := sqlitex.ExecuteTransient(conn, `ALTER TABLE main.journal_activity_creations RENAME COLUMN invalid_test_journal_id TO journal_id`, nil); err != nil {
+				t.Errorf("restore attribution column before tracker Close: %v", err)
+				return
+			}
+			if err := sqlitex.ExecuteTransient(conn, `SELECT journal_id FROM main.journal_activity_creations LIMIT 0`, nil); err != nil {
+				t.Errorf("verify attribution column restoration before tracker Close: %v", err)
+			}
+		})
+	})
+	before := activityCounts(t, path)
 
 	_, err := env.tr.Journal().Apply(OperationInput{
 		OperationID:        "activity-collision-attribution-error",
@@ -442,7 +437,7 @@ func TestActivityCreate_CollisionAttributionLookupErrorPropagates(t *testing.T) 
 	if err == nil || errors.Is(err, ErrActivityConflict) || !strings.Contains(err.Error(), "attribute ActivityID collision") {
 		t.Fatalf("collision attribution lookup: err=%v, want propagated lookup error", err)
 	}
-	requireActivityCountsUnchanged(t, before, env.tr)
+	requireActivityCountsUnchanged(t, before, path)
 }
 
 // TestActivityCreate_ReopenReconstructsActivitySlot verifies that after

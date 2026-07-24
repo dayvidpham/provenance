@@ -48,26 +48,25 @@ func buildCanonicalPreflightErrorFixture(t *testing.T, path string) Tracker {
 	return tr
 }
 
-func readCanonicalPreflightWire(t *testing.T, tr Tracker) []byte {
+func readCanonicalPreflightWire(t *testing.T, path string) []byte {
 	t.Helper()
-	db := tr.(*sqliteTracker).db
-	db.Lock()
-	defer db.Unlock()
 	var wire []byte
-	if err := sqlitex.Execute(db.Conn(), `SELECT canonical_mutation FROM journal_operations WHERE operation_id=?1`, &sqlitex.ExecOptions{Args: []any{canonicalPreflightOperationID}, ResultFunc: func(stmt *sqlite.Stmt) error {
-		wire = make([]byte, stmt.ColumnLen(0))
-		stmt.ColumnBytes(0, wire)
-		return nil
-	}}); err != nil {
-		t.Fatal(err)
-	}
+	withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
+		if err := sqlitex.Execute(conn, `SELECT canonical_mutation FROM journal_operations WHERE operation_id=?1`, &sqlitex.ExecOptions{Args: []any{canonicalPreflightOperationID}, ResultFunc: func(stmt *sqlite.Stmt) error {
+			wire = make([]byte, stmt.ColumnLen(0))
+			stmt.ColumnBytes(0, wire)
+			return nil
+		}}); err != nil {
+			t.Fatal(err)
+		}
+	})
 	return wire
 }
 
-func corruptCanonicalPreflightRow(t *testing.T, tr Tracker, statement string, args ...any) {
+func corruptCanonicalPreflightRow(t *testing.T, path string, statement string, args ...any) {
 	t.Helper()
-	corruptDDL(t, tr, `DROP TRIGGER journal_operations_canonical_update`)
-	corruptSQL(t, tr, statement, args...)
+	corruptDDL(t, path, `DROP TRIGGER journal_operations_canonical_update`)
+	corruptSQL(t, path, statement, args...)
 }
 
 func assertCanonicalStartupActionable(t *testing.T, err error, category string) {
@@ -89,78 +88,78 @@ func assertCanonicalStartupActionable(t *testing.T, err error, category string) 
 func TestCanonicalColumnPreflightErrorsAreTypedActionableAndReadOnly(t *testing.T) {
 	t.Parallel()
 	tests := map[string]struct {
-		mutate       func(*testing.T, Tracker)
+		mutate       func(*testing.T, string)
 		category     string
 		detail       string
 		sentinel     error
 		canonicalErr bool
 	}{
 		"one-column-version-only": {
-			mutate: func(t *testing.T, tr Tracker) {
-				makeOperationsSchemaLegacy(t, tr)
-				corruptDDL(t, tr, `ALTER TABLE journal_operations ADD COLUMN mutation_encoding_version TEXT`)
+			mutate: func(t *testing.T, path string) {
+				makeOperationsSchemaLegacy(t, path)
+				corruptDDL(t, path, `ALTER TABLE journal_operations ADD COLUMN mutation_encoding_version TEXT`)
 			}, category: "one-column canonical shape", sentinel: ErrProjectionDivergence,
 		},
 		"one-column-bytes-only": {
-			mutate: func(t *testing.T, tr Tracker) {
-				makeOperationsSchemaLegacy(t, tr)
-				corruptDDL(t, tr, `ALTER TABLE journal_operations ADD COLUMN canonical_mutation BLOB`)
+			mutate: func(t *testing.T, path string) {
+				makeOperationsSchemaLegacy(t, path)
+				corruptDDL(t, path, `ALTER TABLE journal_operations ADD COLUMN canonical_mutation BLOB`)
 			}, category: "one-column canonical shape", sentinel: ErrProjectionDivergence,
 		},
 		"pair-version-null": {
-			mutate: func(t *testing.T, tr Tracker) {
-				corruptCanonicalPreflightRow(t, tr, `UPDATE journal_operations SET mutation_encoding_version=NULL WHERE operation_id=?1`, canonicalPreflightOperationID)
+			mutate: func(t *testing.T, path string) {
+				corruptCanonicalPreflightRow(t, path, `UPDATE journal_operations SET mutation_encoding_version=NULL WHERE operation_id=?1`, canonicalPreflightOperationID)
 			}, category: "malformed canonical pairing", detail: "version=NULL, bytes=nonempty", sentinel: ErrProjectionDivergence,
 		},
 		"pair-bytes-null": {
-			mutate: func(t *testing.T, tr Tracker) {
-				corruptCanonicalPreflightRow(t, tr, `UPDATE journal_operations SET canonical_mutation=NULL WHERE operation_id=?1`, canonicalPreflightOperationID)
+			mutate: func(t *testing.T, path string) {
+				corruptCanonicalPreflightRow(t, path, `UPDATE journal_operations SET canonical_mutation=NULL WHERE operation_id=?1`, canonicalPreflightOperationID)
 			}, category: "malformed canonical pairing", detail: "version=nonempty", sentinel: ErrProjectionDivergence,
 		},
 		"pair-version-empty": {
-			mutate: func(t *testing.T, tr Tracker) {
-				corruptCanonicalPreflightRow(t, tr, `UPDATE journal_operations SET mutation_encoding_version='' WHERE operation_id=?1`, canonicalPreflightOperationID)
+			mutate: func(t *testing.T, path string) {
+				corruptCanonicalPreflightRow(t, path, `UPDATE journal_operations SET mutation_encoding_version='' WHERE operation_id=?1`, canonicalPreflightOperationID)
 			}, category: "malformed canonical pairing", detail: "version=empty, bytes=nonempty", sentinel: ErrProjectionDivergence,
 		},
 		"pair-bytes-empty": {
-			mutate: func(t *testing.T, tr Tracker) {
-				corruptCanonicalPreflightRow(t, tr, `UPDATE journal_operations SET canonical_mutation=X'' WHERE operation_id=?1`, canonicalPreflightOperationID)
+			mutate: func(t *testing.T, path string) {
+				corruptCanonicalPreflightRow(t, path, `UPDATE journal_operations SET canonical_mutation=X'' WHERE operation_id=?1`, canonicalPreflightOperationID)
 			}, category: "malformed canonical pairing", detail: "bytes=empty", sentinel: ErrProjectionDivergence,
 		},
 		"pair-both-empty": {
-			mutate: func(t *testing.T, tr Tracker) {
-				corruptCanonicalPreflightRow(t, tr, `UPDATE journal_operations SET mutation_encoding_version='',canonical_mutation=X'' WHERE operation_id=?1`, canonicalPreflightOperationID)
+			mutate: func(t *testing.T, path string) {
+				corruptCanonicalPreflightRow(t, path, `UPDATE journal_operations SET mutation_encoding_version='',canonical_mutation=X'' WHERE operation_id=?1`, canonicalPreflightOperationID)
 			}, category: "malformed canonical pairing", detail: "version=empty, bytes=empty", sentinel: ErrProjectionDivergence,
 		},
 		"oversized-wire": {
-			mutate: func(t *testing.T, tr Tracker) {
-				corruptCanonicalPreflightRow(t, tr, `UPDATE journal_operations SET canonical_mutation=zeroblob(?1) WHERE operation_id=?2`, MaxCanonicalMutationBytes+1, canonicalPreflightOperationID)
+			mutate: func(t *testing.T, path string) {
+				corruptCanonicalPreflightRow(t, path, `UPDATE journal_operations SET canonical_mutation=zeroblob(?1) WHERE operation_id=?2`, MaxCanonicalMutationBytes+1, canonicalPreflightOperationID)
 			}, category: "oversized canonical mutation", sentinel: ErrCanonicalMutation, canonicalErr: true,
 		},
 		"malformed-wire": {
-			mutate: func(t *testing.T, tr Tracker) {
-				corruptCanonicalPreflightRow(t, tr, `UPDATE journal_operations SET canonical_mutation=X'01' WHERE operation_id=?1`, canonicalPreflightOperationID)
+			mutate: func(t *testing.T, path string) {
+				corruptCanonicalPreflightRow(t, path, `UPDATE journal_operations SET canonical_mutation=X'01' WHERE operation_id=?1`, canonicalPreflightOperationID)
 			}, category: "malformed canonical wire-version frame", sentinel: ErrCanonicalMutation, canonicalErr: true,
 		},
 		"malformed-supported-wire": {
-			mutate: func(t *testing.T, tr Tracker) {
-				wire := append(readCanonicalPreflightWire(t, tr), []byte("trailing-garbage")...)
-				corruptCanonicalPreflightRow(t, tr, `UPDATE journal_operations SET canonical_mutation=?1 WHERE operation_id=?2`, wire, canonicalPreflightOperationID)
+			mutate: func(t *testing.T, path string) {
+				wire := append(readCanonicalPreflightWire(t, path), []byte("trailing-garbage")...)
+				corruptCanonicalPreflightRow(t, path, `UPDATE journal_operations SET canonical_mutation=?1 WHERE operation_id=?2`, wire, canonicalPreflightOperationID)
 			}, category: "malformed canonical wire for supported version", sentinel: ErrCanonicalMutation, canonicalErr: true,
 		},
 		"matching-unknown-codec": {
-			mutate: func(t *testing.T, tr Tracker) {
-				wire := readCanonicalPreflightWire(t, tr)
+			mutate: func(t *testing.T, path string) {
+				wire := readCanonicalPreflightWire(t, path)
 				from, to := []byte("version:22:provenance.mutation.v1\n"), []byte("version:22:provenance.mutation.v9\n")
 				if bytes.Count(wire, from) != 1 {
 					t.Fatalf("wire version marker count=%d, want one", bytes.Count(wire, from))
 				}
-				corruptCanonicalPreflightRow(t, tr, `UPDATE journal_operations SET mutation_encoding_version='provenance.mutation.v9',canonical_mutation=?1 WHERE operation_id=?2`, bytes.Replace(wire, from, to, 1), canonicalPreflightOperationID)
+				corruptCanonicalPreflightRow(t, path, `UPDATE journal_operations SET mutation_encoding_version='provenance.mutation.v9',canonical_mutation=?1 WHERE operation_id=?2`, bytes.Replace(wire, from, to, 1), canonicalPreflightOperationID)
 			}, category: "unsupported canonical codec version", sentinel: ErrCanonicalMutation, canonicalErr: true,
 		},
 		"column-wire-version-mismatch": {
-			mutate: func(t *testing.T, tr Tracker) {
-				corruptCanonicalPreflightRow(t, tr, `UPDATE journal_operations SET mutation_encoding_version='provenance.mutation.v9' WHERE operation_id=?1`, canonicalPreflightOperationID)
+			mutate: func(t *testing.T, path string) {
+				corruptCanonicalPreflightRow(t, path, `UPDATE journal_operations SET mutation_encoding_version='provenance.mutation.v9' WHERE operation_id=?1`, canonicalPreflightOperationID)
 			}, category: "differs from wire version", sentinel: ErrProjectionDivergence,
 		},
 	}
@@ -169,7 +168,7 @@ func TestCanonicalColumnPreflightErrorsAreTypedActionableAndReadOnly(t *testing.
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "canonical-preflight.sqlite")
 			tr := buildCanonicalPreflightErrorFixture(t, path)
-			test.mutate(t, tr)
+			test.mutate(t, path)
 			if err := tr.Close(); err != nil {
 				t.Fatal(err)
 			}

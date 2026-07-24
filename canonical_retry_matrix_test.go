@@ -157,26 +157,25 @@ func retryMismatchCandidates(t *testing.T, f retryMatrixFixture) map[string]Oper
 
 type operationCounts struct{ journal, operations, slots int64 }
 
-func readOperationCounts(t *testing.T, tr Tracker) operationCounts {
+func readOperationCounts(t *testing.T, path string) operationCounts {
 	t.Helper()
-	db := tr.(*sqliteTracker).db
-	db.Lock()
-	defer db.Unlock()
 	c := operationCounts{}
-	for _, q := range []struct {
-		sql string
-		dst *int64
-	}{{`SELECT count(*) FROM journal`, &c.journal}, {`SELECT count(*) FROM journal_operations`, &c.operations}, {`SELECT count(*) FROM journal_operation_result_slots`, &c.slots}} {
-		if err := sqlitex.Execute(db.Conn(), q.sql, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error { *q.dst = stmt.ColumnInt64(0); return nil }}); err != nil {
-			t.Fatal(err)
+	withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
+		for _, q := range []struct {
+			sql string
+			dst *int64
+		}{{`SELECT count(*) FROM journal`, &c.journal}, {`SELECT count(*) FROM journal_operations`, &c.operations}, {`SELECT count(*) FROM journal_operation_result_slots`, &c.slots}} {
+			if err := sqlitex.Execute(conn, q.sql, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error { *q.dst = stmt.ColumnInt64(0); return nil }}); err != nil {
+				t.Fatal(err)
+			}
 		}
-	}
+	})
 	return c
 }
 
 func assertExactRetry(t *testing.T, tr Tracker, f retryMatrixFixture) {
 	t.Helper()
-	before := readOperationCounts(t, tr)
+	before := readOperationCounts(t, f.path)
 	got, err := tr.Journal().Apply(f.input)
 	if err != nil {
 		t.Fatal(err)
@@ -188,7 +187,7 @@ func assertExactRetry(t *testing.T, tr Tracker, f retryMatrixFixture) {
 	if !reflect.DeepEqual(got, f.result) {
 		t.Fatalf("complete exact result=%+v want=%+v", got, f.result)
 	}
-	if after := readOperationCounts(t, tr); after != before {
+	if after := readOperationCounts(t, f.path); after != before {
 		t.Fatalf("exact retry wrote rows: before=%+v after=%+v", before, after)
 	}
 }
@@ -196,12 +195,12 @@ func assertMismatchMatrix(t *testing.T, tr Tracker, f retryMatrixFixture) {
 	t.Helper()
 	for name, candidate := range retryMismatchCandidates(t, f) {
 		t.Run(name, func(t *testing.T) {
-			before := readOperationCounts(t, tr)
+			before := readOperationCounts(t, f.path)
 			got, err := tr.Journal().Apply(candidate)
 			if !errors.Is(err, ErrOperationConflict) || !completeConflictResult(got, candidate.OperationID) {
 				t.Fatalf("result=%+v error=%v, want typed committed conflict", got, err)
 			}
-			if after := readOperationCounts(t, tr); after != before {
+			if after := readOperationCounts(t, f.path); after != before {
 				t.Fatalf("conflict wrote rows: before=%+v after=%+v", before, after)
 			}
 		})
@@ -229,7 +228,7 @@ func bootstrapMismatchCandidates(f retryMatrixFixture) map[string]OperationInput
 
 func assertBootstrapRetryMatrix(t *testing.T, tr Tracker, f retryMatrixFixture) {
 	t.Helper()
-	before := readOperationCounts(t, tr)
+	before := readOperationCounts(t, f.path)
 	got, err := tr.Journal().Apply(f.genesisInput)
 	if err != nil {
 		t.Fatal(err)
@@ -241,17 +240,17 @@ func assertBootstrapRetryMatrix(t *testing.T, tr Tracker, f retryMatrixFixture) 
 	if !reflect.DeepEqual(got, f.genesisResult) {
 		t.Fatalf("complete genesis retry=%+v want=%+v", got, f.genesisResult)
 	}
-	if after := readOperationCounts(t, tr); after != before {
+	if after := readOperationCounts(t, f.path); after != before {
 		t.Fatalf("genesis retry wrote rows: before=%+v after=%+v", before, after)
 	}
 	for name, candidate := range bootstrapMismatchCandidates(f) {
 		t.Run(name, func(t *testing.T) {
-			before := readOperationCounts(t, tr)
+			before := readOperationCounts(t, f.path)
 			result, err := tr.Journal().Apply(candidate)
 			if !errors.Is(err, ErrOperationConflict) || !completeConflictResult(result, candidate.OperationID) {
 				t.Fatalf("result=%+v error=%v", result, err)
 			}
-			if after := readOperationCounts(t, tr); after != before {
+			if after := readOperationCounts(t, f.path); after != before {
 				t.Fatalf("bootstrap conflict wrote rows: before=%+v after=%+v", before, after)
 			}
 		})
@@ -288,7 +287,7 @@ func TestCanonicalRetryMatrixSimultaneousIndependentHandles(t *testing.T) {
 	defer second.Close()
 	run := func(name string, input OperationInput, exact bool, expected CommittedResult) {
 		t.Run(name, func(t *testing.T) {
-			before := readOperationCounts(t, first)
+			before := readOperationCounts(t, f.path)
 			var results [2]CommittedResult
 			var errs [2]error
 			var wg sync.WaitGroup
@@ -309,7 +308,7 @@ func TestCanonicalRetryMatrixSimultaneousIndependentHandles(t *testing.T) {
 					t.Fatalf("handle %d result=%+v error=%v", i, results[i], errs[i])
 				}
 			}
-			if after := readOperationCounts(t, first); after != before {
+			if after := readOperationCounts(t, f.path); after != before {
 				t.Fatalf("independent retry wrote rows: before=%+v after=%+v", before, after)
 			}
 		})
@@ -328,7 +327,7 @@ func TestInvalidDecisionEvidenceKindsFailBeforeJournalWrites(t *testing.T) {
 	t.Parallel()
 	tr, f := buildRetryMatrixFixture(t)
 	defer tr.Close()
-	before := readOperationCounts(t, tr)
+	before := readOperationCounts(t, f.path)
 	for _, test := range []struct {
 		name   string
 		effect Effect
@@ -338,7 +337,7 @@ func TestInvalidDecisionEvidenceKindsFailBeforeJournalWrites(t *testing.T) {
 			if !errors.Is(err, ErrCanonicalMutation) {
 				t.Fatalf("error=%v, want canonical rejection", err)
 			}
-			if after := readOperationCounts(t, tr); after != before {
+			if after := readOperationCounts(t, f.path); after != before {
 				t.Fatalf("invalid kind wrote rows: before=%+v after=%+v", before, after)
 			}
 		})

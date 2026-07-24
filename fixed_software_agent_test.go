@@ -66,6 +66,16 @@ func testFixedSoftwareAgentRegistration() FixedSoftwareAgentRegistration {
 	}
 }
 
+func newFixedAgentSQLTracker(t *testing.T) (Tracker, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fixed-agent-sql.sqlite")
+	tr, err := OpenSQLite(path, WithModelRegistry(NewRegistry(nil)))
+	if err != nil {
+		t.Fatalf("open file-backed fixed-agent SQL fixture: %v", err)
+	}
+	return tr, path
+}
+
 func TestRegisterFixedSoftwareAgentValidationCorpus(t *testing.T) {
 	t.Parallel()
 	fixture := loadFixedAgentFixture(t)
@@ -134,10 +144,7 @@ func TestRegisterFixedSoftwareAgentErrorsAreActionable(t *testing.T) {
 	t.Parallel()
 	for _, tc := range loadFixedAgentFixture(t).ActionableErrorCases {
 		t.Run(tc.Name, func(t *testing.T) {
-			tr, err := OpenMemory(WithModelRegistry(NewRegistry(nil)))
-			if err != nil {
-				t.Fatal(err)
-			}
+			tr, path := newFixedAgentSQLTracker(t)
 			defer tr.Close()
 			reg := testFixedSoftwareAgentRegistration()
 			switch tc.Mode {
@@ -151,7 +158,7 @@ func TestRegisterFixedSoftwareAgentErrorsAreActionable(t *testing.T) {
 				}
 				reg.AgentName = "different"
 			case "write":
-				cleanup := installFixedAgentAbortTrigger(t, tr, "claim")
+				cleanup := installFixedAgentAbortTrigger(t, path, "claim")
 				defer cleanup()
 			case "transaction":
 				if err := tr.Close(); err != nil {
@@ -161,7 +168,7 @@ func TestRegisterFixedSoftwareAgentErrorsAreActionable(t *testing.T) {
 				t.Fatalf("unknown actionable error mode %q", tc.Mode)
 			}
 
-			_, err = tr.RegisterFixedSoftwareAgent(reg)
+			_, err := tr.RegisterFixedSoftwareAgent(reg)
 			if err == nil {
 				t.Fatal("RegisterFixedSoftwareAgent succeeded; want actionable error")
 			}
@@ -300,29 +307,26 @@ func TestRegisterFixedSoftwareAgentReplayRepairAndDrift(t *testing.T) {
 
 func TestRegisterFixedSoftwareAgentRejectsPreClaimActor(t *testing.T) {
 	t.Parallel()
-	tr, err := OpenMemory(WithModelRegistry(NewRegistry(nil)))
-	if err != nil {
-		t.Fatal(err)
-	}
+	tr, path := newFixedAgentSQLTracker(t)
 	defer tr.Close()
 	reg := testFixedSoftwareAgentRegistration()
-	st := tr.(*sqliteTracker)
-	st.db.Lock()
-	err = sqlitex.Execute(st.db.Conn(), `INSERT INTO agents (id, kind_id) VALUES (?1, ?2)`,
-		&sqlitex.ExecOptions{Args: []any{reg.Entry.ActorID.String(), int(AgentKindSoftware)}})
-	if err == nil {
-		err = sqlitex.Execute(st.db.Conn(),
-			`INSERT INTO agents_software (agent_id, name, version, source) VALUES (?1, ?2, ?3, ?4)`,
-			&sqlitex.ExecOptions{Args: []any{reg.Entry.ActorID.String(), reg.AgentName, reg.Version, reg.Source}})
-	}
-	st.db.Unlock()
+	var err error
+	withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
+		err = sqlitex.Execute(conn, `INSERT INTO agents (id, kind_id) VALUES (?1, ?2)`,
+			&sqlitex.ExecOptions{Args: []any{reg.Entry.ActorID.String(), int(AgentKindSoftware)}})
+		if err == nil {
+			err = sqlitex.Execute(conn,
+				`INSERT INTO agents_software (agent_id, name, version, source) VALUES (?1, ?2, ?3, ?4)`,
+				&sqlitex.ExecOptions{Args: []any{reg.Entry.ActorID.String(), reg.AgentName, reg.Version, reg.Source}})
+		}
+	})
 	if err != nil {
 		t.Fatalf("seed pre-claim actor: %v", err)
 	}
 	if _, err := tr.RegisterFixedSoftwareAgent(reg); !errors.Is(err, ErrAgentAlreadyExists) {
 		t.Fatalf("pre-claim actor error = %v, want ErrAgentAlreadyExists", err)
 	}
-	assertFixedAgentRowCounts(t, tr, [4]int{0, 1, 1, 0})
+	assertFixedAgentRowCounts(t, path, [4]int{0, 1, 1, 0})
 }
 
 func TestRegisterSoftwareAgentRandomIDPathUnchanged(t *testing.T) {
@@ -345,26 +349,20 @@ func TestRegisterFixedSoftwareAgentRollsBackEveryInsertBoundary(t *testing.T) {
 	t.Parallel()
 	for _, tc := range loadFixedAgentFixture(t).RollbackCases {
 		t.Run(tc.Name, func(t *testing.T) {
-			tr, err := OpenMemory(WithModelRegistry(NewRegistry(nil)))
-			if err != nil {
-				t.Fatal(err)
-			}
+			tr, path := newFixedAgentSQLTracker(t)
 			defer tr.Close()
-			cleanup := installFixedAgentAbortTrigger(t, tr, tc.Boundary)
+			cleanup := installFixedAgentAbortTrigger(t, path, tc.Boundary)
 			defer cleanup()
 			if _, err := tr.RegisterFixedSoftwareAgent(testFixedSoftwareAgentRegistration()); err == nil {
 				t.Fatal("RegisterFixedSoftwareAgent succeeded with an injected insert failure")
 			}
-			assertFixedAgentRowCounts(t, tr, [4]int{})
+			assertFixedAgentRowCounts(t, path, [4]int{})
 		})
 	}
 }
 
-func installFixedAgentAbortTrigger(t *testing.T, tr Tracker, boundary string) func() {
+func installFixedAgentAbortTrigger(t *testing.T, path string, boundary string) func() {
 	t.Helper()
-	st := tr.(*sqliteTracker)
-	st.db.Lock()
-	defer st.db.Unlock()
 	var createStmt, dropStmt string
 	switch boundary {
 	case "claim":
@@ -382,23 +380,22 @@ func installFixedAgentAbortTrigger(t *testing.T, tr Tracker, boundary string) fu
 	default:
 		t.Fatalf("unknown rollback boundary %q", boundary)
 	}
-	if err := sqlitex.ExecuteTransient(st.db.Conn(), createStmt, nil); err != nil {
-		t.Fatalf("install %s failure trigger: %v", boundary, err)
-	}
-	return func() {
-		st.db.Lock()
-		defer st.db.Unlock()
-		if err := sqlitex.ExecuteTransient(st.db.Conn(), dropStmt, nil); err != nil {
-			t.Errorf("remove %s failure trigger before tracker close: %v", boundary, err)
+	withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
+		if err := sqlitex.ExecuteTransient(conn, createStmt, nil); err != nil {
+			t.Fatalf("install %s failure trigger: %v", boundary, err)
 		}
+	})
+	return func() {
+		withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
+			if err := sqlitex.ExecuteTransient(conn, dropStmt, nil); err != nil {
+				t.Errorf("remove %s failure trigger before tracker close: %v", boundary, err)
+			}
+		})
 	}
 }
 
-func assertFixedAgentRowCounts(t *testing.T, tr Tracker, want [4]int) {
+func assertFixedAgentRowCounts(t *testing.T, path string, want [4]int) {
 	t.Helper()
-	st := tr.(*sqliteTracker)
-	st.db.Lock()
-	defer st.db.Unlock()
 	tables := []struct {
 		name  string
 		query string
@@ -408,18 +405,20 @@ func assertFixedAgentRowCounts(t *testing.T, tr Tracker, want [4]int) {
 		{"agents_software", `SELECT COUNT(*) FROM agents_software`},
 		{"fixed_actor_manifest_entries", `SELECT COUNT(*) FROM fixed_actor_manifest_entries`},
 	}
-	for i, table := range tables {
-		var got int
-		if err := sqlitex.Execute(st.db.Conn(), table.query, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error {
-			got = stmt.ColumnInt(0)
-			return nil
-		}}); err != nil {
-			t.Fatalf("count %s: %v", table.name, err)
+	withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
+		for i, table := range tables {
+			var got int
+			if err := sqlitex.Execute(conn, table.query, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error {
+				got = stmt.ColumnInt(0)
+				return nil
+			}}); err != nil {
+				t.Fatalf("count %s: %v", table.name, err)
+			}
+			if got != want[i] {
+				t.Errorf("%s rows = %d, want %d", table.name, got, want[i])
+			}
 		}
-		if got != want[i] {
-			t.Errorf("%s rows = %d, want %d", table.name, got, want[i])
-		}
-	}
+	})
 }
 
 func TestRegisterFixedSoftwareAgentConcurrentStartup(t *testing.T) {
@@ -456,5 +455,5 @@ func TestRegisterFixedSoftwareAgentConcurrentStartup(t *testing.T) {
 			t.Errorf("concurrent registration: %v", err)
 		}
 	}
-	assertFixedAgentRowCounts(t, trackers[0], [4]int{1, 1, 1, 1})
+	assertFixedAgentRowCounts(t, path, [4]int{1, 1, 1, 1})
 }

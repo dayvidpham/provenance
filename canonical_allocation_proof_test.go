@@ -19,29 +19,28 @@ type allocationCounts struct {
 	journal, operations, events, slots, tasks int64
 }
 
-func readAllocationCounts(t *testing.T, tr Tracker) allocationCounts {
+func readAllocationCounts(t *testing.T, path string) allocationCounts {
 	t.Helper()
-	db := tr.(*sqliteTracker).db
-	db.Lock()
-	defer db.Unlock()
 	counts := allocationCounts{}
-	for _, query := range []struct {
-		table string
-		out   *int64
-	}{
-		{"journal", &counts.journal},
-		{"journal_operations", &counts.operations},
-		{"journal_task_events", &counts.events},
-		{"journal_operation_result_slots", &counts.slots},
-		{"tasks", &counts.tasks},
-	} {
-		if err := sqlitex.Execute(db.Conn(), "SELECT count(*) FROM "+query.table, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error {
-			*query.out = stmt.ColumnInt64(0)
-			return nil
-		}}); err != nil {
-			t.Fatalf("count %s: %v", query.table, err)
+	withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
+		for _, query := range []struct {
+			table string
+			out   *int64
+		}{
+			{"journal", &counts.journal},
+			{"journal_operations", &counts.operations},
+			{"journal_task_events", &counts.events},
+			{"journal_operation_result_slots", &counts.slots},
+			{"tasks", &counts.tasks},
+		} {
+			if err := sqlitex.Execute(conn, "SELECT count(*) FROM "+query.table, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error {
+				*query.out = stmt.ColumnInt64(0)
+				return nil
+			}}); err != nil {
+				t.Fatalf("count %s: %v", query.table, err)
+			}
 		}
-	}
+	})
 	return counts
 }
 
@@ -120,7 +119,8 @@ func assertSameCompleteResult(t *testing.T, first, retry CommittedResult) {
 func TestAllocatedCreateApplyReturnsCompleteResultAcrossRetryModes(t *testing.T) {
 	t.Parallel()
 	t.Run("same-process-arbitrary-operation-id", func(t *testing.T) {
-		tr, actor, boot := newAllocationApplyTracker(t, filepath.Join(t.TempDir(), "same.sqlite"))
+		path := filepath.Join(t.TempDir(), "same.sqlite")
+		tr, actor, boot := newAllocationApplyTracker(t, path)
 		defer tr.Close()
 		input := allocatedCreateInput("allocated-arbitrary-key", actor, boot, TaskID{Namespace: "allocation", UUID: uuid.Must(uuid.NewV7())})
 		first, err := tr.Journal().Apply(input)
@@ -128,13 +128,13 @@ func TestAllocatedCreateApplyReturnsCompleteResultAcrossRetryModes(t *testing.T)
 			t.Fatal(err)
 		}
 		assertCompleteAllocatedResult(t, first, input.Effects[0].TaskID)
-		before := readAllocationCounts(t, tr)
+		before := readAllocationCounts(t, path)
 		retry, err := tr.Journal().Apply(withFreshAllocatedUUID(input))
 		if err != nil {
 			t.Fatal(err)
 		}
 		assertSameCompleteResult(t, first, retry)
-		if after := readAllocationCounts(t, tr); after != before {
+		if after := readAllocationCounts(t, path); after != before {
 			t.Fatalf("same-process retry changed counts: before=%+v after=%+v", before, after)
 		}
 	})
@@ -148,7 +148,7 @@ func TestAllocatedCreateApplyReturnsCompleteResultAcrossRetryModes(t *testing.T)
 			t.Fatal(err)
 		}
 		assertCompleteAllocatedResult(t, first, input.Effects[0].TaskID)
-		before := readAllocationCounts(t, tr)
+		before := readAllocationCounts(t, path)
 		if err := tr.Close(); err != nil {
 			t.Fatal(err)
 		}
@@ -162,7 +162,7 @@ func TestAllocatedCreateApplyReturnsCompleteResultAcrossRetryModes(t *testing.T)
 			t.Fatal(err)
 		}
 		assertSameCompleteResult(t, first, retry)
-		if after := readAllocationCounts(t, tr); after != before {
+		if after := readAllocationCounts(t, path); after != before {
 			t.Fatalf("reopen retry changed counts: before=%+v after=%+v", before, after)
 		}
 	})
@@ -176,7 +176,7 @@ func TestAllocatedCreateApplyReturnsCompleteResultAcrossRetryModes(t *testing.T)
 			t.Fatal(err)
 		}
 		defer secondTracker.Close()
-		before := readAllocationCounts(t, firstTracker)
+		before := readAllocationCounts(t, path)
 		inputs := [2]OperationInput{
 			allocatedCreateInput("allocated-overlap-key", actor, boot, TaskID{Namespace: "allocation", UUID: uuid.Must(uuid.NewV7())}),
 			allocatedCreateInput("allocated-overlap-key", actor, boot, TaskID{Namespace: "allocation", UUID: uuid.Must(uuid.NewV7())}),
@@ -217,7 +217,7 @@ func TestAllocatedCreateApplyReturnsCompleteResultAcrossRetryModes(t *testing.T)
 			t.Fatal("winner returned no task slot")
 		}
 		assertCompleteAllocatedResult(t, results[0], committedTask)
-		after := readAllocationCounts(t, firstTracker)
+		after := readAllocationCounts(t, path)
 		want := before
 		want.journal += 2
 		want.operations++
@@ -260,69 +260,67 @@ func buildAllocationCorruptionFixture(t *testing.T, path string) (Tracker, alloc
 	return tr, allocationCorruptionFixture{input: input, anchor: result.AnchorJournalID, sameTask: sameTask, decision: decision, other: otherEvent}
 }
 
-func corruptAllocationFamily(t *testing.T, tr Tracker, anchor JournalID, replacement []byte) {
+func corruptAllocationFamily(t *testing.T, path string, anchor JournalID, replacement []byte) {
 	t.Helper()
-	db := tr.(*sqliteTracker).db
-	db.Lock()
 	var wire []byte
-	err := sqlitex.Execute(db.Conn(), `SELECT canonical_mutation FROM journal_operations WHERE journal_id=?1`, &sqlitex.ExecOptions{Args: []any{int64(anchor)}, ResultFunc: func(stmt *sqlite.Stmt) error {
-		wire = make([]byte, stmt.ColumnLen(0))
-		stmt.ColumnBytes(0, wire)
-		return nil
-	}})
-	db.Unlock()
-	if err != nil {
-		t.Fatal(err)
-	}
+	withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
+		if err := sqlitex.Execute(conn, `SELECT canonical_mutation FROM journal_operations WHERE journal_id=?1`, &sqlitex.ExecOptions{Args: []any{int64(anchor)}, ResultFunc: func(stmt *sqlite.Stmt) error {
+			wire = make([]byte, stmt.ColumnLen(0))
+			stmt.ColumnBytes(0, wire)
+			return nil
+		}}); err != nil {
+			t.Fatal(err)
+		}
+	})
 	from := []byte("effect.0.family:21:task_create_allocated\n")
 	if bytes.Count(wire, from) != 1 {
 		t.Fatalf("allocation family marker count=%d, want one", bytes.Count(wire, from))
 	}
 	changed := bytes.Replace(wire, from, replacement, 1)
-	corruptSQL(t, tr, `UPDATE journal_operations SET canonical_mutation=?1 WHERE journal_id=?2`, changed, int64(anchor))
+	corruptSQL(t, path, `UPDATE journal_operations SET canonical_mutation=?1 WHERE journal_id=?2`, changed, int64(anchor))
 }
 
 func TestAllocatedCreateCorruptionFailsLiveAndOnOpenWithoutDrift(t *testing.T) {
 	t.Parallel()
 	cases := map[string]struct {
-		mutate  func(*testing.T, Tracker, allocationCorruptionFixture)
+		mutate  func(*testing.T, string, allocationCorruptionFixture)
 		liveErr error
 		openErr error
 		token   string
 	}{
 		"missing-slot": {
-			mutate: func(t *testing.T, tr Tracker, f allocationCorruptionFixture) {
-				corruptSQL(t, tr, `DELETE FROM journal_operation_result_slots WHERE journal_id=?1 AND result_slot_id='task'`, int64(f.anchor))
+			mutate: func(t *testing.T, path string, f allocationCorruptionFixture) {
+				corruptSQL(t, path, `DELETE FROM journal_operation_result_slots WHERE journal_id=?1 AND result_slot_id='task'`, int64(f.anchor))
 			}, liveErr: ErrResultSlotIntegrity, openErr: ErrProjectionDivergence, token: "result slot",
 		},
 		"renamed-slot": {
-			mutate: func(t *testing.T, tr Tracker, f allocationCorruptionFixture) {
-				corruptSQL(t, tr, `UPDATE journal_operation_result_slots SET result_slot_id='renamed' WHERE journal_id=?1 AND result_slot_id='task'`, int64(f.anchor))
+			mutate: func(t *testing.T, path string, f allocationCorruptionFixture) {
+				corruptSQL(t, path, `UPDATE journal_operation_result_slots SET result_slot_id='renamed' WHERE journal_id=?1 AND result_slot_id='task'`, int64(f.anchor))
 			}, liveErr: ErrResultSlotIntegrity, openErr: ErrProjectionDivergence, token: "result slot",
 		},
 		"redirected-foreign-slot": {
-			mutate: func(t *testing.T, tr Tracker, f allocationCorruptionFixture) {
-				corruptSQL(t, tr, `UPDATE journal_operation_result_slots SET produced_journal_id=?1 WHERE journal_id=?2 AND result_slot_id='task'`, int64(f.other), int64(f.anchor))
+			mutate: func(t *testing.T, path string, f allocationCorruptionFixture) {
+				corruptSQL(t, path, `UPDATE journal_operation_result_slots SET produced_journal_id=?1 WHERE journal_id=?2 AND result_slot_id='task'`, int64(f.other), int64(f.anchor))
 			}, liveErr: ErrResultSlotIntegrity, openErr: ErrProjectionDivergence, token: "result slot",
 		},
 		"non-task-slot": {
-			mutate: func(t *testing.T, tr Tracker, f allocationCorruptionFixture) {
-				corruptSQL(t, tr, `UPDATE journal_operation_result_slots SET produced_journal_id=?1 WHERE journal_id=?2 AND result_slot_id='task'`, int64(f.decision), int64(f.anchor))
+			mutate: func(t *testing.T, path string, f allocationCorruptionFixture) {
+				corruptSQL(t, path, `UPDATE journal_operation_result_slots SET produced_journal_id=?1 WHERE journal_id=?2 AND result_slot_id='task'`, int64(f.decision), int64(f.anchor))
 			}, liveErr: ErrResultSlotIntegrity, openErr: ErrProjectionDivergence, token: "result slot",
 		},
 		"mismatched-produced-row": {
-			mutate: func(t *testing.T, tr Tracker, f allocationCorruptionFixture) {
-				corruptSQL(t, tr, `UPDATE journal_operation_result_slots SET produced_journal_id=?1 WHERE journal_id=?2 AND result_slot_id='task'`, int64(f.sameTask), int64(f.anchor))
+			mutate: func(t *testing.T, path string, f allocationCorruptionFixture) {
+				corruptSQL(t, path, `UPDATE journal_operation_result_slots SET produced_journal_id=?1 WHERE journal_id=?2 AND result_slot_id='task'`, int64(f.sameTask), int64(f.anchor))
 			}, liveErr: ErrResultSlotIntegrity, openErr: ErrProjectionDivergence, token: "result slot",
 		},
 		"canonical-allocation-marker": {
-			mutate: func(t *testing.T, tr Tracker, f allocationCorruptionFixture) {
-				corruptAllocationFamily(t, tr, f.anchor, []byte("effect.0.family:21:task_create_allocatiox\n"))
+			mutate: func(t *testing.T, path string, f allocationCorruptionFixture) {
+				corruptAllocationFamily(t, path, f.anchor, []byte("effect.0.family:21:task_create_allocatiox\n"))
 			}, liveErr: ErrCanonicalMutation, openErr: ErrCanonicalMutation, token: "family",
 		},
 		"canonical-family": {
-			mutate: func(t *testing.T, tr Tracker, f allocationCorruptionFixture) {
-				corruptAllocationFamily(t, tr, f.anchor, []byte("effect.0.family:11:task_create\n"))
+			mutate: func(t *testing.T, path string, f allocationCorruptionFixture) {
+				corruptAllocationFamily(t, path, f.anchor, []byte("effect.0.family:11:task_create\n"))
 			}, liveErr: ErrCanonicalMutation, openErr: ErrProjectionDivergence, token: "mutation digest",
 		},
 	}
@@ -330,13 +328,13 @@ func TestAllocatedCreateCorruptionFailsLiveAndOnOpenWithoutDrift(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "allocation-corrupt.sqlite")
 			tr, fixture := buildAllocationCorruptionFixture(t, path)
-			test.mutate(t, tr, fixture)
-			beforeRetry := readAllocationCounts(t, tr)
+			test.mutate(t, path, fixture)
+			beforeRetry := readAllocationCounts(t, path)
 			result, err := tr.Journal().Apply(withFreshAllocatedUUID(fixture.input))
 			if !errors.Is(err, test.liveErr) {
 				t.Fatalf("live reconciliation result=%+v error=%v, want %v", result, err, test.liveErr)
 			}
-			if afterRetry := readAllocationCounts(t, tr); afterRetry != beforeRetry {
+			if afterRetry := readAllocationCounts(t, path); afterRetry != beforeRetry {
 				t.Fatalf("failed live reconciliation wrote facts: before=%+v after=%+v", beforeRetry, afterRetry)
 			}
 			if err := tr.Close(); err != nil {
