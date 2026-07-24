@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"context"
 	"fmt"
 
 	zs "zombiezen.com/go/sqlite"
@@ -58,7 +59,7 @@ func (shape tasksWatermarkShape) copyQuery() string {
 }
 
 // tasksWatermarkColumnInfoLocked reports whether the tasks table has a last_journal_id
-// column and, if so, whether it is declared NOT NULL. Assumes db.mu is held.
+// column and, if so, whether it is declared NOT NULL. Assumes db.conn is operation-owned.
 func (db *DB) tasksWatermarkColumnInfoLocked() (present bool, notNull bool, err error) {
 	if err := sqlitex.Execute(db.conn, "PRAGMA table_info(tasks)", &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 		if stmt.ColumnText(1) == "last_journal_id" {
@@ -78,7 +79,7 @@ func (db *DB) tasksWatermarkColumnInfoLocked() (present bool, notNull bool, err 
 // only meaningful) when zero un-anchored rows remain. A no-op when the column is absent
 // (the even-older column-less legacy shape) — a column-less table has no watermark to be
 // null, and migration adds the column before anchoring, so this runs after that add.
-// Assumes db.mu is held.
+// Assumes db.conn is operation-owned.
 func (db *DB) countUnanchoredTasksLocked() (int, error) {
 	present, _, err := db.tasksWatermarkColumnInfoLocked()
 	if err != nil {
@@ -104,7 +105,7 @@ func (db *DB) countUnanchoredTasksLocked() (int, error) {
 // existing last_journal_id values are carried into the rebuilt table (false when the old
 // table has no such column). FK enforcement is toggled around an explicit transaction
 // exactly as completeJournalOperationFK does; a detected violation rolls the whole
-// rebuild back. Assumes db.mu is held.
+// rebuild back. Assumes db.conn is operation-owned.
 func (db *DB) rebuildTasksWatermarkLocked(shape tasksWatermarkShape) error {
 	if err := sqlitex.ExecuteTransient(db.conn, "PRAGMA foreign_keys=OFF", nil); err != nil {
 		return fmt.Errorf("rebuildTasksWatermark: disable FK enforcement: %w", err)
@@ -170,7 +171,7 @@ func (db *DB) rebuildTasksWatermarkLocked(shape tasksWatermarkShape) error {
 // the "old-schema downgrade" the test seeding seams perform: a no-op when the watermark
 // is already nullable or the column is already absent, a rebuild-to-nullable when the
 // live schema is the tightened NOT NULL shape. Existing rows (including any native rows
-// already carrying a watermark) are preserved. Assumes db.mu is held.
+// already carrying a watermark) are preserved. Assumes db.conn is operation-owned.
 func (db *DB) downgradeTasksWatermarkToLegacyLocked() error {
 	present, notNull, err := db.tasksWatermarkColumnInfoLocked()
 	if err != nil {
@@ -188,24 +189,27 @@ func (db *DB) downgradeTasksWatermarkToLegacyLocked() error {
 // SeedLegacyTask it is a narrow, test-only *DB seam that models a legacy database on
 // disk, never part of the JournalAPI surface. Existing base-column rows are preserved.
 func (db *DB) DowngradeTasksToColumnlessLegacy() error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	present, _, err := db.tasksWatermarkColumnInfoLocked()
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return fmt.Errorf("DowngradeTasksToColumnlessLegacy: lease connection: %w", err)
+	}
+	defer release()
+	present, _, err := bound.tasksWatermarkColumnInfoLocked()
 	if err != nil {
 		return err
 	}
 	if !present {
 		return nil
 	}
-	return db.rebuildTasksWatermarkLocked(tasksWatermarkColumnless)
+	return bound.rebuildTasksWatermarkLocked(tasksWatermarkColumnless)
 }
 
 // ensureTasksWatermarkColumnLocked is migration's column-add path (§13): a legacy
 // database that predates the last_journal_id column entirely gets it added (nullable,
 // with the journal FK) before any legacy row is anchored, so the anchoring projection
 // has a column to write the watermark into. Idempotent: a no-op when the column already
-// exists (the common case, where the legacy nullable column is present). Assumes db.mu
-// is held.
+// exists (the common case, where the legacy nullable column is present). Assumes
+// db.conn is operation-owned.
 func (db *DB) ensureTasksWatermarkColumnLocked() error {
 	present, _, err := db.tasksWatermarkColumnInfoLocked()
 	if err != nil {

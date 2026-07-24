@@ -7,16 +7,16 @@ optimization experiments live in [docs/test-performance.md](docs/test-performanc
 
 ## Authoritative gates
 
-Local iteration normally uses `go test ./...`, allowing Go's successful-result
-cache. Use `-run` for focused iteration and `-count=1` only to request one
-explicitly uncached execution.
-
-CI-readiness and landing gates use explicit resource, scheduling, freshness,
-order-independence, path, and timeout controls:
+All local, focused, CI-readiness, and landing test invocations use the race
+detector. The typical full-suite invocation is:
 
 ```bash
-go test -count=1 -shuffle=on -fullpath -timeout=10m ./...
-CGO_ENABLED=1 go test -race -count=1 -shuffle=on -fullpath -timeout=20m ./...
+CGO_ENABLED=1 go test -race -shuffle=on -fullpath -timeout=20m ./...
+```
+
+The remaining non-test gates are:
+
+```bash
 go vet ./...
 ast-grep scan --config sgconfig.yml --globs '!vendor/**' --globs '!worktree/**' .
 CGO_ENABLED=0 go build ./...
@@ -26,13 +26,14 @@ nix flake check --no-build
 `CGO_ENABLED=0` is a build-only compatibility gate. There is no CGO-disabled
 test mode and no CGO-disabled race mode: do not run focused, package, full, or
 race tests with `CGO_ENABLED=0`. Focused local iteration may narrow `-run` or
-the package list. A focused diagnostic does not replace either full CI/landing
-suite.
+the package list, but retains `CGO_ENABLED=1`, `-race`, `-shuffle=on`,
+`-fullpath`, and `-timeout=20m`. A focused diagnostic does not replace the full
+CI/landing suite.
 
 CI leaves `-cpu`, `-p`, and `-parallel` unset so Go uses the runner's available
-processors and default package/test concurrency. `-count=1` disables cached
-results without repeating tests. `-shuffle=on` reports a seed; reproduce an
-order failure with `-shuffle=<reported-seed>`.
+processors and default package/test concurrency. Do not specify `-count`.
+`-shuffle=on` reports a seed; reproduce an order failure with
+`-shuffle=<reported-seed>`.
 
 ## Test map
 
@@ -161,27 +162,28 @@ Measure before and after on the same host and with `GOMAXPROCS` set to CI's core
 count. Use several runs and compare medians, not a single favorable result.
 
 ```bash
-time CGO_ENABLED=1 go test -race -cpu=2 -count=1 -timeout=20m -v . -run '^TestName$'
-CGO_ENABLED=1 go test -cpu=2 -count=1 -cpuprofile=cpu.prof .
+time CGO_ENABLED=1 go test -race -shuffle=on -fullpath -timeout=20m -v -run '^TestName$' .
+CGO_ENABLED=1 go test -race -shuffle=on -fullpath -timeout=20m -run '^TestName$' -cpuprofile=cpu.prof .
 go tool pprof -top -cum cpu.prof
 ```
 
 Sum the per-test durations from `-v` and compare them with wall time: similar
 values identify a serial critical path; a much larger sum indicates overlap.
-Record race and non-race results because the race detector changes CPU and
-memory cost. Capture `/proc/<pid>/status` `VmHWM` (or an equivalent process-tree
-peak-RSS measurement); Go heap profiles omit C allocations, SQLite, and race
-shadow memory. Report command, commit/worktree state, Go version, CPU, memory,
-`GOMAXPROCS`, wall/user/system time, package/test time, and before/after medians.
+All comparisons use the race-enabled command because that is the supported test
+configuration. Capture `/proc/<pid>/status` `VmHWM` (or an equivalent
+process-tree peak-RSS measurement); Go heap profiles omit C allocations,
+SQLite, and race shadow memory. Report command, commit/worktree state, Go
+version, CPU, memory, `GOMAXPROCS`, wall/user/system time, package/test time, and
+before/after medians.
 
 Use one diagnostic profile at a time to minimize instrumentation distortion:
 
 ```bash
-go test -count=1 -run '^TestName$' -cpuprofile=cpu.out .
-go test -count=1 -run '^TestName$' -memprofile=mem.out .
-go test -count=1 -run '^TestName$' -blockprofile=block.out .
-go test -count=1 -run '^TestName$' -mutexprofile=mutex.out .
-go test -count=1 -run '^TestName$' -trace=trace.out .
+CGO_ENABLED=1 go test -race -shuffle=on -fullpath -timeout=20m -run '^TestName$' -cpuprofile=cpu.out .
+CGO_ENABLED=1 go test -race -shuffle=on -fullpath -timeout=20m -run '^TestName$' -memprofile=mem.out .
+CGO_ENABLED=1 go test -race -shuffle=on -fullpath -timeout=20m -run '^TestName$' -blockprofile=block.out .
+CGO_ENABLED=1 go test -race -shuffle=on -fullpath -timeout=20m -run '^TestName$' -mutexprofile=mutex.out .
+CGO_ENABLED=1 go test -race -shuffle=on -fullpath -timeout=20m -run '^TestName$' -trace=trace.out .
 ```
 
 For debugging, add `-v` for human-readable events or `-json` for machine

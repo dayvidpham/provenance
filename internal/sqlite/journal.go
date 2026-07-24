@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -10,6 +11,26 @@ import (
 	zs "zombiezen.com/go/sqlite"
 	"zombiezen.com/go/sqlite/sqlitex"
 )
+
+// bindOperationDB leases one pool connection for a complete public operation and
+// binds the existing connection-oriented internals to it. Startup uses a pool-less
+// DB on its exclusive activation connection, so it remains the sole activation
+// owner without taking a runtime lease. P2 removes this adapter with db.conn.
+func (db *DB) bindOperationDB(ctx context.Context) (*DB, func(), error) {
+	if db.pool == nil {
+		return db, func() {}, nil
+	}
+	scope, err := db.bindConn(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	bound := &DB{
+		pool:             db.pool,
+		conn:             scope.conn,
+		projectionTarget: db.projectionTarget,
+	}
+	return bound, scope.release, nil
+}
 
 // journalParseActor / journalParseTask resolve stored wire-format IDs into the
 // single typed identity domain, so a corrupt stored ID surfaces as a decode
@@ -131,8 +152,12 @@ func (db *DB) AppendTaskEvent(in journal.AppendTaskEventInput) (journal.TaskEven
 	}
 	recordedAt := in.RecordedAt.UTC()
 
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return journal.TaskEventRow{}, fmt.Errorf("AppendTaskEvent: lease connection: %w", err)
+	}
+	defer release()
+	db = bound
 
 	var txErr error
 	endTx := sqlitex.Transaction(db.conn)
@@ -204,12 +229,18 @@ func (db *DB) AppendTaskEvent(in journal.AppendTaskEventInput) (journal.TaskEven
 // later slices) always write the subtype row atomically. The caller is expected
 // to VerifyIntegrity and roll back.
 func (db *DB) AppendBareJournalRow(kind journal.JournalKind, actorID journal.ActorID, recordedAt time.Time) (journal.JournalID, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	if err := sqlitex.Execute(db.conn, "INSERT INTO journal (kind_id, actor_id, recorded_at, produced_by_operation_journal_id)\n\t\t VALUES (?1, ?2, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{int(kind), actorID.String(), recordedAt.UTC().UnixNano(), nil}}); err != nil {
-		return 0, fmt.Errorf("AppendBareJournalRow: %w", err)
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return 0, fmt.Errorf("AppendBareJournalRow: lease connection: %w", err)
 	}
-	return journal.JournalID(db.conn.LastInsertRowID()), nil
+	defer release()
+	var txErr error
+	endTx := sqlitex.Save(bound.conn)
+	defer endTx(&txErr)
+	if txErr = sqlitex.Execute(bound.conn, "INSERT INTO journal (kind_id, actor_id, recorded_at, produced_by_operation_journal_id)\n\t\t VALUES (?1, ?2, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{int(kind), actorID.String(), recordedAt.UTC().UnixNano(), nil}}); txErr != nil {
+		return 0, fmt.Errorf("AppendBareJournalRow: %w", txErr)
+	}
+	return journal.JournalID(bound.conn.LastInsertRowID()), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -222,9 +253,15 @@ func (db *DB) AppendBareJournalRow(kind journal.JournalKind, actorID journal.Act
 // discriminator agreement (a subtype row's table matches journal.kind_id). It is
 // the §15 convergence tool Open uses and the gate AppendTaskEvent runs before
 // commit. Returns journal.ErrSubtypeIntegrity on any violation.
-func (db *DB) VerifyIntegrity() error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+func (db *DB) VerifyIntegrity() (err error) {
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return fmt.Errorf("VerifyIntegrity: lease connection: %w", err)
+	}
+	defer release()
+	db = bound
+	endTx := sqlitex.Save(db.conn)
+	defer endTx(&err)
 	if err := db.verifyForeignKeyTopologyLocked(); err != nil {
 		return err
 	}
@@ -678,13 +715,19 @@ func (db *DB) verifyAuthorityDetailIntegrityLocked() error {
 // canonical order, or the composite (AfterRecordedAt, AfterJournalID) under the
 // timeline order so the walk never skips or duplicates a row across equal
 // timestamps or backdated rows.
-func (db *DB) QueryTaskEvents(q journal.JournalQueryV1) (journal.JournalTaskEventPageV1, error) {
+func (db *DB) QueryTaskEvents(q journal.JournalQueryV1) (page journal.JournalTaskEventPageV1, err error) {
 	if err := q.Validate(); err != nil {
 		return journal.JournalTaskEventPageV1{}, err
 	}
 
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return journal.JournalTaskEventPageV1{}, fmt.Errorf("QueryTaskEvents: lease connection: %w", err)
+	}
+	defer release()
+	db = bound
+	endTx := sqlitex.Save(db.conn)
+	defer endTx(&err)
 
 	snapshot := int64(q.SnapshotMaxJournalID)
 	if snapshot == 0 {
@@ -761,7 +804,7 @@ func (db *DB) QueryTaskEvents(q journal.JournalQueryV1) (journal.JournalTaskEven
 		return journal.JournalTaskEventPageV1{}, fmt.Errorf("QueryTaskEvents: %w", err)
 	}
 
-	page := journal.JournalTaskEventPageV1{SnapshotMaxJournalID: journal.JournalID(snapshot)}
+	page = journal.JournalTaskEventPageV1{SnapshotMaxJournalID: journal.JournalID(snapshot)}
 	if fetch > 0 && len(rows) > fetch {
 		rows = rows[:fetch]
 		last := rows[len(rows)-1]
@@ -835,10 +878,15 @@ func (db *DB) loadContextsLocked(journalID int64) ([]journal.EventContext, error
 
 // TaskAttributions returns the cumulative attribution edges for a task in
 // ascending FirstJournalID order.
-func (db *DB) TaskAttributions(taskID journal.TaskID) ([]journal.TaskAttribution, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	var out []journal.TaskAttribution
+func (db *DB) TaskAttributions(taskID journal.TaskID) (out []journal.TaskAttribution, err error) {
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("TaskAttributions: lease connection: %w", err)
+	}
+	defer release()
+	db = bound
+	endTx := sqlitex.Save(db.conn)
+	defer endTx(&err)
 	if err := sqlitex.Execute(db.conn, "SELECT task_id, actor_id, first_journal_id FROM task_attributions\n\t\t WHERE task_id = ?1 ORDER BY first_journal_id ASC", &sqlitex.ExecOptions{
 		Args: []any{taskID.String()},
 		ResultFunc: func(stmt *zs.Stmt) error {

@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"strconv"
 	"strings"
@@ -35,7 +36,7 @@ const (
 // committed journal row, derived solely from the persisted row and the ordered
 // history before it. Apply invokes it incrementally after each effect; Open's full
 // replay invokes it per row from JournalID 1. Both share this one fold (§9.2). It
-// assumes db.mu is held and runs inside the caller's transaction.
+// assumes the caller owns db.conn and runs inside the caller's transaction.
 func (db *DB) projectJournalRowLocked(jid int64) error {
 	var (
 		kind       = -1
@@ -411,9 +412,15 @@ const (
 // migrated task IS journal-anchored: its legacy status is captured in the migration
 // marker's payload and re-derived from there, never trusted as pre-existing row
 // state.
-func (db *DB) ReplayProjections() (journal.ReplayResult, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+func (db *DB) ReplayProjections() (result journal.ReplayResult, err error) {
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return journal.ReplayResult{}, fmt.Errorf("ReplayProjections: lease connection: %w", err)
+	}
+	defer release()
+	db = bound
+	endTx := sqlitex.Save(db.conn)
+	defer endTx(&err)
 	if err := db.preflightSchemaLocked(); err != nil {
 		return journal.ReplayResult{}, err
 	}
@@ -468,7 +475,7 @@ func (db *DB) ReplayProjections() (journal.ReplayResult, error) {
 		return journal.ReplayResult{}, err
 	}
 
-	result := journal.ReplayResult{RowsFolded: folded}
+	result = journal.ReplayResult{RowsFolded: folded}
 	for id := range anchored {
 		if p, ok := derivedTasks[id]; ok {
 			result.Tasks = append(result.Tasks, p)
