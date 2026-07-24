@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -11,7 +12,7 @@ import (
 )
 
 // AddComment adds a comment to a task authored by authorID.
-// A UUIDv7 CommentID is assigned automatically. Acquires the DB mutex.
+// A UUIDv7 CommentID is assigned automatically.
 func (db *DB) AddComment(id ptypes.TaskID, authorID ptypes.AgentID, body string) (ptypes.Comment, error) {
 	now := time.Now().UTC()
 	comment := ptypes.Comment{
@@ -22,9 +23,12 @@ func (db *DB) AddComment(id ptypes.TaskID, authorID ptypes.AgentID, body string)
 		CreatedAt: now,
 	}
 
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	if err := sqlitex.Execute(db.conn, "INSERT INTO comments (id, task_id, author_id, body, created_at) VALUES (?1, ?2, ?3, ?4, ?5)", &sqlitex.ExecOptions{Args: []any{
+	scope, err := db.bindConn(context.Background())
+	if err != nil {
+		return ptypes.Comment{}, fmt.Errorf("sqlite.AddComment on task %q: %w", id.String(), err)
+	}
+	defer scope.release()
+	if err := sqlitex.Execute(scope.conn, "INSERT INTO comments (id, task_id, author_id, body, created_at) VALUES (?1, ?2, ?3, ?4, ?5)", &sqlitex.ExecOptions{Args: []any{
 		comment.ID.String(), comment.TaskID.String(),
 		comment.AuthorID.String(), comment.Body, comment.CreatedAt.UnixNano(),
 	}}); err != nil {
@@ -38,15 +42,18 @@ func (db *DB) AddComment(id ptypes.TaskID, authorID ptypes.AgentID, body string)
 }
 
 // GetComment returns one comment by id. found is false when no such comment exists.
-// Acquires the DB mutex. Used by the journaled Session.AddComment read-back path.
+// Used by the journaled Session.AddComment read-back path.
 func (db *DB) GetComment(id ptypes.CommentID) (ptypes.Comment, bool, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	scope, err := db.bindConn(context.Background())
+	if err != nil {
+		return ptypes.Comment{}, false, fmt.Errorf("sqlite.GetComment %q: %w", id.String(), err)
+	}
+	defer scope.release()
 	var (
 		comment ptypes.Comment
 		found   bool
 	)
-	if err := sqlitex.Execute(db.conn, "SELECT id, task_id, author_id, body, created_at FROM comments WHERE id = ?1", &sqlitex.ExecOptions{
+	if err := sqlitex.Execute(scope.conn, "SELECT id, task_id, author_id, body, created_at FROM comments WHERE id = ?1", &sqlitex.ExecOptions{
 		Args: []any{id.String()},
 		ResultFunc: func(stmt *zs.Stmt) error {
 			c, err := ScanComment(stmt)
@@ -64,12 +71,14 @@ func (db *DB) GetComment(id ptypes.CommentID) (ptypes.Comment, bool, error) {
 }
 
 // GetComments returns all comments on a task in chronological order.
-// Acquires the DB mutex.
 func (db *DB) GetComments(id ptypes.TaskID) ([]ptypes.Comment, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	scope, err := db.bindConn(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("sqlite.GetComments %q: %w", id.String(), err)
+	}
+	defer scope.release()
 	var comments []ptypes.Comment
-	err := sqlitex.Execute(db.conn, "SELECT id, task_id, author_id, body, created_at\n\t\t FROM comments WHERE task_id = ?1 ORDER BY created_at ASC", &sqlitex.ExecOptions{
+	err = sqlitex.Execute(scope.conn, "SELECT id, task_id, author_id, body, created_at\n\t\t FROM comments WHERE task_id = ?1 ORDER BY created_at ASC", &sqlitex.ExecOptions{
 		Args: []any{id.String()},
 		ResultFunc: func(stmt *zs.Stmt) error {
 			c, err := ScanComment(stmt)
