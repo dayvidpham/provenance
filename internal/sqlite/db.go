@@ -197,7 +197,7 @@ func openInMemory(poolURI string, models []ptypes.ModelEntry) (*DB, error) {
 		return nil, fmt.Errorf("sqlite.Open: failed to take connection for in-memory activation at %q: %w", poolURI, err)
 	}
 
-	activationDB := &DB{conn: activationConn}
+	activationDB := borrowConnScope(activationConn, projectionTargetLive).boundDB()
 	// Apply activation pragmas: busy_timeout is already set by PrepareConn but
 	// we need foreign_keys=OFF for schema rebuilds.
 	if err := sqlitex.ExecuteTransient(activationConn, "PRAGMA foreign_keys=OFF;", nil); err != nil {
@@ -261,7 +261,7 @@ func openFileBacked(dbPath, poolURI string, poolSize int, existingJournal bool, 
 		)
 	}
 
-	activationDB := &DB{conn: activationConn}
+	activationDB := borrowConnScope(activationConn, projectionTargetLive).boundDB()
 	if err := activationDB.applyActivationPragmas(); err != nil {
 		_ = activationConn.Close()
 		return nil, fmt.Errorf("sqlite.Open: failed to apply activation pragmas on %q: %w", dbPath, err)
@@ -391,22 +391,27 @@ func runtimePrepareConn(conn *zs.Conn) error {
 // resource; release is idempotent so cleanup paths cannot return a lease twice.
 // P2 replaces this adapter with final explicit connection parameters.
 type connScope struct {
-	conn        *zs.Conn
-	releaseOnce sync.Once
-	releaseFunc func()
+	conn             *zs.Conn
+	projectionTarget projectionTarget
+	releaseOnce      sync.Once
+	releaseFunc      func()
 }
 
 func (scope *connScope) release() {
 	if scope == nil {
 		return
 	}
-	scope.releaseOnce.Do(scope.releaseFunc)
+	scope.releaseOnce.Do(func() {
+		if scope.releaseFunc != nil {
+			scope.releaseFunc()
+		}
+	})
 }
 
-// bindConn returns a connection whose lifetime is controlled by ctx and scope.
-// Every scope leases independently from the originating pool and returns there
-// on release. Pool.Take owns context interruption for file and memory storage.
-func (db *DB) bindConn(ctx context.Context) (*connScope, error) {
+// bindScope leases one runtime connection for an operation. The caller chooses
+// the complete static SQL projection variant and owns the returned scope until
+// release. Pool.Take owns context interruption for file and memory storage.
+func (db *DB) bindScope(ctx context.Context, target projectionTarget) (*connScope, error) {
 	conn, err := db.pool.Take(ctx)
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -416,9 +421,30 @@ func (db *DB) bindConn(ctx context.Context) (*connScope, error) {
 		)
 	}
 	return &connScope{
-		conn:        conn,
-		releaseFunc: func() { db.pool.Put(conn) },
+		conn:             conn,
+		projectionTarget: target,
+		releaseFunc:      func() { db.pool.Put(conn) },
 	}, nil
+}
+
+// borrowConnScope binds activation-owned connection lifetime to an operation
+// scope without transferring ownership. Releasing a borrowed scope is a no-op.
+func borrowConnScope(conn *zs.Conn, target projectionTarget) *connScope {
+	return &connScope{conn: conn, projectionTarget: target}
+}
+
+// boundDB is the temporary P2 bridge for methods that still receive *DB. The
+// adapter carries only the scoped connection and target, so it cannot lease,
+// release, or close the originating runtime DB.
+func (scope *connScope) boundDB() *DB {
+	return &DB{conn: scope.conn, projectionTarget: scope.projectionTarget}
+}
+
+// bindConn preserves the live-projection P1 migration seam. New P2 paths use
+// bindScope so target selection is explicit. P2-R deletes this compatibility
+// receiver after all independent leaves have migrated.
+func (db *DB) bindConn(ctx context.Context) (*connScope, error) {
+	return db.bindScope(ctx, projectionTargetLive)
 }
 
 // ---------------------------------------------------------------------------
@@ -835,7 +861,7 @@ func preflightExistingReadOnly(dbPath string, models []ptypes.ModelEntry) (bool,
 	if err != nil {
 		return false, err
 	}
-	db := &DB{conn: conn}
+	db := borrowConnScope(conn, projectionTargetLive).boundDB()
 	defer conn.Close()
 	existing, err := db.tableExistsLocked("journal")
 	if err != nil {
@@ -875,7 +901,7 @@ func preflightActivationClone(source *zs.Conn, models []ptypes.ModelEntry) error
 	if err = backup.Close(); err != nil {
 		return fmt.Errorf("finish read-only activation clone: %w", err)
 	}
-	db := &DB{conn: clone}
+	db := borrowConnScope(clone, projectionTargetLive).boundDB()
 	if err = db.applyActivationPragmas(); err != nil {
 		return err
 	}

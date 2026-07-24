@@ -3,6 +3,9 @@ package sqlite
 import (
 	"context"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"sync"
 	"testing"
 	"time"
@@ -37,6 +40,11 @@ func (ctx *observedDoneContext) Done() <-chan struct{} {
 type poolBindResult struct {
 	scope *connScope
 	err   error
+}
+
+type poolTakeResult struct {
+	conn *zs.Conn
+	err  error
 }
 
 func waitPoolSignal(t *testing.T, operation string, signal <-chan struct{}) {
@@ -93,6 +101,17 @@ func waitPoolError(t *testing.T, operation string, done <-chan error) error {
 	case <-time.After(poolTestTimeout):
 		t.Fatalf("%s did not complete within %v", operation, poolTestTimeout)
 		return nil
+	}
+}
+
+func waitPoolTakeResult(t *testing.T, operation string, done <-chan poolTakeResult) poolTakeResult {
+	t.Helper()
+	select {
+	case result := <-done:
+		return result
+	case <-time.After(poolTestTimeout):
+		t.Fatalf("%s did not complete within %v", operation, poolTestTimeout)
+		return poolTakeResult{}
 	}
 }
 
@@ -269,6 +288,226 @@ func TestPoolExhaustionHonorsCancellationAndReturn(t *testing.T) {
 	held = held[:len(held)-1]
 	next := takePoolScope(t, db)
 	next.release()
+}
+
+func TestConnScopeLeasedOwnershipIsIdempotentAndPreservesTarget(t *testing.T) {
+	db := openPoolFileDB(t)
+	scope, err := db.bindScope(context.Background(), projectionTargetShadow)
+	if err != nil {
+		t.Fatalf("bind shadow scope: %v", err)
+	}
+	if scope.projectionTarget != projectionTargetShadow {
+		t.Fatalf("scope target = %s, want %s", scope.projectionTarget.label(), projectionTargetShadow.label())
+	}
+	bound := scope.boundDB()
+	if bound.conn != scope.conn {
+		t.Fatal("bound DB did not preserve scoped connection")
+	}
+	if bound.projectionTarget != projectionTargetShadow {
+		t.Fatalf("bound DB target = %s, want %s", bound.projectionTarget.label(), projectionTargetShadow.label())
+	}
+
+	const releasers = 8
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(releasers)
+	for range releasers {
+		go func() {
+			defer wg.Done()
+			<-start
+			scope.release()
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	// The runtime pool has one reserved legacy lease. Exactly-once release makes
+	// all remaining runtime leases available without duplicate connection IDs.
+	held := make([]*connScope, 0, runtimePoolSize-1)
+	seen := make(map[*zs.Conn]struct{}, runtimePoolSize-1)
+	for range runtimePoolSize - 1 {
+		next := takePoolScope(t, db)
+		if _, duplicate := seen[next.conn]; duplicate {
+			t.Fatalf("idempotent release returned duplicate simultaneous connection %p", next.conn)
+		}
+		seen[next.conn] = struct{}{}
+		held = append(held, next)
+	}
+	for _, next := range held {
+		next.release()
+	}
+}
+
+func TestConnScopeActivationBorrowRetainsPoolLeaseUntilOwnerPut(t *testing.T) {
+	poolURI, _, _ := resolvePoolTarget(":memory:")
+	pool, err := sqlitex.NewPool(poolURI, sqlitex.PoolOptions{
+		Flags:    zs.OpenReadWrite | zs.OpenCreate | zs.OpenURI,
+		PoolSize: 1,
+	})
+	if err != nil {
+		t.Fatalf("open size-1 activation pool: %v", err)
+	}
+	activationConn, err := pool.Take(context.Background())
+	if err != nil {
+		_ = pool.Close()
+		t.Fatalf("take activation owner connection: %v", err)
+	}
+	activationOwned := true
+	var waiterConn *zs.Conn
+	defer func() {
+		if waiterConn != nil {
+			pool.Put(waiterConn)
+		}
+		if activationOwned {
+			pool.Put(activationConn)
+		}
+		if err := pool.Close(); err != nil {
+			t.Errorf("close size-1 activation pool: %v", err)
+		}
+	}()
+
+	scope := borrowConnScope(activationConn, projectionTargetLive)
+	bound := scope.boundDB()
+	if bound.conn != activationConn || bound.projectionTarget != projectionTargetLive {
+		t.Fatal("borrowed activation scope did not preserve connection and live target")
+	}
+
+	blockedBase, blockedCancel := context.WithCancel(context.Background())
+	blockedCtx := &observedDoneContext{Context: blockedBase, observed: make(chan struct{})}
+	blockedDone := make(chan poolTakeResult, 1)
+	go func() {
+		conn, err := pool.Take(blockedCtx)
+		blockedDone <- poolTakeResult{conn: conn, err: err}
+	}()
+	waitPoolSignal(t, "pre-Put activation waiter Pool.Take Done", blockedCtx.observed)
+
+	const releasers = 8
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(releasers)
+	for range releasers {
+		go func() {
+			defer wg.Done()
+			<-start
+			scope.release()
+		}()
+	}
+	close(start)
+	wg.Wait()
+	blockedCancel()
+	blockedResult := waitPoolTakeResult(t, "pre-Put canceled activation waiter", blockedDone)
+	if blockedResult.conn != nil || !errors.Is(blockedResult.err, context.Canceled) {
+		t.Fatalf("pre-Put activation waiter = (%p, %v), want (nil, context.Canceled)", blockedResult.conn, blockedResult.err)
+	}
+
+	type queuedWaiter struct {
+		cancel context.CancelFunc
+		done   chan poolTakeResult
+	}
+	waiters := make([]queuedWaiter, 2)
+	for i := range waiters {
+		base, cancel := context.WithTimeout(context.Background(), poolTestTimeout)
+		ctx := &observedDoneContext{Context: base, observed: make(chan struct{})}
+		done := make(chan poolTakeResult, 1)
+		waiters[i] = queuedWaiter{cancel: cancel, done: done}
+		go func() {
+			conn, err := pool.Take(ctx)
+			done <- poolTakeResult{conn: conn, err: err}
+		}()
+		waitPoolSignal(t, "queued activation waiter Pool.Take Done", ctx.observed)
+	}
+	defer func() {
+		for _, waiter := range waiters {
+			waiter.cancel()
+		}
+	}()
+
+	pool.Put(activationConn)
+	activationOwned = false
+	var winner int
+	var winnerResult poolTakeResult
+	select {
+	case winnerResult = <-waiters[0].done:
+		winner = 0
+	case winnerResult = <-waiters[1].done:
+		winner = 1
+	case <-time.After(poolTestTimeout):
+		t.Fatalf("no queued activation waiter progressed within %v", poolTestTimeout)
+	}
+	waiterConn = winnerResult.conn
+	if winnerResult.err != nil || winnerResult.conn != activationConn {
+		t.Fatalf("first post-Put waiter = (%p, %v), want activation connection %p", winnerResult.conn, winnerResult.err, activationConn)
+	}
+
+	loser := 1 - winner
+	waiters[loser].cancel()
+	loserResult := waitPoolTakeResult(t, "second queued activation waiter cancellation", waiters[loser].done)
+	if loserResult.conn != nil || !errors.Is(loserResult.err, context.Canceled) {
+		t.Fatalf("second post-Put waiter = (%p, %v), want (nil, context.Canceled)", loserResult.conn, loserResult.err)
+	}
+	pool.Put(waiterConn)
+	waiterConn = nil
+}
+
+func TestActivationPathsUseBorrowedScopeBridge(t *testing.T) {
+	file, err := parser.ParseFile(token.NewFileSet(), "db.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse db.go activation bridge contract: %v", err)
+	}
+	want := map[string]struct {
+		assigned string
+		conn     string
+	}{
+		"openInMemory":              {assigned: "activationDB", conn: "activationConn"},
+		"openFileBacked":            {assigned: "activationDB", conn: "activationConn"},
+		"preflightExistingReadOnly": {assigned: "db", conn: "conn"},
+		"preflightActivationClone":  {assigned: "db", conn: "clone"},
+	}
+	found := make(map[string]int, len(want))
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Body == nil {
+			continue
+		}
+		expected, inspect := want[fn.Name.Name]
+		if !inspect {
+			continue
+		}
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			assignment, ok := node.(*ast.AssignStmt)
+			if !ok || len(assignment.Lhs) != 1 || len(assignment.Rhs) != 1 {
+				return true
+			}
+			assigned, ok := assignment.Lhs[0].(*ast.Ident)
+			if !ok || assigned.Name != expected.assigned {
+				return true
+			}
+			selector, ok := assignment.Rhs[0].(*ast.CallExpr)
+			if !ok || len(selector.Args) != 0 {
+				return true
+			}
+			boundDB, ok := selector.Fun.(*ast.SelectorExpr)
+			if !ok || boundDB.Sel.Name != "boundDB" {
+				return true
+			}
+			borrow, ok := boundDB.X.(*ast.CallExpr)
+			if !ok || len(borrow.Args) != 2 {
+				return true
+			}
+			borrowName, ok := borrow.Fun.(*ast.Ident)
+			conn, connOK := borrow.Args[0].(*ast.Ident)
+			target, targetOK := borrow.Args[1].(*ast.Ident)
+			if ok && connOK && targetOK && borrowName.Name == "borrowConnScope" && conn.Name == expected.conn && target.Name == "projectionTargetLive" {
+				found[fn.Name.Name]++
+			}
+			return true
+		})
+	}
+	for function := range want {
+		if found[function] != 1 {
+			t.Errorf("%s borrowed scope bridge assignments = %d, want exactly 1", function, found[function])
+		}
+	}
 }
 
 func TestPoolCallerCancellationInterruptsActiveSQL(t *testing.T) {
