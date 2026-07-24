@@ -37,7 +37,7 @@ const (
 // history before it. Apply invokes it incrementally after each effect; Open's full
 // replay invokes it per row from JournalID 1. Both share this one fold (§9.2). It
 // assumes the caller owns db.conn and runs inside the caller's transaction.
-func (db *DB) projectJournalRowLocked(jid int64) error {
+func (db *connScope) projectJournalRowLocked(jid int64) error {
 	var (
 		kind       = -1
 		actorRaw   string
@@ -87,10 +87,16 @@ func (db *DB) projectJournalRowLocked(jid int64) error {
 	}
 }
 
+// projectJournalRowLocked keeps the unchanged Apply slice source-compatible
+// while its caller-owned connection is represented as a DB. P2-R removes it.
+func (db *DB) projectJournalRowLocked(jid int64) error {
+	return borrowConnScope(db.conn, db.projectionTarget).projectJournalRowLocked(jid)
+}
+
 // projectTaskEventRowLocked attributes the committing (authoring) actor (§8.2),
 // projects any lifecycle-status transition Provenance defines for its own
 // namespaced kind (§8.1), and advances the watermark.
-func (db *DB) projectTaskEventRowLocked(jid int64, committing journal.ActorID, recordedAt int64) error {
+func (db *connScope) projectTaskEventRowLocked(jid int64, committing journal.ActorID, recordedAt int64) error {
 	var (
 		taskRaw string
 		kindStr string
@@ -108,7 +114,7 @@ func (db *DB) projectTaskEventRowLocked(jid int64, committing journal.ActorID, r
 	if err != nil {
 		return err
 	}
-	if err := db.insertAttributionLocked(task, committing, jid); err != nil {
+	if err := db.boundDB().insertAttributionLocked(task, committing, jid); err != nil {
 		return err
 	}
 	canonicalEffect, canonical, err := db.canonicalEffectForJournalRowLocked(jid)
@@ -138,7 +144,7 @@ func (db *DB) projectTaskEventRowLocked(jid int64, committing journal.ActorID, r
 	// covered by the §15 convergence check. They are non-lifecycle, so they never reach
 	// the status branches below.
 	if journal.IsMutationFamilyKind(journal.EventKind(kindStr)) {
-		return db.projectMutationFamilyRowLocked(task, journal.EventKind(kindStr), payload, jid, recordedAt)
+		return db.boundDB().projectMutationFamilyRowLocked(task, journal.EventKind(kindStr), payload, jid, recordedAt)
 	}
 	// A migration marker seeds the status projection from the legacy status it
 	// captured in its own payload (§13, §15) — read from the journal row, never from
@@ -152,7 +158,7 @@ func (db *DB) projectTaskEventRowLocked(jid int64, committing journal.ActorID, r
 		if ok {
 			return db.projectTaskStatusLocked(task, status, jid, recordedAt)
 		}
-		return db.advanceWatermarkLocked(task, jid)
+		return db.boundDB().advanceWatermarkLocked(task, jid)
 	}
 	if status, isLifecycle := journal.StatusForEventKind(journal.EventKind(kindStr)); isLifecycle {
 		// The static status FSM (§8.1) governs the four TRANSITION lifecycle kinds
@@ -180,14 +186,14 @@ func (db *DB) projectTaskEventRowLocked(jid int64, committing journal.ActorID, r
 		}
 		return db.projectTaskStatusLocked(task, status, jid, recordedAt)
 	}
-	return db.advanceWatermarkLocked(task, jid)
+	return db.boundDB().advanceWatermarkLocked(task, jid)
 }
 
 // readProjTaskStatusLocked reads a task's current lifecycle status from the projection
 // target (the real tasks table during a live Apply, the shadow table during a from-empty
 // replay derivation), so the status FSM checks the transition against the status derived
 // from history strictly before the row being folded (§8.1, §15).
-func (db *DB) readProjTaskStatusLocked(task journal.TaskID) (journal.TaskStatus, error) {
+func (db *connScope) readProjTaskStatusLocked(task journal.TaskID) (journal.TaskStatus, error) {
 	var status journal.TaskStatus
 	found := false
 	if err := sqlitex.Execute(db.conn,
@@ -214,7 +220,7 @@ func (db *DB) readProjTaskStatusLocked(task journal.TaskID) (journal.TaskStatus,
 // episode occupant on its started transition (§8.2), and recomputes the
 // owner-responsibility projection on the owner slot (§8.1). The reducer reads the
 // episode the transition belongs to rather than re-deriving from the caller.
-func (db *DB) projectAuthorityRowLocked(jid int64) error {
+func (db *connScope) projectAuthorityRowLocked(jid int64) error {
 	var (
 		assignment string
 		transition = -1
@@ -253,14 +259,14 @@ func (db *DB) projectAuthorityRowLocked(jid int64) error {
 		if err != nil {
 			return err
 		}
-		if err := db.insertAttributionLocked(task, occupant, jid); err != nil {
+		if err := db.boundDB().insertAttributionLocked(task, occupant, jid); err != nil {
 			return err
 		}
 	}
 	if slot == slotOwnerResponsibilityID {
-		return db.recomputeTaskOwnerLocked(task, jid)
+		return db.boundDB().recomputeTaskOwnerLocked(task, jid)
 	}
-	return db.advanceWatermarkLocked(task, jid)
+	return db.boundDB().advanceWatermarkLocked(task, jid)
 }
 
 // projectTaskScopedRowLocked attributes the committing actor for a task-scoped
@@ -284,7 +290,7 @@ func (table taskScopedTable) label() string {
 	}
 }
 
-func (db *DB) projectTaskScopedRowLocked(jid int64, committing journal.ActorID, table taskScopedTable) error {
+func (db *connScope) projectTaskScopedRowLocked(jid int64, committing journal.ActorID, table taskScopedTable) error {
 	var taskRaw string
 	hasTask := false
 	if err := sqlitex.Execute(db.conn,
@@ -305,17 +311,17 @@ func (db *DB) projectTaskScopedRowLocked(jid int64, committing journal.ActorID, 
 	if err != nil {
 		return err
 	}
-	if err := db.insertAttributionLocked(task, committing, jid); err != nil {
+	if err := db.boundDB().insertAttributionLocked(task, committing, jid); err != nil {
 		return err
 	}
-	return db.advanceWatermarkLocked(task, jid)
+	return db.boundDB().advanceWatermarkLocked(task, jid)
 }
 
 // projectTaskStatusLocked materializes the lifecycle-status projection on tasks
 // (§8.1): status_id, closed_at (set on close, cleared on re-open), and the
 // watermark. Like owner_id, status here is written only by the shared reducer for
 // journal-anchored lifecycle events.
-func (db *DB) projectTaskStatusLocked(task journal.TaskID, status journal.TaskStatus, jid, recordedAt int64) error {
+func (db *connScope) projectTaskStatusLocked(task journal.TaskID, status journal.TaskStatus, jid, recordedAt int64) error {
 	var closedAt any
 	if status == journal.TaskStatusClosed {
 		closedAt = recordedAt
@@ -413,49 +419,48 @@ const (
 // marker's payload and re-derived from there, never trusted as pre-existing row
 // state.
 func (db *DB) ReplayProjections() (result journal.ReplayResult, err error) {
-	bound, release, err := db.bindOperationDB(context.Background())
+	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return journal.ReplayResult{}, fmt.Errorf("ReplayProjections: lease connection: %w", err)
 	}
-	defer release()
-	db = bound
-	endTx := sqlitex.Save(db.conn)
+	defer scope.release()
+	endTx := sqlitex.Save(scope.conn)
 	defer endTx(&err)
-	if err := db.preflightSchemaLocked(); err != nil {
+	if err := scope.preflightSchemaLocked(); err != nil {
 		return journal.ReplayResult{}, err
 	}
-	if err := db.validateCanonicalOperationsLocked(); err != nil {
+	if err := scope.validateCanonicalOperationsLocked(); err != nil {
 		return journal.ReplayResult{}, err
 	}
 
 	// Snapshot the STORED projection before any change, keyed by task id.
-	storedTasks, err := db.snapshotTaskProjectionsLocked(projectionTargetLive)
+	storedTasks, err := scope.snapshotTaskProjectionsLocked(projectionTargetLive)
 	if err != nil {
 		return journal.ReplayResult{}, err
 	}
-	storedTaskState, err := db.snapshotCompleteTaskStateLocked(projectionTargetLive)
+	storedTaskState, err := scope.snapshotCompleteTaskStateLocked(projectionTargetLive)
 	if err != nil {
 		return journal.ReplayResult{}, err
 	}
-	storedAttribs, err := db.snapshotAttributionsLocked(projectionTargetLive)
+	storedAttribs, err := scope.snapshotAttributionsLocked(projectionTargetLive)
 	if err != nil {
 		return journal.ReplayResult{}, err
 	}
-	anchored, err := db.journalAnchoredTasksLocked()
+	anchored, err := scope.journalAnchoredTasksLocked()
 	if err != nil {
 		return journal.ReplayResult{}, err
 	}
 	// The relationship/annotation domain projections are journaled in full (§6 amendment),
 	// so every edge/label/comment is journal-reproducible; the stored sets are snapshotted
 	// whole (not scoped to anchored tasks) and diffed against the from-empty re-derivation.
-	storedDomain, err := db.snapshotDomainProjectionsLocked(projectionTargetLive)
+	storedDomain, err := scope.snapshotDomainProjectionsLocked(projectionTargetLive)
 	if err != nil {
 		return journal.ReplayResult{}, err
 	}
 
 	// Re-derive every projection from empty into connection-scoped shadow tables;
 	// the real tables stay read-only (SHADOW DERIVATION, §15).
-	derivedTasks, derivedTaskState, derivedAttribs, derivedDomain, folded, err := db.rederiveProjectionsShadowLocked()
+	derivedTasks, derivedTaskState, derivedAttribs, derivedDomain, folded, err := scope.rederiveProjectionsShadowLocked()
 	if err != nil {
 		return journal.ReplayResult{}, err
 	}
@@ -535,7 +540,7 @@ func (shape canonicalColumnShape) seedLegacyTasksQuery() string {
 	}
 }
 
-func (db *DB) validateCanonicalOperationsLocked() error {
+func (db *connScope) validateCanonicalOperationsLocked() error {
 	var operations []canonicalStoredOperation
 	columns, err := db.tableColumnsLocked("journal_operations")
 	if err != nil {
@@ -618,13 +623,13 @@ func (db *DB) validateCanonicalOperationsLocked() error {
 			if op.authority == nil {
 				return canonicalCorruption(op.anchor, "authority", "NULL", "non-NULL governing authority")
 			}
-			if err := db.requireAuthorityExistsLocked(*op.authority); err != nil {
+			if err := db.boundDB().requireAuthorityExistsLocked(*op.authority); err != nil {
 				return fmt.Errorf("startup canonical operation %d authority: %w", op.anchor, err)
 			}
 			in := journal.OperationInput{ActorID: op.actor, AuthorityJournalID: op.authority}
 			for i, effect := range effects {
 				if effect.TaskID.Namespace != "" {
-					if err := db.requireAuthorityGovernsLocked(in, rows[i], effect.TaskID); err != nil {
+					if err := db.boundDB().requireAuthorityGovernsLocked(in, rows[i], effect.TaskID); err != nil {
 						return fmt.Errorf("startup canonical operation %d authority for effect %d: %w", op.anchor, i, err)
 					}
 				}
@@ -642,7 +647,7 @@ func (db *DB) validateCanonicalOperationsLocked() error {
 	return nil
 }
 
-func (db *DB) validateCanonicalResultSlotsLocked(anchor int64, rows []int64, effects []journal.Effect) error {
+func (db *connScope) validateCanonicalResultSlotsLocked(anchor int64, rows []int64, effects []journal.Effect) error {
 	expected := map[string]int64{}
 	for i, effect := range effects {
 		if effect.ResultSlot != "" {
@@ -678,7 +683,7 @@ func canonicalCorruption(anchor int64, field, stored, canonical string) error {
 	return fmt.Errorf("%w: provenance: canonical operation %d field %s diverged — stored=%q canonical=%q; where: startup canonical validation; when: before accepting the database; impact: Open fails closed and no projection row is mutated; fix: restore the operation, canonical bytes, and subtype rows from the same committed backup", journal.ErrProjectionDivergence, anchor, field, stored, canonical)
 }
 
-func (db *DB) validateCanonicalEffectRowLocked(op canonicalStoredOperation, jid int64, effect journal.Effect) error {
+func (db *connScope) validateCanonicalEffectRowLocked(op canonicalStoredOperation, jid int64, effect journal.Effect) error {
 	expectedKind, err := effect.Sort.JournalKind()
 	if err != nil {
 		return err
@@ -735,7 +740,7 @@ func optionalTaskString(id journal.TaskID) string {
 	return id.String()
 }
 
-func (db *DB) validateCanonicalTaskEventLocked(anchor, jid int64, effect journal.Effect) error {
+func (db *connScope) validateCanonicalTaskEventLocked(anchor, jid int64, effect journal.Effect) error {
 	kind := effect.EventKind
 	payload := effect.Payload
 	if effect.Sort == journal.EffectTaskCreate || effect.Sort == journal.EffectTaskCreateAllocated {
@@ -747,7 +752,7 @@ func (db *DB) validateCanonicalTaskEventLocked(anchor, jid int64, effect journal
 	if journalKind, ok := journal.MutationFamilyKindForSort(effect.Sort); ok {
 		kind = journalKind
 		var err error
-		payload, err = db.encodeMutationFamilyPayload(effect)
+		payload, err = db.boundDB().encodeMutationFamilyPayload(effect)
 		if err != nil {
 			return err
 		}
@@ -818,7 +823,7 @@ func (query canonicalSubtypeQuery) sql() string {
 	}
 }
 
-func (db *DB) compareSingleRowLocked(anchor, jid int64, query canonicalSubtypeQuery, expected []string) error {
+func (db *connScope) compareSingleRowLocked(anchor, jid int64, query canonicalSubtypeQuery, expected []string) error {
 	found := false
 	var actual []string
 	if err := sqlitex.Execute(db.conn, query.sql(), &sqlitex.ExecOptions{Args: []any{jid}, ResultFunc: func(stmt *zs.Stmt) error {
@@ -853,7 +858,7 @@ func (db *DB) compareSingleRowLocked(anchor, jid int64, query canonicalSubtypeQu
 // tasks.last_journal_id tightening is never tripped) and needs no savepoint/rollback.
 // The projection-write target and the shadow tables are always restored/dropped
 // before return, on every path.
-func (db *DB) rederiveProjectionsShadowLocked() (
+func (db *connScope) rederiveProjectionsShadowLocked() (
 	tasks map[string]journal.TaskProjection,
 	taskState map[string]completeTaskState,
 	attribs map[string]map[string]int64,
@@ -918,7 +923,7 @@ func (db *DB) rederiveProjectionsShadowLocked() (
 // produced, but on a throwaway table with NO constraints (no NOT NULL watermark, no
 // foreign keys), so the real tables are never touched. The shadow attribution table
 // starts empty. The journal-spine subtype tables the reducer READS are untouched.
-func (db *DB) createProjectionShadowLocked() error {
+func (db *connScope) createProjectionShadowLocked() error {
 	// Drop first in case a prior aborted run left them on the connection.
 	if err := db.dropProjectionShadowLocked(); err != nil {
 		return err
@@ -957,7 +962,7 @@ func (db *DB) createProjectionShadowLocked() error {
 	return nil
 }
 
-func (db *DB) canonicalEffectForJournalRowLocked(jid int64) (journal.Effect, bool, error) {
+func (db *connScope) canonicalEffectForJournalRowLocked(jid int64) (journal.Effect, bool, error) {
 	var version string
 	var wire []byte
 	var anchor int64
@@ -1015,7 +1020,7 @@ func (db *DB) canonicalEffectForJournalRowLocked(jid int64) (journal.Effect, boo
 	return effects[ordinal], true, nil
 }
 
-func (db *DB) insertCanonicalShadowTaskLocked(e journal.Effect, recordedAt, jid int64) error {
+func (db *connScope) insertCanonicalShadowTaskLocked(e journal.Effect, recordedAt, jid int64) error {
 	if err := sqlitex.Execute(db.conn, "INSERT INTO shadow_tasks\n\t\t (id, namespace, title, description, owner_id, status_id, priority_id, type_id,\n\t\t  phase_id, notes, created_at, updated_at, closed_at, close_reason, last_journal_id)\n\t\t VALUES (?1, ?2, ?3, ?4, ?12, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?13, ?9, ?11)", &sqlitex.ExecOptions{Args: []any{e.TaskID.String(), e.TaskID.Namespace, e.Title, e.Description,
 		statusOpenID, int(e.Priority), int(e.Type), int(e.Phase), "", recordedAt, jid, nil, nil}}); err != nil {
 		return fmt.Errorf("replay canonical task create %q: %w", e.TaskID, err)
@@ -1023,7 +1028,7 @@ func (db *DB) insertCanonicalShadowTaskLocked(e journal.Effect, recordedAt, jid 
 	return nil
 }
 
-func (db *DB) materializeCanonicalShadowTaskEventLocked(e journal.Effect, recordedAt int64) error {
+func (db *connScope) materializeCanonicalShadowTaskEventLocked(e journal.Effect, recordedAt int64) error {
 	closeReasonSet := e.EventKind == journal.EventKindTaskClosed && e.CloseReason != ""
 	if e.UpdateTitle == nil && e.UpdateDescription == nil && e.UpdatePriority == nil && e.UpdatePhase == nil && e.UpdateNotes == nil && !closeReasonSet {
 		return nil
@@ -1063,7 +1068,7 @@ func (db *DB) materializeCanonicalShadowTaskEventLocked(e journal.Effect, record
 }
 
 // dropProjectionShadowLocked removes the connection-scoped shadow projection tables.
-func (db *DB) dropProjectionShadowLocked() error {
+func (db *connScope) dropProjectionShadowLocked() error {
 	for _, stmt := range []string{"DROP TABLE IF EXISTS shadow_tasks", "DROP TABLE IF EXISTS shadow_task_attributions", "DROP TABLE IF EXISTS shadow_edges", "DROP TABLE IF EXISTS shadow_labels", "DROP TABLE IF EXISTS shadow_comments"} {
 		if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
 			return fmt.Errorf("drop shadow projection table: %w", err)
@@ -1076,7 +1081,7 @@ func (db *DB) dropProjectionShadowLocked() error {
 // journal-spine subtype row (task_event, assignment episode, task-scoped decision
 // or evidence). These are the tasks whose projections are journal-reproducible and
 // therefore in scope for the §15 convergence assertion.
-func (db *DB) journalAnchoredTasksLocked() (map[string]struct{}, error) {
+func (db *connScope) journalAnchoredTasksLocked() (map[string]struct{}, error) {
 	out := map[string]struct{}{}
 	if err := sqlitex.Execute(db.conn, "SELECT task_id FROM journal_task_events\n\t\t UNION SELECT task_id FROM journal_authority_assignment_episodes\n\t\t UNION SELECT task_id FROM journal_decisions WHERE task_id IS NOT ?1\n\t\t UNION SELECT task_id FROM journal_evidence WHERE task_id IS NOT ?2", &sqlitex.ExecOptions{Args: []any{nil, nil}, ResultFunc: func(stmt *zs.Stmt) error {
 		if stmt.ColumnType(0) != zs.TypeNull {
@@ -1093,7 +1098,7 @@ func (db *DB) journalAnchoredTasksLocked() (map[string]struct{}, error) {
 // status, watermark) keyed by task id from the named table, so a replay can compare
 // the stored projection ("tasks") against the from-empty re-derivation
 // ("shadow_tasks") (§15).
-func (db *DB) snapshotTaskProjectionsLocked(target projectionTarget) (map[string]journal.TaskProjection, error) {
+func (db *connScope) snapshotTaskProjectionsLocked(target projectionTarget) (map[string]journal.TaskProjection, error) {
 	out := map[string]journal.TaskProjection{}
 	if err := sqlitex.Execute(db.conn,
 		target.snapshotTaskProjectionsQuery(),
@@ -1192,7 +1197,7 @@ func (target projectionTarget) snapshotCommentsQuery() string {
 // as a nested map task_id → (actor_id → first_journal_id), so a replay can compare
 // the stored edges ("task_attributions") against the from-empty re-derivation
 // ("shadow_task_attributions") (§8.2, §15).
-func (db *DB) snapshotAttributionsLocked(target projectionTarget) (map[string]map[string]int64, error) {
+func (db *connScope) snapshotAttributionsLocked(target projectionTarget) (map[string]map[string]int64, error) {
 	out := map[string]map[string]int64{}
 	if err := sqlitex.Execute(db.conn,
 		target.snapshotAttributionsQuery(),
@@ -1294,7 +1299,7 @@ type completeTaskState struct {
 	fields map[string]string
 }
 
-func (db *DB) snapshotCompleteTaskStateLocked(target projectionTarget) (map[string]completeTaskState, error) {
+func (db *connScope) snapshotCompleteTaskStateLocked(target projectionTarget) (map[string]completeTaskState, error) {
 	out := map[string]completeTaskState{}
 	if err := sqlitex.Execute(db.conn, target.snapshotCompleteTaskStateQuery(), &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 		id, err := journalParseTask(stmt.ColumnText(0))
@@ -1412,7 +1417,7 @@ type domainComment struct {
 // column, not merely the keys (§15). It selects the non-key content columns
 // (edges.created_at; comments.author_id/body/created_at) alongside the keys; labels have no
 // non-key column.
-func (db *DB) snapshotDomainProjectionsLocked(target projectionTarget) (domainProjection, error) {
+func (db *connScope) snapshotDomainProjectionsLocked(target projectionTarget) (domainProjection, error) {
 	dp := domainProjection{
 		edges:    map[string]domainEdge{},
 		labels:   map[string]domainLabel{},

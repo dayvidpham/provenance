@@ -60,7 +60,7 @@ func (shape tasksWatermarkShape) copyQuery() string {
 
 // tasksWatermarkColumnInfoLocked reports whether the tasks table has a last_journal_id
 // column and, if so, whether it is declared NOT NULL. Assumes db.conn is operation-owned.
-func (db *DB) tasksWatermarkColumnInfoLocked() (present bool, notNull bool, err error) {
+func (db *connScope) tasksWatermarkColumnInfoLocked() (present bool, notNull bool, err error) {
 	if err := sqlitex.Execute(db.conn, "PRAGMA table_info(tasks)", &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 		if stmt.ColumnText(1) == "last_journal_id" {
 			present = true
@@ -73,6 +73,12 @@ func (db *DB) tasksWatermarkColumnInfoLocked() (present bool, notNull bool, err 
 	return present, notNull, nil
 }
 
+// P2 compatibility adapter for existing internal schema assertions. The test
+// caller owns the reserved connection; production migration paths use connScope.
+func (db *DB) tasksWatermarkColumnInfoLocked() (present bool, notNull bool, err error) {
+	return borrowConnScope(db.conn, db.projectionTarget).tasksWatermarkColumnInfoLocked()
+}
+
 // countUnanchoredTasksLocked reports how many tasks rows still carry a NULL watermark —
 // i.e. legacy rows not yet journal-anchored (§8.1, §13). Migration consults it to decide
 // whether the whole table can be re-tightened to NOT NULL: the rebuild is only safe (and
@@ -80,7 +86,7 @@ func (db *DB) tasksWatermarkColumnInfoLocked() (present bool, notNull bool, err 
 // (the even-older column-less legacy shape) — a column-less table has no watermark to be
 // null, and migration adds the column before anchoring, so this runs after that add.
 // Assumes db.conn is operation-owned.
-func (db *DB) countUnanchoredTasksLocked() (int, error) {
+func (db *connScope) countUnanchoredTasksLocked() (int, error) {
 	present, _, err := db.tasksWatermarkColumnInfoLocked()
 	if err != nil {
 		return 0, err
@@ -106,7 +112,7 @@ func (db *DB) countUnanchoredTasksLocked() (int, error) {
 // table has no such column). FK enforcement is toggled around an explicit transaction
 // exactly as completeJournalOperationFK does; a detected violation rolls the whole
 // rebuild back. Assumes db.conn is operation-owned.
-func (db *DB) rebuildTasksWatermarkLocked(shape tasksWatermarkShape) error {
+func (db *connScope) rebuildTasksWatermarkLocked(shape tasksWatermarkShape) error {
 	if err := sqlitex.ExecuteTransient(db.conn, "PRAGMA foreign_keys=OFF", nil); err != nil {
 		return fmt.Errorf("rebuildTasksWatermark: disable FK enforcement: %w", err)
 	}
@@ -172,7 +178,7 @@ func (db *DB) rebuildTasksWatermarkLocked(shape tasksWatermarkShape) error {
 // is already nullable or the column is already absent, a rebuild-to-nullable when the
 // live schema is the tightened NOT NULL shape. Existing rows (including any native rows
 // already carrying a watermark) are preserved. Assumes db.conn is operation-owned.
-func (db *DB) downgradeTasksWatermarkToLegacyLocked() error {
+func (db *connScope) downgradeTasksWatermarkToLegacyLocked() error {
 	present, notNull, err := db.tasksWatermarkColumnInfoLocked()
 	if err != nil {
 		return err
@@ -189,19 +195,19 @@ func (db *DB) downgradeTasksWatermarkToLegacyLocked() error {
 // SeedLegacyTask it is a narrow, test-only *DB seam that models a legacy database on
 // disk, never part of the JournalAPI surface. Existing base-column rows are preserved.
 func (db *DB) DowngradeTasksToColumnlessLegacy() error {
-	bound, release, err := db.bindOperationDB(context.Background())
+	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return fmt.Errorf("DowngradeTasksToColumnlessLegacy: lease connection: %w", err)
 	}
-	defer release()
-	present, _, err := bound.tasksWatermarkColumnInfoLocked()
+	defer scope.release()
+	present, _, err := scope.tasksWatermarkColumnInfoLocked()
 	if err != nil {
 		return err
 	}
 	if !present {
 		return nil
 	}
-	return bound.rebuildTasksWatermarkLocked(tasksWatermarkColumnless)
+	return scope.rebuildTasksWatermarkLocked(tasksWatermarkColumnless)
 }
 
 // ensureTasksWatermarkColumnLocked is migration's column-add path (§13): a legacy
@@ -210,7 +216,7 @@ func (db *DB) DowngradeTasksToColumnlessLegacy() error {
 // has a column to write the watermark into. Idempotent: a no-op when the column already
 // exists (the common case, where the legacy nullable column is present). Assumes
 // db.conn is operation-owned.
-func (db *DB) ensureTasksWatermarkColumnLocked() error {
+func (db *connScope) ensureTasksWatermarkColumnLocked() error {
 	present, _, err := db.tasksWatermarkColumnInfoLocked()
 	if err != nil {
 		return err

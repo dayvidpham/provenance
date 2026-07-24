@@ -12,24 +12,13 @@ import (
 	"zombiezen.com/go/sqlite/sqlitex"
 )
 
-// bindOperationDB leases one pool connection for a complete public operation and
-// binds the existing connection-oriented internals to it. Startup uses a pool-less
-// DB on its exclusive activation connection, so it remains the sole activation
-// owner without taking a runtime lease. P2 removes this adapter with db.conn.
-func (db *DB) bindOperationDB(ctx context.Context) (*DB, func(), error) {
+// bindJournalScope leases one runtime connection or borrows the activation-owned
+// connection. Activation never takes a lease from the runtime pool.
+func (db *DB) bindJournalScope(ctx context.Context, target projectionTarget) (*connScope, error) {
 	if db.pool == nil {
-		return db, func() {}, nil
+		return borrowConnScope(db.conn, target), nil
 	}
-	scope, err := db.bindConn(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	bound := &DB{
-		pool:             db.pool,
-		conn:             scope.conn,
-		projectionTarget: db.projectionTarget,
-	}
-	return bound, scope.release, nil
+	return db.bindScope(ctx, target)
 }
 
 // journalParseActor / journalParseTask resolve stored wire-format IDs into the
@@ -89,7 +78,7 @@ const insertJournalAuthoritySQL = "INSERT INTO journal_authorities (journal_id, 
 // ensureJournalSchema creates the journal-base relations and seeds the closed
 // journal_kinds lookup. Idempotent (CREATE TABLE IF NOT EXISTS / INSERT OR
 // IGNORE), mirroring the existing reference-data discipline.
-func (db *DB) ensureJournalSchema() error {
+func (db *connScope) ensureJournalSchema() error {
 	ddl := []string{
 		"CREATE TABLE IF NOT EXISTS journal_kinds (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT",
 		`CREATE TABLE IF NOT EXISTS journal (
@@ -123,6 +112,20 @@ func (db *DB) ensureJournalSchema() error {
 	return nil
 }
 
+// P2 compatibility adapters for activation and the unchanged Apply slice. They
+// borrow the caller-owned connection and never acquire or release a pool lease.
+func (db *DB) ensureJournalSchema() error {
+	return borrowConnScope(db.conn, db.projectionTarget).ensureJournalSchema()
+}
+
+func (db *DB) verifySubtypeIntegrityLocked() error {
+	return borrowConnScope(db.conn, db.projectionTarget).verifySubtypeIntegrityLocked()
+}
+
+func (db *DB) verifyActorPlacementLocked() error {
+	return borrowConnScope(db.conn, db.projectionTarget).verifyActorPlacementLocked()
+}
+
 // ---------------------------------------------------------------------------
 // Append (journal-base single-row write)
 // ---------------------------------------------------------------------------
@@ -152,26 +155,25 @@ func (db *DB) AppendTaskEvent(in journal.AppendTaskEventInput) (journal.TaskEven
 	}
 	recordedAt := in.RecordedAt.UTC()
 
-	bound, release, err := db.bindOperationDB(context.Background())
+	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return journal.TaskEventRow{}, fmt.Errorf("AppendTaskEvent: lease connection: %w", err)
 	}
-	defer release()
-	db = bound
+	defer scope.release()
 
 	var txErr error
-	endTx := sqlitex.Transaction(db.conn)
+	endTx := sqlitex.Transaction(scope.conn)
 	defer endTx(&txErr)
 
 	var journalID int64
-	if txErr = sqlitex.Execute(db.conn, "INSERT INTO journal (kind_id, actor_id, recorded_at, produced_by_operation_journal_id)\n\t\t VALUES (?1, ?2, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{
+	if txErr = sqlitex.Execute(scope.conn, "INSERT INTO journal (kind_id, actor_id, recorded_at, produced_by_operation_journal_id)\n\t\t VALUES (?1, ?2, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{
 		int(journal.JournalKindTaskEvent), in.ActorID.String(), recordedAt.UnixNano(), nil,
 	}}); txErr != nil {
 		return journal.TaskEventRow{}, fmt.Errorf("AppendTaskEvent: insert journal row: %w", txErr)
 	}
-	journalID = db.conn.LastInsertRowID()
+	journalID = scope.conn.LastInsertRowID()
 
-	if txErr = sqlitex.Execute(db.conn,
+	if txErr = sqlitex.Execute(scope.conn,
 		insertJournalTaskEventSQL,
 		&sqlitex.ExecOptions{Args: []any{
 			journalID, in.TaskID.String(), string(in.EventKind), string(in.Payload),
@@ -186,23 +188,23 @@ func (db *DB) AppendTaskEvent(in journal.AppendTaskEventInput) (journal.TaskEven
 			txErr = encErr
 			return journal.TaskEventRow{}, fmt.Errorf("AppendTaskEvent: encode context: %w", txErr)
 		}
-		if txErr = sqlitex.Execute(db.conn, "INSERT OR IGNORE INTO journal_task_event_contexts\n\t\t\t\t(event_journal_id, context_kind, context_identity, attached_by_journal_id)\n\t\t\t VALUES (?1, ?2, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{journalID, string(kind), identity, journalID}}); txErr != nil {
+		if txErr = sqlitex.Execute(scope.conn, "INSERT OR IGNORE INTO journal_task_event_contexts\n\t\t\t\t(event_journal_id, context_kind, context_identity, attached_by_journal_id)\n\t\t\t VALUES (?1, ?2, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{journalID, string(kind), identity, journalID}}); txErr != nil {
 			return journal.TaskEventRow{}, fmt.Errorf("AppendTaskEvent: insert context edge: %w", txErr)
 		}
 	}
 
 	// Reducer subtype-integrity gate (§10 rule 8) before the projections.
-	if txErr = db.verifySubtypeIntegrityLocked(); txErr != nil {
+	if txErr = scope.verifySubtypeIntegrityLocked(); txErr != nil {
 		return journal.TaskEventRow{}, txErr
 	}
 
 	// Projection: first-wins attribution edge for the authoring actor (§8.2).
-	if txErr = sqlitex.Execute(db.conn, "INSERT OR IGNORE INTO task_attributions (task_id, actor_id, first_journal_id)\n\t\t VALUES (?1, ?2, ?3)", &sqlitex.ExecOptions{Args: []any{in.TaskID.String(), in.ActorID.String(), journalID}}); txErr != nil {
+	if txErr = sqlitex.Execute(scope.conn, "INSERT OR IGNORE INTO task_attributions (task_id, actor_id, first_journal_id)\n\t\t VALUES (?1, ?2, ?3)", &sqlitex.ExecOptions{Args: []any{in.TaskID.String(), in.ActorID.String(), journalID}}); txErr != nil {
 		return journal.TaskEventRow{}, fmt.Errorf("AppendTaskEvent: update task_attributions: %w", txErr)
 	}
 
 	// Projection: advance the current-task-state watermark if the task exists.
-	if txErr = sqlitex.Execute(db.conn, "UPDATE tasks SET last_journal_id = ?1 WHERE id = ?2", &sqlitex.ExecOptions{Args: []any{journalID, in.TaskID.String()}}); txErr != nil {
+	if txErr = sqlitex.Execute(scope.conn, "UPDATE tasks SET last_journal_id = ?1 WHERE id = ?2", &sqlitex.ExecOptions{Args: []any{journalID, in.TaskID.String()}}); txErr != nil {
 		return journal.TaskEventRow{}, fmt.Errorf("AppendTaskEvent: advance tasks.last_journal_id: %w", txErr)
 	}
 
@@ -229,18 +231,18 @@ func (db *DB) AppendTaskEvent(in journal.AppendTaskEventInput) (journal.TaskEven
 // later slices) always write the subtype row atomically. The caller is expected
 // to VerifyIntegrity and roll back.
 func (db *DB) AppendBareJournalRow(kind journal.JournalKind, actorID journal.ActorID, recordedAt time.Time) (journal.JournalID, error) {
-	bound, release, err := db.bindOperationDB(context.Background())
+	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return 0, fmt.Errorf("AppendBareJournalRow: lease connection: %w", err)
 	}
-	defer release()
+	defer scope.release()
 	var txErr error
-	endTx := sqlitex.Save(bound.conn)
+	endTx := sqlitex.Save(scope.conn)
 	defer endTx(&txErr)
-	if txErr = sqlitex.Execute(bound.conn, "INSERT INTO journal (kind_id, actor_id, recorded_at, produced_by_operation_journal_id)\n\t\t VALUES (?1, ?2, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{int(kind), actorID.String(), recordedAt.UTC().UnixNano(), nil}}); txErr != nil {
+	if txErr = sqlitex.Execute(scope.conn, "INSERT INTO journal (kind_id, actor_id, recorded_at, produced_by_operation_journal_id)\n\t\t VALUES (?1, ?2, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{int(kind), actorID.String(), recordedAt.UTC().UnixNano(), nil}}); txErr != nil {
 		return 0, fmt.Errorf("AppendBareJournalRow: %w", txErr)
 	}
-	return journal.JournalID(bound.conn.LastInsertRowID()), nil
+	return journal.JournalID(scope.conn.LastInsertRowID()), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -254,21 +256,20 @@ func (db *DB) AppendBareJournalRow(kind journal.JournalKind, actorID journal.Act
 // the §15 convergence tool Open uses and the gate AppendTaskEvent runs before
 // commit. Returns journal.ErrSubtypeIntegrity on any violation.
 func (db *DB) VerifyIntegrity() (err error) {
-	bound, release, err := db.bindOperationDB(context.Background())
+	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return fmt.Errorf("VerifyIntegrity: lease connection: %w", err)
 	}
-	defer release()
-	db = bound
-	endTx := sqlitex.Save(db.conn)
+	defer scope.release()
+	endTx := sqlitex.Save(scope.conn)
 	defer endTx(&err)
-	if err := db.verifyForeignKeyTopologyLocked(); err != nil {
+	if err := scope.verifyForeignKeyTopologyLocked(); err != nil {
 		return err
 	}
-	if err := db.verifySubtypeIntegrityLocked(); err != nil {
+	if err := scope.verifySubtypeIntegrityLocked(); err != nil {
 		return err
 	}
-	if err := db.verifyActorPlacementLocked(); err != nil {
+	if err := scope.verifyActorPlacementLocked(); err != nil {
 		return err
 	}
 	// Watermark presence is checked LAST: it is the §8.1 tightening (no un-journaled
@@ -277,10 +278,10 @@ func (db *DB) VerifyIntegrity() (err error) {
 	// journal violation. Ordering it last lets the adversarial corpus assert those
 	// journal-row violations by their own sentinel without a coexisting legacy task
 	// row masking them.
-	return db.verifyWatermarkPresenceLocked()
+	return scope.verifyWatermarkPresenceLocked()
 }
 
-func (db *DB) verifyForeignKeyTopologyLocked() error {
+func (db *connScope) verifyForeignKeyTopologyLocked() error {
 	var table, parent string
 	var rowID int64
 	if err := sqlitex.Execute(db.conn, "PRAGMA foreign_key_check", &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
@@ -316,7 +317,7 @@ func (db *DB) verifyForeignKeyTopologyLocked() error {
 // no-op on an even-older legacy database whose tasks table predates the column entirely
 // (that database is not yet migrated; migration adds the column and anchors its rows,
 // §13). Returns journal.ErrWatermarkMissing on the first un-anchored row.
-func (db *DB) verifyWatermarkPresenceLocked() error {
+func (db *connScope) verifyWatermarkPresenceLocked() error {
 	present, _, err := db.tasksWatermarkColumnInfoLocked()
 	if err != nil {
 		return err
@@ -347,7 +348,7 @@ func (db *DB) verifyWatermarkPresenceLocked() error {
 // anchor row missing one. It backs the journal CHECK constraint that also enforces
 // this, and is the §15 convergence tool's placement guard. Returns
 // journal.ErrActorPlacement on any violation.
-func (db *DB) verifyActorPlacementLocked() error {
+func (db *connScope) verifyActorPlacementLocked() error {
 	var (
 		badJID   int64
 		subord   bool
@@ -547,7 +548,7 @@ var subtypeExclusivityPairs = []subtypeExclusivityPair{
 // exist in the live schema, so this guard extends automatically as later slices add
 // operation/authority/decision/evidence tables without weakening the check for the kinds
 // present today.
-func (db *DB) subtypeTablesPresent() (map[journal.JournalKind]subtypeTable, error) {
+func (db *connScope) subtypeTablesPresent() (map[journal.JournalKind]subtypeTable, error) {
 	present := make(map[journal.JournalKind]subtypeTable, len(subtypeAllTables))
 	for kind, table := range subtypeAllTables {
 		var exists bool
@@ -567,7 +568,7 @@ func (db *DB) subtypeTablesPresent() (map[journal.JournalKind]subtypeTable, erro
 	return present, nil
 }
 
-func (db *DB) verifySubtypeIntegrityLocked() error {
+func (db *connScope) verifySubtypeIntegrityLocked() error {
 	tables, err := db.subtypeTablesPresent()
 	if err != nil {
 		return err
@@ -628,7 +629,7 @@ func (db *DB) verifySubtypeIntegrityLocked() error {
 // verifySubtypeExclusivityLocked rejects a JournalID present in two subtype
 // tables at once (§10 rule 8 exclusivity). The subtype PKs are all JournalID, so
 // a pairwise existence probe over the present tables is exact.
-func (db *DB) verifySubtypeExclusivityLocked(tables map[journal.JournalKind]subtypeTable) error {
+func (db *connScope) verifySubtypeExclusivityLocked(tables map[journal.JournalKind]subtypeTable) error {
 	// Walk the pre-built closed pair set, probing only pairs whose BOTH tables are present
 	// in the live schema — so the check is the exact subset of pairs the former dynamic
 	// double loop covered, with no per-call SQL construction.
@@ -659,7 +660,7 @@ func (db *DB) verifySubtypeExclusivityLocked(tables map[journal.JournalKind]subt
 // agreement (§10 rule 8): a bootstrap authority carries a bootstrap detail row
 // and no assignment transition; an assignment authority carries a transition and
 // no bootstrap detail.
-func (db *DB) verifyAuthorityDetailIntegrityLocked() error {
+func (db *connScope) verifyAuthorityDetailIntegrityLocked() error {
 	var present bool
 	if err := sqlitex.Execute(db.conn,
 		"SELECT ?3 FROM sqlite_master WHERE type=?1 AND name=?2",
@@ -720,18 +721,17 @@ func (db *DB) QueryTaskEvents(q journal.JournalQueryV1) (page journal.JournalTas
 		return journal.JournalTaskEventPageV1{}, err
 	}
 
-	bound, release, err := db.bindOperationDB(context.Background())
+	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return journal.JournalTaskEventPageV1{}, fmt.Errorf("QueryTaskEvents: lease connection: %w", err)
 	}
-	defer release()
-	db = bound
-	endTx := sqlitex.Save(db.conn)
+	defer scope.release()
+	endTx := sqlitex.Save(scope.conn)
 	defer endTx(&err)
 
 	snapshot := int64(q.SnapshotMaxJournalID)
 	if snapshot == 0 {
-		if err := sqlitex.Execute(db.conn,
+		if err := sqlitex.Execute(scope.conn,
 			"SELECT COALESCE(MAX(journal_id), ?1) FROM journal",
 			&sqlitex.ExecOptions{Args: []any{0}, ResultFunc: func(stmt *zs.Stmt) error {
 				snapshot = stmt.ColumnInt64(0)
@@ -788,7 +788,7 @@ func (db *DB) QueryTaskEvents(q journal.JournalQueryV1) (page journal.JournalTas
 	}
 
 	var rows []journal.TaskEventRow
-	if err := sqlitex.Execute(db.conn, queryOrder.query(), &sqlitex.ExecOptions{
+	if err := sqlitex.Execute(scope.conn, queryOrder.query(), &sqlitex.ExecOptions{
 		Args: []any{snapshot, afterRecordedAt, int64(q.AfterJournalID),
 			flag(len(taskIDs) > 0), string(taskJSON), flag(len(eventKinds) > 0), string(eventJSON),
 			flag(len(contextFilters) > 0), string(contextJSON), "$[0]", "$[1]", boundLimit, 1},
@@ -821,7 +821,7 @@ func (db *DB) QueryTaskEvents(q journal.JournalQueryV1) (page journal.JournalTas
 	}
 	// Attach each row's canonical context set.
 	for i := range rows {
-		ctxs, err := db.loadContextsLocked(int64(rows[i].JournalID))
+		ctxs, err := scope.loadContextsLocked(int64(rows[i].JournalID))
 		if err != nil {
 			return journal.JournalTaskEventPageV1{}, err
 		}
@@ -853,7 +853,7 @@ func scanTaskEventRow(stmt *zs.Stmt) (journal.TaskEventRow, error) {
 	}, nil
 }
 
-func (db *DB) loadContextsLocked(journalID int64) ([]journal.EventContext, error) {
+func (db *connScope) loadContextsLocked(journalID int64) ([]journal.EventContext, error) {
 	var ctxs []journal.EventContext
 	if err := sqlitex.Execute(db.conn, "SELECT context_kind, context_identity FROM journal_task_event_contexts\n\t\t WHERE event_journal_id = ?1 ORDER BY context_kind, context_identity", &sqlitex.ExecOptions{
 		Args: []any{journalID},
@@ -879,15 +879,14 @@ func (db *DB) loadContextsLocked(journalID int64) ([]journal.EventContext, error
 // TaskAttributions returns the cumulative attribution edges for a task in
 // ascending FirstJournalID order.
 func (db *DB) TaskAttributions(taskID journal.TaskID) (out []journal.TaskAttribution, err error) {
-	bound, release, err := db.bindOperationDB(context.Background())
+	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return nil, fmt.Errorf("TaskAttributions: lease connection: %w", err)
 	}
-	defer release()
-	db = bound
-	endTx := sqlitex.Save(db.conn)
+	defer scope.release()
+	endTx := sqlitex.Save(scope.conn)
 	defer endTx(&err)
-	if err := sqlitex.Execute(db.conn, "SELECT task_id, actor_id, first_journal_id FROM task_attributions\n\t\t WHERE task_id = ?1 ORDER BY first_journal_id ASC", &sqlitex.ExecOptions{
+	if err := sqlitex.Execute(scope.conn, "SELECT task_id, actor_id, first_journal_id FROM task_attributions\n\t\t WHERE task_id = ?1 ORDER BY first_journal_id ASC", &sqlitex.ExecOptions{
 		Args: []any{taskID.String()},
 		ResultFunc: func(stmt *zs.Stmt) error {
 			actorID, err := journalParseActor(stmt.ColumnText(1))
