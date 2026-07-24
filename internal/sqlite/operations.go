@@ -101,6 +101,9 @@ func (db *DB) ensureOperationsSchema() error {
 	if err := db.ensureGenericCanonicalConstraints(); err != nil {
 		return err
 	}
+	if err := db.ensureActivityCreationsSchema(); err != nil {
+		return err
+	}
 	return db.completeJournalOperationFK()
 }
 
@@ -377,6 +380,9 @@ func (db *DB) JournalIsEmpty() (bool, error) {
 // per-effect authorization (§9.3), persists result slots (§3.2), and runs the
 // subtype-integrity and close-ends-assignment gates before commit.
 func (db *DB) Apply(in journal.OperationInput) (journal.CommittedResult, error) {
+	// Canonicalize before acquiring write ownership or allocating (§9.1).
+	// This validates and normalizes conditions and effects; a failure here is a
+	// pure input error and nothing has been written.
 	callerMutationDigest := append([]byte(nil), in.MutationDigest...)
 	prepared, err := journal.Canonicalize(in)
 	if err != nil {
@@ -387,15 +393,50 @@ func (db *DB) Apply(in journal.OperationInput) (journal.CommittedResult, error) 
 	in.Conditions = prepared.NormalizedConditions()
 	in.Effects = prepared.NormalizedEffects()
 	in.MutationDigest = prepared.DerivedDigest()
-	if len(in.Conditions) != 0 {
-		return journal.CommittedResult{}, fmt.Errorf("Apply: operation %q has %d canonical conditions, but transaction-local condition evaluation is not available yet -- where: Apply preparation; when: before opening a transaction or writing; impact: nothing was committed; fix: omit Conditions until atomic condition evaluation is enabled", in.OperationID, len(in.Conditions))
-	}
 	if err := validateApplyInput(in); err != nil {
 		return journal.CommittedResult{}, err
 	}
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	return db.applyPreparedLocked(in, prepared, callerMutationDigest, nil)
+	// BEGIN IMMEDIATE acquires SQLite write ownership before the OperationID
+	// lookup and condition reads. This prevents check-then-act races: two
+	// concurrent contenders on a CurrentFact condition both serialize here;
+	// the loser observes the winner's committed fact and receives ConditionFailure
+	// (not BUSY_SNAPSHOT). Initial BUSY/LOCKED while acquiring this lock is
+	// transient infrastructure — the 5 s busy_timeout (set in Open) retries it.
+	if err := db.beginWriteOwnershipLocked(); err != nil {
+		return journal.CommittedResult{}, err
+	}
+	var commitErr error
+	defer func() {
+		if commitErr != nil {
+			_ = sqlitex.ExecuteTransient(db.conn, "ROLLBACK", nil)
+		} else {
+			commitErr = sqlitex.ExecuteTransient(db.conn, "COMMIT", nil)
+			if commitErr != nil {
+				_ = sqlitex.ExecuteTransient(db.conn, "ROLLBACK", nil)
+				commitErr = fmt.Errorf("Apply: commit standalone write transaction: %w", commitErr)
+			}
+		}
+	}()
+	res, commitErr := db.applyPreparedLocked(in, prepared, callerMutationDigest, nil)
+	return res, commitErr
+}
+
+// beginWriteOwnershipLocked executes BEGIN IMMEDIATE on the held connection,
+// acquiring SQLite write ownership before any read or write in the Apply
+// transaction. The caller must hold db.mu.
+func (db *DB) beginWriteOwnershipLocked() error {
+	if err := sqlitex.ExecuteTransient(db.conn, "BEGIN IMMEDIATE", nil); err != nil {
+		return fmt.Errorf(
+			"Apply: acquire SQLite write ownership (BEGIN IMMEDIATE): %w — "+
+				"where: Apply write transaction setup; when: before OperationID lookup or condition reads; "+
+				"impact: nothing was written; the caller's operation was not committed; "+
+				"fix: if BUSY/LOCKED, the 5 s busy_timeout will retry automatically; "+
+				"persistent failure indicates another connection holds a long write transaction",
+			err)
+	}
+	return nil
 }
 
 // validateApplyInput runs the pre-transaction input checks shared by the public
@@ -433,9 +474,6 @@ func (db *DB) applyLocked(in journal.OperationInput, faultHook func(effectIndex 
 	in.Conditions = prepared.NormalizedConditions()
 	in.Effects = prepared.NormalizedEffects()
 	in.MutationDigest = prepared.DerivedDigest()
-	if len(in.Conditions) != 0 {
-		return journal.CommittedResult{}, fmt.Errorf("Apply: operation %q has %d canonical conditions, but transaction-local condition evaluation is not available yet -- where: nested Apply preparation; when: before opening a savepoint or writing; impact: nothing was committed; fix: omit Conditions until atomic condition evaluation is enabled", in.OperationID, len(in.Conditions))
-	}
 	return db.applyPreparedLocked(in, prepared, callerMutationDigest, faultHook)
 }
 
@@ -465,6 +503,14 @@ func (db *DB) applyPreparedLocked(in journal.OperationInput, prepared journal.Ca
 			txErr = err
 		}
 		return res, err
+	}
+
+	// Evaluate pre-conditions inside the write transaction (§9.5).
+	// Conditions run after exact-replay lookup (above) and before genesis/effects,
+	// so they observe the same transaction snapshot as the effects they gate.
+	if condErr := db.checkConditionsLocked(in); condErr != nil {
+		txErr = condErr
+		return journal.CommittedResult{}, txErr
 	}
 
 	// New operation: genesis discipline (§4.6, §10 rules 6-7).
@@ -549,7 +595,7 @@ func (db *DB) applyPreparedLocked(in journal.OperationInput, prepared journal.Ca
 		return journal.CommittedResult{}, txErr
 	}
 
-	res, err := db.reconstructCommittedLocked(anchorJID)
+	res, err := db.reconstructAndValidateCommittedLocked(anchorJID)
 	if err != nil {
 		txErr = err
 		return journal.CommittedResult{}, txErr
@@ -611,6 +657,8 @@ func (db *DB) foldEffectLocked(in journal.OperationInput, anchorJID int64, eff j
 	case journal.EffectEdgeAdd, journal.EffectEdgeRemove,
 		journal.EffectLabelAdd, journal.EffectLabelRemove, journal.EffectCommentAdd:
 		return jid, db.foldMutationFamilyLocked(in, jid, eff)
+	case journal.EffectActivityCreate:
+		return jid, db.foldActivityCreateLocked(in, jid, eff)
 	default:
 		return 0, fmt.Errorf("Apply: operation %q effect %d has unknown sort %s", in.OperationID, index, eff.Sort)
 	}

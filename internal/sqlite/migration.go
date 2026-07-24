@@ -62,6 +62,7 @@ var recognizedJournalSpineTables = map[string]struct{}{
 	"journal_authority_assignment_transitions": {},
 	"journal_decisions":                        {},
 	"journal_evidence":                         {},
+	"journal_activity_creations":               {},
 }
 
 // PreflightSchema verifies the external pre-journal schema shape (§13). It is a

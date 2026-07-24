@@ -76,6 +76,11 @@ func (db *DB) projectJournalRowLocked(jid int64) error {
 		return db.projectTaskScopedRowLocked(jid, committing, taskScopedDecision)
 	case journal.JournalKindEvidence:
 		return db.projectTaskScopedRowLocked(jid, committing, taskScopedEvidence)
+	case journal.JournalKindActivity:
+		// Activity birth rows have no task-scoped watermark or attribution to advance.
+		// The journal_activity_creations row exists and the activities row was inserted
+		// by the fold; no additional projection state changes here.
+		return nil
 	default:
 		return fmt.Errorf("project journal row %d: unknown journal kind %d", jid, kind)
 	}

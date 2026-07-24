@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"errors"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
@@ -143,25 +142,77 @@ func TestApplyUsesStructuralStoredOperationIdentity(t *testing.T) {
 	}
 }
 
-func TestApplyRejectsConditionsBeforeAnyWrite(t *testing.T) {
+// TestApplyConditionFailClosedWithZeroWrites verifies that a failing condition
+// (CurrentFact: assertion of a non-existent evidence row being current) returns
+// typed ConditionFailure and produces zero persisted journal rows.
+func TestApplyConditionFailClosedWithZeroWrites(t *testing.T) {
 	db := newJournalDB(t)
 	actor, task := seedActorAndTask(t, db)
 	authority := genesisBoot(t, db, actor)
 	before := journalRowCount(t, db)
+	// Asserted JournalID 999 does not exist; CurrentFact must fail.
+	nonExistentJID := journal.JournalID(999)
 	input := journal.OperationInput{
 		OperationID: "condition-fail-closed", ActorID: actor, AuthorityJournalID: &authority, CommandDigest: []byte("command"),
-		Conditions: []journal.Condition{{Kind: journal.ConditionCurrentFact, Selector: journal.FactSelector{Kind: journal.FactEvidence, Filter: journal.FactFilter{TaskScope: journal.FactTaskScope{Kind: journal.FactTaskUnscoped}}, EvidenceKind: "fixture.evidence"}}},
-		Effects:    []journal.Effect{{Sort: journal.EffectTaskEvent, TaskID: task, EventKind: "fixture.event"}},
+		Conditions: []journal.Condition{{
+			Kind:              journal.ConditionCurrentFact,
+			Selector:          journal.FactSelector{Kind: journal.FactEvidence, Filter: journal.FactFilter{TaskScope: journal.FactTaskScope{Kind: journal.FactTaskUnscoped}}, EvidenceKind: "fixture.evidence"},
+			AssertedJournalID: nonExistentJID,
+		}},
+		Effects: []journal.Effect{{Sort: journal.EffectTaskEvent, TaskID: task, EventKind: "fixture.event"}},
 	}
-	if _, err := db.Apply(input); err == nil || !strings.Contains(err.Error(), "transaction-local condition evaluation") || !strings.Contains(err.Error(), "nothing was committed") {
-		t.Fatalf("condition Apply error is not actionable: %v", err)
+	_, err := db.Apply(input)
+	if err == nil {
+		t.Fatal("condition Apply succeeded but should have failed (no matching fact row)")
+	}
+	if !errors.Is(err, journal.ErrConditionFailed) {
+		t.Fatalf("condition Apply error is not ErrConditionFailed: %v", err)
+	}
+	var cf *journal.ConditionFailure
+	if !errors.As(err, &cf) {
+		t.Fatalf("condition Apply error does not wrap *ConditionFailure: %v", err)
+	}
+	if cf.Index != 0 || cf.Kind != journal.ConditionCurrentFact {
+		t.Fatalf("ConditionFailure: got index=%d kind=%s, want index=0 kind=CurrentFact", cf.Index, cf.Kind)
+	}
+	if cf.Reason != journal.ConditionFactMissing {
+		t.Fatalf("ConditionFailure reason: got %s, want FactMissing", cf.Reason)
 	}
 	if after := journalRowCount(t, db); after != before {
-		t.Fatalf("condition Apply changed journal rows: before=%d after=%d", before, after)
+		t.Fatalf("condition Apply changed journal rows (want zero writes): before=%d after=%d", before, after)
 	}
-	result, err := db.LookupCommitted(input.OperationID)
-	if err != nil || result.Kind != journal.CommittedAbsent {
-		t.Fatalf("condition Apply persisted operation: result=%+v err=%v", result, err)
+	result, lookupErr := db.LookupCommitted(input.OperationID)
+	if lookupErr != nil || result.Kind != journal.CommittedAbsent {
+		t.Fatalf("condition Apply persisted operation: result=%+v err=%v", result, lookupErr)
+	}
+}
+
+// TestApplyConditionCurrentFactAbsenceSucceeds verifies that CurrentFact with
+// AssertedJournalID=0 (absence assertion) succeeds when no matching fact exists.
+func TestApplyConditionCurrentFactAbsenceSucceeds(t *testing.T) {
+	db := newJournalDB(t)
+	actor, task := seedActorAndTask(t, db)
+	authority := genesisBoot(t, db, actor)
+	input := journal.OperationInput{
+		OperationID: "condition-absence-ok", ActorID: actor, AuthorityJournalID: &authority, CommandDigest: []byte("command"),
+		Conditions: []journal.Condition{{
+			Kind:              journal.ConditionCurrentFact,
+			Selector:          journal.FactSelector{Kind: journal.FactEvidence, Filter: journal.FactFilter{TaskScope: journal.FactTaskScope{Kind: journal.FactTaskUnscoped}}, EvidenceKind: "fixture.evidence"},
+			AssertedJournalID: 0, // assert absence
+		}},
+		Effects: []journal.Effect{{Sort: journal.EffectTaskEvent, TaskID: task, EventKind: "fixture.event"}},
+	}
+	res, err := db.Apply(input)
+	if err != nil {
+		t.Fatalf("absence-assertion Apply failed: %v", err)
+	}
+	if res.Kind != journal.CommittedExact {
+		t.Fatalf("absence-assertion Apply result kind = %v, want CommittedExact", res.Kind)
+	}
+	// Exact retry must return the same result.
+	res2, err2 := db.Apply(input)
+	if err2 != nil || res2.Kind != journal.CommittedExact || !res2.ShortCircuited {
+		t.Fatalf("condition Apply retry: result=%+v err=%v", res2, err2)
 	}
 }
 

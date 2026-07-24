@@ -777,33 +777,11 @@ func (db *DB) resolveOperationIDInsertRaceLocked(in journal.OperationInput, call
 	return db.committedOutcomeForExistingLocked(in, existing, callerMutationDigest)
 }
 
+// reconstructCommittedLocked delegates to reconstructAndValidateCommittedLocked
+// (result_slots.go), which resolves ActivityID slots and validates all bindings.
+// Kept for backward-compatible call sites inside this file.
 func (db *DB) reconstructCommittedLocked(anchor int64) (journal.CommittedResult, error) {
-	res := journal.CommittedResult{Kind: journal.CommittedExact, AnchorJournalID: journal.JournalID(anchor)}
-	// EmittedEvents: the flat task_event closure in JournalID order (§2.1, §3.2).
-	if err := sqlitex.Execute(db.conn, "SELECT journal_id FROM journal WHERE produced_by_operation_journal_id = ?1 AND kind_id = ?2 ORDER BY journal_id ASC", &sqlitex.ExecOptions{Args: []any{anchor, int(journal.JournalKindTaskEvent)}, ResultFunc: func(stmt *zs.Stmt) error {
-		res.EmittedEvents = append(res.EmittedEvents, journal.JournalID(stmt.ColumnInt64(0)))
-		return nil
-	}}); err != nil {
-		return journal.CommittedResult{}, fmt.Errorf("reconstruct emitted events: %w", err)
-	}
-	// Slot-keyed result map (§3.2), bucketed by JournalKind.
-	if err := sqlitex.Execute(db.conn, "SELECT s.result_slot_id, s.produced_journal_id, j.kind_id, te.task_id\n\t\t FROM journal_operation_result_slots s\n\t\t JOIN journal j ON j.journal_id = s.produced_journal_id\n\t\t LEFT JOIN journal_task_events te ON te.journal_id = s.produced_journal_id\n\t\t WHERE s.journal_id = ?1 ORDER BY s.result_slot_id ASC", &sqlitex.ExecOptions{Args: []any{anchor}, ResultFunc: func(stmt *zs.Stmt) error {
-		binding := journal.ResultSlotBinding{
-			Slot:              journal.ResultSlotID(stmt.ColumnText(0)),
-			ProducedJournalID: journal.JournalID(stmt.ColumnInt64(1)),
-			Kind:              journal.JournalKind(stmt.ColumnInt(2)),
-		}
-		if stmt.ColumnType(3) != zs.TypeNull {
-			if tid, err := journalParseTask(stmt.ColumnText(3)); err == nil {
-				binding.TaskID = &tid
-			}
-		}
-		res.ResultSlots = append(res.ResultSlots, binding)
-		return nil
-	}}); err != nil {
-		return journal.CommittedResult{}, fmt.Errorf("reconstruct result slots: %w", err)
-	}
-	return res, nil
+	return db.reconstructAndValidateCommittedLocked(anchor)
 }
 
 // LookupCommitted returns the committed result for an OperationID (§9.4): the
