@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -28,9 +29,16 @@ func (db *DB) RegisterFixedSoftwareAgent(reg journal.FixedSoftwareAgentRegistrat
 		Name:  reg.AgentName, Version: reg.Version, Source: reg.Source,
 	}
 
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	if err = sqlitex.ExecuteTransient(db.conn, "BEGIN IMMEDIATE", nil); err != nil {
+	scope, err := db.bindConn(context.Background())
+	if err != nil {
+		return ptypes.SoftwareAgent{}, fixedAgentActivationError(fixedAgentLeaseError{cause: err},
+			"the activation transaction could not start", "a pooled connection could not be leased",
+			"DB.RegisterFixedSoftwareAgent transaction setup", "before preflight reads or writes",
+			"no activation rows were changed", "return outstanding leases or reopen the database, then retry")
+	}
+	defer scope.release()
+	conn := scope.conn
+	if err = sqlitex.ExecuteTransient(conn, "BEGIN IMMEDIATE", nil); err != nil {
 		return ptypes.SoftwareAgent{}, fixedAgentActivationError(err,
 			"the activation transaction could not start",
 			"SQLite rejected BEGIN IMMEDIATE",
@@ -41,7 +49,7 @@ func (db *DB) RegisterFixedSoftwareAgent(reg journal.FixedSoftwareAgentRegistrat
 	}
 	defer func() {
 		if err != nil {
-			if rollbackErr := sqlitex.ExecuteTransient(db.conn, "ROLLBACK", nil); rollbackErr != nil {
+			if rollbackErr := sqlitex.ExecuteTransient(conn, "ROLLBACK", nil); rollbackErr != nil {
 				err = fixedAgentActivationError(errors.Join(err, rollbackErr),
 					"the activation failed and its rollback also reported an error",
 					"SQLite rejected ROLLBACK after an earlier activation failure",
@@ -52,8 +60,8 @@ func (db *DB) RegisterFixedSoftwareAgent(reg journal.FixedSoftwareAgentRegistrat
 			}
 			return
 		}
-		if commitErr := sqlitex.ExecuteTransient(db.conn, "COMMIT", nil); commitErr != nil {
-			rollbackErr := sqlitex.ExecuteTransient(db.conn, "ROLLBACK", nil)
+		if commitErr := sqlitex.ExecuteTransient(conn, "COMMIT", nil); commitErr != nil {
+			rollbackErr := sqlitex.ExecuteTransient(conn, "ROLLBACK", nil)
 			cause := commitErr
 			impact := "no agent is returned; SQLite rejected the commit and the transaction was rolled back"
 			fix := "retry the complete activation; if it repeats, verify database health and available storage"
@@ -72,7 +80,7 @@ func (db *DB) RegisterFixedSoftwareAgent(reg journal.FixedSoftwareAgentRegistrat
 		}
 	}()
 
-	claims, err := db.loadNamespaceClaimsLocked()
+	claims, err := loadNamespaceClaims(conn)
 	if err != nil {
 		return ptypes.SoftwareAgent{}, fixedAgentActivationError(err,
 			"existing namespace claims could not be loaded",
@@ -102,7 +110,7 @@ func (db *DB) RegisterFixedSoftwareAgent(reg journal.FixedSoftwareAgentRegistrat
 		return ptypes.SoftwareAgent{}, err
 	}
 
-	storedAgent, agentMatch, err := db.fixedSoftwareAgentLocked(id)
+	storedAgent, agentMatch, err := fixedSoftwareAgent(conn, id)
 	if err != nil {
 		return ptypes.SoftwareAgent{}, err
 	}
@@ -135,7 +143,7 @@ func (db *DB) RegisterFixedSoftwareAgent(reg journal.FixedSoftwareAgentRegistrat
 			"retry with the exact stored name, version, and source or choose a new actor ID")
 	}
 
-	entryMatch, err := db.fixedActorEntryExactLocked(reg.Entry, metadata)
+	entryMatch, err := inspectFixedActorEntry(conn, reg.Entry, metadata)
 	if err != nil {
 		return ptypes.SoftwareAgent{}, err
 	}
@@ -151,7 +159,7 @@ func (db *DB) RegisterFixedSoftwareAgent(reg journal.FixedSoftwareAgentRegistrat
 	entryFound := entryMatch == fixedActorEntryExact
 
 	if !claimFound {
-		if err = sqlitex.Execute(db.conn, "INSERT INTO actor_namespace_claims (namespace, claimant_id, range_min, range_max, codec) VALUES (?1, ?2, ?3, ?4, ?5)", &sqlitex.ExecOptions{Args: []any{reg.Claim.Namespace, reg.Claim.ClaimantID, reg.Claim.Range.Min[:], reg.Claim.Range.Max[:], reg.Claim.Codec}}); err != nil {
+		if err = sqlitex.Execute(conn, "INSERT INTO actor_namespace_claims (namespace, claimant_id, range_min, range_max, codec) VALUES (?1, ?2, ?3, ?4, ?5)", &sqlitex.ExecOptions{Args: []any{reg.Claim.Namespace, reg.Claim.ClaimantID, reg.Claim.Range.Min[:], reg.Claim.Range.Max[:], reg.Claim.Codec}}); err != nil {
 			return ptypes.SoftwareAgent{}, fixedAgentActivationError(err,
 				"the namespace claim could not be written",
 				"SQLite rejected the actor_namespace_claims insert",
@@ -162,7 +170,7 @@ func (db *DB) RegisterFixedSoftwareAgent(reg journal.FixedSoftwareAgentRegistrat
 		}
 	}
 	if !agentFound {
-		if err = sqlitex.Execute(db.conn, insertAgentSQL,
+		if err = sqlitex.Execute(conn, insertAgentSQL,
 			&sqlitex.ExecOptions{Args: []any{id.String(), int(ptypes.AgentKindSoftware)}}); err != nil {
 			return ptypes.SoftwareAgent{}, fixedAgentActivationError(err,
 				"the base agent could not be written",
@@ -172,7 +180,7 @@ func (db *DB) RegisterFixedSoftwareAgent(reg journal.FixedSoftwareAgentRegistrat
 				"the activation is aborted and all writes are rolled back",
 				"resolve the reported constraint, schema, storage, or lock error and retry the complete activation")
 		}
-		if err = sqlitex.Execute(db.conn, "INSERT INTO agents_software (agent_id, name, version, source) VALUES (?1, ?2, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{id.String(), reg.AgentName, reg.Version, reg.Source}}); err != nil {
+		if err = sqlitex.Execute(conn, "INSERT INTO agents_software (agent_id, name, version, source) VALUES (?1, ?2, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{id.String(), reg.AgentName, reg.Version, reg.Source}}); err != nil {
 			return ptypes.SoftwareAgent{}, fixedAgentActivationError(err,
 				"the software-agent detail could not be written",
 				"SQLite rejected the agents_software insert",
@@ -183,7 +191,7 @@ func (db *DB) RegisterFixedSoftwareAgent(reg journal.FixedSoftwareAgentRegistrat
 		}
 	}
 	if !entryFound {
-		if err = sqlitex.Execute(db.conn, "INSERT INTO fixed_actor_manifest_entries (actor_id, namespace, kind_id, name, metadata) VALUES (?1, ?2, ?3, ?4, ?5)", &sqlitex.ExecOptions{Args: []any{id.String(), reg.Entry.Namespace, int(reg.Entry.ActorKind), reg.Entry.Name, metadata}}); err != nil {
+		if err = sqlitex.Execute(conn, "INSERT INTO fixed_actor_manifest_entries (actor_id, namespace, kind_id, name, metadata) VALUES (?1, ?2, ?3, ?4, ?5)", &sqlitex.ExecOptions{Args: []any{id.String(), reg.Entry.Namespace, int(reg.Entry.ActorKind), reg.Entry.Name, metadata}}); err != nil {
 			return ptypes.SoftwareAgent{}, fixedAgentActivationError(err,
 				"the fixed-actor manifest entry could not be written",
 				"SQLite rejected the fixed_actor_manifest_entries insert",
@@ -203,6 +211,31 @@ func fixedAgentActivationError(cause error, what, why, where, when, impact, fix 
 	)
 }
 
+type fixedAgentLeaseError struct {
+	cause error
+}
+
+func (err fixedAgentLeaseError) Error() string { return "pool connection lease failed" }
+func (err fixedAgentLeaseError) Unwrap() error { return err.cause }
+
+func runImmediateTransaction(conn *zs.Conn, operation func() error) (err error) {
+	if err := sqlitex.ExecuteTransient(conn, "BEGIN IMMEDIATE", nil); err != nil {
+		return err
+	}
+	if err = operation(); err != nil {
+		if rollbackErr := sqlitex.ExecuteTransient(conn, "ROLLBACK", nil); rollbackErr != nil {
+			return errors.Join(err, rollbackErr)
+		}
+		return err
+	}
+	if err = sqlitex.ExecuteTransient(conn, "COMMIT", nil); err != nil {
+		if rollbackErr := sqlitex.ExecuteTransient(conn, "ROLLBACK", nil); rollbackErr != nil {
+			return errors.Join(err, rollbackErr)
+		}
+	}
+	return err
+}
+
 type fixedSoftwareAgentMatch uint8
 
 const (
@@ -211,10 +244,10 @@ const (
 	fixedSoftwareAgentInconsistent
 )
 
-func (db *DB) fixedSoftwareAgentLocked(id ptypes.AgentID) (ptypes.SoftwareAgent, fixedSoftwareAgentMatch, error) {
+func fixedSoftwareAgent(conn *zs.Conn, id ptypes.AgentID) (ptypes.SoftwareAgent, fixedSoftwareAgentMatch, error) {
 	var out ptypes.SoftwareAgent
 	match := fixedSoftwareAgentAbsent
-	err := sqlitex.Execute(db.conn, "SELECT a.kind_id, s.name, s.version, s.source FROM agents a LEFT JOIN agents_software s ON s.agent_id = a.id WHERE a.id = ?1", &sqlitex.ExecOptions{Args: []any{id.String()}, ResultFunc: func(stmt *zs.Stmt) error {
+	err := sqlitex.Execute(conn, "SELECT a.kind_id, s.name, s.version, s.source FROM agents a LEFT JOIN agents_software s ON s.agent_id = a.id WHERE a.id = ?1", &sqlitex.ExecOptions{Args: []any{id.String()}, ResultFunc: func(stmt *zs.Stmt) error {
 		if ptypes.AgentKind(stmt.ColumnInt(0)) != ptypes.AgentKindSoftware || stmt.ColumnIsNull(1) {
 			match = fixedSoftwareAgentInconsistent
 			return nil
@@ -227,7 +260,7 @@ func (db *DB) fixedSoftwareAgentLocked(id ptypes.AgentID) (ptypes.SoftwareAgent,
 		return ptypes.SoftwareAgent{}, fixedSoftwareAgentAbsent, fixedAgentActivationError(err,
 			fmt.Sprintf("existing actor %q could not be loaded", id.String()),
 			"the actor preflight query failed",
-			"DB.fixedSoftwareAgentLocked",
+			"fixedSoftwareAgent",
 			"before activation writes",
 			"the activation is aborted and no rows are changed",
 			"repair database access or schema integrity, then retry")
@@ -243,9 +276,9 @@ const (
 	fixedActorEntryConflict
 )
 
-func (db *DB) fixedActorEntryExactLocked(entry journal.FixedActorEntry, metadata string) (fixedActorEntryMatch, error) {
+func inspectFixedActorEntry(conn *zs.Conn, entry journal.FixedActorEntry, metadata string) (fixedActorEntryMatch, error) {
 	match := fixedActorEntryAbsent
-	err := sqlitex.Execute(db.conn, "SELECT actor_id, namespace, kind_id, name, metadata FROM fixed_actor_manifest_entries WHERE actor_id = ?1 OR (namespace = ?2 AND name = ?3)", &sqlitex.ExecOptions{Args: []any{entry.ActorID.String(), entry.Namespace, entry.Name}, ResultFunc: func(stmt *zs.Stmt) error {
+	err := sqlitex.Execute(conn, "SELECT actor_id, namespace, kind_id, name, metadata FROM fixed_actor_manifest_entries WHERE actor_id = ?1 OR (namespace = ?2 AND name = ?3)", &sqlitex.ExecOptions{Args: []any{entry.ActorID.String(), entry.Namespace, entry.Name}, ResultFunc: func(stmt *zs.Stmt) error {
 		if stmt.ColumnText(0) != entry.ActorID.String() || stmt.ColumnText(1) != entry.Namespace ||
 			ptypes.AgentKind(stmt.ColumnInt(2)) != entry.ActorKind || stmt.ColumnText(3) != entry.Name || stmt.ColumnText(4) != metadata {
 			match = fixedActorEntryConflict
@@ -260,7 +293,7 @@ func (db *DB) fixedActorEntryExactLocked(entry journal.FixedActorEntry, metadata
 		return fixedActorEntryAbsent, fixedAgentActivationError(err,
 			fmt.Sprintf("manifest identity %q/%q could not be loaded", entry.Namespace, entry.Name),
 			"the manifest preflight query failed",
-			"DB.fixedActorEntryExactLocked",
+			"inspectFixedActorEntry",
 			"before activation writes",
 			"the activation is aborted and no rows are changed",
 			"repair database access or schema integrity, then retry")
@@ -284,45 +317,45 @@ func (db *DB) RegisterNamespaceClaim(claim journal.ActorNamespaceClaim) error {
 		return err
 	}
 
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	existing, err := db.loadNamespaceClaimsLocked()
+	scope, err := db.bindConn(context.Background())
 	if err != nil {
-		return err
+		return fmt.Errorf("RegisterNamespaceClaim %q: lease connection: %w", claim.Namespace, err)
 	}
+	defer scope.release()
 
-	// Idempotency / conflict on the same namespace name.
-	for _, ex := range existing {
-		if ex.Namespace == claim.Namespace {
-			if ex.Equal(claim) {
-				return nil // idempotent no-op
-			}
-			return fmt.Errorf(
-				"%w: namespace %q is already claimed with a different "+
-					"claimant/range/codec — where: actor namespace registration; "+
-					"when: before commit; impact: the differing re-registration is "+
-					"rejected rather than silently overwriting the existing claim; "+
-					"fix: register a distinct namespace or reconcile the existing "+
-					"claim first",
-				journal.ErrNamespaceClaim, claim.Namespace)
+	return runImmediateTransaction(scope.conn, func() error {
+		existing, err := loadNamespaceClaims(scope.conn)
+		if err != nil {
+			return err
 		}
-	}
 
-	// Range disjointness against every other namespace (§7.3 rule 1).
-	if err := journal.CheckNoOverlap(claim, existing); err != nil {
-		return err
-	}
+		// BEGIN IMMEDIATE makes the preflight and uniqueness-backed insert one
+		// database invariant, including across processes and independent leases.
+		for _, ex := range existing {
+			if ex.Namespace == claim.Namespace {
+				if ex.Equal(claim) {
+					return nil
+				}
+				return fmt.Errorf(
+					"%w: namespace %q is already claimed with a different "+
+						"claimant/range/codec — where: actor namespace registration; "+
+						"when: before commit; impact: the differing re-registration is "+
+						"rejected rather than silently overwriting the existing claim; "+
+						"fix: register a distinct namespace or reconcile the existing claim first",
+					journal.ErrNamespaceClaim, claim.Namespace)
+			}
+		}
 
-	var txErr error
-	endTx := sqlitex.Transaction(db.conn)
-	defer endTx(&txErr)
-	if txErr = sqlitex.Execute(db.conn, "INSERT INTO actor_namespace_claims (namespace, claimant_id, range_min, range_max, codec)\n\t\t VALUES (?1, ?2, ?3, ?4, ?5)", &sqlitex.ExecOptions{Args: []any{
-		claim.Namespace, claim.ClaimantID, claim.Range.Min[:], claim.Range.Max[:], claim.Codec,
-	}}); txErr != nil {
-		return fmt.Errorf("RegisterNamespaceClaim %q: %w", claim.Namespace, txErr)
-	}
-	return nil
+		if err := journal.CheckNoOverlap(claim, existing); err != nil {
+			return err
+		}
+		if err := sqlitex.Execute(scope.conn, "INSERT INTO actor_namespace_claims (namespace, claimant_id, range_min, range_max, codec)\n\t\t VALUES (?1, ?2, ?3, ?4, ?5)", &sqlitex.ExecOptions{Args: []any{
+			claim.Namespace, claim.ClaimantID, claim.Range.Min[:], claim.Range.Max[:], claim.Codec,
+		}}); err != nil {
+			return fmt.Errorf("RegisterNamespaceClaim %q: %w", claim.Namespace, err)
+		}
+		return nil
+	})
 }
 
 // RegisterFixedActorEntry registers one fixed_actor_manifest_entries row (§7.2),
@@ -338,56 +371,58 @@ func (db *DB) RegisterFixedActorEntry(entry journal.FixedActorEntry) error {
 		return fmt.Errorf("%w: entry name is required for namespace %q", journal.ErrNamespaceClaim, entry.Namespace)
 	}
 
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	claim, found, err := db.getNamespaceClaimLocked(entry.Namespace)
-	if err != nil {
-		return err
-	}
-	if !found {
-		return fmt.Errorf(
-			"%w: namespace %q has no registered claim — where: fixed-actor "+
-				"registration; when: before commit; impact: the entry is rejected; "+
-				"fix: register the namespace claim before adding entries",
-			journal.ErrNamespaceClaim, entry.Namespace)
-	}
 	if entry.ActorID.Namespace != entry.Namespace {
 		return fmt.Errorf(
 			"%w: fixed actor entry namespace %q does not match actor namespace %q; why: a manifest entry and its actor ID must share one namespace; where: DB.RegisterFixedActorEntry validation; when: before database lookup or mutation; impact: the entry is rejected and no rows are changed; fix: set Entry.Namespace and Entry.ActorID.Namespace to the same claimed namespace",
 			journal.ErrNamespaceClaim, entry.Namespace, entry.ActorID.Namespace,
 		)
 	}
-	if err := journal.CheckEntryInRange(claim, entry.Namespace, [16]byte(entry.ActorID.UUID)); err != nil {
-		return err
-	}
-
 	metadata := entry.Metadata
 	if metadata == "" {
 		metadata = "{}"
 	}
 
-	var txErr error
-	endTx := sqlitex.Transaction(db.conn)
-	defer endTx(&txErr)
-	if txErr = sqlitex.Execute(db.conn, "INSERT INTO fixed_actor_manifest_entries (actor_id, namespace, kind_id, name, metadata)\n\t\t VALUES (?1, ?2, ?3, ?4, ?5)", &sqlitex.ExecOptions{Args: []any{
-		entry.ActorID.String(), entry.Namespace, int(entry.ActorKind), entry.Name, metadata,
-	}}); txErr != nil {
-		return fmt.Errorf("RegisterFixedActorEntry %q: %w", entry.ActorID.String(), txErr)
+	scope, err := db.bindConn(context.Background())
+	if err != nil {
+		return fmt.Errorf("RegisterFixedActorEntry %q: lease connection: %w", entry.ActorID.String(), err)
 	}
-	return nil
+	defer scope.release()
+
+	return runImmediateTransaction(scope.conn, func() error {
+		claim, found, err := getNamespaceClaim(scope.conn, entry.Namespace)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf(
+				"%w: namespace %q has no registered claim — where: fixed-actor registration; when: before commit; impact: the entry is rejected; fix: register the namespace claim before adding entries",
+				journal.ErrNamespaceClaim, entry.Namespace)
+		}
+		if err := journal.CheckEntryInRange(claim, entry.Namespace, [16]byte(entry.ActorID.UUID)); err != nil {
+			return err
+		}
+		if err := sqlitex.Execute(scope.conn, "INSERT INTO fixed_actor_manifest_entries (actor_id, namespace, kind_id, name, metadata)\n\t\t VALUES (?1, ?2, ?3, ?4, ?5)", &sqlitex.ExecOptions{Args: []any{
+			entry.ActorID.String(), entry.Namespace, int(entry.ActorKind), entry.Name, metadata,
+		}}); err != nil {
+			return fmt.Errorf("RegisterFixedActorEntry %q: %w", entry.ActorID.String(), err)
+		}
+		return nil
+	})
 }
 
 // NamespaceClaims returns every registered claim, namespace-ordered.
 func (db *DB) NamespaceClaims() ([]journal.ActorNamespaceClaim, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	return db.loadNamespaceClaimsLocked()
+	scope, err := db.bindConn(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("NamespaceClaims: lease connection: %w", err)
+	}
+	defer scope.release()
+	return loadNamespaceClaims(scope.conn)
 }
 
-func (db *DB) loadNamespaceClaimsLocked() ([]journal.ActorNamespaceClaim, error) {
+func loadNamespaceClaims(conn *zs.Conn) ([]journal.ActorNamespaceClaim, error) {
 	var claims []journal.ActorNamespaceClaim
-	if err := sqlitex.Execute(db.conn, "SELECT namespace, claimant_id, range_min, range_max, codec\n\t\t FROM actor_namespace_claims ORDER BY namespace ASC", &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
+	if err := sqlitex.Execute(conn, "SELECT namespace, claimant_id, range_min, range_max, codec\n\t\t FROM actor_namespace_claims ORDER BY namespace ASC", &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 		claim, err := scanNamespaceClaim(stmt)
 		if err != nil {
 			return err
@@ -400,10 +435,10 @@ func (db *DB) loadNamespaceClaimsLocked() ([]journal.ActorNamespaceClaim, error)
 	return claims, nil
 }
 
-func (db *DB) getNamespaceClaimLocked(namespace string) (journal.ActorNamespaceClaim, bool, error) {
+func getNamespaceClaim(conn *zs.Conn, namespace string) (journal.ActorNamespaceClaim, bool, error) {
 	var claim journal.ActorNamespaceClaim
 	var found bool
-	if err := sqlitex.Execute(db.conn, "SELECT namespace, claimant_id, range_min, range_max, codec\n\t\t FROM actor_namespace_claims WHERE namespace = ?1", &sqlitex.ExecOptions{
+	if err := sqlitex.Execute(conn, "SELECT namespace, claimant_id, range_min, range_max, codec\n\t\t FROM actor_namespace_claims WHERE namespace = ?1", &sqlitex.ExecOptions{
 		Args: []any{namespace},
 		ResultFunc: func(stmt *zs.Stmt) error {
 			c, err := scanNamespaceClaim(stmt)

@@ -151,7 +151,8 @@ func TestRegisterFixedSoftwareAgentErrorsAreActionable(t *testing.T) {
 				}
 				reg.AgentName = "different"
 			case "write":
-				installFixedAgentAbortTrigger(t, tr, "claim")
+				cleanup := installFixedAgentAbortTrigger(t, tr, "claim")
+				defer cleanup()
 			case "transaction":
 				if err := tr.Close(); err != nil {
 					t.Fatalf("close tracker before transaction test: %v", err)
@@ -349,7 +350,8 @@ func TestRegisterFixedSoftwareAgentRollsBackEveryInsertBoundary(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer tr.Close()
-			installFixedAgentAbortTrigger(t, tr, tc.Boundary)
+			cleanup := installFixedAgentAbortTrigger(t, tr, tc.Boundary)
+			defer cleanup()
 			if _, err := tr.RegisterFixedSoftwareAgent(testFixedSoftwareAgentRegistration()); err == nil {
 				t.Fatal("RegisterFixedSoftwareAgent succeeded with an injected insert failure")
 			}
@@ -358,26 +360,37 @@ func TestRegisterFixedSoftwareAgentRollsBackEveryInsertBoundary(t *testing.T) {
 	}
 }
 
-func installFixedAgentAbortTrigger(t *testing.T, tr Tracker, boundary string) {
+func installFixedAgentAbortTrigger(t *testing.T, tr Tracker, boundary string) func() {
 	t.Helper()
 	st := tr.(*sqliteTracker)
 	st.db.Lock()
 	defer st.db.Unlock()
-	var stmt string
+	var createStmt, dropStmt string
 	switch boundary {
 	case "claim":
-		stmt = `CREATE TEMP TRIGGER fail_fixed_claim BEFORE INSERT ON actor_namespace_claims BEGIN SELECT RAISE(ABORT, 'injected claim failure'); END`
+		createStmt = `CREATE TRIGGER fail_fixed_claim BEFORE INSERT ON actor_namespace_claims BEGIN SELECT RAISE(ABORT, 'injected claim failure'); END`
+		dropStmt = `DROP TRIGGER IF EXISTS fail_fixed_claim`
 	case "agent":
-		stmt = `CREATE TEMP TRIGGER fail_fixed_agent BEFORE INSERT ON agents BEGIN SELECT RAISE(ABORT, 'injected agent failure'); END`
+		createStmt = `CREATE TRIGGER fail_fixed_agent BEFORE INSERT ON agents BEGIN SELECT RAISE(ABORT, 'injected agent failure'); END`
+		dropStmt = `DROP TRIGGER IF EXISTS fail_fixed_agent`
 	case "software":
-		stmt = `CREATE TEMP TRIGGER fail_fixed_software BEFORE INSERT ON agents_software BEGIN SELECT RAISE(ABORT, 'injected software failure'); END`
+		createStmt = `CREATE TRIGGER fail_fixed_software BEFORE INSERT ON agents_software BEGIN SELECT RAISE(ABORT, 'injected software failure'); END`
+		dropStmt = `DROP TRIGGER IF EXISTS fail_fixed_software`
 	case "manifest":
-		stmt = `CREATE TEMP TRIGGER fail_fixed_manifest BEFORE INSERT ON fixed_actor_manifest_entries BEGIN SELECT RAISE(ABORT, 'injected manifest failure'); END`
+		createStmt = `CREATE TRIGGER fail_fixed_manifest BEFORE INSERT ON fixed_actor_manifest_entries BEGIN SELECT RAISE(ABORT, 'injected manifest failure'); END`
+		dropStmt = `DROP TRIGGER IF EXISTS fail_fixed_manifest`
 	default:
 		t.Fatalf("unknown rollback boundary %q", boundary)
 	}
-	if err := sqlitex.ExecuteTransient(st.db.Conn(), stmt, nil); err != nil {
+	if err := sqlitex.ExecuteTransient(st.db.Conn(), createStmt, nil); err != nil {
 		t.Fatalf("install %s failure trigger: %v", boundary, err)
+	}
+	return func() {
+		st.db.Lock()
+		defer st.db.Unlock()
+		if err := sqlitex.ExecuteTransient(st.db.Conn(), dropStmt, nil); err != nil {
+			t.Errorf("remove %s failure trigger before tracker close: %v", boundary, err)
+		}
 	}
 }
 
