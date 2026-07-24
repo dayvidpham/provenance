@@ -136,6 +136,24 @@ func (db *DB) EndActivity(id ptypes.ActivityID) (ptypes.Activity, error) {
 	return act, nil
 }
 
+// ActivityExists reports whether an activity with the given id exists. Used as a
+// pre-check by the derivation-qualifier write path so a non-existent activity is
+// rejected BEFORE any journal event is committed (keeping the journal honest),
+// rather than surfacing only as the projection's activity-FK failure. Acquires the
+// DB mutex.
+func (db *DB) ActivityExists(id ptypes.ActivityID) (bool, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	found := false
+	if err := sqlitex.Execute(db.conn, "SELECT id FROM activities WHERE id = ?1", &sqlitex.ExecOptions{
+		Args:       []any{id.String()},
+		ResultFunc: func(*zs.Stmt) error { found = true; return nil },
+	}); err != nil {
+		return false, fmt.Errorf("sqlite.ActivityExists %q: %w", id.String(), err)
+	}
+	return found, nil
+}
+
 // GetActivities returns all activities, optionally filtered by agent.
 // Pass nil to return activities for all agents. Acquires the DB mutex.
 func (db *DB) GetActivities(agentID *ptypes.AgentID) ([]ptypes.Activity, error) {
