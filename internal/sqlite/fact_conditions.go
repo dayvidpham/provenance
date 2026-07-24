@@ -19,13 +19,18 @@ import (
 // All evaluation is bounded (MaxCanonicalConditions = 64); the canonical layer
 // enforces this before Apply is called.
 
-// checkConditionsLocked evaluates in.Conditions inside the caller's write
-// transaction. It returns a typed *journal.ConditionFailure on the first
-// unsatisfied condition and no error on success.
-// The caller must hold db.mu and be inside a SQLite write transaction.
+// checkConditionsLocked is the temporary P0 adapter for operations.go. The
+// caller already owns db.conn and its write transaction; P2 deletes this adapter
+// when Apply binds its own scope.
 func (db *DB) checkConditionsLocked(in journal.OperationInput) error {
+	return checkConditions(&connScope{conn: db.conn}, in)
+}
+
+// checkConditions evaluates conditions through the caller-owned connection
+// scope and returns the first typed *journal.ConditionFailure.
+func checkConditions(scope *connScope, in journal.OperationInput) error {
 	for i, cond := range in.Conditions {
-		if err := db.checkOneConditionLocked(cond, i); err != nil {
+		if err := checkOneCondition(scope, cond, i); err != nil {
 			return err
 		}
 	}
@@ -34,12 +39,12 @@ func (db *DB) checkConditionsLocked(in journal.OperationInput) error {
 
 // checkOneConditionLocked evaluates one condition and returns a typed
 // *journal.ConditionFailure when the assertion is not satisfied.
-func (db *DB) checkOneConditionLocked(cond journal.Condition, index int) error {
+func checkOneCondition(scope *connScope, cond journal.Condition, index int) error {
 	switch cond.Kind {
 	case journal.ConditionExactFact:
-		return db.checkExactFactLocked(cond, index)
+		return checkExactFact(scope, cond, index)
 	case journal.ConditionCurrentFact:
-		return db.checkCurrentFactLocked(cond, index)
+		return checkCurrentFact(scope, cond, index)
 	default:
 		// Canonical validation rejects unknown kinds before Apply; treat as internal error.
 		return fmt.Errorf(
@@ -51,8 +56,8 @@ func (db *DB) checkOneConditionLocked(cond journal.Condition, index int) error {
 	}
 }
 
-func (db *DB) checkExactFactLocked(cond journal.Condition, index int) error {
-	actual, matched, err := db.evaluateExactFactSelectorLocked(cond.Selector, cond.AssertedJournalID)
+func checkExactFact(scope *connScope, cond journal.Condition, index int) error {
+	actual, matched, err := evaluateExactFactSelector(scope, cond.Selector, cond.AssertedJournalID)
 	if err != nil {
 		return fmt.Errorf("Apply: condition[%d] ExactFact evaluation: %w", index, err)
 	}
@@ -73,8 +78,8 @@ func (db *DB) checkExactFactLocked(cond journal.Condition, index int) error {
 	}
 }
 
-func (db *DB) checkCurrentFactLocked(cond journal.Condition, index int) error {
-	actual, found, err := db.evaluateCurrentFactSelectorLocked(cond.Selector, cond.AssertedJournalID)
+func checkCurrentFact(scope *connScope, cond journal.Condition, index int) error {
+	actual, found, err := evaluateCurrentFactSelector(scope, cond.Selector)
 	if err != nil {
 		return fmt.Errorf("Apply: condition[%d] CurrentFact evaluation: %w", index, err)
 	}

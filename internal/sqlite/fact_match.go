@@ -38,16 +38,17 @@ const (
 
 // latestMatchSQL returns the static SQL to find the MAX(journal_id) matching
 // the selector. Uses positional parameters:
-//  ?1  snapshotMaxJournalID (0/nil = no limit)
-//  ?2  filterByTaskScope: 0 = Any (no filter); 1 = apply scope
-//  ?3  taskScopeValue: nil = Unscoped (task_id IS ?3 = NULL); non-nil string = Exact
-//  ?4  filterActors: 0 = skip; 1 = filter by ?5 JSON array
-//  ?5  JSON array of effective actor_id strings
-//  ?6  filterOperations: 0 = skip; 1 = filter by ?7 JSON array
-//  ?7  JSON array of operation_id strings
-//  ?8  requiredContextCount: 0 = no context filter; >0 = all must match
-//  ?9  JSON array of {kind,identity} context entries (empty when ?8=0)
-//  ?10 kind-specific discriminator string (decision_kind or evidence_kind)
+//
+//	?1  snapshotMaxJournalID (0/nil = no limit)
+//	?2  filterByTaskScope: 0 = Any (no filter); 1 = apply scope
+//	?3  taskScopeValue: nil = Unscoped (task_id IS ?3 = NULL); non-nil string = Exact
+//	?4  filterActors: 0 = skip; 1 = filter by ?5 JSON array
+//	?5  JSON array of effective actor_id strings
+//	?6  filterOperations: 0 = skip; 1 = filter by ?7 JSON array
+//	?7  JSON array of operation_id strings
+//	?8  requiredContextCount: 0 = no context filter; >0 = all must match
+//	?9  JSON array of {kind,identity} context entries (empty when ?8=0)
+//	?10 kind-specific discriminator string (decision_kind or evidence_kind)
 func (k factSelectorKind) latestMatchSQL() string {
 	switch k {
 	case factSelectorDecision:
@@ -121,55 +122,33 @@ func (k factSelectorKind) exactMatchSQL() string {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Public evaluation entry-points
-// ---------------------------------------------------------------------------
-
-// EvaluateExactFactSelector resolves a FactSelector for an ExactFact condition.
-// The caller must hold db.mu and be inside a SQLite transaction.
+// evaluateExactFactSelector resolves a FactSelector for an ExactFact condition
+// using the caller-owned connection scope.
 //
 // Returns:
 //   - (asserted, true, nil)  — the asserted JournalID matches the selector
 //   - (latest, false, nil)   — asserted does not match; latest is the highest match
 //   - (0, false, nil)        — no row matches the selector at all
-func (db *DB) EvaluateExactFactSelector(sel journal.FactSelector, asserted journal.JournalID) (actual journal.JournalID, matched bool, err error) {
-	return db.evaluateExactFactSelectorLocked(sel, asserted)
-}
-
-// EvaluateCurrentFactSelector resolves a FactSelector for a CurrentFact condition.
-// The caller must hold db.mu and be inside a SQLite transaction.
-//
-// Returns:
-//   - (highest, true, nil)   — at least one matching row exists
-//   - (0, false, nil)        — no row matches the selector
-func (db *DB) EvaluateCurrentFactSelector(sel journal.FactSelector, asserted journal.JournalID) (actual journal.JournalID, found bool, err error) {
-	return db.evaluateCurrentFactSelectorLocked(sel, asserted)
-}
-
-// ---------------------------------------------------------------------------
-// Internal evaluation
-// ---------------------------------------------------------------------------
-
-func (db *DB) evaluateExactFactSelectorLocked(sel journal.FactSelector, asserted journal.JournalID) (journal.JournalID, bool, error) {
+func evaluateExactFactSelector(scope *connScope, sel journal.FactSelector, asserted journal.JournalID) (journal.JournalID, bool, error) {
 	kind, args, err := buildSelectorArgs(sel, 0)
 	if err != nil {
 		return 0, false, err
 	}
 	exactArgs := append(args, int64(asserted)) // ?13 (args already has ?11 and ?12)
 	found := false
-	if err := sqlitex.Execute(db.conn, kind.exactMatchSQL(), &sqlitex.ExecOptions{
+	if err := sqlitex.Execute(scope.conn, kind.exactMatchSQL(), &sqlitex.ExecOptions{
 		Args: exactArgs,
 		ResultFunc: func(*zs.Stmt) error {
 			found = true
 			return nil
 		},
 	}); err != nil {
-		return 0, false, fmt.Errorf("evaluateExactFactSelectorLocked (%v): %w", sel.Kind, err)
+		return 0, false, fmt.Errorf("evaluateExactFactSelector (%v): %w", sel.Kind, err)
 	}
 	if found {
 		return asserted, true, nil
 	}
-	latest, anyFound, err := db.latestFactSelectorLocked(kind, args)
+	latest, anyFound, err := latestFactSelector(scope, kind, args)
 	if err != nil {
 		return 0, false, err
 	}
@@ -179,18 +158,20 @@ func (db *DB) evaluateExactFactSelectorLocked(sel journal.FactSelector, asserted
 	return latest, false, nil
 }
 
-func (db *DB) evaluateCurrentFactSelectorLocked(sel journal.FactSelector, _ journal.JournalID) (journal.JournalID, bool, error) {
+// evaluateCurrentFactSelector resolves a FactSelector for a CurrentFact
+// condition using the caller-owned connection scope.
+func evaluateCurrentFactSelector(scope *connScope, sel journal.FactSelector) (journal.JournalID, bool, error) {
 	kind, args, err := buildSelectorArgs(sel, 0)
 	if err != nil {
 		return 0, false, err
 	}
-	return db.latestFactSelectorLocked(kind, args)
+	return latestFactSelector(scope, kind, args)
 }
 
-func (db *DB) latestFactSelectorLocked(kind factSelectorKind, args []any) (journal.JournalID, bool, error) {
+func latestFactSelector(scope *connScope, kind factSelectorKind, args []any) (journal.JournalID, bool, error) {
 	var latest journal.JournalID
 	found := false
-	if err := sqlitex.Execute(db.conn, kind.latestMatchSQL(), &sqlitex.ExecOptions{
+	if err := sqlitex.Execute(scope.conn, kind.latestMatchSQL(), &sqlitex.ExecOptions{
 		Args: args,
 		ResultFunc: func(stmt *zs.Stmt) error {
 			if stmt.ColumnType(0) != zs.TypeNull {
@@ -200,9 +181,15 @@ func (db *DB) latestFactSelectorLocked(kind factSelectorKind, args []any) (journ
 			return nil
 		},
 	}); err != nil {
-		return 0, false, fmt.Errorf("latestFactSelectorLocked: %w", err)
+		return 0, false, fmt.Errorf("latestFactSelector: %w", err)
 	}
 	return latest, found, nil
+}
+
+// latestFactSelectorLocked is the P0 compatibility adapter for unchanged
+// callers that already own db.conn. P2 deletes it with the legacy connection.
+func (db *DB) latestFactSelectorLocked(kind factSelectorKind, args []any) (journal.JournalID, bool, error) {
+	return latestFactSelector(&connScope{conn: db.conn}, kind, args)
 }
 
 // ---------------------------------------------------------------------------
@@ -210,16 +197,17 @@ func (db *DB) latestFactSelectorLocked(kind factSelectorKind, args []any) (journ
 // ---------------------------------------------------------------------------
 
 // buildSelectorArgs translates a normalized FactSelector into 10 positional args:
-//  ?1  snapshotMax (nil = no limit; integer = upper bound)
-//  ?2  filterByTaskScope (0 = Any, 1 = apply scope filter)
-//  ?3  taskScopeValue (nil = Unscoped assertion; string = Exact task_id)
-//  ?4  filterActors (0 = skip; 1 = apply actor filter)
-//  ?5  JSON actor array (ignored when ?4=0)
-//  ?6  filterOperations (0 = skip; 1 = apply operation filter)
-//  ?7  JSON operation array (ignored when ?6=0)
-//  ?8  requiredContextCount (0 = no filter; >0 = all must match)
-//  ?9  JSON context array [{kind,identity},...] (ignored when ?8=0)
-//  ?10 kind discriminator string (decision_kind or evidence_kind value)
+//
+//	?1  snapshotMax (nil = no limit; integer = upper bound)
+//	?2  filterByTaskScope (0 = Any, 1 = apply scope filter)
+//	?3  taskScopeValue (nil = Unscoped assertion; string = Exact task_id)
+//	?4  filterActors (0 = skip; 1 = apply actor filter)
+//	?5  JSON actor array (ignored when ?4=0)
+//	?6  filterOperations (0 = skip; 1 = apply operation filter)
+//	?7  JSON operation array (ignored when ?6=0)
+//	?8  requiredContextCount (0 = no filter; >0 = all must match)
+//	?9  JSON context array [{kind,identity},...] (ignored when ?8=0)
+//	?10 kind discriminator string (decision_kind or evidence_kind value)
 func buildSelectorArgs(sel journal.FactSelector, snapshotMax journal.JournalID) (factSelectorKind, []any, error) {
 	var kind factSelectorKind
 	var discriminator string

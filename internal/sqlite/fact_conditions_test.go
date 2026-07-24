@@ -1,13 +1,16 @@
 package sqlite
 
 import (
+	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/dayvidpham/provenance/internal/journal"
 	"github.com/dayvidpham/provenance/pkg/ptypes"
 	"github.com/google/uuid"
+	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 // fact_conditions_test.go tests transaction-local ExactFact and CurrentFact
@@ -61,6 +64,27 @@ func (e *factCondEnv) makeEventOp(conditions []journal.Condition) journal.Operat
 	}
 }
 
+func latestFactInLeasedTransaction(t *testing.T, db *DB, sel journal.FactSelector) (journal.JournalID, bool) {
+	t.Helper()
+	scope, err := db.bindConn(context.Background())
+	if err != nil {
+		t.Fatalf("bind fact matcher connection: %v", err)
+	}
+	defer scope.release()
+	var txErr error
+	endTx := sqlitex.Save(scope.conn)
+	defer endTx(&txErr)
+	kind, args, err := buildSelectorArgs(sel, 0)
+	if err != nil {
+		t.Fatalf("build fact selector: %v", err)
+	}
+	latest, found, err := latestFactSelector(scope, kind, args)
+	if err != nil {
+		t.Fatalf("evaluate latest fact on leased transaction: %v", err)
+	}
+	return latest, found
+}
+
 // TestExactFactConditionSuccess verifies ExactFact succeeds when the asserted
 // JournalID matches the selector.
 func TestExactFactConditionSuccess(t *testing.T) {
@@ -72,14 +96,11 @@ func TestExactFactConditionSuccess(t *testing.T) {
 	if err != nil || res.Kind != journal.CommittedExact {
 		t.Fatalf("Apply decision: %v %+v", err, res)
 	}
-	env.db.mu.Lock()
-	k, args, _ := buildSelectorArgs(journal.FactSelector{
+	decisionRowJID, found := latestFactInLeasedTransaction(t, env.db, journal.FactSelector{
 		Kind:         journal.FactDecision,
 		DecisionKind: "fixture.decision.v1",
 		Filter:       journal.FactFilter{TaskScope: journal.FactTaskScope{Kind: journal.FactTaskAny}},
-	}, 0)
-	decisionRowJID, found, _ := env.db.latestFactSelectorLocked(k, args)
-	env.db.mu.Unlock()
+	})
 	if !found || decisionRowJID <= 0 {
 		t.Fatalf("could not find committed decision journal row")
 	}
@@ -139,13 +160,10 @@ func TestExactFactConditionMismatch(t *testing.T) {
 	}
 
 	// Find the actual JournalID of the committed decision.
-	env.db.mu.Lock()
-	k, args, _ := buildSelectorArgs(journal.FactSelector{
+	actual, _ := latestFactInLeasedTransaction(t, env.db, journal.FactSelector{
 		Kind: journal.FactDecision, DecisionKind: "fixture.decision.v1",
 		Filter: journal.FactFilter{TaskScope: journal.FactTaskScope{Kind: journal.FactTaskAny}},
-	}, 0)
-	actual, _, _ := env.db.latestFactSelectorLocked(k, args)
-	env.db.mu.Unlock()
+	})
 
 	// Assert a JournalID that is off by 1 (wrong, but the row exists).
 	condOp := env.makeEventOp([]journal.Condition{{
@@ -203,13 +221,10 @@ func TestCurrentFactConditionSuccess(t *testing.T) {
 		t.Fatalf("Apply decision: %v", err)
 	}
 
-	env.db.mu.Lock()
-	k, args, _ := buildSelectorArgs(journal.FactSelector{
+	latest, _ := latestFactInLeasedTransaction(t, env.db, journal.FactSelector{
 		Kind: journal.FactDecision, DecisionKind: "fixture.decision.v1",
 		Filter: journal.FactFilter{TaskScope: journal.FactTaskScope{Kind: journal.FactTaskAny}},
-	}, 0)
-	latest, _, _ := env.db.latestFactSelectorLocked(k, args)
-	env.db.mu.Unlock()
+	})
 
 	condOp := env.makeEventOp([]journal.Condition{{
 		Kind:              journal.ConditionCurrentFact,
@@ -228,27 +243,31 @@ func TestCurrentFactConditionStale(t *testing.T) {
 	t.Parallel()
 	env := newFactCondEnv(t)
 
-	// Commit two decision rows of the same kind.
+	// Capture the second decision, then make it stale with a third decision.
 	for i := range 2 {
-		_ = i
 		dec := env.makeDecisionOp("fixture.decision.v1")
 		if _, err := env.db.Apply(dec); err != nil {
 			t.Fatalf("Apply decision %d: %v", i, err)
 		}
 	}
+	sel := journal.FactSelector{Kind: journal.FactDecision, DecisionKind: "fixture.decision.v1",
+		Filter: journal.FactFilter{TaskScope: journal.FactTaskScope{Kind: journal.FactTaskAny}}}
+	stale, found := latestFactInLeasedTransaction(t, env.db, sel)
+	if !found {
+		t.Fatal("CurrentFact stale: second decision not found")
+	}
+	if _, err := env.db.Apply(env.makeDecisionOp("fixture.decision.v1")); err != nil {
+		t.Fatalf("Apply third decision: %v", err)
+	}
+	current, found := latestFactInLeasedTransaction(t, env.db, sel)
+	if !found || current <= stale {
+		t.Fatalf("CurrentFact stale: current=%d stale=%d found=%v", current, stale, found)
+	}
 
-	// Get the first committed decision's JournalID (now stale — a newer one exists).
-	// We cannot easily get it directly; let's use Apply with absence assertion first to
-	// find the "earlier" JournalID by testing the first one committed.
-	// Instead, assert the JournalID = 999 (non-existent) to get a FactMissing,
-	// then assert a real JID that is not the latest.
-
-	// Actually, assert JournalID = 1 (which won't be a decision row — it's the journal entry).
 	condOp := env.makeEventOp([]journal.Condition{{
-		Kind: journal.ConditionCurrentFact,
-		Selector: journal.FactSelector{Kind: journal.FactDecision, DecisionKind: "fixture.decision.v1",
-			Filter: journal.FactFilter{TaskScope: journal.FactTaskScope{Kind: journal.FactTaskAny}}},
-		AssertedJournalID: 1, // too small — current is higher
+		Kind:              journal.ConditionCurrentFact,
+		Selector:          sel,
+		AssertedJournalID: stale,
 	}})
 	before := journalRowCount(t, env.db)
 	_, err := env.db.Apply(condOp)
@@ -259,30 +278,37 @@ func TestCurrentFactConditionStale(t *testing.T) {
 	if !errors.Is(err, journal.ErrConditionFailed) || !errors.As(err, &cf) {
 		t.Fatalf("CurrentFact stale: wrong error: %v", err)
 	}
-	if cf.Kind != journal.ConditionCurrentFact {
-		t.Fatalf("CurrentFact stale: cf.Kind = %s, want CurrentFact", cf.Kind)
-	}
-	// Must be CurrentMismatch or FactMissing (JID=1 is not a decision row)
-	if cf.Reason != journal.ConditionCurrentMismatch && cf.Reason != journal.ConditionFactMissing {
-		t.Fatalf("CurrentFact stale: unexpected reason %s", cf.Reason)
+	if cf.Kind != journal.ConditionCurrentFact || cf.Reason != journal.ConditionCurrentMismatch || cf.ActualJournalID != current {
+		t.Fatalf("CurrentFact stale: failure=%+v, want CurrentFact/CurrentMismatch actual=%d", cf, current)
 	}
 	if after := journalRowCount(t, env.db); after != before {
 		t.Fatalf("CurrentFact stale: wrote rows, want 0")
 	}
 }
 
-// TestConditionFirstFailureIndex verifies that the first failing condition's index
-// is reported (conditions are evaluated in order; first failure wins).
-func TestConditionFirstFailureIndex(t *testing.T) {
+// TestConditionNonzeroFirstFailureIndex verifies a condition after a passing
+// condition reports its actual index. The matching decision is effect index 1.
+func TestConditionNonzeroFirstFailureIndex(t *testing.T) {
 	t.Parallel()
 	env := newFactCondEnv(t)
 
-	// Two conditions: both asserting non-existent rows. First must fail.
+	decision := env.makeDecisionOp("fixture.decision.v1")
+	decision.Effects = append([]journal.Effect{{Sort: journal.EffectTaskEvent, TaskID: env.task, EventKind: "provenance.test.event"}}, decision.Effects...)
+	if _, err := env.db.Apply(decision); err != nil {
+		t.Fatalf("Apply decision at effect index 1: %v", err)
+	}
+	decisionSelector := journal.FactSelector{Kind: journal.FactDecision, DecisionKind: "fixture.decision.v1",
+		Filter: journal.FactFilter{TaskScope: journal.FactTaskScope{Kind: journal.FactTaskAny}}}
+	decisionJID, found := latestFactInLeasedTransaction(t, env.db, decisionSelector)
+	if !found {
+		t.Fatal("decision at effect index 1 not found")
+	}
+
 	condOp := env.makeEventOp([]journal.Condition{
 		{
 			Kind:              journal.ConditionCurrentFact,
-			Selector:          journal.FactSelector{Kind: journal.FactDecision, DecisionKind: "fixture.decision.v1", Filter: journal.FactFilter{TaskScope: journal.FactTaskScope{Kind: journal.FactTaskAny}}},
-			AssertedJournalID: 9999,
+			Selector:          decisionSelector,
+			AssertedJournalID: decisionJID,
 		},
 		{
 			Kind:              journal.ConditionCurrentFact,
@@ -295,8 +321,8 @@ func TestConditionFirstFailureIndex(t *testing.T) {
 	if !errors.Is(err, journal.ErrConditionFailed) || !errors.As(err, &cf) {
 		t.Fatalf("first condition index: wrong error: %v", err)
 	}
-	if cf.Index != 0 {
-		t.Fatalf("first condition index: cf.Index = %d, want 0", cf.Index)
+	if cf.Index != 1 || cf.Kind != journal.ConditionCurrentFact || cf.Reason != journal.ConditionFactMissing {
+		t.Fatalf("nonzero condition index: failure=%+v, want index=1 CurrentFact/FactMissing", cf)
 	}
 }
 
@@ -321,13 +347,10 @@ func TestConditionEvidenceSelector(t *testing.T) {
 	}
 
 	// Get the committed evidence JournalID.
-	env.db.mu.Lock()
-	k, args, _ := buildSelectorArgs(journal.FactSelector{
+	evJID, found := latestFactInLeasedTransaction(t, env.db, journal.FactSelector{
 		Kind: journal.FactEvidence, EvidenceKind: "fixture.evidence.v1",
 		Filter: journal.FactFilter{TaskScope: journal.FactTaskScope{Kind: journal.FactTaskAny}},
-	}, 0)
-	evJID, found, _ := env.db.latestFactSelectorLocked(k, args)
-	env.db.mu.Unlock()
+	})
 	if !found {
 		t.Fatal("evidence row not found after Apply")
 	}
@@ -395,25 +418,19 @@ func TestConditionTaskScopeUnscoped(t *testing.T) {
 	}
 
 	// Unscoped selector must find only the unscoped row.
-	env.db.mu.Lock()
-	k, args, _ := buildSelectorArgs(journal.FactSelector{
+	unscopedJID, found := latestFactInLeasedTransaction(t, env.db, journal.FactSelector{
 		Kind: journal.FactDecision, DecisionKind: "fixture.scoped.v1",
 		Filter: journal.FactFilter{TaskScope: journal.FactTaskScope{Kind: journal.FactTaskUnscoped}},
-	}, 0)
-	unscopedJID, found, _ := env.db.latestFactSelectorLocked(k, args)
-	env.db.mu.Unlock()
+	})
 	if !found || unscopedJID <= 0 {
 		t.Fatal("Unscoped selector found no row")
 	}
 
 	// Any selector must find a row (the latest of either).
-	env.db.mu.Lock()
-	k2, args2, _ := buildSelectorArgs(journal.FactSelector{
+	anyJID, foundAny := latestFactInLeasedTransaction(t, env.db, journal.FactSelector{
 		Kind: journal.FactDecision, DecisionKind: "fixture.scoped.v1",
 		Filter: journal.FactFilter{TaskScope: journal.FactTaskScope{Kind: journal.FactTaskAny}},
-	}, 0)
-	anyJID, foundAny, _ := env.db.latestFactSelectorLocked(k2, args2)
-	env.db.mu.Unlock()
+	})
 	if !foundAny || anyJID <= 0 {
 		t.Fatal("Any selector found no row")
 	}
@@ -424,10 +441,9 @@ func TestConditionTaskScopeUnscoped(t *testing.T) {
 	}
 }
 
-// TestSharedFactMatcherEquivalenceForDotOneFour verifies that EvaluateExactFactSelector
-// and EvaluateCurrentFactSelector are callable by both condition evaluation and
-// (by design) the .1.4 bounded query path.
-func TestSharedFactMatcherEquivalenceForDotOneFour(t *testing.T) {
+// TestFactMatcherOnLeasedTransaction verifies match and mismatch through the
+// explicit P0 scope while its caller owns a transaction.
+func TestFactMatcherOnLeasedTransaction(t *testing.T) {
 	t.Parallel()
 	env := newFactCondEnv(t)
 
@@ -443,28 +459,115 @@ func TestSharedFactMatcherEquivalenceForDotOneFour(t *testing.T) {
 		Filter:       journal.FactFilter{TaskScope: journal.FactTaskScope{Kind: journal.FactTaskAny}},
 	}
 
-	// EvaluateCurrentFactSelector — finds the row.
-	env.db.mu.Lock()
-	latest, found, err := env.db.EvaluateCurrentFactSelector(sel, 0)
-	env.db.mu.Unlock()
+	scope, err := env.db.bindConn(context.Background())
+	if err != nil {
+		t.Fatalf("bind matcher connection: %v", err)
+	}
+	defer scope.release()
+	if err := sqlitex.ExecuteTransient(scope.conn, "BEGIN IMMEDIATE", nil); err != nil {
+		t.Fatalf("begin matcher transaction: %v", err)
+	}
+	defer func() { _ = sqlitex.ExecuteTransient(scope.conn, "ROLLBACK", nil) }()
+
+	latest, found, err := evaluateCurrentFactSelector(scope, sel)
 	if err != nil || !found || latest <= 0 {
-		t.Fatalf("EvaluateCurrentFactSelector: found=%v latest=%d err=%v", found, latest, err)
+		t.Fatalf("evaluateCurrentFactSelector: found=%v latest=%d err=%v", found, latest, err)
 	}
 
-	// EvaluateExactFactSelector with correct JID — matches.
-	env.db.mu.Lock()
-	actual, matched, err2 := env.db.EvaluateExactFactSelector(sel, latest)
-	env.db.mu.Unlock()
+	actual, matched, err2 := evaluateExactFactSelector(scope, sel, latest)
 	if err2 != nil || !matched || actual != latest {
-		t.Fatalf("EvaluateExactFactSelector correct: matched=%v actual=%d err=%v", matched, actual, err2)
+		t.Fatalf("evaluateExactFactSelector correct: matched=%v actual=%d err=%v", matched, actual, err2)
 	}
 
-	// EvaluateExactFactSelector with wrong JID — mismatch.
-	env.db.mu.Lock()
-	actual2, matched2, err3 := env.db.EvaluateExactFactSelector(sel, latest+100)
-	env.db.mu.Unlock()
+	actual2, matched2, err3 := evaluateExactFactSelector(scope, sel, latest+100)
 	if err3 != nil || matched2 || actual2 != latest {
-		t.Fatalf("EvaluateExactFactSelector wrong JID: matched=%v actual=%d latest=%d err=%v", matched2, actual2, latest, err3)
+		t.Fatalf("evaluateExactFactSelector wrong JID: matched=%v actual=%d latest=%d err=%v", matched2, actual2, latest, err3)
+	}
+}
+
+func TestFactConditionsObserveSuppliedTransactionAndRollback(t *testing.T) {
+	t.Parallel()
+	env := newFactCondEnv(t)
+	if _, err := env.db.Apply(env.makeDecisionOp("fixture.committed.v1")); err != nil {
+		t.Fatalf("Apply committed decision: %v", err)
+	}
+	committedSel := journal.FactSelector{Kind: journal.FactDecision, DecisionKind: "fixture.committed.v1",
+		Filter: journal.FactFilter{TaskScope: journal.FactTaskScope{Kind: journal.FactTaskAny}}}
+	jid, found := latestFactInLeasedTransaction(t, env.db, committedSel)
+	if !found {
+		t.Fatal("committed decision not found")
+	}
+
+	scope, err := env.db.bindConn(context.Background())
+	if err != nil {
+		t.Fatalf("bind condition connection: %v", err)
+	}
+	defer scope.release()
+	if err := sqlitex.ExecuteTransient(scope.conn, "BEGIN IMMEDIATE", nil); err != nil {
+		t.Fatalf("begin condition transaction: %v", err)
+	}
+	if err := sqlitex.Execute(scope.conn, "UPDATE journal_decisions SET decision_kind=?1 WHERE journal_id=?2", &sqlitex.ExecOptions{Args: []any{"fixture.transaction.v1", int64(jid)}}); err != nil {
+		t.Fatalf("update transaction-local decision: %v", err)
+	}
+	txSel := journal.FactSelector{Kind: journal.FactDecision, DecisionKind: "fixture.transaction.v1",
+		Filter: journal.FactFilter{TaskScope: journal.FactTaskScope{Kind: journal.FactTaskAny}}}
+	conditions := journal.OperationInput{Conditions: []journal.Condition{
+		{Kind: journal.ConditionExactFact, Selector: txSel, AssertedJournalID: jid},
+		{Kind: journal.ConditionCurrentFact, Selector: txSel, AssertedJournalID: jid},
+	}}
+	if err := checkConditions(scope, conditions); err != nil {
+		t.Fatalf("transaction-local conditions: %v", err)
+	}
+	if err := sqlitex.ExecuteTransient(scope.conn, "ROLLBACK", nil); err != nil {
+		t.Fatalf("rollback condition transaction: %v", err)
+	}
+
+	if err := sqlitex.ExecuteTransient(scope.conn, "BEGIN", nil); err != nil {
+		t.Fatalf("begin post-rollback read transaction: %v", err)
+	}
+	defer func() { _ = sqlitex.ExecuteTransient(scope.conn, "ROLLBACK", nil) }()
+	if _, found, err := evaluateCurrentFactSelector(scope, txSel); err != nil || found {
+		t.Fatalf("rolled-back selector: found=%v err=%v, want absent", found, err)
+	}
+	if actual, found, err := evaluateCurrentFactSelector(scope, committedSel); err != nil || !found || actual != jid {
+		t.Fatalf("committed selector after rollback: actual=%d found=%v err=%v, want %d", actual, found, err, jid)
+	}
+}
+
+func TestFactMatcherLookupFailureRollsBackCleanly(t *testing.T) {
+	t.Parallel()
+	env := newFactCondEnv(t)
+	if _, err := env.db.Apply(env.makeDecisionOp("fixture.decision.v1")); err != nil {
+		t.Fatalf("Apply decision: %v", err)
+	}
+	sel := journal.FactSelector{Kind: journal.FactDecision, DecisionKind: "fixture.decision.v1",
+		Filter: journal.FactFilter{TaskScope: journal.FactTaskScope{Kind: journal.FactTaskAny}}}
+
+	scope, err := env.db.bindConn(context.Background())
+	if err != nil {
+		t.Fatalf("bind matcher connection: %v", err)
+	}
+	defer scope.release()
+	if err := sqlitex.ExecuteTransient(scope.conn, "BEGIN IMMEDIATE", nil); err != nil {
+		t.Fatalf("begin lookup-failure transaction: %v", err)
+	}
+	if err := sqlitex.ExecuteTransient(scope.conn, "DROP VIEW journal_attributed", nil); err != nil {
+		t.Fatalf("drop matcher dependency in transaction: %v", err)
+	}
+	_, _, lookupErr := evaluateExactFactSelector(scope, sel, 1)
+	if lookupErr == nil || !strings.Contains(lookupErr.Error(), "evaluateExactFactSelector") {
+		t.Fatalf("lookup failure = %v, want contextual matcher error", lookupErr)
+	}
+	if err := sqlitex.ExecuteTransient(scope.conn, "ROLLBACK", nil); err != nil {
+		t.Fatalf("rollback lookup-failure transaction: %v", err)
+	}
+
+	if err := sqlitex.ExecuteTransient(scope.conn, "BEGIN", nil); err != nil {
+		t.Fatalf("begin recovered lookup transaction: %v", err)
+	}
+	defer func() { _ = sqlitex.ExecuteTransient(scope.conn, "ROLLBACK", nil) }()
+	if _, found, err := evaluateCurrentFactSelector(scope, sel); err != nil || !found {
+		t.Fatalf("matcher after rollback: found=%v err=%v", found, err)
 	}
 }
 
@@ -495,25 +598,19 @@ func TestConditionExactTaskScopeFilter(t *testing.T) {
 	}
 
 	// Exact scope for env.task must find the row.
-	env.db.mu.Lock()
-	k, args, _ := buildSelectorArgs(journal.FactSelector{
+	jid, found := latestFactInLeasedTransaction(t, env.db, journal.FactSelector{
 		Kind: journal.FactDecision, DecisionKind: "fixture.scoped.v1",
 		Filter: journal.FactFilter{TaskScope: journal.FactTaskScope{Kind: journal.FactTaskExact, TaskID: env.task}},
-	}, 0)
-	jid, found, _ := env.db.latestFactSelectorLocked(k, args)
-	env.db.mu.Unlock()
+	})
 	if !found || jid <= 0 {
 		t.Fatal("Exact scope for env.task found no row")
 	}
 
 	// Exact scope for task2 must find no row.
-	env.db.mu.Lock()
-	k2, args2, _ := buildSelectorArgs(journal.FactSelector{
+	_, found2 := latestFactInLeasedTransaction(t, env.db, journal.FactSelector{
 		Kind: journal.FactDecision, DecisionKind: "fixture.scoped.v1",
 		Filter: journal.FactFilter{TaskScope: journal.FactTaskScope{Kind: journal.FactTaskExact, TaskID: task2}},
-	}, 0)
-	_, found2, _ := env.db.latestFactSelectorLocked(k2, args2)
-	env.db.mu.Unlock()
+	})
 	if found2 {
 		t.Fatal("Exact scope for task2 found a row, expected none")
 	}
