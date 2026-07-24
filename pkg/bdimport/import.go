@@ -162,21 +162,53 @@ func (imp *importer) plan() Result {
 			}
 			r.Edges++
 		}
-		if _, ok := statusForBD(iss.Status); !ok {
-			r.Warnings = append(r.Warnings, fmt.Sprintf("issue %s: unknown status %q (defaulted to open)", iss.ID, iss.Status))
-		}
-		if _, ok := taskTypeForBD(iss.IssueType); !ok {
-			r.Warnings = append(r.Warnings, fmt.Sprintf("issue %s: unknown issue_type %q (defaulted to task)", iss.ID, iss.IssueType))
-		}
-		if _, ok := priorityForBD(iss.Priority); !ok {
-			r.Warnings = append(r.Warnings, fmt.Sprintf("issue %s: priority %d out of range (clamped)", iss.ID, iss.Priority))
+		r.Warnings = append(r.Warnings, coercionWarnings(iss)...)
+	}
+	// Comments count only those attached to an imported issue; orphans are skipped and
+	// warned (mirroring execute), never counted.
+	for id, cs := range imp.commentsByIssue {
+		if _, ok := imp.byID[id]; ok {
+			r.Comments += len(cs)
 		}
 	}
-	r.Comments = 0
-	for _, cs := range imp.commentsByIssue {
-		r.Comments += len(cs)
-	}
+	r.Warnings = append(r.Warnings, imp.orphanCommentWarnings()...)
 	return r
+}
+
+// coercionWarnings returns the status/type/priority coercion warnings for one issue.
+// The dry-run plan and the primary write path share this so the two report identically
+// (no silent coercion asymmetry between them).
+func coercionWarnings(iss Issue) []string {
+	var w []string
+	if _, ok := statusForBD(iss.Status); !ok {
+		w = append(w, fmt.Sprintf("issue %s: unknown status %q (defaulted to open)", iss.ID, iss.Status))
+	}
+	if _, ok := taskTypeForBD(iss.IssueType); !ok {
+		w = append(w, fmt.Sprintf("issue %s: unknown issue_type %q (defaulted to task)", iss.ID, iss.IssueType))
+	}
+	if _, ok := priorityForBD(iss.Priority); !ok {
+		w = append(w, fmt.Sprintf("issue %s: priority %d out of range (clamped)", iss.ID, iss.Priority))
+	}
+	return w
+}
+
+// orphanCommentWarnings reports, in deterministic order, every comment whose issue_id is
+// not among the imported issues — a dropped comment that would otherwise vanish silently.
+func (imp *importer) orphanCommentWarnings() []string {
+	var ids []string
+	for id := range imp.commentsByIssue {
+		if _, ok := imp.byID[id]; !ok {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	var w []string
+	for _, id := range ids {
+		for _, c := range imp.commentsByIssue[id] {
+			w = append(w, fmt.Sprintf("comment %d: issue %s not in dump (skipped)", c.ID, id))
+		}
+	}
+	return w
 }
 
 // execute performs the import in dependency-safe order: identity/genesis, agents, then
@@ -214,6 +246,9 @@ func (imp *importer) execute() error {
 			return err
 		}
 	}
+	// Comments whose issue was never imported are dropped — surface them rather than
+	// letting them vanish silently.
+	imp.result.Warnings = append(imp.result.Warnings, imp.orphanCommentWarnings()...)
 	return nil
 }
 
@@ -355,6 +390,9 @@ func (imp *importer) importTask(iss Issue) error {
 	taskType, _ := taskTypeForBD(iss.IssueType)
 	priority, _ := priorityForBD(iss.Priority)
 	status, _ := statusForBD(iss.Status)
+	// Report every coercion/clamp in the PRIMARY write path, identically to the
+	// dry-run plan() — the two paths must not diverge in what they surface.
+	imp.result.Warnings = append(imp.result.Warnings, coercionWarnings(iss)...)
 
 	existing, err := imp.tr.Show(id)
 	switch {
@@ -498,8 +536,12 @@ func (imp *importer) importEdges(iss Issue) error {
 			continue
 		}
 		target := TaskID(imp.opts.Namespace, dep.DependsOnID)
+		// A dependency edge from hostile/degenerate bd JSON can be cycle-inducing
+		// (self-dep, 2-cycle); Session.AddEdge rejects it (ErrCycleDetected). Warn and
+		// skip that one edge rather than aborting the whole import mid-way with a
+		// partial commit — every other issue and edge still lands.
 		if err := imp.addEdge(src, target.String(), kind); err != nil {
-			return err
+			imp.warn("issue %s: %s edge to %s rejected (%v) (skipped)", iss.ID, kind, dep.DependsOnID, err)
 		}
 	}
 	return nil
