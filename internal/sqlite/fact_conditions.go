@@ -12,19 +12,12 @@ import (
 // observe the same snapshot as the effects they gate.
 //
 // Concurrent contenders: two goroutines racing a CurrentFact condition both
-// acquire the SQLite write lock via BEGIN IMMEDIATE (db.beginWriteOwnershipLocked).
+// acquire the SQLite write lock via BEGIN IMMEDIATE (scope.beginWriteOwnership).
 // The loser finds the winner's committed fact as the current row and receives
 // ConditionFailure rather than BUSY_SNAPSHOT.
 //
 // All evaluation is bounded (MaxCanonicalConditions = 64); the canonical layer
 // enforces this before Apply is called.
-
-// checkConditionsLocked is the temporary P0 adapter for operations.go. The
-// caller already owns db.conn and its write transaction; P2 deletes this adapter
-// when Apply binds its own scope.
-func (db *DB) checkConditionsLocked(in journal.OperationInput) error {
-	return checkConditions(&connScope{conn: db.conn}, in)
-}
 
 // checkConditions evaluates conditions through the caller-owned connection
 // scope and returns the first typed *journal.ConditionFailure.

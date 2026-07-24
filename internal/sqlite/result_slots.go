@@ -21,12 +21,12 @@ import (
 // an anchor journal_id, resolves all result slot bindings (including ActivityID
 // for JournalKindActivity slots), validates each binding, and returns the result.
 // It does NOT set ShortCircuited — the caller sets that for replay paths.
-// The caller must hold db.mu and be inside a transaction.
-func (db *DB) reconstructAndValidateCommittedLocked(anchor int64) (journal.CommittedResult, error) {
+// The caller owns scope.conn and its transaction.
+func (scope *connScope) reconstructAndValidateCommittedLocked(anchor int64) (journal.CommittedResult, error) {
 	res := journal.CommittedResult{Kind: journal.CommittedExact, AnchorJournalID: journal.JournalID(anchor)}
 
 	// EmittedEvents: flat task_event closure in JournalID order (§2.1, §3.2).
-	if err := sqlitex.Execute(db.conn,
+	if err := sqlitex.Execute(scope.conn,
 		`SELECT journal_id FROM journal WHERE produced_by_operation_journal_id = ?1 AND kind_id = ?2 ORDER BY journal_id ASC`,
 		&sqlitex.ExecOptions{
 			Args: []any{anchor, int(journal.JournalKindTaskEvent)},
@@ -40,7 +40,7 @@ func (db *DB) reconstructAndValidateCommittedLocked(anchor int64) (journal.Commi
 
 	// Slot-keyed result map (§3.2): resolve TaskID for task_event slots and
 	// ActivityID for activity slots. Other slot kinds carry neither.
-	if err := sqlitex.Execute(db.conn,
+	if err := sqlitex.Execute(scope.conn,
 		`SELECT s.result_slot_id, s.produced_journal_id, j.kind_id, te.task_id FROM journal_operation_result_slots s JOIN journal j ON j.journal_id = s.produced_journal_id LEFT JOIN journal_task_events te ON te.journal_id = s.produced_journal_id WHERE s.journal_id = ?1 ORDER BY s.result_slot_id ASC`,
 		&sqlitex.ExecOptions{
 			Args: []any{anchor},
@@ -68,7 +68,7 @@ func (db *DB) reconstructAndValidateCommittedLocked(anchor int64) (journal.Commi
 			continue
 		}
 		jid := int64(res.ResultSlots[i].ProducedJournalID)
-		actID, found, err := db.lookupActivityIDForJournalRowLocked(jid)
+		actID, found, err := scope.lookupActivityIDForJournalRowLocked(jid)
 		if err != nil {
 			return journal.CommittedResult{}, fmt.Errorf(
 				"reconstruct activity result slot %q (journal row %d): %w",

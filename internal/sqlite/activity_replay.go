@@ -32,7 +32,7 @@ import (
 
 // ensureActivityCreationsSchema idempotently creates journal_activity_creations.
 // Called from ensureOperationsSchema (operations.go) during DB activation.
-func (db *DB) ensureActivityCreationsSchema() error {
+func (scope *connScope) ensureActivityCreationsSchema() error {
 	ddl := []string{
 		// journal_activity_creations: one row per journaled Activity birth.
 		//   journal_id PK FK journal          → ties birth to global journal spine
@@ -41,7 +41,7 @@ func (db *DB) ensureActivityCreationsSchema() error {
 		"CREATE INDEX IF NOT EXISTS idx_journal_activity_creations_activity ON journal_activity_creations (activity_id)",
 	}
 	for _, stmt := range ddl {
-		if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
+		if err := sqlitex.ExecuteTransient(scope.conn, stmt, nil); err != nil {
 			return fmt.Errorf("ensureActivityCreationsSchema: %w", err)
 		}
 	}
@@ -49,8 +49,8 @@ func (db *DB) ensureActivityCreationsSchema() error {
 }
 
 // foldActivityCreateLocked folds one EffectActivityCreate inside Apply's write
-// transaction. The caller must hold db.mu and be inside the Apply savepoint.
-func (db *DB) foldActivityCreateLocked(in journal.OperationInput, jid int64, eff journal.Effect) error {
+// transaction. The caller owns scope.conn and the enclosing Apply savepoint.
+func (scope *connScope) foldActivityCreateLocked(in journal.OperationInput, jid int64, eff journal.Effect) error {
 	activityID := eff.ActivityID
 	if activityID.Namespace == "" {
 		return fmt.Errorf(
@@ -76,7 +76,7 @@ func (db *DB) foldActivityCreateLocked(in journal.OperationInput, jid int64, eff
 	if eff.RecordedAtOverride != nil {
 		recordedAt = *eff.RecordedAtOverride
 	}
-	if err := sqlitex.Execute(db.conn,
+	if err := sqlitex.Execute(scope.conn,
 		`INSERT INTO activities (id, agent_id, phase_id, stage_id, started_at, ended_at, notes) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
 		&sqlitex.ExecOptions{Args: []any{
 			activityID.String(), agentID.String(),
@@ -85,7 +85,7 @@ func (db *DB) foldActivityCreateLocked(in journal.OperationInput, jid int64, eff
 		}}); err != nil {
 		if isUniqueViolation(err) {
 			var claimingJournalID int64
-			if lookupErr := sqlitex.Execute(db.conn,
+			if lookupErr := sqlitex.Execute(scope.conn,
 				`SELECT journal_id FROM journal_activity_creations WHERE activity_id = ?1`,
 				&sqlitex.ExecOptions{
 					Args: []any{activityID.String()},
@@ -116,7 +116,7 @@ func (db *DB) foldActivityCreateLocked(in journal.OperationInput, jid int64, eff
 
 	// Step 2: Insert journal_activity_creations (birth record). Any failure rolls
 	// the fresh activities row back with the enclosing Apply savepoint.
-	if err := sqlitex.Execute(db.conn,
+	if err := sqlitex.Execute(scope.conn,
 		`INSERT INTO journal_activity_creations (journal_id, activity_id) VALUES (?1, ?2)`,
 		&sqlitex.ExecOptions{Args: []any{jid, activityID.String()}}); err != nil {
 		return fmt.Errorf(
@@ -131,11 +131,11 @@ func (db *DB) foldActivityCreateLocked(in journal.OperationInput, jid int64, eff
 
 // lookupActivityIDForJournalRowLocked retrieves the ActivityID for a
 // journal_activity_creations row by journal_id. Used by result-slot reconstruction.
-// The caller must hold db.mu and be inside a transaction.
-func (db *DB) lookupActivityIDForJournalRowLocked(jid int64) (ptypes.ActivityID, bool, error) {
+// The caller owns scope.conn and its transaction.
+func (scope *connScope) lookupActivityIDForJournalRowLocked(jid int64) (ptypes.ActivityID, bool, error) {
 	var actID ptypes.ActivityID
 	found := false
-	if err := sqlitex.Execute(db.conn,
+	if err := sqlitex.Execute(scope.conn,
 		`SELECT activity_id FROM journal_activity_creations WHERE journal_id = ?1`,
 		&sqlitex.ExecOptions{
 			Args: []any{jid},

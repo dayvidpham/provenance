@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -10,8 +11,8 @@ import (
 )
 
 // operations_helpers.go holds the low-level reducer steps and read-path
-// reconstruction that Apply (operations.go) composes. Every function assumes the
-// caller exclusively owns db.conn and runs inside Apply's single transaction (§9.5), so it
+// reconstruction that Apply (operations.go) composes. Every scope helper assumes
+// the caller owns scope.conn and runs inside Apply's single transaction (§9.5), so it
 // observes the state produced by all earlier effects of the same operation
 // (§9.3). LookupCommitted and the pure authorization predicate are the public
 // read surfaces.
@@ -20,7 +21,7 @@ import (
 // Row inserts
 // ---------------------------------------------------------------------------
 
-func (db *DB) insertJournalRowLocked(kind journal.JournalKind, actor journal.ActorID, recordedAt int64, pboj *int64) (int64, error) {
+func (scope *connScope) insertJournalRowLocked(kind journal.JournalKind, actor journal.ActorID, recordedAt int64, pboj *int64) (int64, error) {
 	// Anchor-only actor placement (§2.1, §10 rule 5): a subordinate row (pboj set —
 	// produced by an operation) stores actor_id NULL and derives its committing actor
 	// from its anchor (§8.5); only an anchor row (pboj nil) stores the actor. The
@@ -31,53 +32,61 @@ func (db *DB) insertJournalRowLocked(kind journal.JournalKind, actor journal.Act
 	} else {
 		actorArg = actor.String()
 	}
-	if err := sqlitex.Execute(db.conn, "INSERT INTO journal (kind_id, actor_id, recorded_at, produced_by_operation_journal_id) VALUES (?1, ?2, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{int(kind), actorArg, recordedAt, pbojArg}}); err != nil {
+	if err := sqlitex.Execute(scope.conn, "INSERT INTO journal (kind_id, actor_id, recorded_at, produced_by_operation_journal_id) VALUES (?1, ?2, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{int(kind), actorArg, recordedAt, pbojArg}}); err != nil {
 		return 0, fmt.Errorf("insert journal row (kind %s): %w", kind, err)
 	}
-	return db.conn.LastInsertRowID(), nil
+	return scope.conn.LastInsertRowID(), nil
 }
 
-func (db *DB) insertOperationRowLocked(anchor int64, in journal.OperationInput, prepared journal.CanonicalMutation) error {
+func (db *DB) insertJournalRowLocked(kind journal.JournalKind, actor journal.ActorID, recordedAt int64, pboj *int64) (int64, error) {
+	return borrowConnScope(db.conn, db.projectionTarget).insertJournalRowLocked(kind, actor, recordedAt, pboj)
+}
+
+func (scope *connScope) insertOperationRowLocked(anchor int64, in journal.OperationInput, prepared journal.CanonicalMutation) error {
 	var authArg any
 	if in.AuthorityJournalID != nil {
 		authArg = int64(*in.AuthorityJournalID)
 	}
-	if err := sqlitex.Execute(db.conn, "INSERT INTO journal_operations\n\t\t (journal_id, operation_id, authority_journal_id, command_digest, mutation_digest, mutation_encoding_version, canonical_mutation)\n\t\t VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", &sqlitex.ExecOptions{Args: []any{anchor, string(in.OperationID), authArg, in.CommandDigest, prepared.DerivedDigest(), prepared.EncodingVersion().String(), prepared.CanonicalBytes()}}); err != nil {
+	if err := sqlitex.Execute(scope.conn, "INSERT INTO journal_operations\n\t\t (journal_id, operation_id, authority_journal_id, command_digest, mutation_digest, mutation_encoding_version, canonical_mutation)\n\t\t VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", &sqlitex.ExecOptions{Args: []any{anchor, string(in.OperationID), authArg, in.CommandDigest, prepared.DerivedDigest(), prepared.EncodingVersion().String(), prepared.CanonicalBytes()}}); err != nil {
 		return fmt.Errorf("insert journal_operations for %q: %w", in.OperationID, err)
 	}
 	return nil
 }
 
-func (db *DB) insertAuthorityAssignmentTransitionLocked(jid int64, assignment journal.AssignmentID, transitionID int) error {
+func (scope *connScope) insertAuthorityAssignmentTransitionLocked(jid int64, assignment journal.AssignmentID, transitionID int) error {
 	opAuthID := fmt.Sprintf("authority--assignment--%d", jid)
-	if err := sqlitex.Execute(db.conn,
+	if err := sqlitex.Execute(scope.conn,
 		insertJournalAuthoritySQL,
 		&sqlitex.ExecOptions{Args: []any{jid, authKindAssignmentID, opAuthID}}); err != nil {
 		return fmt.Errorf("insert journal_authorities (assignment): %w", err)
 	}
-	if err := sqlitex.Execute(db.conn, "INSERT INTO journal_authority_assignment_transitions (journal_id, assignment_id, transition_id) VALUES (?1, ?2, ?3)", &sqlitex.ExecOptions{Args: []any{jid, string(assignment), transitionID}}); err != nil {
+	if err := sqlitex.Execute(scope.conn, "INSERT INTO journal_authority_assignment_transitions (journal_id, assignment_id, transition_id) VALUES (?1, ?2, ?3)", &sqlitex.ExecOptions{Args: []any{jid, string(assignment), transitionID}}); err != nil {
 		return fmt.Errorf("insert assignment transition (%s): %w", journal.AssignmentTransition(transitionID), err)
 	}
 	return nil
 }
 
-func (db *DB) insertResultSlotLocked(anchor int64, slot journal.ResultSlotID, producedJID int64) error {
+func (db *DB) insertAuthorityAssignmentTransitionLocked(jid int64, assignment journal.AssignmentID, transitionID int) error {
+	return borrowConnScope(db.conn, db.projectionTarget).insertAuthorityAssignmentTransitionLocked(jid, assignment, transitionID)
+}
+
+func (scope *connScope) insertResultSlotLocked(anchor int64, slot journal.ResultSlotID, producedJID int64) error {
 	// rule 9 own-operation integrity (§3.2, §10 rule 9): the produced row must
 	// have been produced by this same operation. Always holds on the normal path
 	// (producedJID is a row this operation just inserted), enforced anyway.
-	if err := db.requireResultSlotOwnOperationLocked(anchor, producedJID); err != nil {
+	if err := scope.requireResultSlotOwnOperationLocked(anchor, producedJID); err != nil {
 		return err
 	}
-	if err := sqlitex.Execute(db.conn, "INSERT INTO journal_operation_result_slots (journal_id, result_slot_id, produced_journal_id) VALUES (?1, ?2, ?3)", &sqlitex.ExecOptions{Args: []any{anchor, string(slot), producedJID}}); err != nil {
+	if err := sqlitex.Execute(scope.conn, "INSERT INTO journal_operation_result_slots (journal_id, result_slot_id, produced_journal_id) VALUES (?1, ?2, ?3)", &sqlitex.ExecOptions{Args: []any{anchor, string(slot), producedJID}}); err != nil {
 		return fmt.Errorf("insert result slot %q: %w", slot, err)
 	}
 	return nil
 }
 
-func (db *DB) requireResultSlotOwnOperationLocked(anchor, producedJID int64) error {
+func (scope *connScope) requireResultSlotOwnOperationLocked(anchor, producedJID int64) error {
 	var producer int64
 	var isNull = true
-	if err := sqlitex.Execute(db.conn, "SELECT produced_by_operation_journal_id FROM journal WHERE journal_id = ?1", &sqlitex.ExecOptions{Args: []any{producedJID}, ResultFunc: func(stmt *zs.Stmt) error {
+	if err := sqlitex.Execute(scope.conn, "SELECT produced_by_operation_journal_id FROM journal WHERE journal_id = ?1", &sqlitex.ExecOptions{Args: []any{producedJID}, ResultFunc: func(stmt *zs.Stmt) error {
 		if stmt.ColumnType(0) != zs.TypeNull {
 			producer = stmt.ColumnInt64(0)
 			isNull = false
@@ -96,26 +105,38 @@ func (db *DB) requireResultSlotOwnOperationLocked(anchor, producedJID int64) err
 	return nil
 }
 
-func (db *DB) insertAttributionLocked(task journal.TaskID, actor journal.ActorID, jid int64) error {
+func (db *DB) requireResultSlotOwnOperationLocked(anchor, producedJID int64) error {
+	return borrowConnScope(db.conn, db.projectionTarget).requireResultSlotOwnOperationLocked(anchor, producedJID)
+}
+
+func (scope *connScope) insertAttributionLocked(task journal.TaskID, actor journal.ActorID, jid int64) error {
 	// Targets the real task_attributions during a live Apply and the shadow
 	// attribution table during a from-empty replay derivation (§8.2, §15).
-	if err := sqlitex.Execute(db.conn,
-		db.projectionTarget.insertAttributionQuery(),
+	if err := sqlitex.Execute(scope.conn,
+		scope.projectionTarget.insertAttributionQuery(),
 		&sqlitex.ExecOptions{Args: []any{task.String(), actor.String(), jid}}); err != nil {
-		return fmt.Errorf("update %s attribution: %w", db.projectionTarget.label(), err)
+		return fmt.Errorf("update %s attribution: %w", scope.projectionTarget.label(), err)
+	}
+	return nil
+}
+
+func (db *DB) insertAttributionLocked(task journal.TaskID, actor journal.ActorID, jid int64) error {
+	return borrowConnScope(db.conn, db.projectionTarget).insertAttributionLocked(task, actor, jid)
+}
+
+func (scope *connScope) advanceWatermarkLocked(task journal.TaskID, jid int64) error {
+	// Targets the real tasks table during a live Apply and the shadow tasks table
+	// during a from-empty replay derivation (§8.1, §15).
+	if err := sqlitex.Execute(scope.conn,
+		scope.projectionTarget.advanceWatermarkQuery(),
+		&sqlitex.ExecOptions{Args: []any{jid, task.String()}}); err != nil {
+		return fmt.Errorf("advance %s task watermark: %w", scope.projectionTarget.label(), err)
 	}
 	return nil
 }
 
 func (db *DB) advanceWatermarkLocked(task journal.TaskID, jid int64) error {
-	// Targets the real tasks table during a live Apply and the shadow tasks table
-	// during a from-empty replay derivation (§8.1, §15).
-	if err := sqlitex.Execute(db.conn,
-		db.projectionTarget.advanceWatermarkQuery(),
-		&sqlitex.ExecOptions{Args: []any{jid, task.String()}}); err != nil {
-		return fmt.Errorf("advance %s task watermark: %w", db.projectionTarget.label(), err)
-	}
-	return nil
+	return borrowConnScope(db.conn, db.projectionTarget).advanceWatermarkLocked(task, jid)
 }
 
 // recomputeTaskOwnerLocked materializes the owner-responsibility projection
@@ -123,20 +144,24 @@ func (db *DB) advanceWatermarkLocked(task journal.TaskID, jid int64) error {
 // NULL when none is active. The watermark advances to jid. The SELECT reads the
 // journal spine (the source of truth, untouched by replay); the UPDATE targets the
 // projection table — real during Apply, shadow during replay (§15).
-func (db *DB) recomputeTaskOwnerLocked(task journal.TaskID, jid int64) error {
+func (scope *connScope) recomputeTaskOwnerLocked(task journal.TaskID, jid int64) error {
 	var owner any
-	if err := sqlitex.Execute(db.conn, "SELECT e.actor_id FROM journal_authority_assignment_episodes e\n\t\t JOIN journal_authority_assignment_transitions started\n\t\t   ON started.assignment_id = e.assignment_id AND started.transition_id = ?2\n\t\t WHERE e.task_id = ?1 AND e.slot_id = ?3\n\t\t   AND NOT EXISTS (SELECT ?5 FROM journal_authority_assignment_transitions ended\n\t\t                   WHERE ended.assignment_id = e.assignment_id AND ended.transition_id = ?4)\n\t\t ORDER BY started.journal_id DESC LIMIT ?6", &sqlitex.ExecOptions{
+	if err := sqlitex.Execute(scope.conn, "SELECT e.actor_id FROM journal_authority_assignment_episodes e\n\t\t JOIN journal_authority_assignment_transitions started\n\t\t   ON started.assignment_id = e.assignment_id AND started.transition_id = ?2\n\t\t WHERE e.task_id = ?1 AND e.slot_id = ?3\n\t\t   AND NOT EXISTS (SELECT ?5 FROM journal_authority_assignment_transitions ended\n\t\t                   WHERE ended.assignment_id = e.assignment_id AND ended.transition_id = ?4)\n\t\t ORDER BY started.journal_id DESC LIMIT ?6", &sqlitex.ExecOptions{
 		Args:       []any{task.String(), transitionStartedID, slotOwnerResponsibilityID, transitionEndedID, 1, 1},
 		ResultFunc: func(stmt *zs.Stmt) error { owner = stmt.ColumnText(0); return nil },
 	}); err != nil {
 		return fmt.Errorf("recompute task owner: %w", err)
 	}
-	if err := sqlitex.Execute(db.conn,
-		db.projectionTarget.updateOwnerQuery(),
+	if err := sqlitex.Execute(scope.conn,
+		scope.projectionTarget.updateOwnerQuery(),
 		&sqlitex.ExecOptions{Args: []any{owner, jid, task.String()}}); err != nil {
-		return fmt.Errorf("update %s owner: %w", db.projectionTarget.label(), err)
+		return fmt.Errorf("update %s owner: %w", scope.projectionTarget.label(), err)
 	}
 	return nil
+}
+
+func (db *DB) recomputeTaskOwnerLocked(task journal.TaskID, jid int64) error {
+	return borrowConnScope(db.conn, db.projectionTarget).recomputeTaskOwnerLocked(task, jid)
 }
 
 func (target projectionTarget) insertAttributionQuery() string {
@@ -176,41 +201,45 @@ func (target projectionTarget) updateOwnerQuery() string {
 // Episode/authority state queries (§4.4, §14)
 // ---------------------------------------------------------------------------
 
-func (db *DB) episodeStartedLocked(assignment journal.AssignmentID) (bool, error) {
-	return db.transitionExistsLocked(assignment, transitionStartedID)
+func (scope *connScope) episodeStartedLocked(assignment journal.AssignmentID) (bool, error) {
+	return scope.transitionExistsLocked(assignment, transitionStartedID)
 }
 
-func (db *DB) episodeEndedLocked(assignment journal.AssignmentID) (ended bool, exists bool, err error) {
-	exists, err = db.episodeExistsLocked(assignment)
+func (scope *connScope) episodeEndedLocked(assignment journal.AssignmentID) (ended bool, exists bool, err error) {
+	exists, err = scope.episodeExistsLocked(assignment)
 	if err != nil {
 		return false, false, err
 	}
 	if !exists {
 		return false, false, nil
 	}
-	ended, err = db.transitionExistsLocked(assignment, transitionEndedID)
+	ended, err = scope.transitionExistsLocked(assignment, transitionEndedID)
 	return ended, true, err
 }
 
-func (db *DB) episodeExistsLocked(assignment journal.AssignmentID) (bool, error) {
+func (scope *connScope) episodeExistsLocked(assignment journal.AssignmentID) (bool, error) {
 	found := false
-	if err := sqlitex.Execute(db.conn, "SELECT ?2 FROM journal_authority_assignment_episodes WHERE assignment_id = ?1", &sqlitex.ExecOptions{Args: []any{string(assignment), 1}, ResultFunc: func(*zs.Stmt) error { found = true; return nil }}); err != nil {
+	if err := sqlitex.Execute(scope.conn, "SELECT ?2 FROM journal_authority_assignment_episodes WHERE assignment_id = ?1", &sqlitex.ExecOptions{Args: []any{string(assignment), 1}, ResultFunc: func(*zs.Stmt) error { found = true; return nil }}); err != nil {
 		return false, fmt.Errorf("episode exists %q: %w", assignment, err)
 	}
 	return found, nil
 }
 
-func (db *DB) transitionExistsLocked(assignment journal.AssignmentID, transitionID int) (bool, error) {
+func (scope *connScope) transitionExistsLocked(assignment journal.AssignmentID, transitionID int) (bool, error) {
 	found := false
-	if err := sqlitex.Execute(db.conn, "SELECT ?3 FROM journal_authority_assignment_transitions WHERE assignment_id = ?1 AND transition_id = ?2", &sqlitex.ExecOptions{Args: []any{string(assignment), transitionID, 1}, ResultFunc: func(*zs.Stmt) error { found = true; return nil }}); err != nil {
+	if err := sqlitex.Execute(scope.conn, "SELECT ?3 FROM journal_authority_assignment_transitions WHERE assignment_id = ?1 AND transition_id = ?2", &sqlitex.ExecOptions{Args: []any{string(assignment), transitionID, 1}, ResultFunc: func(*zs.Stmt) error { found = true; return nil }}); err != nil {
 		return false, fmt.Errorf("transition exists %q/%d: %w", assignment, transitionID, err)
 	}
 	return found, nil
 }
 
-func (db *DB) episodeTaskLocked(assignment journal.AssignmentID) (journal.TaskID, error) {
+func (db *DB) transitionExistsLocked(assignment journal.AssignmentID, transitionID int) (bool, error) {
+	return borrowConnScope(db.conn, db.projectionTarget).transitionExistsLocked(assignment, transitionID)
+}
+
+func (scope *connScope) episodeTaskLocked(assignment journal.AssignmentID) (journal.TaskID, error) {
 	var raw string
-	if err := sqlitex.Execute(db.conn, "SELECT task_id FROM journal_authority_assignment_episodes WHERE assignment_id = ?1", &sqlitex.ExecOptions{Args: []any{string(assignment)}, ResultFunc: func(stmt *zs.Stmt) error { raw = stmt.ColumnText(0); return nil }}); err != nil {
+	if err := sqlitex.Execute(scope.conn, "SELECT task_id FROM journal_authority_assignment_episodes WHERE assignment_id = ?1", &sqlitex.ExecOptions{Args: []any{string(assignment)}, ResultFunc: func(stmt *zs.Stmt) error { raw = stmt.ColumnText(0); return nil }}); err != nil {
 		return journal.TaskID{}, fmt.Errorf("episode task %q: %w", assignment, err)
 	}
 	if raw == "" {
@@ -222,8 +251,8 @@ func (db *DB) episodeTaskLocked(assignment journal.AssignmentID) (journal.TaskID
 // episodeParentLocked returns the ParentAssignmentID citation of an episode
 // (§4.4, §14.5). hasParent is false when the episode cites no parent (NULL
 // parent_assignment_id) or does not exist.
-func (db *DB) episodeParentLocked(assignment journal.AssignmentID) (parent journal.AssignmentID, hasParent bool, err error) {
-	if execErr := sqlitex.Execute(db.conn, "SELECT parent_assignment_id FROM journal_authority_assignment_episodes WHERE assignment_id = ?1", &sqlitex.ExecOptions{Args: []any{string(assignment)}, ResultFunc: func(stmt *zs.Stmt) error {
+func (scope *connScope) episodeParentLocked(assignment journal.AssignmentID) (parent journal.AssignmentID, hasParent bool, err error) {
+	if execErr := sqlitex.Execute(scope.conn, "SELECT parent_assignment_id FROM journal_authority_assignment_episodes WHERE assignment_id = ?1", &sqlitex.ExecOptions{Args: []any{string(assignment)}, ResultFunc: func(stmt *zs.Stmt) error {
 		if stmt.ColumnType(0) != zs.TypeNull {
 			parent = journal.AssignmentID(stmt.ColumnText(0))
 			hasParent = parent != ""
@@ -239,9 +268,9 @@ func (db *DB) episodeParentLocked(assignment journal.AssignmentID) (parent journ
 // transition committed at a journal position strictly before beforeJID (§14.5
 // position-aware liveness). It is the position-scoped variant of
 // transitionExistsLocked, which considers transitions at any position.
-func (db *DB) transitionExistsBeforeLocked(assignment journal.AssignmentID, transitionID int, beforeJID int64) (bool, error) {
+func (scope *connScope) transitionExistsBeforeLocked(assignment journal.AssignmentID, transitionID int, beforeJID int64) (bool, error) {
 	found := false
-	if err := sqlitex.Execute(db.conn, "SELECT ?4 FROM journal_authority_assignment_transitions\n\t\t WHERE assignment_id = ?1 AND transition_id = ?2 AND journal_id < ?3 LIMIT ?5", &sqlitex.ExecOptions{Args: []any{string(assignment), transitionID, beforeJID, 1, 1}, ResultFunc: func(*zs.Stmt) error { found = true; return nil }}); err != nil {
+	if err := sqlitex.Execute(scope.conn, "SELECT ?4 FROM journal_authority_assignment_transitions\n\t\t WHERE assignment_id = ?1 AND transition_id = ?2 AND journal_id < ?3 LIMIT ?5", &sqlitex.ExecOptions{Args: []any{string(assignment), transitionID, beforeJID, 1, 1}, ResultFunc: func(*zs.Stmt) error { found = true; return nil }}); err != nil {
 		return false, fmt.Errorf("transition-before %q/%d < %d: %w", assignment, transitionID, beforeJID, err)
 	}
 	return found, nil
@@ -253,24 +282,24 @@ func (db *DB) transitionExistsBeforeLocked(assignment journal.AssignmentID, tran
 // time" — used both for the citation guard (at the start transition's own
 // position) and for whole-chain liveness in the governance walk (at the consuming
 // effect's position).
-func (db *DB) episodeActiveAtLocked(assignment journal.AssignmentID, beforeJID int64) (bool, error) {
-	started, err := db.transitionExistsBeforeLocked(assignment, transitionStartedID, beforeJID)
+func (scope *connScope) episodeActiveAtLocked(assignment journal.AssignmentID, beforeJID int64) (bool, error) {
+	started, err := scope.transitionExistsBeforeLocked(assignment, transitionStartedID, beforeJID)
 	if err != nil {
 		return false, err
 	}
 	if !started {
 		return false, nil
 	}
-	ended, err := db.transitionExistsBeforeLocked(assignment, transitionEndedID, beforeJID)
+	ended, err := scope.transitionExistsBeforeLocked(assignment, transitionEndedID, beforeJID)
 	if err != nil {
 		return false, err
 	}
 	return !ended, nil
 }
 
-func (db *DB) taskHasActiveOwnerEpisodeLocked(task journal.TaskID) (bool, error) {
+func (scope *connScope) taskHasActiveOwnerEpisodeLocked(task journal.TaskID) (bool, error) {
 	found := false
-	if err := sqlitex.Execute(db.conn, "SELECT ?5 FROM journal_authority_assignment_episodes e\n\t\t WHERE e.task_id = ?1 AND e.slot_id = ?2\n\t\t   AND EXISTS (SELECT ?6 FROM journal_authority_assignment_transitions s WHERE s.assignment_id = e.assignment_id AND s.transition_id = ?3)\n\t\t   AND NOT EXISTS (SELECT ?7 FROM journal_authority_assignment_transitions x WHERE x.assignment_id = e.assignment_id AND x.transition_id = ?4)\n\t\t LIMIT ?8", &sqlitex.ExecOptions{
+	if err := sqlitex.Execute(scope.conn, "SELECT ?5 FROM journal_authority_assignment_episodes e\n\t\t WHERE e.task_id = ?1 AND e.slot_id = ?2\n\t\t   AND EXISTS (SELECT ?6 FROM journal_authority_assignment_transitions s WHERE s.assignment_id = e.assignment_id AND s.transition_id = ?3)\n\t\t   AND NOT EXISTS (SELECT ?7 FROM journal_authority_assignment_transitions x WHERE x.assignment_id = e.assignment_id AND x.transition_id = ?4)\n\t\t LIMIT ?8", &sqlitex.ExecOptions{
 		Args:       []any{task.String(), slotOwnerResponsibilityID, transitionStartedID, transitionEndedID, 1, 1, 1, 1},
 		ResultFunc: func(*zs.Stmt) error { found = true; return nil },
 	}); err != nil {
@@ -283,16 +312,16 @@ func (db *DB) taskHasActiveOwnerEpisodeLocked(task journal.TaskID) (bool, error)
 // Genesis + authority scope validation (§4.6, §9.3, §10 rules 6-7, §14.1)
 // ---------------------------------------------------------------------------
 
-func (db *DB) operationCountLocked() (int, error) {
+func (scope *connScope) operationCountLocked() (int, error) {
 	var n int
-	if err := sqlitex.Execute(db.conn, "SELECT COUNT(*) FROM journal_operations", &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
+	if err := sqlitex.Execute(scope.conn, "SELECT COUNT(*) FROM journal_operations", &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
 		return 0, fmt.Errorf("count operations: %w", err)
 	}
 	return n, nil
 }
 
-func (db *DB) validateGenesisLocked(in journal.OperationInput) error {
-	count, err := db.operationCountLocked()
+func (scope *connScope) validateGenesisLocked(in journal.OperationInput) error {
+	count, err := scope.operationCountLocked()
 	if err != nil {
 		return err
 	}
@@ -314,9 +343,9 @@ func (db *DB) validateGenesisLocked(in journal.OperationInput) error {
 	return nil
 }
 
-func (db *DB) requireAuthorityExistsLocked(authJID journal.JournalID) error {
+func (scope *connScope) requireAuthorityExistsLocked(authJID journal.JournalID) error {
 	found := false
-	if err := sqlitex.Execute(db.conn, "SELECT ?2 FROM journal_authorities WHERE journal_id = ?1", &sqlitex.ExecOptions{Args: []any{int64(authJID), 1}, ResultFunc: func(*zs.Stmt) error { found = true; return nil }}); err != nil {
+	if err := sqlitex.Execute(scope.conn, "SELECT ?2 FROM journal_authorities WHERE journal_id = ?1", &sqlitex.ExecOptions{Args: []any{int64(authJID), 1}, ResultFunc: func(*zs.Stmt) error { found = true; return nil }}); err != nil {
 		return fmt.Errorf("require authority %d: %w", authJID, err)
 	}
 	if !found {
@@ -329,16 +358,20 @@ func (db *DB) requireAuthorityExistsLocked(authJID journal.JournalID) error {
 	return nil
 }
 
+func (db *DB) requireAuthorityExistsLocked(authJID journal.JournalID) error {
+	return borrowConnScope(db.conn, db.projectionTarget).requireAuthorityExistsLocked(authJID)
+}
+
 // requireAuthorityGovernsLocked authorizes a task-bearing effect against the
 // operation's authority at the effect's own JournalID (§9.3, §14.1). A genesis
 // operation never reaches here (its sole effect is a bootstrap, task-free).
-func (db *DB) requireAuthorityGovernsLocked(in journal.OperationInput, effectJID int64, task journal.TaskID) error {
+func (scope *connScope) requireAuthorityGovernsLocked(in journal.OperationInput, effectJID int64, task journal.TaskID) error {
 	if in.AuthorityJournalID == nil {
 		return fmt.Errorf(
 			"%w: a task-bearing effect on %q requires a non-NULL authority (§4.6 restricts NULL "+
 				"authority to a genesis operation's sole bootstrap effect)", journal.ErrGenesis, task)
 	}
-	governs, err := db.authorityGovernsTaskAtLocked(*in.AuthorityJournalID, task, effectJID)
+	governs, err := scope.authorityGovernsTaskAtLocked(*in.AuthorityJournalID, task, effectJID)
 	if err != nil {
 		return err
 	}
@@ -353,6 +386,10 @@ func (db *DB) requireAuthorityGovernsLocked(in journal.OperationInput, effectJID
 	return nil
 }
 
+func (db *DB) requireAuthorityGovernsLocked(in journal.OperationInput, effectJID int64, task journal.TaskID) error {
+	return borrowConnScope(db.conn, db.projectionTarget).requireAuthorityGovernsLocked(in, effectJID, task)
+}
+
 // authorityGovernsTaskAtLocked answers whether the authority at authJID governs
 // targetTask for an effect committed at beforeJID (§9.3, §14.5): a bootstrap
 // authority (the system root) governs every task; an assignment authority governs
@@ -363,19 +400,19 @@ func (db *DB) requireAuthorityGovernsLocked(in journal.OperationInput, effectJID
 // one is NOT governed (§14.1); only deliberate parent citations cross tasks. The
 // authority must strictly precede the effect by JournalID (never by RecordedAt,
 // §12).
-func (db *DB) authorityGovernsTaskAtLocked(authJID journal.JournalID, targetTask journal.TaskID, beforeJID int64) (bool, error) {
+func (scope *connScope) authorityGovernsTaskAtLocked(authJID journal.JournalID, targetTask journal.TaskID, beforeJID int64) (bool, error) {
 	if int64(authJID) >= beforeJID {
 		return false, nil // authority does not precede the effect (§9.3)
 	}
 	var kind = -1
-	if err := sqlitex.Execute(db.conn, "SELECT authority_kind_id FROM journal_authorities WHERE journal_id = ?1", &sqlitex.ExecOptions{Args: []any{int64(authJID)}, ResultFunc: func(stmt *zs.Stmt) error { kind = stmt.ColumnInt(0); return nil }}); err != nil {
+	if err := sqlitex.Execute(scope.conn, "SELECT authority_kind_id FROM journal_authorities WHERE journal_id = ?1", &sqlitex.ExecOptions{Args: []any{int64(authJID)}, ResultFunc: func(stmt *zs.Stmt) error { kind = stmt.ColumnInt(0); return nil }}); err != nil {
 		return false, fmt.Errorf("authority kind %d: %w", authJID, err)
 	}
 	switch kind {
 	case authKindBootstrapID:
 		return true, nil
 	case authKindAssignmentID:
-		return db.assignmentAuthorityGovernsLocked(authJID, targetTask, beforeJID)
+		return scope.assignmentAuthorityGovernsLocked(authJID, targetTask, beforeJID)
 	default:
 		return false, nil // unknown/absent authority governs nothing
 	}
@@ -389,10 +426,10 @@ func (db *DB) authorityGovernsTaskAtLocked(authJID journal.JournalID, targetTask
 // ancestor up to E — active at beforeJID. The walk is bounded and visited-tracked;
 // a corrupted stored chain that cycles fails closed with ErrCorruptParentChain
 // rather than looping.
-func (db *DB) assignmentAuthorityGovernsLocked(authJID journal.JournalID, targetTask journal.TaskID, beforeJID int64) (bool, error) {
+func (scope *connScope) assignmentAuthorityGovernsLocked(authJID journal.JournalID, targetTask journal.TaskID, beforeJID int64) (bool, error) {
 	// Resolve the assignment episode this authority (a transition row) belongs to.
 	var authEpisode string
-	if err := sqlitex.Execute(db.conn, "SELECT assignment_id FROM journal_authority_assignment_transitions WHERE journal_id = ?1", &sqlitex.ExecOptions{Args: []any{int64(authJID)}, ResultFunc: func(stmt *zs.Stmt) error { authEpisode = stmt.ColumnText(0); return nil }}); err != nil {
+	if err := sqlitex.Execute(scope.conn, "SELECT assignment_id FROM journal_authority_assignment_transitions WHERE journal_id = ?1", &sqlitex.ExecOptions{Args: []any{int64(authJID)}, ResultFunc: func(stmt *zs.Stmt) error { authEpisode = stmt.ColumnText(0); return nil }}); err != nil {
 		return false, fmt.Errorf("authority assignment %d: %w", authJID, err)
 	}
 	if authEpisode == "" {
@@ -401,7 +438,7 @@ func (db *DB) assignmentAuthorityGovernsLocked(authJID journal.JournalID, target
 	authAssignment := journal.AssignmentID(authEpisode)
 	// The authority's own episode E must itself be active at the effect position:
 	// an ended authority governs nothing, directly or by delegation.
-	authActive, err := db.episodeActiveAtLocked(authAssignment, beforeJID)
+	authActive, err := scope.episodeActiveAtLocked(authAssignment, beforeJID)
 	if err != nil {
 		return false, err
 	}
@@ -409,7 +446,7 @@ func (db *DB) assignmentAuthorityGovernsLocked(authJID journal.JournalID, target
 		return false, nil
 	}
 	// (a) Direct: the authority's own episode task.
-	authTask, err := db.episodeTaskLocked(authAssignment)
+	authTask, err := scope.episodeTaskLocked(authAssignment)
 	if err != nil {
 		return false, err
 	}
@@ -418,19 +455,19 @@ func (db *DB) assignmentAuthorityGovernsLocked(authJID journal.JournalID, target
 	}
 	// (b) Transitive: some active episode on targetTask reaches E by parent
 	// citations, every episode on the chain active at beforeJID.
-	starts, err := db.episodesOnTaskLocked(targetTask)
+	starts, err := scope.episodesOnTaskLocked(targetTask)
 	if err != nil {
 		return false, err
 	}
 	for _, start := range starts {
-		active, err := db.episodeActiveAtLocked(start, beforeJID)
+		active, err := scope.episodeActiveAtLocked(start, beforeJID)
 		if err != nil {
 			return false, err
 		}
 		if !active {
 			continue // an inactive child episode roots no live delegation chain
 		}
-		reached, err := db.parentChainReachesLocked(start, authAssignment, beforeJID)
+		reached, err := scope.parentChainReachesLocked(start, authAssignment, beforeJID)
 		if err != nil {
 			return false, err // corrupted cyclic chain — fail closed (§14.5)
 		}
@@ -443,9 +480,9 @@ func (db *DB) assignmentAuthorityGovernsLocked(authJID journal.JournalID, target
 
 // episodesOnTaskLocked returns every episode whose task is `task` (§14.5 walk
 // entry points). A task typically has few episodes.
-func (db *DB) episodesOnTaskLocked(task journal.TaskID) ([]journal.AssignmentID, error) {
+func (scope *connScope) episodesOnTaskLocked(task journal.TaskID) ([]journal.AssignmentID, error) {
 	var out []journal.AssignmentID
-	if err := sqlitex.Execute(db.conn, "SELECT assignment_id FROM journal_authority_assignment_episodes WHERE task_id = ?1", &sqlitex.ExecOptions{Args: []any{task.String()}, ResultFunc: func(stmt *zs.Stmt) error {
+	if err := sqlitex.Execute(scope.conn, "SELECT assignment_id FROM journal_authority_assignment_episodes WHERE task_id = ?1", &sqlitex.ExecOptions{Args: []any{task.String()}, ResultFunc: func(stmt *zs.Stmt) error {
 		out = append(out, journal.AssignmentID(stmt.ColumnText(0)))
 		return nil
 	}}); err != nil {
@@ -460,12 +497,12 @@ func (db *DB) episodesOnTaskLocked(task journal.TaskID) ([]journal.AssignmentID,
 // active). It fails closed with ErrCorruptParentChain when a cycle is detected
 // (a revisited episode or a step past the bounded cap), so a corrupted stored
 // chain halts authorization rather than looping (§14.5).
-func (db *DB) parentChainReachesLocked(start, target journal.AssignmentID, beforeJID int64) (bool, error) {
+func (scope *connScope) parentChainReachesLocked(start, target journal.AssignmentID, beforeJID int64) (bool, error) {
 	visited := map[journal.AssignmentID]struct{}{}
 	cur := start
 	// Defense-in-depth bound: the number of episodes is a hard ceiling on any
 	// acyclic chain length; the visited set is the primary cycle guard.
-	maxSteps, err := db.countEpisodesLocked()
+	maxSteps, err := scope.countEpisodesLocked()
 	if err != nil {
 		return false, err
 	}
@@ -482,7 +519,7 @@ func (db *DB) parentChainReachesLocked(start, target journal.AssignmentID, befor
 					"the journal", journal.ErrCorruptParentChain, start, cur, target)
 		}
 		visited[cur] = struct{}{}
-		parent, hasParent, err := db.episodeParentLocked(cur)
+		parent, hasParent, err := scope.episodeParentLocked(cur)
 		if err != nil {
 			return false, err
 		}
@@ -491,7 +528,7 @@ func (db *DB) parentChainReachesLocked(start, target journal.AssignmentID, befor
 		}
 		// Each cited ancestor on the chain must be active at the effect position;
 		// a chain broken by an ended middle episode delegates nothing past it.
-		active, err := db.episodeActiveAtLocked(parent, beforeJID)
+		active, err := scope.episodeActiveAtLocked(parent, beforeJID)
 		if err != nil {
 			return false, err
 		}
@@ -502,9 +539,9 @@ func (db *DB) parentChainReachesLocked(start, target journal.AssignmentID, befor
 	}
 }
 
-func (db *DB) countEpisodesLocked() (int, error) {
+func (scope *connScope) countEpisodesLocked() (int, error) {
 	var n int
-	if err := sqlitex.Execute(db.conn, "SELECT COUNT(*) FROM journal_authority_assignment_episodes", &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
+	if err := sqlitex.Execute(scope.conn, "SELECT COUNT(*) FROM journal_authority_assignment_episodes", &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
 		return 0, fmt.Errorf("count episodes: %w", err)
 	}
 	return n, nil
@@ -514,11 +551,11 @@ func (db *DB) countEpisodesLocked() (int, error) {
 // ParentAssignmentID citation (§14.5): the cited parent must exist and be active
 // at this start transition's own journal position startJID, and the citation must
 // not create a cycle. It returns nil for an empty (absent) citation.
-func (db *DB) requireParentCitationValidLocked(newEpisode, parent journal.AssignmentID, startJID int64) error {
+func (scope *connScope) requireParentCitationValidLocked(newEpisode, parent journal.AssignmentID, startJID int64) error {
 	if parent == "" {
 		return nil
 	}
-	exists, err := db.episodeExistsLocked(parent)
+	exists, err := scope.episodeExistsLocked(parent)
 	if err != nil {
 		return err
 	}
@@ -529,7 +566,7 @@ func (db *DB) requireParentCitationValidLocked(newEpisode, parent journal.Assign
 				"episode, or omit the parent citation",
 			journal.ErrParentCitation, parent)
 	}
-	active, err := db.episodeActiveAtLocked(parent, startJID)
+	active, err := scope.episodeActiveAtLocked(parent, startJID)
 	if err != nil {
 		return err
 	}
@@ -545,17 +582,17 @@ func (db *DB) requireParentCitationValidLocked(newEpisode, parent journal.Assign
 	// ancestry. With citation-at-start the new AssignmentID does not yet exist, so
 	// this is structurally impossible for honest input; the bounded, visited-
 	// tracked walk still fails closed on a forged/corrupt ancestry.
-	return db.requireNoParentCycleLocked(newEpisode, parent)
+	return scope.requireNoParentCycleLocked(newEpisode, parent)
 }
 
 // requireNoParentCycleLocked walks the parent's existing ancestry and rejects a
 // citation that would place newEpisode in its own ancestry (a cycle), or that
 // traverses a pre-existing corrupt cycle (§14.5). Liveness is not consulted here —
 // a cycle is a structural property of the stored chain.
-func (db *DB) requireNoParentCycleLocked(newEpisode, parent journal.AssignmentID) error {
+func (scope *connScope) requireNoParentCycleLocked(newEpisode, parent journal.AssignmentID) error {
 	visited := map[journal.AssignmentID]struct{}{}
 	cur := parent
-	maxSteps, err := db.countEpisodesLocked()
+	maxSteps, err := scope.countEpisodesLocked()
 	if err != nil {
 		return err
 	}
@@ -575,7 +612,7 @@ func (db *DB) requireNoParentCycleLocked(newEpisode, parent journal.AssignmentID
 				journal.ErrCorruptParentChain, parent, cur)
 		}
 		visited[cur] = struct{}{}
-		next, hasParent, err := db.episodeParentLocked(cur)
+		next, hasParent, err := scope.episodeParentLocked(cur)
 		if err != nil {
 			return err
 		}
@@ -590,12 +627,12 @@ func (db *DB) requireNoParentCycleLocked(newEpisode, parent journal.AssignmentID
 // (a provenance.task.closed effect) while leaving an active owner-responsibility
 // episode on it (§8.1 / owner_responsibility regression c): the close and the
 // episode end must not drift apart.
-func (db *DB) validateClosesEndAssignmentsLocked(anchor int64, effects []journal.Effect) error {
+func (scope *connScope) validateClosesEndAssignmentsLocked(anchor int64, effects []journal.Effect) error {
 	for _, eff := range effects {
 		if eff.Sort != journal.EffectTaskEvent || eff.EventKind != "provenance.task.closed" {
 			continue
 		}
-		active, err := db.taskHasActiveOwnerEpisodeLocked(eff.TaskID)
+		active, err := scope.taskHasActiveOwnerEpisodeLocked(eff.TaskID)
 		if err != nil {
 			return err
 		}
@@ -619,13 +656,13 @@ type storedOperation struct {
 	identity storedOperationReplayIdentity
 }
 
-func (db *DB) lookupOperationLocked(op journal.OperationID) (storedOperation, bool, error) {
+func (scope *connScope) lookupOperationLocked(op journal.OperationID) (storedOperation, bool, error) {
 	out := storedOperation{}
 	var authority *journal.JournalID
 	var commandDigest, mutationDigest, canonicalMutation []byte
 	var encodingVersion string
 	found := false
-	if err := sqlitex.Execute(db.conn, "SELECT journal_id, authority_journal_id, command_digest, mutation_digest,\n\t\t        mutation_encoding_version, canonical_mutation\n\t\t FROM journal_operations WHERE operation_id = ?1", &sqlitex.ExecOptions{Args: []any{string(op)}, ResultFunc: func(stmt *zs.Stmt) error {
+	if err := sqlitex.Execute(scope.conn, "SELECT journal_id, authority_journal_id, command_digest, mutation_digest,\n\t\t        mutation_encoding_version, canonical_mutation\n\t\t FROM journal_operations WHERE operation_id = ?1", &sqlitex.ExecOptions{Args: []any{string(op)}, ResultFunc: func(stmt *zs.Stmt) error {
 		found = true
 		out.anchor = stmt.ColumnInt64(0)
 		if stmt.ColumnType(1) != zs.TypeNull {
@@ -649,7 +686,7 @@ func (db *DB) lookupOperationLocked(op journal.OperationID) (storedOperation, bo
 	}
 	// The committing actor lives on the anchor journal row.
 	var actor journal.ActorID
-	if err := sqlitex.Execute(db.conn, "SELECT actor_id FROM journal WHERE journal_id = ?1", &sqlitex.ExecOptions{Args: []any{out.anchor}, ResultFunc: func(stmt *zs.Stmt) error {
+	if err := sqlitex.Execute(scope.conn, "SELECT actor_id FROM journal WHERE journal_id = ?1", &sqlitex.ExecOptions{Args: []any{out.anchor}, ResultFunc: func(stmt *zs.Stmt) error {
 		parsed, err := journalParseActor(stmt.ColumnText(0))
 		if err != nil {
 			return err
@@ -667,7 +704,7 @@ func (db *DB) lookupOperationLocked(op journal.OperationID) (storedOperation, bo
 // provisional UUIDs from the already committed result slots. Fixed task_create
 // effects never enter this path. Namespace, slot, order, and every non-UUID
 // operand remain part of canonical replay identity.
-func (db *DB) reconcileAllocatedTaskCreatesLocked(in journal.OperationInput, existing storedOperation) (journal.OperationInput, error) {
+func (scope *connScope) reconcileAllocatedTaskCreatesLocked(in journal.OperationInput, existing storedOperation) (journal.OperationInput, error) {
 	hasAllocation := false
 	for _, effect := range in.Effects {
 		if effect.Sort == journal.EffectTaskCreateAllocated {
@@ -686,7 +723,7 @@ func (db *DB) reconcileAllocatedTaskCreatesLocked(in journal.OperationInput, exi
 	if len(committedEffects) != len(in.Effects) {
 		return in, nil
 	}
-	result, err := db.reconstructAndValidateCommittedLocked(existing.anchor)
+	result, err := scope.reconstructAndValidateCommittedLocked(existing.anchor)
 	if err != nil {
 		return journal.OperationInput{}, err
 	}
@@ -695,7 +732,7 @@ func (db *DB) reconcileAllocatedTaskCreatesLocked(in journal.OperationInput, exi
 		slots[binding.Slot] = binding
 	}
 	var produced []journal.JournalID
-	if err := sqlitex.Execute(db.conn, "SELECT journal_id FROM journal WHERE produced_by_operation_journal_id=?1 ORDER BY journal_id", &sqlitex.ExecOptions{Args: []any{existing.anchor}, ResultFunc: func(stmt *zs.Stmt) error {
+	if err := sqlitex.Execute(scope.conn, "SELECT journal_id FROM journal WHERE produced_by_operation_journal_id=?1 ORDER BY journal_id", &sqlitex.ExecOptions{Args: []any{existing.anchor}, ResultFunc: func(stmt *zs.Stmt) error {
 		produced = append(produced, journal.JournalID(stmt.ColumnInt64(0)))
 		return nil
 	}}); err != nil {
@@ -733,9 +770,9 @@ func (db *DB) reconcileAllocatedTaskCreatesLocked(in journal.OperationInput, exi
 // errors.As(err, &*OperationConflict), and a caller switching on res.Kind sees
 // CommittedConflict (§11, §9.6). Shared by the Apply short-circuit and the
 // concurrent-insert race translation so both surface the identical typed shape.
-func (db *DB) committedOutcomeForExistingLocked(in journal.OperationInput, existing storedOperation, callerMutationDigest []byte) (journal.CommittedResult, error) {
+func (scope *connScope) committedOutcomeForExistingLocked(in journal.OperationInput, existing storedOperation, callerMutationDigest []byte) (journal.CommittedResult, error) {
 	err := compareStoredOperationIdentity(existing.identity, in, func(candidate journal.OperationInput) (journal.OperationInput, error) {
-		return db.reconcileAllocatedTaskCreatesLocked(candidate, existing)
+		return scope.reconcileAllocatedTaskCreatesLocked(candidate, existing)
 	})
 	if err != nil {
 		var conflict *journal.OperationConflict
@@ -744,7 +781,7 @@ func (db *DB) committedOutcomeForExistingLocked(in journal.OperationInput, exist
 		}
 		return journal.CommittedResult{}, err
 	}
-	res, err := db.reconstructAndValidateCommittedLocked(existing.anchor)
+	res, err := scope.reconstructAndValidateCommittedLocked(existing.anchor)
 	if err != nil {
 		return journal.CommittedResult{}, err
 	}
@@ -761,8 +798,8 @@ func (db *DB) committedOutcomeForExistingLocked(in journal.OperationInput, exist
 // this unreachable for cooperating Apply callers because the §9.4 lookup runs
 // after write ownership is acquired; it remains defense in depth for a writer
 // that bypasses that protocol.
-func (db *DB) resolveOperationIDInsertRaceLocked(in journal.OperationInput, callerMutationDigest []byte) (journal.CommittedResult, error) {
-	existing, found, err := db.lookupOperationLocked(in.OperationID)
+func (scope *connScope) resolveOperationIDInsertRaceLocked(in journal.OperationInput, callerMutationDigest []byte) (journal.CommittedResult, error) {
+	existing, found, err := scope.lookupOperationLocked(in.OperationID)
 	if err != nil {
 		return journal.CommittedResult{}, err
 	}
@@ -774,7 +811,11 @@ func (db *DB) resolveOperationIDInsertRaceLocked(in journal.OperationInput, call
 		// be observed from this transaction's snapshot.
 		return journal.CommittedResult{}, fmt.Errorf("%w: OperationID %q lost a concurrent insert but the winning row is not visible — where: insert-race structural replay; when: after UNIQUE rejection; impact: no caller conflict axis can be classified and nothing additional is committed; fix: retry after opening a fresh transaction so the winning canonical row can be compared", journal.ErrProjectionDivergence, in.OperationID)
 	}
-	return db.committedOutcomeForExistingLocked(in, existing, callerMutationDigest)
+	return scope.committedOutcomeForExistingLocked(in, existing, callerMutationDigest)
+}
+
+func (db *DB) resolveOperationIDInsertRaceLocked(in journal.OperationInput, callerMutationDigest []byte) (journal.CommittedResult, error) {
+	return borrowConnScope(db.conn, db.projectionTarget).resolveOperationIDInsertRaceLocked(in, callerMutationDigest)
 }
 
 // LookupCommitted returns the committed result for an OperationID (§9.4): the
@@ -784,16 +825,19 @@ func (db *DB) LookupCommitted(op journal.OperationID) (journal.CommittedResult, 
 	if err := journal.ValidateOperationID(op); err != nil {
 		return journal.CommittedResult{}, fmt.Errorf("LookupCommitted: %w", err)
 	}
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	stored, found, err := db.lookupOperationLocked(op)
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
+	if err != nil {
+		return journal.CommittedResult{}, fmt.Errorf("LookupCommitted: lease pooled connection: %w", err)
+	}
+	defer scope.release()
+	stored, found, err := scope.lookupOperationLocked(op)
 	if err != nil {
 		return journal.CommittedResult{}, err
 	}
 	if !found {
 		return journal.CommittedResult{Kind: journal.CommittedAbsent}, nil
 	}
-	return db.reconstructAndValidateCommittedLocked(stored.anchor)
+	return scope.reconstructAndValidateCommittedLocked(stored.anchor)
 }
 
 // AuthorityGovernsTaskAt is the pure authorization predicate (§9.3, §14.1),
@@ -801,19 +845,25 @@ func (db *DB) LookupCommitted(op journal.OperationID) (journal.CommittedResult, 
 // authority committed after an effect (greater JournalID) never authorizes it,
 // regardless of RecordedAt (§12).
 func (db *DB) AuthorityGovernsTaskAt(authJID journal.JournalID, task journal.TaskID, beforeJID journal.JournalID) (bool, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	return db.authorityGovernsTaskAtLocked(authJID, task, int64(beforeJID))
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
+	if err != nil {
+		return false, fmt.Errorf("AuthorityGovernsTaskAt: lease pooled connection: %w", err)
+	}
+	defer scope.release()
+	return scope.authorityGovernsTaskAtLocked(authJID, task, int64(beforeJID))
 }
 
 // CountAuthoritiesOfKind returns how many journal_authorities rows carry the
 // given authority_kind_id. It is an audit/read helper (e.g. asserting a genesis
 // retry created no second bootstrap authority).
 func (db *DB) CountAuthoritiesOfKind(kind int) (int, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
+	if err != nil {
+		return 0, fmt.Errorf("CountAuthoritiesOfKind: lease pooled connection: %w", err)
+	}
+	defer scope.release()
 	var n int
-	if err := sqlitex.Execute(db.conn, "SELECT COUNT(*) FROM journal_authorities WHERE authority_kind_id = ?1", &sqlitex.ExecOptions{Args: []any{kind}, ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
+	if err := sqlitex.Execute(scope.conn, "SELECT COUNT(*) FROM journal_authorities WHERE authority_kind_id = ?1", &sqlitex.ExecOptions{Args: []any{kind}, ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
 		return 0, fmt.Errorf("CountAuthoritiesOfKind %d: %w", kind, err)
 	}
 	return n, nil
@@ -823,10 +873,13 @@ func (db *DB) CountAuthoritiesOfKind(kind int) (int, error) {
 // (i.e. were created by a transfer). It is an audit/read helper used to prove a
 // losing CAS transfer wrote nothing.
 func (db *DB) CountSuccessorEpisodes(task journal.TaskID) (int, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
+	if err != nil {
+		return 0, fmt.Errorf("CountSuccessorEpisodes: lease pooled connection: %w", err)
+	}
+	defer scope.release()
 	var n int
-	if err := sqlitex.Execute(db.conn, "SELECT COUNT(*) FROM journal_authority_assignment_episodes WHERE task_id = ?1 AND predecessor_assignment_id IS NOT ?2", &sqlitex.ExecOptions{Args: []any{task.String(), nil}, ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
+	if err := sqlitex.Execute(scope.conn, "SELECT COUNT(*) FROM journal_authority_assignment_episodes WHERE task_id = ?1 AND predecessor_assignment_id IS NOT ?2", &sqlitex.ExecOptions{Args: []any{task.String(), nil}, ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
 		return 0, fmt.Errorf("CountSuccessorEpisodes %q: %w", task, err)
 	}
 	return n, nil

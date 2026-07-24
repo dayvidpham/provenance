@@ -189,7 +189,7 @@ func latestFactSelector(scope *connScope, kind factSelectorKind, args []any) (jo
 // latestFactSelectorLocked is the P0 compatibility adapter for unchanged
 // callers that already own db.conn. P2 deletes it with the legacy connection.
 func (db *DB) latestFactSelectorLocked(kind factSelectorKind, args []any) (journal.JournalID, bool, error) {
-	return latestFactSelector(&connScope{conn: db.conn}, kind, args)
+	return latestFactSelector(borrowConnScope(db.conn, db.projectionTarget), kind, args)
 }
 
 // ---------------------------------------------------------------------------

@@ -36,7 +36,7 @@ import (
 // (§9.3), validates a blocked_by edge-add for cycles, and writes the journal_task_events
 // subtype row with the fixed per-family kind and the operand payload. The domain write is
 // deferred to the shared projection step so it is reproducible from history.
-func (db *DB) foldMutationFamilyLocked(in journal.OperationInput, jid int64, eff journal.Effect) error {
+func (scope *connScope) foldMutationFamilyLocked(in journal.OperationInput, jid int64, eff journal.Effect) error {
 	if eff.TaskID.Namespace == "" {
 		return fmt.Errorf(
 			"provenance: operation %q %s effect has an empty subject task id — where: mutation-family fold "+
@@ -45,14 +45,14 @@ func (db *DB) foldMutationFamilyLocked(in journal.OperationInput, jid int64, eff
 	}
 	// Same per-effect authorization discipline as a task_event (§9.3): the committing
 	// authority must govern the subject/source task at this effect's own JournalID.
-	if err := db.requireAuthorityGovernsLocked(in, jid, eff.TaskID); err != nil {
+	if err := scope.requireAuthorityGovernsLocked(in, jid, eff.TaskID); err != nil {
 		return err
 	}
 	kind, ok := journal.MutationFamilyKindForSort(eff.Sort)
 	if !ok {
 		return fmt.Errorf("provenance: operation %q effect sort %s is not a mutation family", in.OperationID, eff.Sort)
 	}
-	payload, err := db.encodeMutationFamilyPayload(eff)
+	payload, err := encodeMutationFamilyPayload(eff)
 	if err != nil {
 		return fmt.Errorf("Apply: operation %q: %w", in.OperationID, err)
 	}
@@ -61,7 +61,7 @@ func (db *DB) foldMutationFamilyLocked(in journal.OperationInput, jid int64, eff
 	// so a cycle-free journal keeps the graph acyclic. Replay never re-validates — it only
 	// reconstructs — so the check lives here, not in the projection step.
 	if eff.Sort == journal.EffectEdgeAdd && eff.EdgeRelKind == ptypes.EdgeBlockedBy {
-		creates, cerr := db.edgeCreatesCycleLocked(eff.TaskID.String(), eff.EdgeTargetID)
+		creates, cerr := scope.edgeCreatesCycleLocked(eff.TaskID.String(), eff.EdgeTargetID)
 		if cerr != nil {
 			return cerr
 		}
@@ -74,7 +74,7 @@ func (db *DB) foldMutationFamilyLocked(in journal.OperationInput, jid int64, eff
 				ptypes.ErrCycleDetected, eff.TaskID.String(), eff.EdgeTargetID)
 		}
 	}
-	if err := sqlitex.Execute(db.conn,
+	if err := sqlitex.Execute(scope.conn,
 		insertJournalTaskEventSQL,
 		&sqlitex.ExecOptions{Args: []any{jid, eff.TaskID.String(), string(kind), string(payload)}}); err != nil {
 		return fmt.Errorf("Apply: insert journal_task_events (%s): %w", kind, err)
@@ -88,14 +88,14 @@ func (db *DB) foldMutationFamilyLocked(in journal.OperationInput, jid int64, eff
 		if err != nil {
 			return fmt.Errorf("Apply: encode context (%s): %w", kind, err)
 		}
-		if err := sqlitex.Execute(db.conn, "INSERT INTO journal_task_event_contexts (event_journal_id, context_kind, context_identity, attached_by_journal_id) VALUES (?1, ?2, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{jid, string(contextKind), identity, jid}}); err != nil {
+		if err := sqlitex.Execute(scope.conn, "INSERT INTO journal_task_event_contexts (event_journal_id, context_kind, context_identity, attached_by_journal_id) VALUES (?1, ?2, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{jid, string(contextKind), identity, jid}}); err != nil {
 			return fmt.Errorf("Apply: insert context (%s): %w", kind, err)
 		}
 	}
 	return nil
 }
 
-func (db *DB) encodeMutationFamilyPayload(eff journal.Effect) ([]byte, error) {
+func encodeMutationFamilyPayload(eff journal.Effect) ([]byte, error) {
 	switch eff.Sort {
 	case journal.EffectEdgeAdd, journal.EffectEdgeRemove:
 		return journal.EncodeEdgeMutationPayload(eff.EdgeTargetID, eff.EdgeRelKind)
@@ -109,14 +109,18 @@ func (db *DB) encodeMutationFamilyPayload(eff journal.Effect) ([]byte, error) {
 	}
 }
 
+func (db *DB) encodeMutationFamilyPayload(eff journal.Effect) ([]byte, error) {
+	return encodeMutationFamilyPayload(eff)
+}
+
 // edgeCreatesCycleLocked reports whether adding a blocked_by edge source→target would
 // create a cycle in the blocked_by subgraph: it does iff source is already reachable FROM
 // target through blocked_by edges (a self-edge source==target is the degenerate cycle).
 // The bounded recursive walk reads the projection edges table (real during Apply), the
 // same table the graph store reads, so journal and graph stay consistent (§6).
-func (db *DB) edgeCreatesCycleLocked(source, target string) (bool, error) {
+func (scope *connScope) edgeCreatesCycleLocked(source, target string) (bool, error) {
 	found := false
-	if err := sqlitex.Execute(db.conn, db.projectionTarget.edgeCycleQuery(),
+	if err := sqlitex.Execute(scope.conn, scope.projectionTarget.edgeCycleQuery(),
 		&sqlitex.ExecOptions{
 			Args:       []any{target, source, int(ptypes.EdgeBlockedBy), 1, 1},
 			ResultFunc: func(*zs.Stmt) error { found = true; return nil },
@@ -136,15 +140,15 @@ func (db *DB) edgeCreatesCycleLocked(source, target string) (bool, error) {
 // tables are re-derivable solely from ordered journal history and the §15 convergence
 // check covers them. The committing-actor attribution and watermark advance are handled by
 // the caller (projectTaskEventRowLocked) around this step, exactly as for any task_event.
-func (db *DB) projectMutationFamilyRowLocked(task journal.TaskID, kind journal.EventKind, payload []byte, jid, recordedAt int64) error {
+func (scope *connScope) projectMutationFamilyRowLocked(task journal.TaskID, kind journal.EventKind, payload []byte, jid, recordedAt int64) error {
 	switch kind {
 	case journal.EventKindEdgeAdded:
 		p, err := journal.DecodeEdgeMutationPayload(payload)
 		if err != nil {
 			return err
 		}
-		if err := sqlitex.Execute(db.conn,
-			db.projectionTarget.projectEdgeAddQuery(),
+		if err := sqlitex.Execute(scope.conn,
+			scope.projectionTarget.projectEdgeAddQuery(),
 			&sqlitex.ExecOptions{Args: []any{task.String(), p.Target, int(p.EdgeKind), recordedAt}}); err != nil {
 			return fmt.Errorf("project edge-add %s->%s: %w", task, p.Target, err)
 		}
@@ -153,8 +157,8 @@ func (db *DB) projectMutationFamilyRowLocked(task journal.TaskID, kind journal.E
 		if err != nil {
 			return err
 		}
-		if err := sqlitex.Execute(db.conn,
-			db.projectionTarget.projectEdgeRemoveQuery(),
+		if err := sqlitex.Execute(scope.conn,
+			scope.projectionTarget.projectEdgeRemoveQuery(),
 			&sqlitex.ExecOptions{Args: []any{task.String(), p.Target, int(p.EdgeKind)}}); err != nil {
 			return fmt.Errorf("project edge-remove %s->%s: %w", task, p.Target, err)
 		}
@@ -163,8 +167,8 @@ func (db *DB) projectMutationFamilyRowLocked(task journal.TaskID, kind journal.E
 		if err != nil {
 			return err
 		}
-		if err := sqlitex.Execute(db.conn,
-			db.projectionTarget.projectLabelAddQuery(),
+		if err := sqlitex.Execute(scope.conn,
+			scope.projectionTarget.projectLabelAddQuery(),
 			&sqlitex.ExecOptions{Args: []any{task.String(), p.Label}}); err != nil {
 			return fmt.Errorf("project label-add %s %q: %w", task, p.Label, err)
 		}
@@ -173,8 +177,8 @@ func (db *DB) projectMutationFamilyRowLocked(task journal.TaskID, kind journal.E
 		if err != nil {
 			return err
 		}
-		if err := sqlitex.Execute(db.conn,
-			db.projectionTarget.projectLabelRemoveQuery(),
+		if err := sqlitex.Execute(scope.conn,
+			scope.projectionTarget.projectLabelRemoveQuery(),
 			&sqlitex.ExecOptions{Args: []any{task.String(), p.Label}}); err != nil {
 			return fmt.Errorf("project label-remove %s %q: %w", task, p.Label, err)
 		}
@@ -186,15 +190,19 @@ func (db *DB) projectMutationFamilyRowLocked(task journal.TaskID, kind journal.E
 		// INSERT OR IGNORE keeps a from-empty replay of the SAME journaled comment
 		// idempotent (the caller-minted id is carried in the payload, §6), so the
 		// projection reproduces exactly one row.
-		if err := sqlitex.Execute(db.conn,
-			db.projectionTarget.projectCommentAddQuery(),
+		if err := sqlitex.Execute(scope.conn,
+			scope.projectionTarget.projectCommentAddQuery(),
 			&sqlitex.ExecOptions{Args: []any{p.CommentID, task.String(), p.Author, p.Body, recordedAt}}); err != nil {
 			return fmt.Errorf("project comment-add %s %q: %w", task, p.CommentID, err)
 		}
 	default:
 		return fmt.Errorf("provenance: %q is not a journaled mutation-family kind (§6)", kind)
 	}
-	return db.advanceWatermarkLocked(task, jid)
+	return scope.advanceWatermarkLocked(task, jid)
+}
+
+func (db *DB) projectMutationFamilyRowLocked(task journal.TaskID, kind journal.EventKind, payload []byte, jid, recordedAt int64) error {
+	return borrowConnScope(db.conn, db.projectionTarget).projectMutationFamilyRowLocked(task, kind, payload, jid, recordedAt)
 }
 
 func (target projectionTarget) edgeCycleQuery() string {
