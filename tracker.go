@@ -276,16 +276,16 @@ func (t *sqliteTracker) SoftwareAgent(id AgentID) (SoftwareAgent, error) {
 // PROV-O Activities
 // ---------------------------------------------------------------------------
 
-func (t *sqliteTracker) StartActivity(agentID AgentID, phase Phase, stage Stage, notes string) (Activity, error) {
-	act, err := t.db.StartActivity(agentID, phase, stage, notes)
+func (t *sqliteTracker) StartActivity(agentID AgentID, phase Phase, stage Stage, notes string, opts ...StartActivityOption) (Activity, error) {
+	act, err := t.db.StartActivity(agentID, phase, stage, notes, resolvePlan(opts))
 	if err != nil {
 		return Activity{}, fmt.Errorf("provenance.Tracker.StartActivity: %w", err)
 	}
 	return act, nil
 }
 
-func (t *sqliteTracker) StartActivityWithID(id ActivityID, agentID AgentID, phase Phase, stage Stage, notes string) (Activity, error) {
-	act, err := t.db.StartActivityWithID(id, agentID, phase, stage, notes)
+func (t *sqliteTracker) StartActivityWithID(id ActivityID, agentID AgentID, phase Phase, stage Stage, notes string, opts ...StartActivityOption) (Activity, error) {
+	act, err := t.db.StartActivityWithID(id, agentID, phase, stage, notes, resolvePlan(opts))
 	if err != nil {
 		return Activity{}, fmt.Errorf("provenance.Tracker.StartActivityWithID: %w", err)
 	}
@@ -306,4 +306,39 @@ func (t *sqliteTracker) Activities(agentID *AgentID) ([]Activity, error) {
 		return nil, fmt.Errorf("provenance.Tracker.Activities: %w", err)
 	}
 	return activities, nil
+}
+
+// ---------------------------------------------------------------------------
+// Plans
+// ---------------------------------------------------------------------------
+
+func (t *sqliteTracker) Plans() ([]Plan, error) {
+	plans, err := t.db.GetPlans()
+	if err != nil {
+		return nil, fmt.Errorf("provenance.Tracker.Plans: %w", err)
+	}
+	return plans, nil
+}
+
+func (t *sqliteTracker) PlanSteps(id PlanID) ([]PlanStep, error) {
+	steps, err := t.db.GetPlanSteps(id)
+	if err != nil {
+		return nil, fmt.Errorf("provenance.Tracker.PlanSteps: %w", err)
+	}
+	return steps, nil
+}
+
+// ---------------------------------------------------------------------------
+// Derivation qualifiers
+// ---------------------------------------------------------------------------
+//
+// The QualifyDerivation write verb is journaled on the Session SDK (Tracker.As →
+// Session.QualifyDerivation); DerivationQualifiers reads stay on the Tracker.
+
+func (t *sqliteTracker) DerivationQualifiers(id TaskID) ([]DerivationQualifier, error) {
+	qualifiers, err := t.db.GetDerivationQualifiers(id)
+	if err != nil {
+		return nil, fmt.Errorf("provenance.Tracker.DerivationQualifiers: %w", err)
+	}
+	return qualifiers, nil
 }

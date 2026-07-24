@@ -154,16 +154,20 @@ type Tracker interface {
 	// ---------------------------------------------------------------------------
 
 	// StartActivity records the start of an activity for the given agent.
-	// A UUIDv7 ActivityID is assigned automatically.
-	StartActivity(agentID AgentID, phase Phase, stage Stage, notes string) (Activity, error)
+	// A UUIDv7 ActivityID is assigned automatically. By default the activity is
+	// recorded under the built-in "pasture-12-phase" plan; pass InPlan to pin a
+	// specific plan or Unplanned to opt out.
+	StartActivity(agentID AgentID, phase Phase, stage Stage, notes string, opts ...StartActivityOption) (Activity, error)
 
 	// StartActivityWithID records the start of an activity using a
 	// caller-supplied ActivityID, idempotently: a second call with the same id
 	// is a no-op (INSERT ... ON CONFLICT(id) DO NOTHING) returning the existing
 	// row. Use a deterministic id (e.g. a name-based UUIDv5 over the caller's
 	// logical identity) to make activity emission safe to replay, e.g. across
-	// durable-workflow recovery. Returns the canonical persisted activity.
-	StartActivityWithID(id ActivityID, agentID AgentID, phase Phase, stage Stage, notes string) (Activity, error)
+	// durable-workflow recovery. Returns the canonical persisted activity. Plan
+	// association follows StartActivity (default = built-in plan; InPlan/Unplanned
+	// override).
+	StartActivityWithID(id ActivityID, agentID AgentID, phase Phase, stage Stage, notes string, opts ...StartActivityOption) (Activity, error)
 
 	// EndActivity records the end time of an activity.
 	// Returns ErrNotFound if the activity does not exist.
@@ -172,6 +176,29 @@ type Tracker interface {
 	// Activities returns all activities, optionally filtered by agent.
 	// Pass nil to return activities for all agents.
 	Activities(agentID *AgentID) ([]Activity, error)
+
+	// ---------------------------------------------------------------------------
+	// Plans (P-Plan reification of the Phase enum)
+	// ---------------------------------------------------------------------------
+
+	// Plans returns every plan, ordered deterministically by ID. The built-in
+	// "pasture-12-phase" plan is always present (seeded at Open).
+	Plans() ([]Plan, error)
+
+	// PlanSteps returns the ordered steps of a plan (by ordinal). An unknown plan
+	// returns an empty slice.
+	PlanSteps(id PlanID) ([]PlanStep, error)
+
+	// ---------------------------------------------------------------------------
+	// Derivation qualifiers (typed :derivationKind)
+	// ---------------------------------------------------------------------------
+	//
+	// The QualifyDerivation write verb is journaled and lives on the Session SDK
+	// (Tracker.As → Session.QualifyDerivation); this read stays on Tracker.
+
+	// DerivationQualifiers returns every derivation qualifier whose SOURCE is id,
+	// ordered deterministically by target.
+	DerivationQualifiers(id TaskID) ([]DerivationQualifier, error)
 }
 
 // OpenSQLite creates a Tracker backed by a SQLite database at dbPath.

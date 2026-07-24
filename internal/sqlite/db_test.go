@@ -733,7 +733,7 @@ func TestStartAndEndActivity(t *testing.T) {
 		t.Fatalf("RegisterHumanAgent error: %v", err)
 	}
 
-	act, err := db.StartActivity(agent.ID, ptypes.PhaseWorkerSlices, ptypes.StageInProgress, "working on slice")
+	act, err := db.StartActivity(agent.ID, ptypes.PhaseWorkerSlices, ptypes.StageInProgress, "working on slice", nil)
 	if err != nil {
 		t.Fatalf("StartActivity error: %v", err)
 	}
@@ -769,7 +769,7 @@ func TestStartActivityWithID_Idempotent(t *testing.T) {
 	id1 := mkID("epoch-1/p9-worker-slices/slice/2")
 
 	// First emission inserts the row.
-	a1, err := db.StartActivityWithID(id1, agent.ID, ptypes.PhaseWorkerSlices, ptypes.StageInProgress, "slice 2")
+	a1, err := db.StartActivityWithID(id1, agent.ID, ptypes.PhaseWorkerSlices, ptypes.StageInProgress, "slice 2", nil)
 	if err != nil {
 		t.Fatalf("StartActivityWithID (1st) error: %v", err)
 	}
@@ -779,7 +779,7 @@ func TestStartActivityWithID_Idempotent(t *testing.T) {
 
 	// Replaying with the SAME id is a no-op (ON CONFLICT DO NOTHING) and returns
 	// the existing row — this is the exactly-once guarantee under crash-replay.
-	a2, err := db.StartActivityWithID(id1, agent.ID, ptypes.PhaseWorkerSlices, ptypes.StageInProgress, "slice 2 (replay)")
+	a2, err := db.StartActivityWithID(id1, agent.ID, ptypes.PhaseWorkerSlices, ptypes.StageInProgress, "slice 2 (replay)", nil)
 	if err != nil {
 		t.Fatalf("StartActivityWithID (replay) error: %v", err)
 	}
@@ -801,7 +801,7 @@ func TestStartActivityWithID_Idempotent(t *testing.T) {
 
 	// A distinct logical key -> a distinct row.
 	id2 := mkID("epoch-1/p9-worker-slices/slice/3")
-	if _, err := db.StartActivityWithID(id2, agent.ID, ptypes.PhaseWorkerSlices, ptypes.StageInProgress, "slice 3"); err != nil {
+	if _, err := db.StartActivityWithID(id2, agent.ID, ptypes.PhaseWorkerSlices, ptypes.StageInProgress, "slice 3", nil); err != nil {
 		t.Fatalf("StartActivityWithID (distinct) error: %v", err)
 	}
 	acts, err = db.GetActivities(&agent.ID)
@@ -821,10 +821,10 @@ func TestGetActivities(t *testing.T) {
 		t.Fatalf("RegisterHumanAgent error: %v", err)
 	}
 
-	if _, err := db.StartActivity(agent.ID, ptypes.PhaseRequest, ptypes.StageNotStarted, ""); err != nil {
+	if _, err := db.StartActivity(agent.ID, ptypes.PhaseRequest, ptypes.StageNotStarted, "", nil); err != nil {
 		t.Fatalf("StartActivity error: %v", err)
 	}
-	if _, err := db.StartActivity(agent.ID, ptypes.PhaseElicit, ptypes.StageInProgress, ""); err != nil {
+	if _, err := db.StartActivity(agent.ID, ptypes.PhaseElicit, ptypes.StageInProgress, "", nil); err != nil {
 		t.Fatalf("StartActivity error: %v", err)
 	}
 
@@ -905,7 +905,7 @@ func TestBoundQueryValuesRemainOpaqueAcrossTaskActivityAndEdgeReads(t *testing.T
 			if err != nil {
 				t.Fatalf("register hostile agent: %v", err)
 			}
-			if _, err := db.StartActivity(agent.ID, ptypes.PhaseRequest, ptypes.StageInProgress, hostile); err != nil {
+			if _, err := db.StartActivity(agent.ID, ptypes.PhaseRequest, ptypes.StageInProgress, hostile, nil); err != nil {
 				t.Fatalf("start hostile activity: %v", err)
 			}
 			activities, err := db.GetActivities(&agent.ID)
@@ -1355,7 +1355,7 @@ func TestStartActivity_YAMLPermutations(t *testing.T) {
 					stage := ptypes.Stage(stageVal)
 					notes := noteVar.Value
 
-					act, err := db.StartActivity(agent.ID, phase, stage, notes)
+					act, err := db.StartActivity(agent.ID, phase, stage, notes, nil)
 					if err != nil {
 						t.Fatalf("StartActivity(phase=%v, stage=%v, notes=%q) error: %v",
 							phase, stage, notes, err)
