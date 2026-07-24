@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/dayvidpham/provenance/internal/journal"
@@ -37,9 +38,12 @@ func (db *DB) SeedLegacyTaskRow(task ptypes.Task) error {
 				"test seeding seam (§13); when: before migration; impact: nothing seeded; fix: supply a " +
 				"TaskID with a non-empty namespace")
 	}
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	return db.insertLegacyTaskRowLocked(task)
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return fmt.Errorf("SeedLegacyTaskRow: lease connection: %w", err)
+	}
+	defer release()
+	return bound.insertLegacyTaskRowLocked(task)
 }
 
 // SeedLegacyTask raw-inserts one pre-journal (OLD-schema) task row so migration can
@@ -69,16 +73,19 @@ func (db *DB) SeedLegacyTask(row journal.LegacyTaskRow) error {
 		UpdatedAt: row.UpdatedAt.UTC(),
 		ClosedAt:  row.ClosedAt,
 	}
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	return db.insertLegacyTaskRowLocked(task)
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return fmt.Errorf("SeedLegacyTask: lease connection: %w", err)
+	}
+	defer release()
+	return bound.insertLegacyTaskRowLocked(task)
 }
 
 // insertLegacyTaskRowLocked is the single raw OLD-schema task-row INSERT both legacy
 // seams share (§13). It first DOWNGRADES the tasks table to the legacy nullable-watermark
 // shape (a no-op once already legacy-shaped), mirroring a pre-tightening database on
 // disk, so the legacy row can be written with no watermark (NULL); migration anchors it
-// and populates the watermark. Assumes db.mu is held.
+// and populates the watermark. Assumes db.conn is operation-owned.
 func (db *DB) insertLegacyTaskRowLocked(task ptypes.Task) error {
 	if err := db.downgradeTasksWatermarkToLegacyLocked(); err != nil {
 		return fmt.Errorf("provenance: SeedLegacyTaskRow downgrade tasks to legacy shape: %w", err)

@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/dayvidpham/provenance/internal/journal"
@@ -63,8 +64,12 @@ func (table AdversarialSubtypeTable) deleteQuery() string {
 }
 
 func (db *DB) AdversarialDeleteSubtypeRow(jid journal.JournalID, table AdversarialSubtypeTable) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return fmt.Errorf("AdversarialDeleteSubtypeRow: lease connection: %w", err)
+	}
+	defer release()
+	db = bound
 	if err := sqlitex.ExecuteTransient(db.conn, "PRAGMA foreign_keys=OFF", nil); err != nil {
 		return fmt.Errorf("AdversarialDeleteSubtypeRow %q: disable FK: %w", table, err)
 	}
@@ -87,8 +92,12 @@ func (db *DB) AdversarialDeleteSubtypeRow(jid journal.JournalID, table Adversari
 // discriminator is fixed at insert. The corpus drives VerifyIntegrity against this
 // (expecting ErrSubtypeIntegrity). newKind must differ from the row's current kind.
 func (db *DB) AdversarialRewriteDiscriminator(jid journal.JournalID, newKind journal.JournalKind) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return fmt.Errorf("AdversarialRewriteDiscriminator: lease connection: %w", err)
+	}
+	defer release()
+	db = bound
 	var current int = -1
 	if err := sqlitex.Execute(db.conn, "SELECT kind_id FROM journal WHERE journal_id = ?1", &sqlitex.ExecOptions{Args: []any{int64(jid)}, ResultFunc: func(stmt *zs.Stmt) error { current = stmt.ColumnInt(0); return nil }}); err != nil {
 		return fmt.Errorf("AdversarialRewriteDiscriminator journal_id=%d: read current kind: %w", jid, err)
@@ -117,8 +126,12 @@ func (db *DB) AdversarialRewriteDiscriminator(jid journal.JournalID, newKind jou
 // deliberately truncated state the corpus drives ReplayProjections against. n must
 // be positive and smaller than the journal length.
 func (db *DB) AdversarialTruncateTail(n int) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return fmt.Errorf("AdversarialTruncateTail: lease connection: %w", err)
+	}
+	defer release()
+	db = bound
 	if n <= 0 {
 		return fmt.Errorf("AdversarialTruncateTail: n must be positive, got %d", n)
 	}
@@ -163,8 +176,12 @@ func (db *DB) AdversarialTruncateTail(n int) error {
 // caller-supplied. gap must be positive so the row lands beyond the current tail.
 // Returns the non-contiguous JournalID it wrote.
 func (db *DB) AdversarialInsertNonContiguousSupertype(actor journal.ActorID, gap int) (journal.JournalID, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return 0, fmt.Errorf("AdversarialInsertNonContiguousSupertype: lease connection: %w", err)
+	}
+	defer release()
+	db = bound
 	if gap <= 0 {
 		return 0, fmt.Errorf("AdversarialInsertNonContiguousSupertype: gap must be positive, got %d", gap)
 	}
@@ -213,8 +230,12 @@ func (db *DB) deleteSpineRowCascadeLocked(jid int64) error {
 // ascending JournalID order, so a corpus handler can pick a concrete interior or
 // tail row to corrupt without hardcoding an id. It writes nothing.
 func (db *DB) AdversarialJournalRows() ([]journal.JournalID, []journal.JournalKind, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return nil, nil, fmt.Errorf("AdversarialJournalRows: lease connection: %w", err)
+	}
+	defer release()
+	db = bound
 	var ids []journal.JournalID
 	var kinds []journal.JournalKind
 	if err := sqlitex.Execute(db.conn, "SELECT journal_id, kind_id FROM journal ORDER BY journal_id ASC", &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {

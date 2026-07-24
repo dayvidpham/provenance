@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/dayvidpham/provenance/internal/journal"
@@ -12,8 +13,12 @@ import (
 // shape while preserving all rows and other constraints. It exists only for the
 // end-to-end migration and rollback corpus.
 func (db *DB) AdversarialRemoveJournalOperationFK() (err error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return fmt.Errorf("AdversarialRemoveJournalOperationFK: lease connection: %w", err)
+	}
+	defer release()
+	db = bound
 	if err = sqlitex.ExecuteTransient(db.conn, "PRAGMA foreign_keys=OFF", nil); err != nil {
 		return err
 	}
@@ -40,8 +45,12 @@ func (db *DB) AdversarialRemoveJournalOperationFK() (err error) {
 // AdversarialInstallV1OperationConstraint recreates the schema emitted by the
 // previous release so migration tests can prove its V1-specific SQL authority is removed.
 func (db *DB) AdversarialInstallV1OperationConstraint() (err error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return fmt.Errorf("AdversarialInstallV1OperationConstraint: lease connection: %w", err)
+	}
+	defer release()
+	db = bound
 	if err = sqlitex.ExecuteTransient(db.conn, "PRAGMA foreign_keys=OFF", nil); err != nil {
 		return err
 	}
@@ -75,8 +84,12 @@ func (db *DB) AdversarialInstallV1OperationConstraint() (err error) {
 // gives it rows in BOTH journal_decisions and journal_evidence, violating
 // subtype exclusivity (§10 rule 8). Returns the offending JournalID.
 func (db *DB) AdversarialJournalRowTwoSubtypes(actor journal.ActorID) (journal.JournalID, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return 0, fmt.Errorf("AdversarialJournalRowTwoSubtypes: lease connection: %w", err)
+	}
+	defer release()
+	db = bound
 	var txErr error
 	endTx := sqlitex.Transaction(db.conn)
 	defer endTx(&txErr)
@@ -106,8 +119,12 @@ func (db *DB) AdversarialJournalRowTwoSubtypes(actor journal.ActorID) (journal.J
 // subtype totality. Returns the offending subordinate JournalID; the caller is
 // expected to VerifyIntegrity and observe ErrActorPlacement.
 func (db *DB) AdversarialSubordinateRowCarryingActor(actor journal.ActorID, task journal.TaskID) (journal.JournalID, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return 0, fmt.Errorf("AdversarialSubordinateRowCarryingActor: lease connection: %w", err)
+	}
+	defer release()
+	db = bound
 	// Bypass the structural CHECK so the reducer-level placement guard is what
 	// catches the row (the CHECK is exercised on the production write path instead).
 	if err := sqlitex.ExecuteTransient(db.conn, "PRAGMA ignore_check_constraints=ON", nil); err != nil {
@@ -147,8 +164,12 @@ func (db *DB) AdversarialSubordinateRowCarryingActor(actor journal.ActorID, task
 // (in addition to its matching journal_decisions row) carries a journal_operations
 // subtype row, violating discriminator agreement (§10 rule 8).
 func (db *DB) AdversarialSubtypeMismatchingKind(actor journal.ActorID) (journal.JournalID, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return 0, fmt.Errorf("AdversarialSubtypeMismatchingKind: lease connection: %w", err)
+	}
+	defer release()
+	db = bound
 	var txErr error
 	endTx := sqlitex.Transaction(db.conn)
 	defer endTx(&txErr)
@@ -171,8 +192,12 @@ func (db *DB) AdversarialSubtypeMismatchingKind(actor journal.ActorID) (journal.
 // transition row to it, violating authority-level discriminator agreement
 // (§10 rule 8, second inheritance level). task must be an existing task.
 func (db *DB) AdversarialAuthorityDetailMismatch(actor journal.ActorID, task journal.TaskID) (journal.JournalID, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return 0, fmt.Errorf("AdversarialAuthorityDetailMismatch: lease connection: %w", err)
+	}
+	defer release()
+	db = bound
 	var txErr error
 	endTx := sqlitex.Transaction(db.conn)
 	defer endTx(&txErr)
@@ -205,9 +230,12 @@ func (db *DB) AdversarialAuthorityDetailMismatch(actor journal.ActorID, task jou
 // names a produced row belonging to a different operation, returning the typed
 // ErrResultSlotIntegrity the reducer would raise before commit. It writes nothing.
 func (db *DB) AdversarialForeignResultSlotRejected(anchorOp, foreignProduced journal.JournalID) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	return db.requireResultSlotOwnOperationLocked(int64(anchorOp), int64(foreignProduced))
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return fmt.Errorf("AdversarialForeignResultSlotRejected: lease connection: %w", err)
+	}
+	defer release()
+	return bound.requireResultSlotOwnOperationLocked(int64(anchorOp), int64(foreignProduced))
 }
 
 // AdversarialApplyWithFault applies one operation but injects a fault immediately
@@ -220,8 +248,12 @@ func (db *DB) AdversarialApplyWithFault(in journal.OperationInput, faultAfterEff
 	if err := validateApplyInput(in); err != nil {
 		return journal.CommittedResult{}, err
 	}
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return journal.CommittedResult{}, fmt.Errorf("AdversarialApplyWithFault: lease connection: %w", err)
+	}
+	defer release()
+	db = bound
 	hook := func(i int) error {
 		if i == faultAfterEffectIndex {
 			return fmt.Errorf("%w: fault injected after effect %d (§9.5)", journal.ErrInjectedFault, i)
@@ -237,8 +269,12 @@ func (db *DB) AdversarialApplyWithFault(in journal.OperationInput, faultAfterEff
 // migration path: every baseline written so far, not just the faulted task, must
 // roll back atomically. It writes nothing on return.
 func (db *DB) AdversarialMigrateWithFault(in journal.MigrationInput, faultAfterTaskIndex int) (journal.MigrationResult, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return journal.MigrationResult{}, fmt.Errorf("AdversarialMigrateWithFault: lease connection: %w", err)
+	}
+	defer release()
+	db = bound
 	hook := func(i int) error {
 		if i == faultAfterTaskIndex {
 			return fmt.Errorf("%w: fault injected after baseline %d (§9.5, §13)", journal.ErrMigrationFault, i)
@@ -265,8 +301,12 @@ func (addition AdversarialColumnAddition) query() string {
 }
 
 func (db *DB) AdversarialAddColumn(addition AdversarialColumnAddition) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return fmt.Errorf("AdversarialAddColumn: lease connection: %w", err)
+	}
+	defer release()
+	db = bound
 	// DDL identifiers cannot be bound as parameters; table/column come from the
 	// closed corpus, never caller input, so identifier interpolation is safe here.
 	if err := sqlitex.ExecuteTransient(db.conn, addition.query(), nil); err != nil {
@@ -292,8 +332,12 @@ func (drop AdversarialColumnDrop) query() string {
 }
 
 func (db *DB) AdversarialDropColumn(drop AdversarialColumnDrop) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return fmt.Errorf("AdversarialDropColumn: lease connection: %w", err)
+	}
+	defer release()
+	db = bound
 	// DDL identifiers cannot be bound; table/column come from the closed corpus.
 	if err := sqlitex.ExecuteTransient(db.conn, drop.query(), nil); err != nil {
 		return fmt.Errorf("AdversarialDropColumn: %w", err)
@@ -320,8 +364,12 @@ func (drop AdversarialTableDrop) query() string {
 }
 
 func (db *DB) AdversarialDropTable(drop AdversarialTableDrop) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return fmt.Errorf("AdversarialDropTable: lease connection: %w", err)
+	}
+	defer release()
+	db = bound
 	if err := sqlitex.ExecuteTransient(db.conn, "PRAGMA foreign_keys=OFF", nil); err != nil {
 		return fmt.Errorf("AdversarialDropTable: disable FK: %w", err)
 	}
@@ -340,8 +388,12 @@ func (db *DB) AdversarialDropTable(drop AdversarialTableDrop) error {
 // ErrDishonestMigrationTimestamp before any write; nothing is committed. The input
 // must carry exactly one closed, owned legacy task.
 func (db *DB) AdversarialMigrateFabricatedEndedTimestamp(in journal.MigrationInput, wallClockNanos int64) (journal.MigrationResult, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return journal.MigrationResult{}, fmt.Errorf("AdversarialMigrateFabricatedEndedTimestamp: lease connection: %w", err)
+	}
+	defer release()
+	db = bound
 	if err := db.preflightSchemaLocked(); err != nil {
 		return journal.MigrationResult{}, err
 	}
@@ -393,8 +445,12 @@ func (addition AdversarialTableAddition) query() string {
 }
 
 func (db *DB) AdversarialAddTable(addition AdversarialTableAddition) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return fmt.Errorf("AdversarialAddTable: lease connection: %w", err)
+	}
+	defer release()
+	db = bound
 	// DDL identifier cannot be bound as a parameter; table comes from the closed
 	// corpus, never caller input, so identifier interpolation is safe here.
 	if err := sqlitex.ExecuteTransient(db.conn, addition.query(), nil); err != nil {
@@ -423,8 +479,12 @@ const (
 // history would derive. The field comes from the closed AdversarialProjectionField
 // set, never free-form caller input.
 func (db *DB) AdversarialCorruptTaskProjection(task journal.TaskID, field AdversarialProjectionField, value any) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return fmt.Errorf("AdversarialCorruptTaskProjection: lease connection: %w", err)
+	}
+	defer release()
+	db = bound
 	switch field {
 	case AdversarialFieldOwner, AdversarialFieldStatus, AdversarialFieldWatermark:
 	default:
@@ -459,8 +519,12 @@ func (field AdversarialProjectionField) query() string {
 // body no ordered journal history would derive. The comment id comes from the caller's
 // committed row; body is the corpus's chosen tamper value, never a column identifier.
 func (db *DB) AdversarialCorruptCommentBody(commentID, body string) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return fmt.Errorf("AdversarialCorruptCommentBody: lease connection: %w", err)
+	}
+	defer release()
+	db = bound
 	if err := sqlitex.Execute(db.conn, "UPDATE comments SET body = ?1 WHERE id = ?2", &sqlitex.ExecOptions{Args: []any{body, commentID}}); err != nil {
 		return fmt.Errorf("AdversarialCorruptCommentBody %q: %w", commentID, err)
 	}
@@ -471,8 +535,12 @@ func (db *DB) AdversarialCorruptCommentBody(commentID, body string) error {
 // BYPASSING the shared reducer, so the corpus can prove ReplayProjections detects a
 // spurious attribution edge no ordered journal history would derive (§8.2, §15).
 func (db *DB) AdversarialInsertSpuriousAttribution(task journal.TaskID, actor journal.ActorID, jid journal.JournalID) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return fmt.Errorf("AdversarialInsertSpuriousAttribution: lease connection: %w", err)
+	}
+	defer release()
+	db = bound
 	if err := sqlitex.Execute(db.conn, "INSERT OR REPLACE INTO task_attributions (task_id, actor_id, first_journal_id) VALUES (?1, ?2, ?3)", &sqlitex.ExecOptions{Args: []any{task.String(), actor.String(), int64(jid)}}); err != nil {
 		return fmt.Errorf("AdversarialInsertSpuriousAttribution %q/%q: %w", task, actor, err)
 	}
@@ -480,8 +548,8 @@ func (db *DB) AdversarialInsertSpuriousAttribution(task journal.TaskID, actor jo
 }
 
 // AdversarialResolveOperationIDInsertRace drives the §9.6-bullet-2 race-translation
-// path (resolveOperationIDInsertRaceLocked) directly. Under the in-process db.mu
-// that path is unreachable — Apply's §9.4 lookup always observes a concurrent
+// path (resolveOperationIDInsertRaceLocked) directly. Before pool migration that
+// path was unreachable — Apply's §9.4 lookup always observed a concurrent
 // writer's committed row before reaching the anchor insert — so this seam invokes
 // the translation the reducer runs when the anchor insert loses the UNIQUE race:
 // it re-reads the now-committed row for in.OperationID and returns the typed
@@ -496,9 +564,12 @@ func (db *DB) AdversarialResolveOperationIDInsertRace(in journal.OperationInput)
 	callerMutationDigest := append([]byte(nil), in.MutationDigest...)
 	in.MutationDigest = prepared.DerivedDigest()
 	in.Effects = prepared.NormalizedEffects()
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	return db.resolveOperationIDInsertRaceLocked(in, callerMutationDigest)
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return journal.CommittedResult{}, fmt.Errorf("AdversarialResolveOperationIDInsertRace: lease connection: %w", err)
+	}
+	defer release()
+	return bound.resolveOperationIDInsertRaceLocked(in, callerMutationDigest)
 }
 
 // AdversarialCyclicParentChain seeds a CORRUPT cyclic parent-citation chain that
@@ -512,8 +583,12 @@ func (db *DB) AdversarialResolveOperationIDInsertRace(in journal.OperationInput)
 // Z's authority governs taskX; the §14.5 governance walk must fail closed with
 // ErrCorruptParentChain (bounded, visited-tracked traversal) rather than looping.
 func (db *DB) AdversarialCyclicParentChain(actor journal.ActorID, taskX, taskY, taskZ journal.TaskID) (zAuth journal.JournalID, target journal.TaskID, beforeJID journal.JournalID, err error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return 0, journal.TaskID{}, 0, fmt.Errorf("AdversarialCyclicParentChain: lease connection: %w", err)
+	}
+	defer release()
+	db = bound
 	var txErr error
 	endTx := sqlitex.Transaction(db.conn)
 	defer endTx(&txErr)

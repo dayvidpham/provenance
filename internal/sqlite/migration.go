@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"context"
 	"fmt"
 	"sort"
 
@@ -66,12 +67,17 @@ var recognizedJournalSpineTables = map[string]struct{}{
 }
 
 // PreflightSchema verifies the external pre-journal schema shape (§13). It is a
-// read-only check that runs strictly before any transaction opens; any mismatch is
+// read-only check that runs in its own snapshot before any write transaction opens; any mismatch is
 // a typed SchemaPreflightError and no row of any kind is written.
-func (db *DB) PreflightSchema() error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	return db.preflightSchemaLocked()
+func (db *DB) PreflightSchema() (err error) {
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return fmt.Errorf("PreflightSchema: lease connection: %w", err)
+	}
+	defer release()
+	endTx := sqlitex.Save(bound.conn)
+	defer endTx(&err)
+	return bound.preflightSchemaLocked()
 }
 
 func (db *DB) preflightSchemaLocked() error {
@@ -87,7 +93,7 @@ func (db *DB) preflightSchemaLocked() error {
 				FoundShape:    "table " + want.name + " absent",
 				Stage:         "table-presence check for " + want.name,
 				Why:           "the live schema is missing a table this build requires before migration/replay can proceed",
-				Impact:        "no row of any kind is written; activation halts before any transaction opens",
+				Impact:        "no row of any kind is written; activation halts before any write transaction opens",
 				Fix:           "restore the expected schema shape or run the correct forward migration, then re-open",
 			}
 		}
@@ -164,7 +170,7 @@ func checkColumns(want expectedTable, actual map[string]struct{}) error {
 				FoundShape:    fmt.Sprintf("column %s.%s absent", want.name, c),
 				Stage:         fmt.Sprintf("column-presence check for %s.%s", want.name, c),
 				Why:           "the live schema is missing an expected column this build reads",
-				Impact:        "no row of any kind is written; activation halts before any transaction opens",
+				Impact:        "no row of any kind is written; activation halts before any write transaction opens",
 				Fix:           "restore the expected column or run the correct forward migration, then re-open",
 			}
 		}
@@ -219,13 +225,16 @@ func (db *DB) tableColumnsLocked(table string) (map[string]struct{}, error) {
 // task (§13 item 4, §9.5). The deterministic per-task OperationID makes a re-run
 // idempotent (§9.4).
 func (db *DB) MigrateLegacyBaseline(in journal.MigrationInput) (journal.MigrationResult, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	return db.migrateLockedWithFault(in, nil)
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return journal.MigrationResult{}, fmt.Errorf("MigrateLegacyBaseline: lease connection: %w", err)
+	}
+	defer release()
+	return bound.migrateLockedWithFault(in, nil)
 }
 
 func (db *DB) migrateLockedWithFault(in journal.MigrationInput, faultHook func(taskIndex int) error) (journal.MigrationResult, error) {
-	// Preflight strictly before any transaction opens (§13).
+	// Preflight strictly before any write transaction opens (§13).
 	if err := db.preflightSchemaLocked(); err != nil {
 		return journal.MigrationResult{}, err
 	}
@@ -292,7 +301,7 @@ func (db *DB) migrateLockedWithFault(in journal.MigrationInput, faultHook func(t
 	// still-NULL row. The canonical SQLite table rebuild toggles PRAGMA foreign_keys, which
 	// is a no-op inside a transaction, so the rebuild runs its own FK-safe atomic
 	// transaction immediately after the anchor batch commits rather than nesting inside the
-	// anchor savepoint — still under the single held db.mu, so no other writer observes the
+	// anchor savepoint — still on the single operation lease, so no other writer observes the
 	// intermediate shape. Should the rebuild itself fail, the committed anchors are left in
 	// the valid legacy nullable shape; a re-run is idempotent (§9.4) and re-applies it.
 	unanchored, err := db.countUnanchoredTasksLocked()
@@ -319,7 +328,7 @@ func (db *DB) migrateLockedWithFault(in journal.MigrationInput, faultHook func(t
 // nothing for any task in the run. On success the savepoint commits when this function
 // returns, so the caller's subsequent watermark re-tightening rebuild — which needs the
 // foreign-keys pragma that is a no-op inside a transaction — runs cleanly against the
-// committed, fully-anchored table. Assumes db.mu is held; ordered/resolved are the
+// committed, fully-anchored table. Assumes db.conn is operation-owned; ordered/resolved are the
 // deterministically-ordered legacy rows and their pre-resolved owners.
 func (db *DB) anchorLegacyBaselinesLocked(in journal.MigrationInput, ordered []journal.LegacyTaskRow, resolved []*journal.ActorID, faultHook func(taskIndex int) error) (journal.MigrationResult, error) {
 	var txErr error
@@ -458,11 +467,15 @@ func assertHonestBaselineTimestamps(lt journal.LegacyTaskRow, op journal.Operati
 // CountBaselineAnchors returns how many committed operations are legacy-baseline
 // anchors (their OperationID carries the deterministic migration prefix, §13). It
 // is an audit/read helper proving a re-run created no duplicate baseline.
-func (db *DB) CountBaselineAnchors() (int, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	var n int
-	if err := sqlitex.Execute(db.conn, "SELECT COUNT(*) FROM journal_operations WHERE operation_id LIKE ?1", &sqlitex.ExecOptions{Args: []any{"provenance.migration.baseline--%"}, ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
+func (db *DB) CountBaselineAnchors() (n int, err error) {
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return 0, fmt.Errorf("CountBaselineAnchors: lease connection: %w", err)
+	}
+	defer release()
+	endTx := sqlitex.Save(bound.conn)
+	defer endTx(&err)
+	if err := sqlitex.Execute(bound.conn, "SELECT COUNT(*) FROM journal_operations WHERE operation_id LIKE ?1", &sqlitex.ExecOptions{Args: []any{"provenance.migration.baseline--%"}, ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
 		return 0, fmt.Errorf("CountBaselineAnchors: %w", err)
 	}
 	return n, nil
@@ -471,16 +484,19 @@ func (db *DB) CountBaselineAnchors() (int, error) {
 // StartedTransitionRecordedAt returns the RecordedAt (UnixNano) stamped on the
 // started transition of a migration episode, so a corpus history can assert the
 // honest legacy timestamp was used (§13). ok is false when no such episode exists.
-func (db *DB) EpisodeTransitionRecordedAt(assignment journal.AssignmentID, started bool) (int64, bool, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+func (db *DB) EpisodeTransitionRecordedAt(assignment journal.AssignmentID, started bool) (recordedAt int64, found bool, err error) {
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return 0, false, fmt.Errorf("EpisodeTransitionRecordedAt: lease connection: %w", err)
+	}
+	defer release()
+	endTx := sqlitex.Save(bound.conn)
+	defer endTx(&err)
 	transition := transitionEndedID
 	if started {
 		transition = transitionStartedID
 	}
-	var recordedAt int64
-	found := false
-	if err := sqlitex.Execute(db.conn, "SELECT j.recorded_at FROM journal_authority_assignment_transitions t\n\t\t JOIN journal j ON j.journal_id = t.journal_id\n\t\t WHERE t.assignment_id = ?1 AND t.transition_id = ?2", &sqlitex.ExecOptions{Args: []any{string(assignment), transition}, ResultFunc: func(stmt *zs.Stmt) error {
+	if err := sqlitex.Execute(bound.conn, "SELECT j.recorded_at FROM journal_authority_assignment_transitions t\n\t\t JOIN journal j ON j.journal_id = t.journal_id\n\t\t WHERE t.assignment_id = ?1 AND t.transition_id = ?2", &sqlitex.ExecOptions{Args: []any{string(assignment), transition}, ResultFunc: func(stmt *zs.Stmt) error {
 		found = true
 		recordedAt = stmt.ColumnInt64(0)
 		return nil
@@ -492,14 +508,19 @@ func (db *DB) EpisodeTransitionRecordedAt(assignment journal.AssignmentID, start
 
 // EpisodeActive reports whether an episode has a started transition and no ended
 // transition (§8.4), so a corpus history can assert a migrated episode's activity.
-func (db *DB) EpisodeActive(assignment journal.AssignmentID) (bool, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	started, err := db.transitionExistsLocked(assignment, transitionStartedID)
+func (db *DB) EpisodeActive(assignment journal.AssignmentID) (active bool, err error) {
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return false, fmt.Errorf("EpisodeActive: lease connection: %w", err)
+	}
+	defer release()
+	endTx := sqlitex.Save(bound.conn)
+	defer endTx(&err)
+	started, err := bound.transitionExistsLocked(assignment, transitionStartedID)
 	if err != nil {
 		return false, err
 	}
-	ended, err := db.transitionExistsLocked(assignment, transitionEndedID)
+	ended, err := bound.transitionExistsLocked(assignment, transitionEndedID)
 	if err != nil {
 		return false, err
 	}
@@ -508,11 +529,15 @@ func (db *DB) EpisodeActive(assignment journal.AssignmentID) (bool, error) {
 
 // CountEpisodesForTask returns how many owner-responsibility episodes exist for a
 // task, so a corpus history can assert episodesCreated (§13).
-func (db *DB) CountEpisodesForTask(task journal.TaskID) (int, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	var n int
-	if err := sqlitex.Execute(db.conn, "SELECT COUNT(*) FROM journal_authority_assignment_episodes WHERE task_id = ?1", &sqlitex.ExecOptions{Args: []any{task.String()}, ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
+func (db *DB) CountEpisodesForTask(task journal.TaskID) (n int, err error) {
+	bound, release, err := db.bindOperationDB(context.Background())
+	if err != nil {
+		return 0, fmt.Errorf("CountEpisodesForTask: lease connection: %w", err)
+	}
+	defer release()
+	endTx := sqlitex.Save(bound.conn)
+	defer endTx(&err)
+	if err := sqlitex.Execute(bound.conn, "SELECT COUNT(*) FROM journal_authority_assignment_episodes WHERE task_id = ?1", &sqlitex.ExecOptions{Args: []any{task.String()}, ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
 		return 0, fmt.Errorf("CountEpisodesForTask %q: %w", task, err)
 	}
 	return n, nil
