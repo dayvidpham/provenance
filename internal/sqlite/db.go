@@ -6,15 +6,28 @@
 // zombiezen.com/go/sqlite for pure-Go SQLite access (no CGo required at
 // runtime, though CGo tests use the C library for the race detector).
 //
-// The DB struct holds a single SQLite connection guarded by a sync.Mutex.
-// All exported methods acquire the mutex before accessing the connection.
+// # Connection model (v0.0.4 pool transition)
+//
+// P0 introduces a sqlitex.Pool as the runtime connection source. New callers
+// bind a [connScope] for the duration of one operation. Every scope owns an
+// independent context-controlled pool lease, for both file and memory storage.
+// During migration the memory pool has two connections: one reserved legacy
+// lease and one available scope lease. P2 removes the reservation and returns
+// memory storage to a size-1 pool.
+//
+// The exported Conn/Lock/Unlock methods and the db.mu/db.conn fields are a
+// temporary migration seam retained so all existing P1 production paths compile
+// and run unchanged from this P0 commit. They must be deleted in P2 once every
+// caller is converted to explicit connection ownership.
 package sqlite
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dayvidpham/provenance/pkg/ptypes"
@@ -22,11 +35,67 @@ import (
 	"zombiezen.com/go/sqlite/sqlitex"
 )
 
-// DB wraps a single SQLite connection with a mutex for safe concurrent access.
-// Use Open to create a new DB instance.
+// runtimePoolSize is the connection-pool size for file-backed databases.
+// Four concurrent connections support typical parallel Apply + read workloads
+// while staying well within SQLite's practical per-process connection budget.
+// P2 may expose this as a constructor option.
+const runtimePoolSize = 4
+
+// memoryMigrationPoolSize provides one reserved legacy lease and one new scope
+// lease. P2 returns this to 1 when it deletes the legacy reservation.
+const memoryMigrationPoolSize = 2
+
+// closeResult runs one close operation and publishes its result to every
+// concurrent and later caller. It is deliberately only lifecycle state, not a
+// pool abstraction or dependency-injection boundary.
+type closeResult struct {
+	once sync.Once
+	err  error
+}
+
+func (result *closeResult) do(closeFunc func() error) error {
+	result.once.Do(func() {
+		result.err = closeFunc()
+	})
+	return result.err
+}
+
+// DB wraps a SQLite connection pool for safe concurrent access.
+// Use [Open] to create a new DB instance.
+//
+// # Migration seam (P2-removable)
+//
+// The fields mu, conn and the exported methods Conn/Lock/Unlock are retained
+// solely so that all existing production code compiles and runs correctly from
+// the P0 commit. They represent the old single-connection model. After every
+// P1 caller is migrated to explicit connection ownership, P2 removes this entire
+// seam. No new code may depend on mu or conn for concurrency control.
 type DB struct {
-	mu   sync.Mutex
+	// pool is the runtime connection pool. New callers bind a connScope.
+	pool *sqlitex.Pool
+
+	close closeResult
+
+	// ---------------------------------------------------------------------------
+	// P2-REMOVABLE migration seam: retained for P1 branch compatibility only.
+	// The fields below preserve the legacy single-connection model so that
+	// existing callers of db.mu / db.conn continue to compile and run without
+	// modification. After all P1 callers migrate to explicit scopes, delete mu,
+	// conn, Conn, Lock, and Unlock in their entirety.
+	// ---------------------------------------------------------------------------
+
+	// mu guards conn for all existing P1 callers. Do not use for new code.
+	mu sync.Mutex
+
+	// conn is the reserved pool lease that backs the legacy migration seam.
+	// It is taken from the pool during Open and returned during Close.
+	// Do not use for new code.
 	conn *zs.Conn
+
+	// legacyCancel interrupts the Pool.Take context attached to conn. P2 removes
+	// it together with conn, mu, Conn, Lock, and Unlock.
+	legacyCancel context.CancelFunc
+
 	// projectionTarget is a closed selector for complete static SQL variants.
 	// SQLite cannot bind identifiers, so arbitrary table names are never stored.
 	projectionTarget projectionTarget
@@ -53,160 +122,312 @@ func (target projectionTarget) label() string {
 // Open opens (or creates) a SQLite database at dbPath and returns an
 // initialised DB. Pass ":memory:" for an in-memory database.
 //
+// For file-backed databases a pool of [runtimePoolSize] connections is opened.
+// For ":memory:" the URI "file:memdbN?mode=memory&cache=shared" is used with
+// migration pool size 2 (N is a unique process-level counter). The shared-cache form
+// ensures that a separate preflight/activation connection and the pool see the
+// same logical database. P2 returns the pool to size 1 after removing the
+// reserved legacy lease.
+//
 // The schema is applied idempotently on every open (CREATE TABLE IF NOT EXISTS).
 // Reference data (enums) is inserted via INSERT OR IGNORE.
 // The models parameter provides the ML model entries to seed into ml_models.
 func Open(dbPath string, models []ptypes.ModelEntry) (*DB, error) {
-	existed := false
-	if dbPath != ":memory:" {
+	// Resolve the URI and pool size for the given dbPath.
+	poolURI, poolSize, isMemory := resolvePoolTarget(dbPath)
+
+	// -------------------------------------------------------------------------
+	// Step 1: For file-backed databases run a read-only preflight first.
+	//         For in-memory databases there is nothing to preflight.
+	// -------------------------------------------------------------------------
+	existingJournal := false
+	if !isMemory {
+		existed := false
 		if info, err := os.Stat(dbPath); err == nil {
 			existed = info.Size() > 0
 		} else if !os.IsNotExist(err) {
 			return nil, fmt.Errorf("sqlite.Open: inspect path %q before read-only preflight: %w", dbPath, err)
 		}
-	}
-	existingJournal := false
-	if existed {
-		var err error
-		existingJournal, err = preflightExistingReadOnly(dbPath, models)
-		if err != nil {
-			return nil, fmt.Errorf("sqlite.Open: read-only startup preflight failed on %q: %w", dbPath, err)
+		if existed {
+			var err error
+			existingJournal, err = preflightExistingReadOnly(dbPath, models)
+			if err != nil {
+				return nil, fmt.Errorf("sqlite.Open: read-only startup preflight failed on %q: %w", dbPath, err)
+			}
 		}
 	}
 
-	conn, err := zs.OpenConn(dbPath, zs.OpenReadWrite|zs.OpenCreate|zs.OpenURI)
+	// -------------------------------------------------------------------------
+	// Step 2: Open the runtime pool.
+	//
+	// For in-memory databases the pool must be opened BEFORE activation so
+	// that at least one connection keeps the shared-cache database alive
+	// throughout activation. Closing the only connection to a shared-cache
+	// in-memory database destroys it.
+	//
+	// For file-backed databases the pool is opened after activation so that
+	// activation has exclusive write access during schema migration.
+	// -------------------------------------------------------------------------
+	if isMemory {
+		return openInMemory(poolURI, models)
+	}
+	return openFileBacked(dbPath, poolURI, poolSize, existingJournal, models)
+}
+
+// openInMemory handles Open for ":memory:" databases.
+// The pool is opened first to keep the shared-cache database alive, then
+// activation runs on a leased connection from the pool.
+func openInMemory(poolURI string, models []ptypes.ModelEntry) (*DB, error) {
+	pool, err := sqlitex.NewPool(poolURI, sqlitex.PoolOptions{
+		Flags:       zs.OpenReadWrite | zs.OpenCreate | zs.OpenWAL | zs.OpenURI,
+		PoolSize:    memoryMigrationPoolSize,
+		PrepareConn: runtimePrepareConn,
+	})
 	if err != nil {
 		return nil, fmt.Errorf(
-			"sqlite.Open: failed to open SQLite at %q: %w — "+
+			"sqlite.Open: failed to open in-memory pool at %q: %w",
+			poolURI, err,
+		)
+	}
+
+	// Activation has one owner even though the migration pool has two connections.
+	activationConn, err := pool.Take(context.Background())
+	if err != nil {
+		_ = pool.Close()
+		return nil, fmt.Errorf("sqlite.Open: failed to take connection for in-memory activation at %q: %w", poolURI, err)
+	}
+
+	activationDB := &DB{conn: activationConn}
+	// Apply activation pragmas: busy_timeout is already set by PrepareConn but
+	// we need foreign_keys=OFF for schema rebuilds.
+	if err := sqlitex.ExecuteTransient(activationConn, "PRAGMA foreign_keys=OFF;", nil); err != nil {
+		pool.Put(activationConn)
+		_ = pool.Close()
+		return nil, fmt.Errorf("sqlite.Open: disable FK enforcement for in-memory activation at %q: %w", poolURI, err)
+	}
+
+	var activationErr error
+	end := sqlitex.Save(activationConn)
+	activationErr = func() error {
+		if err := activationDB.ensureSchema(models); err != nil {
+			return fmt.Errorf("apply schema: %w", err)
+		}
+		if err := activationDB.VerifyIntegrity(); err != nil {
+			return fmt.Errorf("whole-journal integrity: %w", err)
+		}
+		if _, err := activationDB.ReplayProjections(); err != nil {
+			return fmt.Errorf("journal replay: %w", err)
+		}
+		return nil
+	}()
+	end(&activationErr)
+	if activationErr != nil {
+		pool.Put(activationConn)
+		_ = pool.Close()
+		return nil, fmt.Errorf("sqlite.Open: in-memory activation failed at %q: %w", poolURI, activationErr)
+	}
+	// Re-enable FK enforcement on this connection after schema activation.
+	if err := sqlitex.ExecuteTransient(activationConn, "PRAGMA foreign_keys=ON;", nil); err != nil {
+		pool.Put(activationConn)
+		_ = pool.Close()
+		return nil, fmt.Errorf("sqlite.Open: re-enable FK enforcement after in-memory activation at %q: %w", poolURI, err)
+	}
+
+	// Return activation connection to pool, then re-take it as the legacy seam.
+	pool.Put(activationConn)
+
+	legacyCtx, legacyCancel := context.WithCancel(context.Background())
+	legacyConn, err := pool.Take(legacyCtx)
+	if err != nil {
+		legacyCancel()
+		_ = pool.Close()
+		return nil, fmt.Errorf("sqlite.Open: failed to reserve legacy connection from in-memory pool at %q: %w", poolURI, err)
+	}
+
+	return &DB{pool: pool, conn: legacyConn, legacyCancel: legacyCancel}, nil
+}
+
+// openFileBacked handles Open for file-backed databases.
+// Activation runs on a dedicated connection that is closed before the pool
+// is opened, giving activation exclusive schema write access.
+func openFileBacked(dbPath, poolURI string, poolSize int, existingJournal bool, models []ptypes.ModelEntry) (*DB, error) {
+	activationConn, err := zs.OpenConn(poolURI, zs.OpenReadWrite|zs.OpenCreate|zs.OpenURI)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"sqlite.Open: failed to open activation connection at %q (resolved URI %q): %w — "+
 				"ensure the path is writable, the parent directory exists, "+
 				"and no other process holds an exclusive lock",
+			dbPath, poolURI, err,
+		)
+	}
+
+	activationDB := &DB{conn: activationConn}
+	if err := activationDB.applyActivationPragmas(); err != nil {
+		_ = activationConn.Close()
+		return nil, fmt.Errorf("sqlite.Open: failed to apply activation pragmas on %q: %w", dbPath, err)
+	}
+
+	existing, err := activationDB.tableExistsLocked("journal")
+	if err != nil {
+		_ = activationConn.Close()
+		return nil, fmt.Errorf("sqlite.Open: inspect existing schema on %q: %w", dbPath, err)
+	}
+	if existing != existingJournal {
+		_ = activationConn.Close()
+		return nil, fmt.Errorf(
+			"sqlite.Open: schema changed between read-only preflight (journal=%t) and activation (journal=%t) on %q; "+
+				"retry after concurrent schema work finishes",
+			existingJournal, existing, dbPath,
+		)
+	}
+
+	var activationErr error
+	end := sqlitex.Save(activationConn)
+	activationErr = func() error {
+		if err := activationDB.ensureSchema(models); err != nil {
+			return fmt.Errorf("apply schema: %w", err)
+		}
+		if err := activationDB.VerifyIntegrity(); err != nil {
+			return fmt.Errorf("whole-journal integrity: %w", err)
+		}
+		if _, err := activationDB.ReplayProjections(); err != nil {
+			return fmt.Errorf("journal replay: %w", err)
+		}
+		return nil
+	}()
+	end(&activationErr)
+	if activationErr != nil {
+		_ = activationConn.Close()
+		return nil, fmt.Errorf("sqlite.Open: transactional startup validation failed on %q: %w", dbPath, activationErr)
+	}
+	// Enable WAL on the activation connection before closing it. WAL is a
+	// file-level persistent property; per-connection pool flags (OpenWAL)
+	// confirm the mode but the initial activation must set it first.
+	if err := activationDB.enableWAL(); err != nil {
+		_ = activationConn.Close()
+		return nil, fmt.Errorf("sqlite.Open: enable WAL after validated activation on %q: %w", dbPath, err)
+	}
+	if err := activationConn.Close(); err != nil {
+		return nil, fmt.Errorf("sqlite.Open: close activation connection on %q: %w", dbPath, err)
+	}
+
+	pool, err := sqlitex.NewPool(poolURI, sqlitex.PoolOptions{
+		Flags:       zs.OpenReadWrite | zs.OpenCreate | zs.OpenWAL | zs.OpenURI,
+		PoolSize:    poolSize,
+		PrepareConn: runtimePrepareConn,
+	})
+	if err != nil {
+		return nil, fmt.Errorf(
+			"sqlite.Open: failed to open runtime pool (size=%d) at %q (resolved URI %q): %w — "+
+				"ensure the path is accessible and no other process holds a conflicting lock",
+			poolSize, dbPath, poolURI, err,
+		)
+	}
+
+	legacyCtx, legacyCancel := context.WithCancel(context.Background())
+	legacyConn, err := pool.Take(legacyCtx)
+	if err != nil {
+		legacyCancel()
+		_ = pool.Close()
+		return nil, fmt.Errorf(
+			"sqlite.Open: failed to reserve legacy connection lease from pool at %q: %w — "+
+				"this is an internal startup failure; fix: ensure the pool opened correctly",
 			dbPath, err,
 		)
 	}
 
-	db := &DB{conn: conn}
-
-	// SQLite table rebuilds must run with FK enforcement disabled before the
-	// activation transaction starts. VerifyIntegrity checks the complete FK graph
-	// before commit; runtime enforcement is restored after the transaction ends.
-	if err := db.applyActivationPragmas(); err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("sqlite.Open: failed to apply pragmas on %q: %w", dbPath, err)
-	}
-
-	existing, err := db.tableExistsLocked("journal")
-	if err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("sqlite.Open: inspect existing schema on %q: %w", dbPath, err)
-	}
-	if existing != existingJournal {
-		_ = conn.Close()
-		return nil, fmt.Errorf("sqlite.Open: schema changed between read-only preflight (journal=%t) and activation (journal=%t) on %q; retry after concurrent schema work finishes", existingJournal, existing, dbPath)
-	}
-	activate := func() error {
-		if err := db.ensureSchema(models); err != nil {
-			return fmt.Errorf("apply schema: %w", err)
-		}
-		if err := db.VerifyIntegrity(); err != nil {
-			return fmt.Errorf("whole-journal integrity: %w", err)
-		}
-		if _, err := db.ReplayProjections(); err != nil {
-			return fmt.Errorf("journal replay: %w", err)
-		}
-		return nil
-	}
-	var activationErr error
-	end := sqlitex.Save(conn)
-	activationErr = activate()
-	end(&activationErr)
-	err = activationErr
-	if err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("sqlite.Open: transactional startup validation failed on %q: %w", dbPath, err)
-	}
-	if err := db.enableForeignKeys(); err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("sqlite.Open: enable runtime foreign-key enforcement on %q: %w", dbPath, err)
-	}
-	if err := db.enableWAL(); err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("sqlite.Open: enable WAL after validated activation on %q: %w", dbPath, err)
-	}
-
-	return db, nil
+	return &DB{pool: pool, conn: legacyConn, legacyCancel: legacyCancel}, nil
 }
 
-func preflightExistingReadOnly(dbPath string, models []ptypes.ModelEntry) (bool, error) {
-	u := url.URL{Scheme: "file", Path: dbPath}
-	if _, err := os.Stat(dbPath + "-wal"); os.IsNotExist(err) {
-		query := u.Query()
-		query.Set("immutable", "1")
-		u.RawQuery = query.Encode()
-	} else if err != nil {
-		return false, fmt.Errorf("inspect WAL sidecar before read-only preflight: %w", err)
+// memoryDBCounter generates unique names for shared-cache in-memory databases.
+// Each call to Open(":memory:", ...) gets its own isolated database so parallel
+// tests do not share schema state. The counter is process-global and monotonically
+// increasing; it never needs to be reset.
+var memoryDBCounter atomic.Uint64
+
+// resolvePoolTarget maps an Open dbPath to the URI, pool size, and in-memory flag.
+//
+//   - ":memory:" becomes a unique shared-cache URI of the form
+//     "file:memdbN?mode=memory&cache=shared" with migration pool size 2 and
+//     isMemory=true.
+//     Each Open(":memory:") call allocates its own unique name via
+//     [memoryDBCounter] so parallel callers do not share the same database.
+//   - Any other path is used as-is with [runtimePoolSize] and isMemory=false.
+func resolvePoolTarget(dbPath string) (uri string, poolSize int, isMemory bool) {
+	if dbPath == ":memory:" {
+		n := memoryDBCounter.Add(1)
+		return fmt.Sprintf("file:memdb%d?mode=memory&cache=shared", n), memoryMigrationPoolSize, true
 	}
-	conn, err := zs.OpenConn(u.String(), zs.OpenReadOnly|zs.OpenURI)
-	if err != nil {
-		return false, err
-	}
-	db := &DB{conn: conn}
-	defer conn.Close()
-	existing, err := db.tableExistsLocked("journal")
-	if err != nil {
-		return existing, err
-	}
-	if existing {
-		if err := db.preflightCanonicalColumnsReadOnly(); err != nil {
-			return true, err
-		}
-		if err := db.VerifyIntegrity(); err != nil {
-			return true, err
-		}
-		if _, err := db.ReplayProjections(); err != nil {
-			return true, err
-		}
-	}
-	if err := preflightActivationClone(conn, models); err != nil {
-		return existing, err
-	}
-	return existing, nil
+	return dbPath, runtimePoolSize, false
 }
 
-func preflightActivationClone(source *zs.Conn, models []ptypes.ModelEntry) error {
-	clone, err := zs.OpenConn(":memory:", zs.OpenReadWrite|zs.OpenCreate|zs.OpenURI)
-	if err != nil {
-		return fmt.Errorf("open isolated activation clone: %w", err)
-	}
-	defer clone.Close()
-	backup, err := zs.NewBackup(clone, "main", source, "main")
-	if err != nil {
-		return fmt.Errorf("start read-only activation clone: %w", err)
-	}
-	if _, err = backup.Step(-1); err != nil {
-		_ = backup.Close()
-		return fmt.Errorf("copy read-only activation clone: %w", err)
-	}
-	if err = backup.Close(); err != nil {
-		return fmt.Errorf("finish read-only activation clone: %w", err)
-	}
-	db := &DB{conn: clone}
-	if err = db.applyActivationPragmas(); err != nil {
-		return err
-	}
-	var activationErr error
-	end := sqlitex.Save(clone)
-	if activationErr = db.ensureSchema(models); activationErr == nil {
-		activationErr = db.VerifyIntegrity()
-	}
-	if activationErr == nil {
-		_, activationErr = db.ReplayProjections()
-	}
-	end(&activationErr)
-	if activationErr != nil {
-		return fmt.Errorf("isolated activation clone rejected existing database: %w", activationErr)
+// runtimePrepareConn is the PrepareConn callback for the runtime pool.
+// sqlitex.Pool calls it exactly once per connection the first time it is leased.
+// It applies per-connection PRAGMAs:
+//
+//   - foreign_keys=ON  — enforce referential integrity on every write.
+//   - busy_timeout=5000 — retry write-lock acquisition for up to 5 s before SQLITE_BUSY.
+func runtimePrepareConn(conn *zs.Conn) error {
+	for _, pragma := range []string{
+		"PRAGMA foreign_keys=ON;",
+		"PRAGMA busy_timeout=5000;",
+	} {
+		if err := sqlitex.ExecuteTransient(conn, pragma, nil); err != nil {
+			return fmt.Errorf(
+				"sqlite: runtimePrepareConn: failed to apply %q: %w — "+
+					"where: pool connection initialization (PrepareConn); "+
+					"when: first Take of this connection; "+
+					"impact: connection cannot be used; it will be retried on next Take; "+
+					"fix: this is an internal error; ensure the SQLite library is functional",
+				pragma, err,
+			)
+		}
 	}
 	return nil
 }
+
+// connScope is the P2-removable connection ownership contract used while P1
+// branches migrate independently. A scope must be released exactly as an owned
+// resource; release is idempotent so cleanup paths cannot return a lease twice.
+// P2 replaces this adapter with final explicit connection parameters.
+type connScope struct {
+	conn        *zs.Conn
+	releaseOnce sync.Once
+	releaseFunc func()
+}
+
+func (scope *connScope) release() {
+	if scope == nil {
+		return
+	}
+	scope.releaseOnce.Do(scope.releaseFunc)
+}
+
+// bindConn returns a connection whose lifetime is controlled by ctx and scope.
+// Every scope leases independently from the originating pool and returns there
+// on release. Pool.Take owns context interruption for file and memory storage.
+func (db *DB) bindConn(ctx context.Context) (*connScope, error) {
+	conn, err := db.pool.Take(ctx)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"sqlite: bind connection during operation: %w; caller cannot continue; "+
+				"fix: return outstanding scopes, retry with a live context, or open a new DB if this pool was closed",
+			err,
+		)
+	}
+	return &connScope{
+		conn:        conn,
+		releaseFunc: func() { db.pool.Put(conn) },
+	}, nil
+}
+
+// ---------------------------------------------------------------------------
+// P2-REMOVABLE migration seam: Conn, Lock, Unlock
+//
+// These methods expose the reserved legacy connection lease so that existing
+// P1 callers that have not yet migrated to explicit connection scopes continue to
+// compile and run. Delete these methods and the mu/conn fields in P2.
+// ---------------------------------------------------------------------------
 
 // Conn returns the underlying SQLite connection. This is exposed so that
 // the root package's graphStore can access the connection for vertex/edge
@@ -226,29 +447,61 @@ func (db *DB) Unlock() {
 	db.mu.Unlock()
 }
 
-// Close releases the SQLite connection. Safe to call multiple times.
+// Close shuts down the pool. It is safe to call from multiple goroutines. Every
+// caller waits for the first close attempt and observes the same result.
+//
+// Close first cancels active legacy SQL, then concurrently waits to return that
+// mutex-protected lease while Pool.Close interrupts and drains independent
+// scopes. The underlying SQLite files are not deleted.
 func (db *DB) Close() error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	if db.conn == nil {
+	return db.close.do(func() error {
+		legacyContended := make(chan bool, 1)
+		legacyReturned := make(chan struct{})
+		go func() {
+			if db.mu.TryLock() {
+				legacyContended <- false
+			} else {
+				legacyContended <- true
+				db.mu.Lock()
+			}
+			conn := db.conn
+			db.conn = nil
+			if conn != nil {
+				db.pool.Put(conn)
+			}
+			db.mu.Unlock()
+			close(legacyReturned)
+		}()
+
+		// Cancel before waiting on contended legacy ownership. For an idle lease,
+		// return it first so shutdown does not inject an unnecessary SQLite
+		// interrupt that can alter WAL checkpoint bytes on a read-only reopen.
+		if <-legacyContended {
+			db.legacyCancel()
+		} else {
+			<-legacyReturned
+			db.legacyCancel()
+		}
+		err := db.pool.Close()
+		<-legacyReturned
+		if err != nil {
+			return fmt.Errorf(
+				"sqlite.DB.Close: failed to close connection pool: %w; "+
+					"the DB is shut down but one or more SQLite connections failed to close",
+				err,
+			)
+		}
 		return nil
-	}
-	err := db.conn.Close()
-	db.conn = nil
-	if err != nil {
-		return fmt.Errorf(
-			"sqlite.DB.Close: failed to close SQLite connection: %w — "+
-				"this may indicate uncommitted transactions",
-			err,
-		)
-	}
-	return nil
+	})
 }
 
 // ---------------------------------------------------------------------------
 // Pragmas
 // ---------------------------------------------------------------------------
 
+// applyActivationPragmas configures the activation connection only.
+// FK enforcement is disabled during schema rebuilds. The runtime pool's
+// runtimePrepareConn re-enables FK enforcement per-connection.
 func (db *DB) applyActivationPragmas() error {
 	for _, pragma := range []string{"PRAGMA busy_timeout=5000;", "PRAGMA foreign_keys=OFF;"} {
 		if err := sqlitex.ExecuteTransient(db.conn, pragma, nil); err != nil {
@@ -441,7 +694,7 @@ func (db *DB) seedMLModels(models []ptypes.ModelEntry) error {
 //	id, namespace, title, description, status_id, priority_id, type_id,
 //	phase_id, owner_id, notes, created_at, updated_at, closed_at, close_reason
 //
-// (14 columns, indexed 0–13).
+// (14 columns, indexed 0-13).
 func ScanTask(stmt *zs.Stmt) (ptypes.Task, error) {
 	idStr := stmt.ColumnText(0)
 	id, err := ptypes.ParseTaskID(idStr)
@@ -489,7 +742,7 @@ func ScanTask(stmt *zs.Stmt) (ptypes.Task, error) {
 //
 //	id, agent_id, phase_id, stage_id, started_at, ended_at, notes
 //
-// (7 columns, indexed 0–6).
+// (7 columns, indexed 0-6).
 func ScanActivity(stmt *zs.Stmt) (ptypes.Activity, error) {
 	idStr := stmt.ColumnText(0)
 	id, err := ptypes.ParseActivityID(idStr)
@@ -526,7 +779,7 @@ func ScanActivity(stmt *zs.Stmt) (ptypes.Activity, error) {
 //
 //	id, task_id, author_id, body, created_at
 //
-// (5 columns, indexed 0–4).
+// (5 columns, indexed 0-4).
 func ScanComment(stmt *zs.Stmt) (ptypes.Comment, error) {
 	idStr := stmt.ColumnText(0)
 	id, err := ptypes.ParseCommentID(idStr)
@@ -559,4 +812,84 @@ func TimeToNullInt(t *time.Time) any {
 		return nil
 	}
 	return t.UnixNano()
+}
+
+// ---------------------------------------------------------------------------
+// Startup preflight helpers (called before pool creation)
+// ---------------------------------------------------------------------------
+
+// preflightExistingReadOnly validates an existing SQLite file using a separate
+// read-only connection opened outside the pool. This runs before the activation
+// connection is opened so that a corrupt or incompatible database is detected
+// before any write-capable connection is established.
+func preflightExistingReadOnly(dbPath string, models []ptypes.ModelEntry) (bool, error) {
+	u := url.URL{Scheme: "file", Path: dbPath}
+	if _, err := os.Stat(dbPath + "-wal"); os.IsNotExist(err) {
+		query := u.Query()
+		query.Set("immutable", "1")
+		u.RawQuery = query.Encode()
+	} else if err != nil {
+		return false, fmt.Errorf("inspect WAL sidecar before read-only preflight: %w", err)
+	}
+	conn, err := zs.OpenConn(u.String(), zs.OpenReadOnly|zs.OpenURI)
+	if err != nil {
+		return false, err
+	}
+	db := &DB{conn: conn}
+	defer conn.Close()
+	existing, err := db.tableExistsLocked("journal")
+	if err != nil {
+		return existing, err
+	}
+	if existing {
+		if err := db.preflightCanonicalColumnsReadOnly(); err != nil {
+			return true, err
+		}
+		if err := db.VerifyIntegrity(); err != nil {
+			return true, err
+		}
+		if _, err := db.ReplayProjections(); err != nil {
+			return true, err
+		}
+	}
+	if err := preflightActivationClone(conn, models); err != nil {
+		return existing, err
+	}
+	return existing, nil
+}
+
+func preflightActivationClone(source *zs.Conn, models []ptypes.ModelEntry) error {
+	clone, err := zs.OpenConn(":memory:", zs.OpenReadWrite|zs.OpenCreate|zs.OpenURI)
+	if err != nil {
+		return fmt.Errorf("open isolated activation clone: %w", err)
+	}
+	defer clone.Close()
+	backup, err := zs.NewBackup(clone, "main", source, "main")
+	if err != nil {
+		return fmt.Errorf("start read-only activation clone: %w", err)
+	}
+	if _, err = backup.Step(-1); err != nil {
+		_ = backup.Close()
+		return fmt.Errorf("copy read-only activation clone: %w", err)
+	}
+	if err = backup.Close(); err != nil {
+		return fmt.Errorf("finish read-only activation clone: %w", err)
+	}
+	db := &DB{conn: clone}
+	if err = db.applyActivationPragmas(); err != nil {
+		return err
+	}
+	var activationErr error
+	end := sqlitex.Save(clone)
+	if activationErr = db.ensureSchema(models); activationErr == nil {
+		activationErr = db.VerifyIntegrity()
+	}
+	if activationErr == nil {
+		_, activationErr = db.ReplayProjections()
+	}
+	end(&activationErr)
+	if activationErr != nil {
+		return fmt.Errorf("isolated activation clone rejected existing database: %w", activationErr)
+	}
+	return nil
 }
