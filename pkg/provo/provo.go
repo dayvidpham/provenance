@@ -13,19 +13,20 @@
 //	HumanAgent        -> prov:Person
 //	SoftwareAgent     -> prov:SoftwareAgent
 //	MLAgent           -> :LLMAgent (rdfs:subClassOf prov:SoftwareAgent) with :modelId
-//	EdgeDerivedFrom   -> prov:wasDerivedFrom + an (empty) prov:qualifiedDerivation node
-//	EdgeSupersedes    -> prov:wasRevisionOf  + an (empty) prov:qualifiedDerivation node
+//	EdgeDerivedFrom   -> prov:wasDerivedFrom + prov:qualifiedDerivation node; the
+//	                     node carries :derivationKind + prov:hadActivity when the
+//	                     derivation is qualified
+//	EdgeSupersedes    -> prov:wasRevisionOf  + prov:qualifiedDerivation node (as above)
 //	EdgeDiscoveredFrom-> prov:wasInfluencedBy
 //	EdgeGeneratedBy   -> prov:wasGeneratedBy
 //	EdgeAttributedTo  -> prov:wasAttributedTo
 //	EdgeBlockedBy     -> NOT exported (scheduling, not provenance)
-//	Phase             -> a static p-plan:Plan of Step-per-phase; each activity
-//	                     p-plan:correspondsToStep its phase's step
+//	Plan / PlanStep   -> p-plan:Plan / p-plan:Step (dct:title + dct:hasVersion),
+//	                     read from the tracker; each activity
+//	                     p-plan:correspondsToStep the step of its own plan
 //
 // # Deferred to later milestones (never fabricated here)
 //
-//   - :derivationKind on the qualified-derivation node (M4): the derivation node is
-//     emitted WITHOUT a kind. SHACL's DerivationShape permits maxCount 0.
 //   - :modelVersion / :decodingParameters (§2.3 capture fields): only :modelId is
 //     emitted, because provenance does not yet capture the other two.
 //   - Act-level role: role is synthesized at AGENT level from MLAgent.Role until the
@@ -55,24 +56,35 @@ const DefaultVocabIRI = "https://example.org/data-labour-prov#"
 // Options.BaseIRI is empty. IDs render as BaseIRI + url.PathEscape(id.String()).
 const DefaultBaseIRI = "urn:provenance:"
 
-// planLocalName is the local name of the single built-in plan reifying the Phase enum.
-const planLocalName = "plan/pasture-12-phase"
-
 // Fixed external namespaces.
 const (
 	nsProv  = "http://www.w3.org/ns/prov#"
 	nsPplan = "http://purl.org/net/p-plan#"
 	nsRdfs  = "http://www.w3.org/2000/01/rdf-schema#"
 	nsXsd   = "http://www.w3.org/2001/XMLSchema#"
+	nsDct   = "http://purl.org/dc/terms/"
 )
 
-// allPhases is the ordered Phase enum, reified as the built-in plan's steps. It is
-// static (not reflected) so the plan preamble is deterministic and reviewable.
-var allPhases = []ptypes.Phase{
-	ptypes.PhaseRequest, ptypes.PhaseElicit, ptypes.PhasePropose, ptypes.PhaseReview,
-	ptypes.PhasePlanUAT, ptypes.PhaseRatify, ptypes.PhaseHandoff, ptypes.PhaseImplPlan,
-	ptypes.PhaseWorkerSlices, ptypes.PhaseCodeReview, ptypes.PhaseImplUAT, ptypes.PhaseLanding,
-	ptypes.PhaseUnscoped,
+// derivationIndividuals maps each DerivationKind to its vocabulary individual
+// local name (in the ':' namespace), which is the object of :derivationKind. It is
+// indexed by the DerivationKind enum value; the mapping is the exporter's
+// wire-token -> paper-individual bridge.
+var derivationIndividuals = [...]string{
+	ptypes.DerivationLabelCorrection:        "LabelCorrection",
+	ptypes.DerivationDeduplication:          "Deduplication",
+	ptypes.DerivationDifficultyFiltering:    "DifficultyFiltering",
+	ptypes.DerivationTranslation:            "Translation",
+	ptypes.DerivationContaminationScrubbing: "ContaminationScrubbing",
+	ptypes.DerivationAdversarialFiltering:   "AdversarialFiltering",
+	ptypes.DerivationVerificationSubset:     "VerificationSubset",
+}
+
+// derivationIndividual returns the vocabulary individual local name for a kind.
+func derivationIndividual(k ptypes.DerivationKind) (string, bool) {
+	if int(k) >= 0 && int(k) < len(derivationIndividuals) {
+		return derivationIndividuals[k], true
+	}
+	return "", false
 }
 
 // Options configures a PROV-O export.
@@ -123,6 +135,7 @@ type encoder struct {
 	tasks      []ptypes.Task
 	actors     []ptypes.Agent
 	activities []ptypes.Activity
+	plans      []ptypes.Plan
 
 	// detail maps keyed by ID string, populated by load().
 	humans   map[string]ptypes.HumanAgent
@@ -130,6 +143,14 @@ type encoder struct {
 	software map[string]ptypes.SoftwareAgent
 	// edgesByTask is the sorted, non-blocked-by edge list per task ID string.
 	edgesByTask map[string][]ptypes.Edge
+	// stepsByPlan is the ordinal-sorted step list per plan ID string.
+	stepsByPlan map[string][]ptypes.PlanStep
+	// planHasPhase[planID][phase] reports whether a plan carries a step for a phase,
+	// so correspondsToStep is emitted only against a step that exists.
+	planHasPhase map[string]map[ptypes.Phase]struct{}
+	// qualByTask[sourceTaskID][targetTaskID] is the derivation qualifier on that
+	// derivation relationship, if any.
+	qualByTask map[string]map[string]ptypes.DerivationQualifier
 }
 
 // load performs every read against the Tracker and sorts all collections so the
@@ -178,6 +199,7 @@ func (e *encoder) load(tr provenance.Tracker) error {
 	}
 
 	e.edgesByTask = map[string][]ptypes.Edge{}
+	e.qualByTask = map[string]map[string]ptypes.DerivationQualifier{}
 	for _, t := range e.tasks {
 		edges, err := tr.Edges(t.ID, nil)
 		if err != nil {
@@ -197,6 +219,39 @@ func (e *encoder) load(tr provenance.Tracker) error {
 			return filtered[i].TargetID < filtered[j].TargetID
 		})
 		e.edgesByTask[t.ID.String()] = filtered
+
+		quals, err := tr.DerivationQualifiers(t.ID)
+		if err != nil {
+			return fmt.Errorf("provo: derivation qualifiers for task %q: %w", t.ID.String(), err)
+		}
+		if len(quals) > 0 {
+			byTarget := map[string]ptypes.DerivationQualifier{}
+			for _, q := range quals {
+				byTarget[q.TargetID.String()] = q
+			}
+			e.qualByTask[t.ID.String()] = byTarget
+		}
+	}
+
+	// Plans + steps: read from the tracker, not hardcoded.
+	if e.plans, err = tr.Plans(); err != nil {
+		return fmt.Errorf("provo: list plans: %w", err)
+	}
+	sort.Slice(e.plans, func(i, j int) bool { return e.plans[i].ID.String() < e.plans[j].ID.String() })
+	e.stepsByPlan = map[string][]ptypes.PlanStep{}
+	e.planHasPhase = map[string]map[ptypes.Phase]struct{}{}
+	for _, pl := range e.plans {
+		steps, err := tr.PlanSteps(pl.ID)
+		if err != nil {
+			return fmt.Errorf("provo: steps for plan %q: %w", pl.ID.String(), err)
+		}
+		sort.Slice(steps, func(i, j int) bool { return steps[i].Ordinal < steps[j].Ordinal })
+		e.stepsByPlan[pl.ID.String()] = steps
+		phases := map[ptypes.Phase]struct{}{}
+		for _, st := range steps {
+			phases[st.Phase] = struct{}{}
+		}
+		e.planHasPhase[pl.ID.String()] = phases
 	}
 	return nil
 }
@@ -224,30 +279,41 @@ func (e *encoder) header() {
 	fmt.Fprintln(p, "#   role is a property of the acting ML agent, not of the specific act; only")
 	fmt.Fprintln(p, "#   ML-agent activities are typed p-plan:Activity (they can furnish the required")
 	fmt.Fprintln(p, "#   agent+role association per the AnnotationActShape).")
-	fmt.Fprintln(p, "# NOTE (:derivationKind): NOT emitted here. Qualified")
-	fmt.Fprintln(p, "#   derivation nodes carry the fact of derivation and its time, but no typed reason.")
+	fmt.Fprintln(p, "# NOTE (:derivationKind): a qualified derivation carries its typed reason")
+	fmt.Fprintln(p, "#   (:derivationKind) and, when recorded, prov:hadActivity;")
+	fmt.Fprintln(p, "#   an unqualified derivation carries only the fact of derivation and its time.")
 	fmt.Fprintf(p, "# NOTE (namespace): the ':' vocabulary namespace <%s> is a PLACEHOLDER pending w3id registration.\n", e.opts.VocabIRI)
 	fmt.Fprintln(p)
 	fmt.Fprintf(p, "@prefix :      <%s> .\n", e.opts.VocabIRI)
 	fmt.Fprintf(p, "@prefix prov:  <%s> .\n", nsProv)
 	fmt.Fprintf(p, "@prefix pplan: <%s> .\n", nsPplan)
 	fmt.Fprintf(p, "@prefix rdfs:  <%s> .\n", nsRdfs)
+	fmt.Fprintf(p, "@prefix dct:   <%s> .\n", nsDct)
 	fmt.Fprintf(p, "@prefix xsd:   <%s> .\n", nsXsd)
 	fmt.Fprintln(p)
 }
 
 func (e *encoder) plan() {
+	if len(e.plans) == 0 {
+		return
+	}
 	p := &e.buf
-	planIRI := e.rawIRI(planLocalName)
-	fmt.Fprintln(p, "# Built-in plan 'pasture-12-phase': the 12 protocol phases plus the 'unscoped'")
-	fmt.Fprintln(p, "# catch-all, reified as one p-plan:Step per Phase enum value (13 steps total).")
-	fmt.Fprintf(p, "%s a pplan:Plan ;\n", planIRI)
-	fmt.Fprintf(p, "    rdfs:label %s .\n", literal("pasture-12-phase"))
-	for _, ph := range allPhases {
-		token := phaseToken(ph)
-		fmt.Fprintf(p, "%s a pplan:Step ;\n", e.stepIRI(token))
-		fmt.Fprintf(p, "    pplan:isStepOfPlan %s ;\n", planIRI)
-		fmt.Fprintf(p, "    rdfs:label %s .\n", literal(token))
+	fmt.Fprintln(p, "# Plans (p-plan:Plan) and their steps (p-plan:Step), read from the tracker.")
+	fmt.Fprintln(p, "# The built-in 'pasture-12-phase' plan reifies the Phase enum (one step per phase).")
+	for _, pl := range e.plans {
+		planIRI := e.iri(pl.ID.String())
+		fmt.Fprintf(p, "%s a pplan:Plan ;\n", planIRI)
+		fmt.Fprintf(p, "    dct:title %s", literal(pl.Title))
+		if pl.Version != "" {
+			fmt.Fprintf(p, " ;\n    dct:hasVersion %s", literal(pl.Version))
+		}
+		fmt.Fprintln(p, " .")
+		for _, st := range e.stepsByPlan[pl.ID.String()] {
+			token := phaseToken(st.Phase)
+			fmt.Fprintf(p, "%s a pplan:Step ;\n", e.stepIRI(pl.ID, token))
+			fmt.Fprintf(p, "    pplan:isStepOfPlan %s ;\n", planIRI)
+			fmt.Fprintf(p, "    rdfs:label %s .\n", literal(token))
+		}
 	}
 	fmt.Fprintln(p)
 }
@@ -303,7 +369,16 @@ func (e *encoder) activitiesSection() {
 		if act.EndedAt != nil {
 			fmt.Fprintf(p, "    prov:endedAtTime %s ;\n", dateTime(*act.EndedAt))
 		}
-		fmt.Fprintf(p, "    pplan:correspondsToStep %s ;\n", e.stepIRI(phaseToken(act.Phase)))
+		// correspondsToStep resolves against the activity's OWN plan's step for its
+		// phase. An unplanned activity (nil PlanID), or one whose plan
+		// lacks a step for its phase, emits none.
+		if act.PlanID != nil {
+			if phases, ok := e.planHasPhase[act.PlanID.String()]; ok {
+				if _, has := phases[act.Phase]; has {
+					fmt.Fprintf(p, "    pplan:correspondsToStep %s ;\n", e.stepIRI(*act.PlanID, phaseToken(act.Phase)))
+				}
+			}
+		}
 		fmt.Fprintf(p, "    prov:wasAssociatedWith %s", e.iri(agentID))
 		if isML {
 			// Synthesize the qualified association the AnnotationActShape requires:
@@ -351,10 +426,10 @@ func (e *encoder) edges(taskID string) {
 		switch ed.Kind {
 		case ptypes.EdgeDerivedFrom:
 			fmt.Fprintf(p, "%s prov:wasDerivedFrom %s ;\n", src, tgt)
-			e.qualifiedDerivation(tgt, ed.CreatedAt)
+			e.qualifiedDerivation(tgt, ed.CreatedAt, e.qualifier(taskID, ed.TargetID))
 		case ptypes.EdgeSupersedes:
 			fmt.Fprintf(p, "%s prov:wasRevisionOf %s ;\n", src, tgt)
-			e.qualifiedDerivation(tgt, ed.CreatedAt)
+			e.qualifiedDerivation(tgt, ed.CreatedAt, e.qualifier(taskID, ed.TargetID))
 		case ptypes.EdgeDiscoveredFrom:
 			fmt.Fprintf(p, "%s prov:wasInfluencedBy %s .\n", src, tgt)
 		case ptypes.EdgeGeneratedBy:
@@ -365,17 +440,39 @@ func (e *encoder) edges(taskID string) {
 	}
 }
 
+// qualifier returns the derivation qualifier on the source->target relationship,
+// or nil if the derivation is unqualified.
+func (e *encoder) qualifier(sourceID, targetID string) *ptypes.DerivationQualifier {
+	if byTarget, ok := e.qualByTask[sourceID]; ok {
+		if q, ok := byTarget[targetID]; ok {
+			return &q
+		}
+	}
+	return nil
+}
+
 // qualifiedDerivation emits the trailing prov:qualifiedDerivation blank node for a
 // derived_from / supersedes edge. The node is typed prov:Derivation and carries the
-// derivation's time (from Edge.CreatedAt) but NO :derivationKind (deferred to M4).
-// It is written as the continuation of the ';'-terminated relation line above it.
-func (e *encoder) qualifiedDerivation(entityIRI string, createdAt time.Time) {
+// derivation's time (from Edge.CreatedAt). When the derivation is qualified
+//, the node also carries :derivationKind (the paper's controlled
+// individual — the attachment point the SHACL DerivationKindAttachmentShape
+// validates) and, when recorded, prov:hadActivity. It is written as the
+// continuation of the ';'-terminated relation line above it.
+func (e *encoder) qualifiedDerivation(entityIRI string, createdAt time.Time, qual *ptypes.DerivationQualifier) {
 	p := &e.buf
 	fmt.Fprintf(p, "    prov:qualifiedDerivation [\n")
 	fmt.Fprintf(p, "        a prov:Derivation ;\n")
 	fmt.Fprintf(p, "        prov:entity %s", entityIRI)
 	if !createdAt.IsZero() {
 		fmt.Fprintf(p, " ;\n        prov:atTime %s", dateTime(createdAt))
+	}
+	if qual != nil {
+		if individual, ok := derivationIndividual(qual.Kind); ok {
+			fmt.Fprintf(p, " ;\n        :derivationKind :%s", individual)
+		}
+		if qual.ActivityID != nil {
+			fmt.Fprintf(p, " ;\n        prov:hadActivity %s", e.iri(qual.ActivityID.String()))
+		}
 	}
 	fmt.Fprintf(p, "\n    ] .\n")
 }
@@ -391,14 +488,10 @@ func (e *encoder) iri(id string) string {
 	return "<" + e.opts.BaseIRI + url.PathEscape(id) + ">"
 }
 
-// rawIRI renders a synthetic local name (ASCII, exporter-controlled) under BaseIRI.
-func (e *encoder) rawIRI(localName string) string {
-	return "<" + e.opts.BaseIRI + localName + ">"
-}
-
-// stepIRI renders the plan-step IRI for a phase wire token.
-func (e *encoder) stepIRI(phaseToken string) string {
-	return e.rawIRI(planLocalName + "/step/" + phaseToken)
+// stepIRI renders the IRI of a plan's step for a phase wire token, minted under
+// the plan's own IRI local name so steps of different plans never collide.
+func (e *encoder) stepIRI(planID ptypes.PlanID, phaseToken string) string {
+	return "<" + e.opts.BaseIRI + url.PathEscape(planID.String()) + "/step/" + phaseToken + ">"
 }
 
 // roleIRI mints a role RESOURCE IRI (not a string literal) for a role wire token, so
