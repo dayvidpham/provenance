@@ -49,6 +49,13 @@ type Tracker interface {
 	// If kind is non-nil, only edges of that kind are returned.
 	Edges(id TaskID, kind *EdgeKind) ([]Edge, error)
 
+	// AllEdges returns every edge in the graph (all kinds, including
+	// EdgeBlockedBy), each with Edge.CreatedAt populated from the edges.created_at
+	// column. Rows are ordered deterministically by (source, kind, target). This is
+	// a pure read intended for whole-graph consumers such as the PROV-O exporter,
+	// which cannot be written against the per-task Edges surface alone.
+	AllEdges() ([]Edge, error)
+
 	// ---------------------------------------------------------------------------
 	// Readiness Queries (blocked-by subgraph only)
 	// ---------------------------------------------------------------------------
@@ -115,6 +122,13 @@ type Tracker interface {
 	// Exact retries are inert; missing rows under an exact claim are repaired;
 	// conflicting existing rows fail before mutation.
 	RegisterFixedSoftwareAgent(reg FixedSoftwareAgentRegistration) (SoftwareAgent, error)
+
+	// AllActors returns every registered actor as a base row (ID + Kind only);
+	// dereference detail with the kind-specific getters (HumanAgent/MLAgent/
+	// SoftwareAgent). Rows are ordered deterministically by ID. This is a pure read
+	// intended for whole-graph consumers such as the PROV-O exporter, which cannot be
+	// written against the per-ID Agent surface alone.
+	AllActors() ([]Agent, error)
 
 	// Agent returns the base agent (kind only) by ID.
 	// Returns ErrNotFound if the agent does not exist.

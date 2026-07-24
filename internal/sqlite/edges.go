@@ -35,19 +35,47 @@ func (db *DB) GetEdges(sourceID ptypes.TaskID, kind *ptypes.EdgeKind) ([]ptypes.
 	}
 
 	var edges []ptypes.Edge
-	err := sqlitex.Execute(db.conn, "SELECT source_id,target_id,kind_id FROM edges WHERE source_id=?1 AND (NOT ?2 OR kind_id=?3) ORDER BY created_at ASC", &sqlitex.ExecOptions{
+	err := sqlitex.Execute(db.conn, "SELECT source_id,target_id,kind_id,created_at FROM edges WHERE source_id=?1 AND (NOT ?2 OR kind_id=?3) ORDER BY created_at ASC", &sqlitex.ExecOptions{
 		Args: []any{sourceID.String(), kind != nil, kindValue},
 		ResultFunc: func(stmt *zs.Stmt) error {
-			edges = append(edges, ptypes.Edge{
-				SourceID: stmt.ColumnText(0),
-				TargetID: stmt.ColumnText(1),
-				Kind:     ptypes.EdgeKind(stmt.ColumnInt(2)),
-			})
+			edges = append(edges, scanEdge(stmt))
 			return nil
 		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("sqlite.GetEdges %q: %w", sourceID.String(), err)
+	}
+	return edges, nil
+}
+
+// scanEdge reads a (source_id, target_id, kind_id, created_at) row into a
+// ptypes.Edge. created_at is stored as Unix nanoseconds and materialized as UTC.
+func scanEdge(stmt *zs.Stmt) ptypes.Edge {
+	return ptypes.Edge{
+		SourceID:  stmt.ColumnText(0),
+		TargetID:  stmt.ColumnText(1),
+		Kind:      ptypes.EdgeKind(stmt.ColumnInt(2)),
+		CreatedAt: time.Unix(0, stmt.ColumnInt64(3)).UTC(),
+	}
+}
+
+// GetAllEdges returns every edge in the database, including EdgeBlockedBy, with
+// CreatedAt populated. Rows are ordered deterministically by (source_id, kind_id,
+// target_id) so callers that require reproducible output (e.g. a golden-file
+// exporter) get a stable iteration order. Acquires the DB mutex.
+func (db *DB) GetAllEdges() ([]ptypes.Edge, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	var edges []ptypes.Edge
+	err := sqlitex.Execute(db.conn, "SELECT source_id,target_id,kind_id,created_at FROM edges ORDER BY source_id ASC, kind_id ASC, target_id ASC", &sqlitex.ExecOptions{
+		ResultFunc: func(stmt *zs.Stmt) error {
+			edges = append(edges, scanEdge(stmt))
+			return nil
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("sqlite.GetAllEdges: %w", err)
 	}
 	return edges, nil
 }
@@ -59,13 +87,9 @@ func (db *DB) GetBlockedByEdges() ([]ptypes.Edge, error) {
 	defer db.mu.Unlock()
 
 	var edges []ptypes.Edge
-	err := sqlitex.Execute(db.conn, "SELECT source_id, target_id, kind_id FROM edges WHERE kind_id = ?1 ORDER BY created_at ASC", &sqlitex.ExecOptions{Args: []any{int(ptypes.EdgeBlockedBy)},
+	err := sqlitex.Execute(db.conn, "SELECT source_id, target_id, kind_id, created_at FROM edges WHERE kind_id = ?1 ORDER BY created_at ASC", &sqlitex.ExecOptions{Args: []any{int(ptypes.EdgeBlockedBy)},
 		ResultFunc: func(stmt *zs.Stmt) error {
-			edges = append(edges, ptypes.Edge{
-				SourceID: stmt.ColumnText(0),
-				TargetID: stmt.ColumnText(1),
-				Kind:     ptypes.EdgeBlockedBy,
-			})
+			edges = append(edges, scanEdge(stmt))
 			return nil
 		},
 	})

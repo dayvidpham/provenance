@@ -113,6 +113,14 @@ func (t *sqliteTracker) Edges(id TaskID, kind *EdgeKind) ([]Edge, error) {
 	return edges, nil
 }
 
+func (t *sqliteTracker) AllEdges() ([]Edge, error) {
+	edges, err := t.db.GetAllEdges()
+	if err != nil {
+		return nil, fmt.Errorf("provenance.Tracker.AllEdges: %w", err)
+	}
+	return edges, nil
+}
+
 // ---------------------------------------------------------------------------
 // Readiness Queries
 // ---------------------------------------------------------------------------
@@ -222,6 +230,14 @@ func (t *sqliteTracker) RegisterFixedSoftwareAgent(reg FixedSoftwareAgentRegistr
 		return SoftwareAgent{}, fmt.Errorf("provenance.Tracker.RegisterFixedSoftwareAgent: %w", err)
 	}
 	return sa, nil
+}
+
+func (t *sqliteTracker) AllActors() ([]Agent, error) {
+	agents, err := t.db.GetAllAgents()
+	if err != nil {
+		return nil, fmt.Errorf("provenance.Tracker.AllActors: %w", err)
+	}
+	return agents, nil
 }
 
 func (t *sqliteTracker) Agent(id AgentID) (Agent, error) {
