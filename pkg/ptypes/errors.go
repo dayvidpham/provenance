@@ -46,4 +46,11 @@ var (
 	// retries are inert; only drift is a conflict. To fix: use the exact stored
 	// registration or choose a distinct fixed ID.
 	ErrAgentAlreadyExists = error(errSentinel("provenance: agent already registered"))
+
+	// ErrNoDerivationEdge is returned by QualifyDerivation when no derived_from or
+	// supersedes edge exists between the given source and target: a derivation
+	// qualifier (the vocabulary's :derivationKind) can attach only to an existing
+	// derivation relationship, never conjure one. To fix: AddEdge a derived_from or
+	// supersedes edge from source to target first, then qualify it.
+	ErrNoDerivationEdge = error(errSentinel("provenance: no derivation edge to qualify"))
 )

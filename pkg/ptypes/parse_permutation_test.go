@@ -93,6 +93,11 @@ func callParseCommentID(input string) (string, uuid.UUID, error) {
 	return id.Namespace, id.UUID, err
 }
 
+func callParsePlanID(input string) (string, uuid.UUID, error) {
+	id, err := ptypes.ParsePlanID(input)
+	return id.Namespace, id.UUID, err
+}
+
 // dispatchParse maps an IDTypeSpec.ParseFunc name to the actual parser.
 // Returns nil if the name is unknown (test will fail with a clear message).
 func dispatchParse(parseFunc string) func(string) (string, uuid.UUID, error) {
@@ -105,13 +110,15 @@ func dispatchParse(parseFunc string) func(string) (string, uuid.UUID, error) {
 		return callParseActivityID
 	case "ParseCommentID":
 		return callParseCommentID
+	case "ParsePlanID":
+		return callParsePlanID
 	default:
 		return nil
 	}
 }
 
 // ---------------------------------------------------------------------------
-// Success permutations: 4 id_types × 6 namespaces × 3 uuids = 72 cases
+// Success permutations: 5 id_types × 6 namespaces × 3 uuids = 90 cases
 // ---------------------------------------------------------------------------
 
 func TestParseID_SuccessPermutations(t *testing.T) {
@@ -124,7 +131,7 @@ func TestParseID_SuccessPermutations(t *testing.T) {
 		if parseFn == nil {
 			t.Errorf(
 				"TestParseID_SuccessPermutations: unknown parse_func %q in fixtures.yaml — "+
-					"expected one of ParseTaskID, ParseAgentID, ParseActivityID, ParseCommentID",
+					"expected one of ParseTaskID, ParseAgentID, ParseActivityID, ParseCommentID, ParsePlanID",
 				idType.ParseFunc,
 			)
 			continue
@@ -175,7 +182,7 @@ func TestParseID_SuccessPermutations(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Error permutations: 4 id_types × 8 error_cases = 32 cases
+// Error permutations: 5 id_types × 8 error_cases = 40 cases
 // ---------------------------------------------------------------------------
 
 func TestParseID_ErrorPermutations(t *testing.T) {
@@ -188,7 +195,7 @@ func TestParseID_ErrorPermutations(t *testing.T) {
 		if parseFn == nil {
 			t.Errorf(
 				"TestParseID_ErrorPermutations: unknown parse_func %q in fixtures.yaml — "+
-					"expected one of ParseTaskID, ParseAgentID, ParseActivityID, ParseCommentID",
+					"expected one of ParseTaskID, ParseAgentID, ParseActivityID, ParseCommentID, ParsePlanID",
 				idType.ParseFunc,
 			)
 			continue

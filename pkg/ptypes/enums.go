@@ -243,6 +243,70 @@ func (e EdgeKind) IsValid() bool {
 }
 
 // ---------------------------------------------------------------------------
+// DerivationKind
+// ---------------------------------------------------------------------------
+
+// DerivationKind is the typed reason a dataset/task was derived from another
+// (the vocabulary's :derivationKind controlled vocabulary). It is a closed enum of
+// the seven individuals the vocabulary enumerates. Wire tokens are lower_snake_case
+// and are the stable mapping the exporter turns into the vocabulary individuals
+// (:LabelCorrection, :Deduplication, …).
+type DerivationKind int
+
+const (
+	DerivationLabelCorrection        DerivationKind = iota // 0
+	DerivationDeduplication                                // 1
+	DerivationDifficultyFiltering                          // 2
+	DerivationTranslation                                  // 3
+	DerivationContaminationScrubbing                       // 4
+	DerivationAdversarialFiltering                         // 5
+	DerivationVerificationSubset                           // 6
+)
+
+var derivationKindStrings = [...]string{
+	DerivationLabelCorrection:        "label_correction",
+	DerivationDeduplication:          "deduplication",
+	DerivationDifficultyFiltering:    "difficulty_filtering",
+	DerivationTranslation:            "translation",
+	DerivationContaminationScrubbing: "contamination_scrubbing",
+	DerivationAdversarialFiltering:   "adversarial_filtering",
+	DerivationVerificationSubset:     "verification_subset",
+}
+
+func (d DerivationKind) String() string {
+	if int(d) >= 0 && int(d) < len(derivationKindStrings) {
+		return derivationKindStrings[d]
+	}
+	return fmt.Sprintf("DerivationKind(%d)", int(d))
+}
+
+func (d DerivationKind) MarshalText() ([]byte, error) {
+	if !d.IsValid() {
+		return nil, fmt.Errorf("provenance: cannot marshal invalid DerivationKind(%d) — valid range is 0–%d", int(d), len(derivationKindStrings)-1)
+	}
+	return []byte(d.String()), nil
+}
+
+func (d *DerivationKind) UnmarshalText(b []byte) error {
+	text := string(b)
+	for i, name := range derivationKindStrings {
+		if name == text {
+			*d = DerivationKind(i)
+			return nil
+		}
+	}
+	return fmt.Errorf(
+		"provenance: unknown DerivationKind %q — valid values: %v — "+
+			"fix by using one of the listed values",
+		text, derivationKindStrings[:],
+	)
+}
+
+func (d DerivationKind) IsValid() bool {
+	return d >= DerivationLabelCorrection && d <= DerivationVerificationSubset
+}
+
+// ---------------------------------------------------------------------------
 // AgentKind
 // ---------------------------------------------------------------------------
 

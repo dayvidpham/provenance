@@ -15,7 +15,7 @@ import (
 // namespacedID is a type constraint for all ID types that have
 // Namespace and UUID fields. Used by parseID to deduplicate parse logic.
 type namespacedID interface {
-	TaskID | ActorID | ActivityID | CommentID
+	TaskID | ActorID | ActivityID | CommentID | PlanID
 }
 
 // parseID is a generic helper that parses "namespace--uuid" into any ID type
@@ -54,6 +54,8 @@ func parseID[T namespacedID](raw, caller string) (T, error) {
 		result = ActivityID{Namespace: ns, UUID: u}
 	case CommentID:
 		result = CommentID{Namespace: ns, UUID: u}
+	case PlanID:
+		result = PlanID{Namespace: ns, UUID: u}
 	}
 	return result.(T), nil
 }
@@ -151,6 +153,56 @@ func ParseCommentID(s string) (CommentID, error) {
 	return parseID[CommentID](s, "ParseCommentID")
 }
 
+// PlanID uniquely identifies a plan (P-Plan Plan; the reified protocol-phase
+// sequence a run follows). Wire format: "namespace--uuid", the same
+// namespace--uuidv7 grammar as every other ID. The built-in plan carries a
+// DETERMINISTIC (name-based UUIDv5) id so it is stable across opens — see
+// BuiltinPlanID.
+type PlanID struct {
+	Namespace string
+	UUID      uuid.UUID
+}
+
+// String returns the wire format: "namespace--uuid".
+func (id PlanID) String() string {
+	return id.Namespace + "--" + id.UUID.String()
+}
+
+// ParsePlanID parses "namespace--uuid" into a PlanID.
+// Uses strings.LastIndex to split on the rightmost "--" separator.
+// Returns ErrInvalidID if the format is invalid or the UUID is malformed.
+func ParsePlanID(s string) (PlanID, error) {
+	return parseID[PlanID](s, "ParsePlanID")
+}
+
+// ---------------------------------------------------------------------------
+// Built-in plan identity (reification of the Phase enum)
+// ---------------------------------------------------------------------------
+
+const (
+	// BuiltinPlanNamespace is the namespace of the seeded built-in plan.
+	BuiltinPlanNamespace = "provenance"
+	// BuiltinPlanTitle is the human title of the seeded built-in plan; it is the
+	// canonical name ("pasture-12-phase").
+	BuiltinPlanTitle = "pasture-12-phase"
+	// BuiltinPlanVersion is the version string carried on the seeded built-in
+	// plan. Guideline-document plans (prov:hadPlan) become
+	// Version-carrying plans; this const is that version for the built-in one.
+	BuiltinPlanVersion = "1.0.0"
+	// builtinPlanSeed is the stable name-based UUIDv5 seed for the built-in plan.
+	builtinPlanSeed = "provenance/plan/pasture-12-phase"
+)
+
+// BuiltinPlanID returns the deterministic PlanID of the seeded built-in
+// "pasture-12-phase" plan. It is a name-based UUIDv5 (stable across opens), so
+// idempotent seeding and the StartActivity default both reference the same id.
+func BuiltinPlanID() PlanID {
+	return PlanID{
+		Namespace: BuiltinPlanNamespace,
+		UUID:      uuid.NewSHA1(uuid.NameSpaceURL, []byte(builtinPlanSeed)),
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Entity Types
 // ---------------------------------------------------------------------------
@@ -217,6 +269,24 @@ type MLModel struct {
 	Name     ModelID  `json:"name"`
 }
 
+// Plan represents a reified sequence of protocol steps (P-Plan Plan). The
+// built-in plan reifies the Phase enum; guideline documents (the vocabulary's
+// prov:hadPlan on associations) become Version-carrying plans.
+type Plan struct {
+	ID      PlanID `json:"id"`
+	Title   string `json:"title"`
+	Version string `json:"version"`
+}
+
+// PlanStep is one ordered step of a Plan (P-Plan Step), corresponding to one
+// Phase. Ordinal is the step's position within its plan (0-based).
+type PlanStep struct {
+	PlanID  PlanID `json:"planId"`
+	Ordinal int    `json:"ordinal"`
+	Phase   Phase  `json:"phase"`
+	Title   string `json:"title"`
+}
+
 // Activity represents a recorded action (PROV-O Activity).
 type Activity struct {
 	ID        ActivityID `json:"id"`
@@ -226,6 +296,11 @@ type Activity struct {
 	StartedAt time.Time  `json:"startedAt"`
 	EndedAt   *time.Time `json:"endedAt,omitempty"`
 	Notes     string     `json:"notes,omitempty"`
+	// PlanID is the plan this activity was carried out under (P-Plan
+	// correspondsToStep resolves against its steps). nil means legacy/unplanned
+	// — an activity recorded before the plan layer, or one deliberately opted out
+	// of a plan (see StartActivity's Unplanned option).
+	PlanID *PlanID `json:"planId,omitempty"`
 }
 
 // Edge represents a typed relationship originating from a task.
@@ -252,6 +327,22 @@ type Edge struct {
 type Label struct {
 	TaskID TaskID `json:"taskId"`
 	Name   string `json:"name"`
+}
+
+// DerivationQualifier is the typed reason for a derivation relationship between
+// two tasks (the vocabulary's :derivationKind, attached only via
+// prov:qualifiedDerivation — never directly to the derivation edge). It
+// qualifies an existing derived_from or supersedes edge from SourceID to
+// TargetID; the qualifier cannot exist without such an edge (enforced in the
+// persistence layer). ActivityID, when non-nil, is the activity that performed
+// the derivation (prov:hadActivity). The edge kind (derived_from vs supersedes)
+// is not carried here: the qualifier is keyed by (source, target) and applies to
+// the derivation relationship however it is expressed.
+type DerivationQualifier struct {
+	SourceID   TaskID         `json:"sourceId"`
+	TargetID   TaskID         `json:"targetId"`
+	Kind       DerivationKind `json:"kind"`
+	ActivityID *ActivityID    `json:"activityId,omitempty"`
 }
 
 // Comment is a timestamped note attached to a task.

@@ -29,6 +29,9 @@ parse_id:
     - name: CommentID
       parse_func: ParseCommentID
 
+    - name: PlanID
+      parse_func: ParsePlanID
+
   # Axis 2: Namespace patterns
   namespaces:
     - name: simple
