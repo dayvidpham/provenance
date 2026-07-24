@@ -47,8 +47,18 @@ An **Activity** is a bounded action performed by an agent. Activities have a sta
 | `prov:startedAtTime` | `StartedAt` | Always set at creation |
 | `prov:endedAtTime` | `EndedAt` | Set by `EndActivity()`, nil until then |
 | Activity attributes | `Phase`, `Stage`, `Notes` | Extended attributes |
+| `p-plan:correspondsToStep` | `PlanID` | The plan the act was carried out under (nil = unplanned) |
 
 `Stage` captures fine-grained progress within a phase: NotStarted, InProgress, Blocked, Complete.
+
+### Plan (p-plan:Plan) -- Plan / PlanStep
+
+A **Plan** reifies an ordered sequence of protocol steps (one `PlanStep` per `Phase`), so an activity can cite the guideline it followed (`p-plan:correspondsToStep`). One built-in plan, `pasture-12-phase`, is seeded at `Open` from the `Phase` enum (12 protocol phases plus the `unscoped` catch-all, 13 steps). `StartActivity` records the built-in plan by default; `InPlan(planID)` pins another and `Unplanned()` opts out. `Activity.PlanID` is nil for legacy/unplanned activities. Reads: `Plans()`, `PlanSteps(PlanID)`.
+
+| PROV / P-Plan | Provenance | Notes |
+|---------------|-----------|-------|
+| `p-plan:Plan` | `Plan` | `ID`, `Title`, `Version`; built-in id is a deterministic UUIDv5 |
+| `p-plan:Step` | `PlanStep` | `(PlanID, Ordinal, Phase, Title)`; one per phase |
 
 ## Relations (Edges)
 
@@ -82,6 +92,12 @@ These relations are not in PROV-DM but are essential for task dependency trackin
 - `Descendants(id)` -- all tasks that are transitively waiting for the given task
 
 Other edge kinds (DerivedFrom, Supersedes, DiscoveredFrom, GeneratedBy, AttributedTo) are informational lineage -- they record provenance but do not affect scheduling.
+
+### Derivation Qualifiers (`:derivationKind`)
+
+A **DerivationQualifier** records the *typed reason* for a derivation relationship (the vocabulary's `:derivationKind`: `label_correction`, `deduplication`, `difficulty_filtering`, `translation`, `contamination_scrubbing`, `adversarial_filtering`, `verification_subset`). Following the vocabulary's design, the reason is attached only via a qualified derivation, never conflated with the derivation edge itself: `Edge` is unchanged, and a side table carries the qualifier. A qualifier can attach only to an existing `derived_from` or `supersedes` edge (enforced by a composite foreign key + CHECK), and is single-valued per relationship, keyed by `(source, target)`.
+
+The write verb is `Session.QualifyDerivation(source, target, kind, activity)`; the read is `Tracker.DerivationQualifiers(id)`. `QualifyDerivation` journals the who-provenance of the qualification as a caller-domain task_event (authorized against the source task like an edge) and then projects the qualifier row -- a deliberate "closest conforming shape" rather than a full journaled mutation family, to avoid extending the versioned canonical-mutation codec for one additive qualifier (see the verb's doc comment). The exporter emits the qualifier as `:derivationKind` (plus `prov:hadActivity`) on the `prov:qualifiedDerivation` node -- the attachment point the vocabulary's SHACL `DerivationKindAttachmentShape` validates.
 
 ## Supporting Concepts
 
