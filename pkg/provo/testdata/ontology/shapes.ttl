@@ -1,0 +1,145 @@
+@prefix :        <https://example.org/data-labour-prov#> .
+@prefix sh:      <http://www.w3.org/ns/shacl#> .
+@prefix rdfs:    <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd:     <http://www.w3.org/2001/XMLSchema#> .
+@prefix prov:    <http://www.w3.org/ns/prov#> .
+@prefix pplan:   <http://purl.org/net/p-plan#> .
+
+#################################################################
+# SHACL shapes validating the composition pattern the paper's
+# Section 4 (Approach) prescribes for its minted vocabulary.
+#
+# Scope discipline: these shapes validate exactly what the paper's
+# text and Listings 1-6 state or demonstrate. They do not attempt
+# to validate the full PROV-O / P-Plan / OA / PAV / CAV / CCCEV /
+# Org graph -- only the parts this paper's own Approach section
+# newly constrains (the qualified-association pattern for acts,
+# the qualified-derivation attachment point for :derivationKind,
+# the :LLMAgent configuration properties, and the closed value set
+# for :attributionGranularity).
+#################################################################
+
+#################################################################
+# (a) Annotation/review-act shape: every p-plan:Activity (the class
+# the paper uses for concrete annotate/verify acts, Listing 1) must
+# carry a prov:qualifiedAssociation naming both the acting agent
+# and the role it played in the act.
+#
+# MODELLING JUDGMENT CALL: the paper does not mint a distinct class
+# for "annotation act" -- Listing 1 types each concrete act
+# `a prov:Activity, p-plan:Activity`. We target p-plan:Activity
+# (not the broader prov:Activity) because the paper's own run-side
+# extension (Section 4.9, Listing showing ex:run-42) is a plain
+# prov:Activity / cav:Assessment that is associated via
+# cav:performedBy rather than prov:qualifiedAssociation -- so
+# requiring qualifiedAssociation on every prov:Activity would
+# contradict the paper's own worked example. p-plan:Activity is the
+# narrower, correct target: it is exactly the class the paper uses
+# for creation-side annotation/review acts, and every p-plan:Activity
+# instance in Listing 1 does carry qualifiedAssociation with
+# prov:agent + prov:hadRole.
+#################################################################
+
+:AnnotationActShape a sh:NodeShape ;
+    sh:targetClass pplan:Activity ;
+    rdfs:label "Annotation/review act association shape"@en ;
+    rdfs:comment "Requires a p-plan:Activity (Listing 1's annotate/verify acts) to carry at least one prov:qualifiedAssociation, itself carrying an agent and a role, per Section 4.4 (Trace Layer): 'Each act is a prov:Activity that ... carr[ies] a qualified association with prov:hadRole (annotator, reviewer) and prov:hadPlan (the guideline version the agent followed).'"@en ;
+    sh:property [
+        sh:path prov:qualifiedAssociation ;
+        sh:minCount 1 ;
+        sh:node :QualifiedAssociationShape ;
+        sh:message "A p-plan:Activity (an annotation or review act) must carry at least one prov:qualifiedAssociation." ;
+    ] .
+
+:QualifiedAssociationShape a sh:NodeShape ;
+    rdfs:label "Qualified association content shape"@en ;
+    sh:property [
+        sh:path prov:agent ;
+        sh:minCount 1 ;
+        sh:message "A prov:qualifiedAssociation must name the acting agent via prov:agent." ;
+    ] ;
+    sh:property [
+        sh:path prov:hadRole ;
+        sh:minCount 1 ;
+        sh:message "A prov:qualifiedAssociation on an annotation/review act must carry prov:hadRole (the agent's function in this act, e.g. annotator or reviewer)." ;
+    ] .
+
+#################################################################
+# (b) :derivationKind may appear ONLY on a node typed prov:Derivation
+# (i.e. only inside a prov:qualifiedDerivation reification), and its
+# value must be one of the paper's seven controlled-vocabulary
+# individuals. Two shapes enforce this together:
+#   - DerivationKindAttachmentShape: whatever node has a
+#     :derivationKind triple must be typed prov:Derivation.
+#   - DerivationShape: on a prov:Derivation node, :derivationKind
+#     (when present) is single-valued and drawn from the closed set.
+#################################################################
+
+:DerivationKindAttachmentShape a sh:NodeShape ;
+    sh:targetSubjectsOf :derivationKind ;
+    rdfs:label "derivationKind attachment-point shape"@en ;
+    rdfs:comment "Per Section 4.5 (Item Identity and Lineage) and Listing 3's caption: 'The :derivationKind is attached only via prov:qualifiedDerivation, never directly to prov:wasRevisionOf.' Any subject of a :derivationKind triple must therefore be typed prov:Derivation."@en ;
+    sh:class prov:Derivation ;
+    sh:message "A :derivationKind value must be attached only to a node typed prov:Derivation (i.e. only inside a prov:qualifiedDerivation reification), never directly to prov:wasRevisionOf/prov:wasDerivedFrom." .
+
+:DerivationShape a sh:NodeShape ;
+    sh:targetClass prov:Derivation ;
+    rdfs:label "prov:Derivation :derivationKind value shape"@en ;
+    sh:property [
+        sh:path :derivationKind ;
+        sh:maxCount 1 ;
+        sh:in ( :LabelCorrection :Deduplication :DifficultyFiltering :Translation
+                :ContaminationScrubbing :AdversarialFiltering :VerificationSubset ) ;
+        sh:message "derivationKind, when present, must be exactly one of the paper's seven controlled-vocabulary individuals." ;
+    ] .
+
+#################################################################
+# (c) :LLMAgent must carry :modelId (minCount 1); all three
+# configuration properties, when present, must be xsd:string.
+# Per Section 4.6: ':LLMAgent ... with three configuration
+# properties: :modelId, :modelVersion, and :decodingParameters.'
+# and the Glossary's ':LLMAgent ... configured by :modelId,
+# :modelVersion, and :decodingParameters.'
+#
+# MODELLING JUDGMENT CALL: only :modelId is made mandatory
+# (minCount 1). The paper's own run-provenance example
+# (ex:gpt-judge, unlabelled block in Section 4.9) omits
+# :modelVersion and :decodingParameters, and Section 4.9 explicitly
+# says these are recorded 'where reported' -- so making them
+# mandatory would reject the paper's own worked example.
+#################################################################
+
+:LLMAgentShape a sh:NodeShape ;
+    sh:targetClass :LLMAgent ;
+    rdfs:label "LLMAgent configuration shape"@en ;
+    sh:property [
+        sh:path :modelId ;
+        sh:minCount 1 ;
+        sh:datatype xsd:string ;
+        sh:message ":LLMAgent requires at least one :modelId (xsd:string)." ;
+    ] ;
+    sh:property [
+        sh:path :modelVersion ;
+        sh:datatype xsd:string ;
+        sh:message ":modelVersion, when present, must be xsd:string." ;
+    ] ;
+    sh:property [
+        sh:path :decodingParameters ;
+        sh:datatype xsd:string ;
+        sh:message ":decodingParameters, when present, must be xsd:string." ;
+    ] .
+
+#################################################################
+# (d) :attributionGranularity, when present, is single-valued and
+# drawn from the paper's five controlled values.
+#################################################################
+
+:AttributionGranularityShape a sh:NodeShape ;
+    sh:targetSubjectsOf :attributionGranularity ;
+    rdfs:label "attributionGranularity value shape"@en ;
+    sh:property [
+        sh:path :attributionGranularity ;
+        sh:maxCount 1 ;
+        sh:in ( :person :team :organization :undeterminable :unspecified ) ;
+        sh:message "attributionGranularity, when present, must be exactly one of: person, team, organization, undeterminable, unspecified." ;
+    ] .

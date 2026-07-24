@@ -48,6 +48,7 @@
         go-tools             # staticcheck
         delve
         ast-grep
+        apache-jena          # riot + shacl — PROV-O Turtle validation & SHACL conformance (pkg/provo)
       ];
 
       # ast-grep is part of the package checkPhase, not only the dev shell.
