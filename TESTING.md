@@ -35,6 +35,16 @@ processors and default package/test concurrency. Do not specify `-count`.
 `-shuffle=on` reports a seed; reproduce an order failure with
 `-shuffle=<reported-seed>`.
 
+The private file-backed WAL pool benchmarks use the same race-only policy:
+
+```bash
+CGO_ENABLED=1 go test -race -fullpath -timeout=20m -run '^$' -bench '^BenchmarkPool' -benchmem ./internal/sqlite
+```
+
+They measure pooled reads, one `Apply` writer with readers, and contending
+`CurrentFact` writers. Their standard benchmark metrics and domain counters are
+performance observations only; ordinary tests remain the correctness proof.
+
 ## Test map
 
 | Layer | Purpose | Representative files |
