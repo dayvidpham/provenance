@@ -15,18 +15,20 @@ import (
 // The fold:
 //  1. Validates ActivityID and AgentID (Canonicalize already does this; we
 //     double-check for defense-in-depth).
-//  2. Inserts the activities row (INSERT OR IGNORE — idempotent on exact replay).
-//  3. Checks for a foreign-operation ActivityID collision in
-//     journal_activity_creations; returns typed *ActivityConflict if found.
-//  4. Inserts journal_activity_creations (journal_id, activity_id).
+//  2. Strictly inserts the activities row. Exact OperationID replay has already
+//     short-circuited before folding, so any existing ActivityID is a conflict.
+//  3. On an ActivityID uniqueness conflict only, looks up an existing journal
+//     birth attribution and returns typed *ActivityConflict.
+//  4. After a fresh activity insert, inserts journal_activity_creations.
 //
 // The result-slot recording (insertResultSlotLocked) is the caller's
 // responsibility (foldEffectLocked in operations.go), consistent with all other
 // effect kinds.
 //
-// ActivityID collision semantics: a collision means a *different* committed
-// operation owns this ActivityID. The fold rolls back the whole operation via
-// the returned error. DBOS callers treat this as a terminal domain failure.
+// ActivityID collision semantics: every pre-existing ActivityID conflicts,
+// including activities created outside the journal. The fold rolls back the
+// whole operation via the returned error. DBOS callers treat this as a terminal
+// domain failure.
 
 // ensureActivityCreationsSchema idempotently creates journal_activity_creations.
 // Called from ensureOperationsSchema (operations.go) during DB activation.
@@ -68,20 +70,42 @@ func (db *DB) foldActivityCreateLocked(in journal.OperationInput, jid int64, eff
 			in.OperationID)
 	}
 
-	// Step 1: Insert the activities row (INSERT OR IGNORE — idempotent for
-	// exact replay; the row may already exist from a prior attempt that was
-	// rolled back at a later step).
+	// Step 1: Strictly insert the activities row. Exact OperationID replay exits
+	// before folding, and the Apply savepoint removes every partial prior attempt.
 	recordedAt := in.RecordedAt
 	if eff.RecordedAtOverride != nil {
 		recordedAt = *eff.RecordedAtOverride
 	}
 	if err := sqlitex.Execute(db.conn,
-		`INSERT OR IGNORE INTO activities (id, agent_id, phase_id, stage_id, started_at, ended_at, notes) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
+		`INSERT INTO activities (id, agent_id, phase_id, stage_id, started_at, ended_at, notes) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
 		&sqlitex.ExecOptions{Args: []any{
 			activityID.String(), agentID.String(),
 			int(eff.ActivityPhase), int(eff.ActivityStage),
 			recordedAt, nil, eff.ActivityNotes,
 		}}); err != nil {
+		if isUniqueViolation(err) {
+			var claimingJournalID int64
+			if lookupErr := sqlitex.Execute(db.conn,
+				`SELECT journal_id FROM journal_activity_creations WHERE activity_id = ?1`,
+				&sqlitex.ExecOptions{
+					Args: []any{activityID.String()},
+					ResultFunc: func(stmt *zs.Stmt) error {
+						claimingJournalID = stmt.ColumnInt64(0)
+						return nil
+					},
+				}); lookupErr != nil {
+				return fmt.Errorf(
+					"Apply: operation %q EffectActivityCreate: attribute ActivityID collision for %q: %w — "+
+						"where: EffectActivityCreate fold, journal_activity_creations lookup after activities uniqueness failure; "+
+						"when: before returning ActivityConflict; impact: operation rolled back and collision ownership is unknown; "+
+						"fix: verify journal_activity_creations integrity and retry",
+					in.OperationID, activityID.String(), lookupErr)
+			}
+			return &journal.ActivityConflict{
+				ActivityID:        activityID,
+				ExistingJournalID: journal.JournalID(claimingJournalID),
+			}
+		}
 		return fmt.Errorf(
 			"Apply: operation %q EffectActivityCreate: insert activities row for %q: %w — "+
 				"where: EffectActivityCreate fold, activities INSERT; when: before journal_activity_creations INSERT; "+
@@ -90,53 +114,11 @@ func (db *DB) foldActivityCreateLocked(in journal.OperationInput, jid int64, eff
 			in.OperationID, activityID.String(), err, agentID.String())
 	}
 
-	// Step 2: Check for a foreign-operation collision on this ActivityID.
-	var claimingJournalID int64
-	found := false
-	if err := sqlitex.Execute(db.conn,
-		`SELECT journal_id FROM journal_activity_creations WHERE activity_id = ?1`,
-		&sqlitex.ExecOptions{
-			Args: []any{activityID.String()},
-			ResultFunc: func(stmt *zs.Stmt) error {
-				claimingJournalID = stmt.ColumnInt64(0)
-				found = true
-				return nil
-			},
-		}); err != nil {
-		return fmt.Errorf(
-			"Apply: operation %q EffectActivityCreate: lookup existing journal_activity_creations for %q: %w",
-			in.OperationID, activityID.String(), err)
-	}
-	if found {
-		return &journal.ActivityConflict{
-			ActivityID:        activityID,
-			ExistingJournalID: journal.JournalID(claimingJournalID),
-		}
-	}
-
-	// Step 3: Insert journal_activity_creations (birth record).
+	// Step 2: Insert journal_activity_creations (birth record). Any failure rolls
+	// the fresh activities row back with the enclosing Apply savepoint.
 	if err := sqlitex.Execute(db.conn,
 		`INSERT INTO journal_activity_creations (journal_id, activity_id) VALUES (?1, ?2)`,
 		&sqlitex.ExecOptions{Args: []any{jid, activityID.String()}}); err != nil {
-		if isUniqueViolation(err) {
-			// Defense-in-depth: concurrent insert of the same activity_id.
-			var existingJID int64
-			_ = sqlitex.Execute(db.conn,
-				`SELECT journal_id FROM journal_activity_creations WHERE activity_id = ?1`,
-				&sqlitex.ExecOptions{
-					Args: []any{activityID.String()},
-					ResultFunc: func(stmt *zs.Stmt) error {
-						existingJID = stmt.ColumnInt64(0)
-						return nil
-					},
-				})
-			if existingJID != 0 {
-				return &journal.ActivityConflict{
-					ActivityID:        activityID,
-					ExistingJournalID: journal.JournalID(existingJID),
-				}
-			}
-		}
 		return fmt.Errorf(
 			"Apply: operation %q EffectActivityCreate: insert journal_activity_creations for %q: %w — "+
 				"where: EffectActivityCreate fold, journal_activity_creations INSERT; when: after activities INSERT; "+
