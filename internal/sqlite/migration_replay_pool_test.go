@@ -19,7 +19,7 @@ import (
 	"zombiezen.com/go/sqlite/sqlitex"
 )
 
-func TestQueryTaskEventsUsesPoolLeaseIndependentOfLegacySeam(t *testing.T) {
+func TestQueryTaskEventsUsesPoolLeaseIndependentOfHeldScope(t *testing.T) {
 	db := openPoolFileDB(t)
 	actor, task := seedActorAndTask(t, db)
 	boot := genesisBoot(t, db, actor)
@@ -28,13 +28,11 @@ func TestQueryTaskEventsUsesPoolLeaseIndependentOfLegacySeam(t *testing.T) {
 		recordedAt: time.Now().UTC(),
 	}})
 
-	db.Lock()
-	locked := true
-	defer func() {
-		if locked {
-			db.Unlock()
-		}
-	}()
+	held, err := db.bindConn(context.Background())
+	if err != nil {
+		t.Fatalf("bind independent held scope: %v", err)
+	}
+	defer held.release()
 	done := make(chan error, 1)
 	go func() {
 		_, err := db.QueryTaskEvents(journal.JournalQueryV1{OrderBy: journal.OrderByJournalID})
@@ -43,13 +41,12 @@ func TestQueryTaskEventsUsesPoolLeaseIndependentOfLegacySeam(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("QueryTaskEvents while legacy lease locked: %v", err)
+			t.Fatalf("QueryTaskEvents while an independent scope was held: %v", err)
 		}
 	case <-time.After(poolTestTimeout):
-		t.Fatal("QueryTaskEvents waited on the legacy connection instead of leasing from the pool")
+		t.Fatal("QueryTaskEvents waited on a held connection instead of leasing an independent pool scope")
 	}
-	db.Unlock()
-	locked = false
+	held.release()
 	assertAllRuntimeScopesAvailable(t, db, "successful journal read")
 }
 

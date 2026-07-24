@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,16 +31,19 @@ func newJournalDB(t *testing.T) *DB {
 func seedActorAndTask(t *testing.T, db *DB) (journal.ActorID, journal.TaskID) {
 	t.Helper()
 	actor := ptypes.ActorID{Namespace: "provenance-test", UUID: uuid.New()}
-	db.Lock()
-	err := sqlitex.Execute(db.Conn(),
+	scope, err := db.bindConn(context.Background())
+	if err != nil {
+		t.Fatalf("bind agent seed scope: %v", err)
+	}
+	err = sqlitex.Execute(scope.conn,
 		`INSERT INTO agents (id, kind_id) VALUES (?1, ?2)`,
 		&sqlitex.ExecOptions{Args: []any{actor.String(), int(ptypes.AgentKindSoftware)}})
 	if err == nil {
-		err = sqlitex.Execute(db.Conn(),
+		err = sqlitex.Execute(scope.conn,
 			`INSERT INTO agents_software (agent_id, name, version, source) VALUES (?1,?2,?3,?4)`,
 			&sqlitex.ExecOptions{Args: []any{actor.String(), "harness", "0", "test"}})
 	}
-	db.Unlock()
+	scope.release()
 	if err != nil {
 		t.Fatalf("seed agent: %v", err)
 	}
@@ -209,14 +213,17 @@ func TestQueryTaskEventsTreatsHostileTaskAndContextFiltersAsData(t *testing.T) {
 func TestJournalKindsSeededMatchGoEnum(t *testing.T) {
 	db := newJournalDB(t)
 	got := map[int]string{}
-	db.Lock()
-	err := sqlitex.Execute(db.Conn(),
+	scope, err := db.bindConn(context.Background())
+	if err != nil {
+		t.Fatalf("bind journal-kind inspection scope: %v", err)
+	}
+	defer scope.release()
+	err = sqlitex.Execute(scope.conn,
 		`SELECT id, name FROM journal_kinds ORDER BY id`,
 		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 			got[stmt.ColumnInt(0)] = stmt.ColumnText(1)
 			return nil
 		}})
-	db.Unlock()
 	if err != nil {
 		t.Fatalf("read journal_kinds: %v", err)
 	}
@@ -250,12 +257,18 @@ func TestAppendTaskEventAdvancesProjections(t *testing.T) {
 
 	// Watermark advanced on the projection to this event's JournalID.
 	var watermark int64
-	db.Lock()
-	_ = sqlitex.Execute(db.Conn(),
+	scope, err := db.bindConn(context.Background())
+	if err != nil {
+		t.Fatalf("bind watermark inspection scope: %v", err)
+	}
+	if err := sqlitex.Execute(scope.conn,
 		`SELECT last_journal_id FROM tasks WHERE id = ?1`,
 		&sqlitex.ExecOptions{Args: []any{task.String()},
-			ResultFunc: func(stmt *zs.Stmt) error { watermark = stmt.ColumnInt64(0); return nil }})
-	db.Unlock()
+			ResultFunc: func(stmt *zs.Stmt) error { watermark = stmt.ColumnInt64(0); return nil }}); err != nil {
+		scope.release()
+		t.Fatalf("read task watermark: %v", err)
+	}
+	scope.release()
 	if watermark != int64(evJID) {
 		t.Errorf("tasks.last_journal_id = %d, want %d", watermark, evJID)
 	}
@@ -627,11 +640,14 @@ func TestVerifyIntegrityRejectsBareJournalRow(t *testing.T) {
 // reducer fold, which always carries the watermark.
 func TestTasksWatermarkSchemaIsNotNull(t *testing.T) {
 	db := newJournalDB(t)
-	db.Lock()
-	err := sqlitex.Execute(db.Conn(),
+	scope, err := db.bindConn(context.Background())
+	if err != nil {
+		t.Fatalf("bind watermark constraint scope: %v", err)
+	}
+	defer scope.release()
+	err = sqlitex.Execute(scope.conn,
 		`INSERT INTO tasks (id, namespace, title, phase_id, created_at, updated_at)
 		 VALUES ('provenance-test--x','provenance-test','x',12,1,1)`, nil)
-	db.Unlock()
 	if err == nil {
 		t.Fatal("expected the NOT NULL last_journal_id constraint to reject a watermark-less tasks insert")
 	}
@@ -642,16 +658,19 @@ func TestTasksWatermarkSchemaIsNotNull(t *testing.T) {
 func registerSoftwareActor(t *testing.T, db *DB, name string) journal.ActorID {
 	t.Helper()
 	actor := ptypes.ActorID{Namespace: "provenance-test", UUID: uuid.New()}
-	db.Lock()
-	err := sqlitex.Execute(db.Conn(),
+	scope, err := db.bindConn(context.Background())
+	if err != nil {
+		t.Fatalf("bind software actor registration scope: %v", err)
+	}
+	defer scope.release()
+	err = sqlitex.Execute(scope.conn,
 		`INSERT INTO agents (id, kind_id) VALUES (?1, ?2)`,
 		&sqlitex.ExecOptions{Args: []any{actor.String(), int(ptypes.AgentKindSoftware)}})
 	if err == nil {
-		err = sqlitex.Execute(db.Conn(),
+		err = sqlitex.Execute(scope.conn,
 			`INSERT INTO agents_software (agent_id, name, version, source) VALUES (?1,?2,?3,?4)`,
 			&sqlitex.ExecOptions{Args: []any{actor.String(), name, "0", "test"}})
 	}
-	db.Unlock()
 	if err != nil {
 		t.Fatalf("registerSoftwareActor %q: %v", name, err)
 	}
@@ -675,9 +694,12 @@ func TestMigrationReTightensWatermarkToNotNull(t *testing.T) {
 	if err := db.DowngradeTasksToColumnlessLegacy(); err != nil {
 		t.Fatalf("downgrade to column-less legacy: %v", err)
 	}
-	db.Lock()
-	present, _, err := db.tasksWatermarkColumnInfoLocked()
-	db.Unlock()
+	scope, err := db.bindConn(context.Background())
+	if err != nil {
+		t.Fatalf("bind pre-migration schema scope: %v", err)
+	}
+	present, _, err := scope.boundDB().tasksWatermarkColumnInfoLocked()
+	scope.release()
 	if err != nil {
 		t.Fatalf("watermark column info (pre-migration): %v", err)
 	}
@@ -704,9 +726,12 @@ func TestMigrationReTightensWatermarkToNotNull(t *testing.T) {
 
 	// The core assertion: the DDL is schema-level NOT NULL again post-migration, matching
 	// a fresh native database — not merely data-level satisfied.
-	db.Lock()
-	present, notNull, err := db.tasksWatermarkColumnInfoLocked()
-	db.Unlock()
+	scope, err = db.bindConn(context.Background())
+	if err != nil {
+		t.Fatalf("bind post-migration schema scope: %v", err)
+	}
+	present, notNull, err := scope.boundDB().tasksWatermarkColumnInfoLocked()
+	scope.release()
 	if err != nil {
 		t.Fatalf("watermark column info (post-migration): %v", err)
 	}
@@ -716,14 +741,17 @@ func TestMigrationReTightensWatermarkToNotNull(t *testing.T) {
 
 	// And every migrated row is anchored: it carries a non-null, non-zero watermark.
 	var watermark int64
-	db.Lock()
-	err = sqlitex.Execute(db.Conn(),
+	scope, err = db.bindConn(context.Background())
+	if err != nil {
+		t.Fatalf("bind migrated watermark scope: %v", err)
+	}
+	err = sqlitex.Execute(scope.conn,
 		`SELECT last_journal_id FROM tasks WHERE id = ?1`,
 		&sqlitex.ExecOptions{Args: []any{migrated.String()}, ResultFunc: func(stmt *zs.Stmt) error {
 			watermark = stmt.ColumnInt64(0)
 			return nil
 		}})
-	db.Unlock()
+	scope.release()
 	if err != nil {
 		t.Fatalf("read migrated watermark: %v", err)
 	}
@@ -733,11 +761,14 @@ func TestMigrationReTightensWatermarkToNotNull(t *testing.T) {
 
 	// The schema is now tight, so a bare watermark-less insert is rejected at the schema
 	// level exactly as on a fresh database (the fresh-vs-migrated asymmetry is closed).
-	db.Lock()
-	insErr := sqlitex.Execute(db.Conn(),
+	scope, err = db.bindConn(context.Background())
+	if err != nil {
+		t.Fatalf("bind post-migration constraint scope: %v", err)
+	}
+	insErr := sqlitex.Execute(scope.conn,
 		`INSERT INTO tasks (id, namespace, title, phase_id, created_at, updated_at)
 		 VALUES ('provenance-test--bare','provenance-test','x',12,1,1)`, nil)
-	db.Unlock()
+	scope.release()
 	if insErr == nil {
 		t.Fatal("post-migration schema accepted a watermark-less tasks insert; NOT NULL was not restored")
 	}

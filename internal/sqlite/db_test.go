@@ -13,8 +13,6 @@ import (
 	"github.com/dayvidpham/provenance/pkg/ptypes"
 	"github.com/google/uuid"
 	"gopkg.in/yaml.v3"
-	zs "zombiezen.com/go/sqlite"
-	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 // openTestDB delegates to shared testutil.OpenTestDB.
@@ -114,17 +112,11 @@ func TestOpenAndClose(t *testing.T) {
 
 func TestOpenRestoresRuntimeForeignKeyEnforcement(t *testing.T) {
 	db := openTestDB(t)
-	db.Lock()
-	defer db.Unlock()
-	enabled := 0
-	if err := sqlitex.Execute(db.Conn(), "PRAGMA foreign_keys", &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
-		enabled = stmt.ColumnInt(0)
-		return nil
-	}}); err != nil {
-		t.Fatalf("read runtime foreign-key state: %v", err)
-	}
-	if enabled != 1 {
-		t.Fatalf("runtime foreign-key enforcement = %d after Open, want 1", enabled)
+	task := makeTask("test-ns", "foreign-key check")
+	missingOwner := ptypes.AgentID{Namespace: "test-ns", UUID: uuid.Must(uuid.NewV7())}
+	task.Owner = &missingOwner
+	if err := db.SeedLegacyTaskRow(task); err == nil {
+		t.Fatal("runtime connection accepted a task whose owner does not exist; foreign-key enforcement is disabled")
 	}
 }
 

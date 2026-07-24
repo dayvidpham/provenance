@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"context"
 	"crypto/sha256"
 	"errors"
 	"os"
@@ -147,16 +148,19 @@ func TestApplyReplayAxisAndIndexMatrixHasZeroDurableDelta(t *testing.T) {
 	actor, task := seedActorAndTask(t, db)
 	authority := genesisBoot(t, db, actor)
 	other, _ := ptypes.ParseActorID("fixture--018f0000-0000-7000-8000-000000000099")
-	db.Lock()
-	if err := sqlitex.Execute(db.Conn(), `INSERT INTO agents (id, kind_id) VALUES (?1, ?2)`, &sqlitex.ExecOptions{Args: []any{other.String(), int(ptypes.AgentKindSoftware)}}); err != nil {
-		db.Unlock()
+	scope, err := db.bindConn(context.Background())
+	if err != nil {
+		t.Fatalf("bind alternate actor seed scope: %v", err)
+	}
+	if err := sqlitex.Execute(scope.conn, `INSERT INTO agents (id, kind_id) VALUES (?1, ?2)`, &sqlitex.ExecOptions{Args: []any{other.String(), int(ptypes.AgentKindSoftware)}}); err != nil {
+		scope.release()
 		t.Fatalf("seed alternate actor: %v", err)
 	}
-	if err := sqlitex.Execute(db.Conn(), `INSERT INTO agents_software (agent_id, name, version, source) VALUES (?1,?2,?3,?4)`, &sqlitex.ExecOptions{Args: []any{other.String(), "alternate", "0", "test"}}); err != nil {
-		db.Unlock()
+	if err := sqlitex.Execute(scope.conn, `INSERT INTO agents_software (agent_id, name, version, source) VALUES (?1,?2,?3,?4)`, &sqlitex.ExecOptions{Args: []any{other.String(), "alternate", "0", "test"}}); err != nil {
+		scope.release()
 		t.Fatalf("seed alternate software actor: %v", err)
 	}
-	db.Unlock()
+	scope.release()
 
 	setup, err := db.Apply(journal.OperationInput{
 		OperationID: "identity-matrix-setup", ActorID: actor, AuthorityJournalID: &authority,
@@ -339,10 +343,13 @@ func TestApplyConditionCurrentFactAbsenceSucceeds(t *testing.T) {
 
 func journalRowCount(t *testing.T, db *DB) int {
 	t.Helper()
-	db.Lock()
-	defer db.Unlock()
+	scope, err := db.bindConn(context.Background())
+	if err != nil {
+		t.Fatalf("bind journal row count scope: %v", err)
+	}
+	defer scope.release()
 	count := -1
-	if err := sqlitex.Execute(db.Conn(), "SELECT COUNT(*) FROM journal", &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { count = stmt.ColumnInt(0); return nil }}); err != nil {
+	if err := sqlitex.Execute(scope.conn, "SELECT COUNT(*) FROM journal", &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { count = stmt.ColumnInt(0); return nil }}); err != nil {
 		t.Fatal(err)
 	}
 	return count
@@ -357,22 +364,25 @@ func assertApplyZeroDelta(t *testing.T, db *DB, rows int) {
 
 func persistAndLoadStoredIdentity(t *testing.T, db *DB, input storedOperationReplayIdentity) storedOperationReplayIdentity {
 	t.Helper()
-	db.Lock()
-	defer db.Unlock()
-	if err := sqlitex.Execute(db.Conn(), `CREATE TEMP TABLE operation_identity_fixture (
+	scope, err := db.bindConn(context.Background())
+	if err != nil {
+		t.Fatalf("bind operation identity fixture scope: %v", err)
+	}
+	defer scope.release()
+	if err := sqlitex.Execute(scope.conn, `CREATE TEMP TABLE operation_identity_fixture (
 		operation_id TEXT PRIMARY KEY, actor_id TEXT NOT NULL, authority_journal_id INTEGER,
 		command_digest BLOB NOT NULL, mutation_digest BLOB NOT NULL,
 		encoding_version TEXT NOT NULL, canonical_mutation BLOB NOT NULL
 	)`, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := sqlitex.Execute(db.Conn(), `INSERT INTO operation_identity_fixture VALUES (?1,?2,?3,?4,?5,?6,?7)`, &sqlitex.ExecOptions{Args: []any{
+	if err := sqlitex.Execute(scope.conn, `INSERT INTO operation_identity_fixture VALUES (?1,?2,?3,?4,?5,?6,?7)`, &sqlitex.ExecOptions{Args: []any{
 		string(input.operationID), input.actorID.String(), int64(*input.authorityJournalID), input.commandDigest, input.mutationDigest, input.encodingVersion, input.canonicalMutation,
 	}}); err != nil {
 		t.Fatal(err)
 	}
 	var output storedOperationReplayIdentity
-	if err := sqlitex.Execute(db.Conn(), `SELECT operation_id,actor_id,authority_journal_id,command_digest,mutation_digest,encoding_version,canonical_mutation FROM operation_identity_fixture`, &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
+	if err := sqlitex.Execute(scope.conn, `SELECT operation_id,actor_id,authority_journal_id,command_digest,mutation_digest,encoding_version,canonical_mutation FROM operation_identity_fixture`, &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 		output.operationID = journal.OperationID(stmt.ColumnText(0))
 		actor, err := ptypes.ParseActorID(stmt.ColumnText(1))
 		if err != nil {

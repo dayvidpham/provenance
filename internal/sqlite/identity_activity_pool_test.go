@@ -408,59 +408,41 @@ func TestStartActivityWithIDConcurrentReplayReturnsCanonicalRow(t *testing.T) {
 	}
 }
 
-func TestIdentityActivityBlockedLeaseIsCanceledByClose(t *testing.T) {
+func TestIdentityActivityActiveLeaseIsDrainedByClose(t *testing.T) {
 	db := openIdentityActivityDB(t)
 	agent, err := db.RegisterHumanAgent("close", "reader", "")
 	if err != nil {
 		t.Fatalf("RegisterHumanAgent: %v", err)
 	}
 
-	// Keep the legacy lease contended so Close cannot return it to satisfy the
-	// blocked pooled operation before Pool.Close cancels outstanding takes.
-	db.Lock()
-	legacyLocked := true
-	held := make([]*connScope, 0, runtimePoolSize-1)
-	defer func() {
-		if legacyLocked {
-			db.Unlock()
-		}
-		for _, scope := range held {
-			scope.release()
-		}
-	}()
-	for range runtimePoolSize - 1 {
-		held = append(held, takePoolScope(t, db))
-	}
-	readDone := make(chan error, 1)
-	go func() {
-		_, err := db.GetAgent(agent.ID)
-		readDone <- err
-	}()
-
+	held := takePoolScope(t, db)
+	defer held.release()
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- db.Close() }()
-	readErr := waitIdentityActivityError(t, "Close-canceled blocked identity lease", readDone)
-	var closeErr error
-	closeReturned := false
+
+	// Observe pool shutdown through the exported read path before checking that
+	// Close is still draining the explicitly held lease.
+	readDone := make(chan error, 1)
+	go func() {
+		for {
+			_, err := db.GetAgent(agent.ID)
+			if err != nil {
+				readDone <- err
+				return
+			}
+		}
+	}()
+	if readErr := waitIdentityActivityError(t, "identity read after pool shutdown", readDone); readErr == nil {
+		t.Fatal("GetAgent succeeded after pool shutdown; want lease acquisition failure")
+	}
 	select {
-	case closeErr = <-closeDone:
-		closeReturned = true
-		t.Errorf("Close returned before held leases were released: %v", closeErr)
+	case closeErr := <-closeDone:
+		t.Fatalf("Close returned while an explicitly owned lease was still active: %v", closeErr)
 	default:
 	}
-	db.Unlock()
-	legacyLocked = false
-	for _, scope := range held {
-		scope.release()
-	}
-	if !closeReturned {
-		closeErr = waitIdentityActivityError(t, "Close after identity lease returns", closeDone)
-	}
-	if closeErr != nil {
+	held.release()
+	if closeErr := waitIdentityActivityError(t, "Close after identity lease return", closeDone); closeErr != nil {
 		t.Fatalf("Close: %v", closeErr)
-	}
-	if readErr == nil {
-		t.Fatal("blocked GetAgent succeeded after Close; want canceled pool lease")
 	}
 }
 

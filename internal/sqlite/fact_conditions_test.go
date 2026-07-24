@@ -578,7 +578,7 @@ func TestConditionExactTaskScopeFilter(t *testing.T) {
 
 	// Commit a decision scoped to a specific task.
 	task2 := ptypes.TaskID{Namespace: "provenance-test", UUID: uuid.Must(uuid.NewV7())}
-	// SeedLegacyTaskRow acquires the mutex internally; do not hold it here.
+	// Seed through the production API, which owns and releases its connection scope.
 	if err := env.db.SeedLegacyTaskRow(ptypes.Task{
 		ID:        task2,
 		Title:     "task2",

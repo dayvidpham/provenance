@@ -116,7 +116,7 @@ func TestApplyOwnsOnePoolLeaseWhileWALReadersProceedAndWritersAreBounded(t *test
 	if code := zs.ErrCode(busyErr); code != zs.ResultBusy {
 		t.Fatalf("competing Apply error=%v code=%v, want SQLITE_BUSY", busyErr, code)
 	}
-	// The owner and reader still hold the other non-legacy leases, so successfully
+	// The owner and reader still hold the other available leases, so successfully
 	// binding here proves the failed contender returned its lease.
 	returnedContender := takeApplyTestScope(t, db)
 	returnedContender.release()
@@ -240,13 +240,19 @@ func TestApplyConcurrentCurrentFactHasOneWinnerOneDomainLoser(t *testing.T) {
 		t.Fatalf("Apply base decision: %v", err)
 	}
 
-	db.mu.Lock()
-	k, args, _ := buildSelectorArgs(journal.FactSelector{
+	k, args, err := buildSelectorArgs(journal.FactSelector{
 		Kind: journal.FactDecision, DecisionKind: decisionKind,
 		Filter: journal.FactFilter{TaskScope: journal.FactTaskScope{Kind: journal.FactTaskAny}},
 	}, 0)
-	baseDecisionJID, found, _ := db.latestFactSelectorLocked(k, args)
-	db.mu.Unlock()
+	if err != nil {
+		t.Fatalf("build base decision selector: %v", err)
+	}
+	scope := takeApplyTestScope(t, db)
+	baseDecisionJID, found, err := latestFactSelector(scope, k, args)
+	scope.release()
+	if err != nil {
+		t.Fatalf("query base decision: %v", err)
+	}
 	if !found {
 		t.Fatal("base decision not found")
 	}
@@ -400,12 +406,18 @@ func TestApplyChangedActorReturnsConflictWithoutWrites(t *testing.T) {
 
 	actor2ID := actor
 	actor2ID.UUID = uuid.Must(uuid.NewV7())
-	db.mu.Lock()
-	_ = sqlitex.Execute(db.Conn(), `INSERT OR IGNORE INTO agents (id, kind_id) VALUES (?1, ?2)`,
-		&sqlitex.ExecOptions{Args: []any{actor2ID.String(), int(ptypes.AgentKindSoftware)}})
-	_ = sqlitex.Execute(db.Conn(), `INSERT OR IGNORE INTO agents_software (agent_id, name, version, source) VALUES (?1,?2,?3,?4)`,
-		&sqlitex.ExecOptions{Args: []any{actor2ID.String(), "test2", "0", "test"}})
-	db.mu.Unlock()
+	scope := takeApplyTestScope(t, db)
+	if err := sqlitex.Execute(scope.conn, `INSERT OR IGNORE INTO agents (id, kind_id) VALUES (?1, ?2)`,
+		&sqlitex.ExecOptions{Args: []any{actor2ID.String(), int(ptypes.AgentKindSoftware)}}); err != nil {
+		scope.release()
+		t.Fatalf("seed conflicting actor: %v", err)
+	}
+	if err := sqlitex.Execute(scope.conn, `INSERT OR IGNORE INTO agents_software (agent_id, name, version, source) VALUES (?1,?2,?3,?4)`,
+		&sqlitex.ExecOptions{Args: []any{actor2ID.String(), "test2", "0", "test"}}); err != nil {
+		scope.release()
+		t.Fatalf("seed conflicting software actor: %v", err)
+	}
+	scope.release()
 
 	in := journal.OperationInput{
 		OperationID:        "conflict-actor-test",
@@ -452,15 +464,15 @@ func TestSchemaMigrationFreshOpenWorks(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 
 	// journal_activity_creations must exist.
-	db.mu.Lock()
+	scope := takeApplyTestScope(t, db)
 	var tableExists bool
-	if err := sqlitex.Execute(db.Conn(),
+	if err := sqlitex.Execute(scope.conn,
 		`SELECT name FROM sqlite_master WHERE type='table' AND name='journal_activity_creations'`,
 		&sqlitex.ExecOptions{ResultFunc: func(*zs.Stmt) error { tableExists = true; return nil }}); err != nil {
-		db.mu.Unlock()
+		scope.release()
 		t.Fatalf("check table: %v", err)
 	}
-	db.mu.Unlock()
+	scope.release()
 	if !tableExists {
 		t.Fatal("journal_activity_creations table not created on fresh Open")
 	}
@@ -481,19 +493,19 @@ func TestSchemaMigrationFreshOpenWorks(t *testing.T) {
 func TestJournalActivityCreationsSchemaConstraints(t *testing.T) {
 	t.Parallel()
 	db := newJournalDB(t)
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	scope := takeApplyTestScope(t, db)
+	defer scope.release()
 
 	// Get a valid journal_id (genesis bootstrap operation anchor).
 	var validJournalID int64
-	_ = sqlitex.Execute(db.Conn(), `SELECT journal_id FROM journal LIMIT 1`,
+	_ = sqlitex.Execute(scope.conn, `SELECT journal_id FROM journal LIMIT 1`,
 		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 			validJournalID = stmt.ColumnInt64(0)
 			return nil
 		}})
 
 	// FK constraint: activity_id must reference activities.id.
-	err := sqlitex.Execute(db.Conn(),
+	err := sqlitex.Execute(scope.conn,
 		`INSERT INTO journal_activity_creations (journal_id, activity_id) VALUES (?1, ?2)`,
 		&sqlitex.ExecOptions{Args: []any{validJournalID, "nonexistent--00000000-0000-0000-0000-000000000001"}})
 	if err == nil {
