@@ -108,3 +108,19 @@ cases:
     mutation: {description: "Comment add operands are immutable.", operator: comment-add}
     input: {contextHex: *context, mutation: "version:22:provenance.mutation.v1\ncondition-count:1:0\neffect-count:1:1\neffect.0.family:11:comment_add\neffect.0.result-slot:7:comment\neffect.0.recorded-at-override:3:142\neffect.0.task:45:fixture--018f0000-0000-7000-8000-000000000001\neffect.0.comment:45:fixture--018f0000-0000-7000-8000-000000000003\neffect.0.comment-author:45:fixture--018f0000-0000-7000-8000-000000000002\neffect.0.comment-body:4:body\neffect.0.context-count:1:1\neffect.0.context.0.kind:4:task\neffect.0.context.0.identity:45:fixture--018f0000-0000-7000-8000-000000000001\n"}
     expected: {sort: comment_add, digestHex: a3ee79f417c17b56b72d6403e2b6be572773c01266a35aac99a4d1bdab2fa7e4, fingerprint: 1dd7d59b78c42e7c4e18f0d7ad8ba0282162fe12bee55e41ab83eaaf51d9e40e, context: *expectedContext, effect: {sort: comment_add, resultSlot: comment, recordedAtOverride: 42, taskID: fixture--018f0000-0000-7000-8000-000000000001, commentID: fixture--018f0000-0000-7000-8000-000000000003, commentAuthor: fixture--018f0000-0000-7000-8000-000000000002, commentBody: body, contexts: [{kind: task, identity: fixture--018f0000-0000-7000-8000-000000000001}]}}
+  - name: activity-create
+    classification: must-pass
+    provenance: {source: requirement, ref: "ActivityCreate and both canonical condition arms"}
+    mutation: {description: "One immutable fixture carries ExactFact, CurrentFact, and ActivityCreate.", operator: activity-create}
+    input:
+      contextHex: *context
+      mutation: "version:22:provenance.mutation.v1\ncondition-count:1:2\ncondition.0.kind:1:1\ncondition.0.fact-kind:1:0\ncondition.0.task-scope:1:1\ncondition.0.task-id:0:\ncondition.0.context-count:1:0\ncondition.0.actor-count:1:0\ncondition.0.operation-count:1:0\ncondition.0.decision-kind:16:fixture.decision\ncondition.0.evidence-kind:0:\ncondition.0.asserted-journal-id:1:7\ncondition.1.kind:1:2\ncondition.1.fact-kind:1:1\ncondition.1.task-scope:1:1\ncondition.1.task-id:0:\ncondition.1.context-count:1:0\ncondition.1.actor-count:1:0\ncondition.1.operation-count:1:0\ncondition.1.decision-kind:0:\ncondition.1.evidence-kind:16:fixture.evidence\ncondition.1.asserted-journal-id:1:0\neffect-count:1:1\neffect.0.family:15:activity_create\neffect.0.result-slot:8:activity\neffect.0.recorded-at-override:3:142\neffect.0.activity-id:45:fixture--018f0000-0000-7000-8000-000000000004\neffect.0.activity-agent-id:45:fixture--018f0000-0000-7000-8000-000000000002\neffect.0.activity-phase:13:worker_slices\neffect.0.activity-stage:11:in_progress\neffect.0.activity-notes:5:notes\n"
+    expected:
+      sort: activity_create
+      digestHex: 7a44e9499a57755f829ab776ce113abd43bd9d8e4f449b3724294b850310653f
+      fingerprint: df542e1498f089df3bb71891384a13a979c2120566f20783aecbc8267897ec2c
+      context: *expectedContext
+      conditions:
+        - {kind: exact_fact, factKind: decision, taskScope: unscoped, decisionKind: fixture.decision, assertedJournalID: 7}
+        - {kind: current_fact, factKind: evidence, taskScope: unscoped, evidenceKind: fixture.evidence, assertedJournalID: 0}
+      effect: {sort: activity_create, resultSlot: activity, recordedAtOverride: 42, activityID: fixture--018f0000-0000-7000-8000-000000000004, activityAgentID: fixture--018f0000-0000-7000-8000-000000000002, activityPhase: worker_slices, activityStage: in_progress, activityNotes: notes}

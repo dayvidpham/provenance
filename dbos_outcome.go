@@ -125,6 +125,12 @@ func validateOperationConflict(failure *CanonicalApplyFailure) error {
 	if axis >= journal.ConflictCondition && index < -1 {
 		return &conflictMetadataError{field: DBOSDiagFieldConflictIndex, reason: fmt.Sprintf("collection conflict axis %s requires conflict_index >= -1, got %d", axis, index)}
 	}
+	if axis == journal.ConflictCondition && index >= MaxCanonicalConditions {
+		return &conflictMetadataError{field: DBOSDiagFieldConflictIndex, reason: fmt.Sprintf("condition conflict index %d exceeds maximum %d", index, MaxCanonicalConditions-1)}
+	}
+	if axis == journal.ConflictEffect && index >= MaxCanonicalEffects {
+		return &conflictMetadataError{field: DBOSDiagFieldConflictIndex, reason: fmt.Sprintf("effect conflict index %d exceeds maximum %d", index, MaxCanonicalEffects-1)}
+	}
 	return nil
 }
 
@@ -169,8 +175,8 @@ func validateConditionFailure(failure *CanonicalApplyFailure) error {
 	if failure.ActualJournalID == nil {
 		return &conflictMetadataError{field: DBOSDiagFieldActualJournalID, reason: "condition failure requires actual_journal_id"}
 	}
-	if *failure.ConditionIndex < 0 {
-		return &conflictMetadataError{field: DBOSDiagFieldConditionIndex, reason: "condition_index must be non-negative"}
+	if *failure.ConditionIndex < 0 || *failure.ConditionIndex >= MaxCanonicalConditions {
+		return &conflictMetadataError{field: DBOSDiagFieldConditionIndex, reason: fmt.Sprintf("condition_index %d is outside 0..%d", *failure.ConditionIndex, MaxCanonicalConditions-1)}
 	}
 	if *failure.ConditionKind != journal.ConditionExactFact && *failure.ConditionKind != journal.ConditionCurrentFact {
 		return &conflictMetadataError{field: DBOSDiagFieldConditionKind, reason: fmt.Sprintf("invalid condition_kind %d", *failure.ConditionKind)}
@@ -181,17 +187,22 @@ func validateConditionFailure(failure *CanonicalApplyFailure) error {
 	if *failure.AssertedJournalID < 0 || *failure.ActualJournalID < 0 {
 		return &conflictMetadataError{field: DBOSDiagFieldAssertedJournalID, reason: "condition journal IDs must be non-negative"}
 	}
-	if *failure.ConditionKind == journal.ConditionExactFact && *failure.ConditionReason == journal.ConditionCurrentMismatch {
-		return &conflictMetadataError{field: DBOSDiagFieldConditionReason, reason: "ExactFact cannot report CurrentMismatch"}
-	}
-	if *failure.ConditionKind == journal.ConditionCurrentFact && *failure.ConditionReason == journal.ConditionFactMismatch {
-		return &conflictMetadataError{field: DBOSDiagFieldConditionReason, reason: "CurrentFact cannot report FactMismatch"}
+	validCombination := (*failure.ConditionKind == journal.ConditionExactFact && (*failure.ConditionReason == journal.ConditionFactMissing || *failure.ConditionReason == journal.ConditionFactMismatch)) ||
+		(*failure.ConditionKind == journal.ConditionCurrentFact && (*failure.ConditionReason == journal.ConditionFactMissing || *failure.ConditionReason == journal.ConditionCurrentMismatch))
+	if !validCombination {
+		return &conflictMetadataError{field: DBOSDiagFieldConditionReason, reason: fmt.Sprintf("condition kind %s cannot report reason %s", *failure.ConditionKind, *failure.ConditionReason)}
 	}
 	if *failure.ConditionReason == journal.ConditionFactMissing && *failure.ActualJournalID != 0 {
 		return &conflictMetadataError{field: DBOSDiagFieldActualJournalID, reason: "FactMissing requires actual_journal_id 0"}
 	}
 	if *failure.ConditionReason != journal.ConditionFactMissing && *failure.ActualJournalID <= 0 {
 		return &conflictMetadataError{field: DBOSDiagFieldActualJournalID, reason: "a mismatch reason requires a positive actual_journal_id"}
+	}
+	if *failure.ConditionReason == journal.ConditionFactMismatch && *failure.ActualJournalID == *failure.AssertedJournalID {
+		return &conflictMetadataError{field: DBOSDiagFieldActualJournalID, reason: "FactMismatch requires actual_journal_id different from asserted_journal_id"}
+	}
+	if *failure.ConditionReason == journal.ConditionCurrentMismatch && *failure.ActualJournalID <= *failure.AssertedJournalID {
+		return &conflictMetadataError{field: DBOSDiagFieldActualJournalID, reason: "CurrentMismatch requires a newer actual_journal_id than asserted_journal_id"}
 	}
 	return nil
 }
@@ -417,6 +428,9 @@ func encodeDBOSApplySuccess(contract dbosContractSnapshot, operation journal.Ope
 		slots = append(slots, slot)
 	}
 	sort.Slice(slots, func(i, j int) bool { return slots[i].Slot < slots[j].Slot })
+	if len(result.EmittedEvents) > MaxCanonicalEffects {
+		return DBOSStepOutcome{}, fmt.Errorf("%w: provenance: encode success outcome for operation %q -- emitted-event count %d exceeds maximum %d before allocation -- where: step success encode; impact: the checkpoint is rejected; fix: split the operation into bounded effects", journal.ErrResultSlotIntegrity, operation, len(result.EmittedEvents), MaxCanonicalEffects)
+	}
 	emitted := make([]int64, len(result.EmittedEvents))
 	for i, event := range result.EmittedEvents {
 		emitted[i] = int64(event)
@@ -573,6 +587,9 @@ func validateCanonicalMutationResult(anchor int64, emitted []int64, slots []Cano
 	if anchor <= 0 {
 		return fmt.Errorf("%w: anchor_journal_id must be positive", journal.ErrResultSlotIntegrity)
 	}
+	if len(emitted) > MaxCanonicalEffects {
+		return fmt.Errorf("%w: emitted-event count %d exceeds maximum %d before validation iteration", journal.ErrResultSlotIntegrity, len(emitted), MaxCanonicalEffects)
+	}
 	previous := anchor
 	for i, event := range emitted {
 		if event <= previous {
@@ -614,13 +631,13 @@ func validateApplyFailureEnvelope(outerOperation string, failure *CanonicalApply
 		return reject(field, reason, fix)
 	}
 	if descriptor.kind != FailureOperationConflict && (failure.ConflictAxis != nil || failure.ConflictIndex != nil) {
-		return metadataReject(DBOSDiagFieldConflictAxis, "operation conflict metadata is forbidden for this failure kind", "remove conflict metadata from non-conflict failures")
+		return metadataReject(DBOSDiagFieldConflictAxis, "operation conflict metadata is forbidden for this failure kind", failureRepairFix(descriptor.kind, DBOSDiagFieldConflictAxis))
 	}
 	if descriptor.kind != FailureConditionFailed && (failure.ConditionIndex != nil || failure.ConditionKind != nil || failure.ConditionReason != nil || failure.AssertedJournalID != nil || failure.ActualJournalID != nil) {
-		return metadataReject(DBOSDiagFieldConditionIndex, "condition failure metadata is forbidden for this failure kind", "remove condition metadata from non-condition failures")
+		return metadataReject(DBOSDiagFieldConditionIndex, "condition failure metadata is forbidden for this failure kind", failureRepairFix(descriptor.kind, DBOSDiagFieldConditionIndex))
 	}
 	if descriptor.kind != FailureActivityConflict && (failure.ActivityID != "" || failure.ExistingJournalID != nil) {
-		return metadataReject(DBOSDiagFieldActivityID, "activity conflict metadata is forbidden for this failure kind", "remove activity metadata from non-activity failures")
+		return metadataReject(DBOSDiagFieldActivityID, "activity conflict metadata is forbidden for this failure kind", failureRepairFix(descriptor.kind, DBOSDiagFieldActivityID))
 	}
 	if descriptor.validate != nil {
 		if err := descriptor.validate(failure); err != nil {
@@ -629,10 +646,32 @@ func validateApplyFailureEnvelope(outerOperation string, failure *CanonicalApply
 			if errors.As(err, &metadata) {
 				field = metadata.field
 			}
-			return reject(field, err.Error(), "restore the typed axis and index for the operation conflict")
+			return reject(field, err.Error(), failureRepairFix(descriptor.kind, field))
 		}
 	}
 	return nil
+}
+
+func failureRepairFix(kind ApplyFailureKind, field DBOSDiagnosticField) string {
+	switch kind {
+	case FailureOperationConflict:
+		return "restore conflict_axis and conflict_index from the canonical OperationConflict descriptor, using -1 for scalar or length-mismatch conflicts"
+	case FailureConditionFailed:
+		return "restore condition_index, kind, reason, and observed journal IDs from the canonical ConditionFailure descriptor"
+	case FailureActivityConflict:
+		return "restore activity_id and existing_journal_id from the canonical ActivityConflict descriptor"
+	default:
+		switch field {
+		case DBOSDiagFieldConflictAxis, DBOSDiagFieldConflictIndex:
+			return "remove operation-conflict metadata from this failure descriptor"
+		case DBOSDiagFieldConditionIndex, DBOSDiagFieldConditionKind, DBOSDiagFieldConditionReason, DBOSDiagFieldAssertedJournalID, DBOSDiagFieldActualJournalID:
+			return "remove condition-failure metadata from this failure descriptor"
+		case DBOSDiagFieldActivityID, DBOSDiagFieldExistingJournalID:
+			return "remove activity-conflict metadata from this failure descriptor"
+		default:
+			return "restore the complete metadata for the closed failure descriptor"
+		}
+	}
 }
 
 func (d applyFailureDescriptor) asError(failure *CanonicalApplyFailure) error {

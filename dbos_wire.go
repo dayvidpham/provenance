@@ -24,6 +24,14 @@ const (
 	// operation context frame. 3 field-max-bytes covers operation+actor+command;
 	// 64 covers schema tag, authority, recorded-at, and length prefixes.
 	maxDBOSContextBytes = 3*MaxCanonicalFieldBytes + 64
+	// maxDBOSJSONBytes bounds the raw JSON envelope before encoding/json can
+	// allocate a decoded object. The multiplier accounts for JSON/base64
+	// framing while deriving the payload budget from canonical limits rather
+	// than exposing a second public limit.
+	maxDBOSJSONBytes = 2 * (MaxCanonicalMutationBytes + maxDBOSContextBytes + MaxCanonicalFieldBytes)
+	// maxDBOSJSONDepth keeps malformed nested JSON from consuming an unbounded
+	// parser stack while leaving ample room for the closed envelopes.
+	maxDBOSJSONDepth = 16
 )
 
 var ErrDBOSContextFrame = errors.New("provenance: invalid DBOS context frame")
@@ -73,6 +81,9 @@ func decodeStrictDBOSJSON(raw []byte, target any) error {
 	if len(trimmed) == 0 || trimmed[0] != '{' {
 		return errors.New("DBOS wire value must be one JSON object")
 	}
+	if len(trimmed) > maxDBOSJSONBytes {
+		return fmt.Errorf("DBOS wire JSON is %d bytes, exceeds maximum %d", len(trimmed), maxDBOSJSONBytes)
+	}
 	if err := validateUniqueJSONKeys(trimmed); err != nil {
 		return err
 	}
@@ -87,6 +98,78 @@ func decodeStrictDBOSJSON(raw []byte, target any) error {
 			return errors.New("DBOS wire value contains a trailing JSON value")
 		}
 		return fmt.Errorf("read trailing DBOS wire JSON: %w", err)
+	}
+	return nil
+}
+
+func validateUniqueJSONKeys(raw []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	if err := validateUniqueJSONValue(decoder, 0); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("trailing JSON value")
+		}
+		return fmt.Errorf("read trailing JSON data: %w", err)
+	}
+	return nil
+}
+
+func validateUniqueJSONValue(decoder *json.Decoder, depth int) error {
+	if depth > maxDBOSJSONDepth {
+		return fmt.Errorf("JSON nesting depth %d exceeds maximum %d", depth, maxDBOSJSONDepth)
+	}
+	token, err := decoder.Token()
+	if err != nil {
+		return fmt.Errorf("read JSON value: %w", err)
+	}
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{':
+		keys := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return fmt.Errorf("read JSON object key: %w", err)
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return fmt.Errorf("JSON object key has type %T, want string", keyToken)
+			}
+			if _, exists := keys[key]; exists {
+				return fmt.Errorf("duplicate JSON object key %q", key)
+			}
+			keys[key] = struct{}{}
+			if err := validateUniqueJSONValue(decoder, depth+1); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil {
+			return fmt.Errorf("close JSON object: %w", err)
+		}
+		if closing != json.Delim('}') {
+			return fmt.Errorf("close JSON object with %q, want }", closing)
+		}
+	case '[':
+		for decoder.More() {
+			if err := validateUniqueJSONValue(decoder, depth+1); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil {
+			return fmt.Errorf("close JSON array: %w", err)
+		}
+		if closing != json.Delim(']') {
+			return fmt.Errorf("close JSON array with %q, want ]", closing)
+		}
+	default:
+		return fmt.Errorf("unexpected JSON delimiter %q", delim)
 	}
 	return nil
 }

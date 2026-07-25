@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/dayvidpham/provenance/internal/journal"
@@ -89,7 +90,14 @@ func TestDBOSFailureWireCorpus(t *testing.T) {
 		if err != nil || string(raw) != c.Expected.JSON {
 			t.Fatalf("failure wire drift for %q: got %s err=%v want %s", c.Name, raw, err, c.Expected.JSON)
 		}
-		_, decodedErr := decodeDBOSStepOutcome(contract, outcome)
+		var fixtureOutcome DBOSStepOutcome
+		if err := json.Unmarshal([]byte(c.Expected.JSON), &fixtureOutcome); err != nil {
+			t.Fatalf("failure fixture %q did not pass strict DBOSStepOutcome.UnmarshalJSON: %v", c.Name, err)
+		}
+		if !reflect.DeepEqual(fixtureOutcome, outcome) {
+			t.Fatalf("failure fixture %q does not describe the independently encoded outcome: fixture=%#v encoded=%#v", c.Name, fixtureOutcome, outcome)
+		}
+		_, decodedErr := decodeDBOSStepOutcome(contract, fixtureOutcome)
 		expectedSentinel := sentinel
 		if c.Input.Sentinel == "operation-conflict" {
 			expectedSentinel = journal.ErrOperationConflict
@@ -195,9 +203,185 @@ func diffDBOSOutcomeFields(control, malformed DBOSStepOutcome) []DBOSDiagnosticF
 		if !reflect.DeepEqual(control.Failure.ConflictIndex, malformed.Failure.ConflictIndex) {
 			diffs = append(diffs, DBOSDiagFieldConflictIndex)
 		}
-		// ConflictOperand removed in corrected 5-axis model
+		if !reflect.DeepEqual(control.Failure.ConditionIndex, malformed.Failure.ConditionIndex) {
+			diffs = append(diffs, DBOSDiagFieldConditionIndex)
+		}
+		if !reflect.DeepEqual(control.Failure.ConditionKind, malformed.Failure.ConditionKind) {
+			diffs = append(diffs, DBOSDiagFieldConditionKind)
+		}
+		if !reflect.DeepEqual(control.Failure.ConditionReason, malformed.Failure.ConditionReason) {
+			diffs = append(diffs, DBOSDiagFieldConditionReason)
+		}
+		if !reflect.DeepEqual(control.Failure.AssertedJournalID, malformed.Failure.AssertedJournalID) {
+			diffs = append(diffs, DBOSDiagFieldAssertedJournalID)
+		}
+		if !reflect.DeepEqual(control.Failure.ActualJournalID, malformed.Failure.ActualJournalID) {
+			diffs = append(diffs, DBOSDiagFieldActualJournalID)
+		}
+		if control.Failure.ActivityID != malformed.Failure.ActivityID {
+			diffs = append(diffs, DBOSDiagFieldActivityID)
+		}
+		if !reflect.DeepEqual(control.Failure.ExistingJournalID, malformed.Failure.ExistingJournalID) {
+			diffs = append(diffs, DBOSDiagFieldExistingJournalID)
+		}
 	}
 	return diffs
+}
+
+func TestDBOSOutcomeBoundaryLimits(t *testing.T) {
+	contract := newDBOSContractSnapshot()
+	t.Run("json-byte-bound", func(t *testing.T) {
+		raw := []byte("{" + strings.Repeat("x", maxDBOSJSONBytes) + "}")
+		var outcome DBOSStepOutcome
+		if err := json.Unmarshal(raw, &outcome); err == nil {
+			t.Fatal("over-limit JSON passed strict outcome decode")
+		}
+	})
+	inputCases := []string{
+		`{"schema":"input","context":"","mutation":"","unknown":1}`,
+		`{"schema":"input","schema":"input","context":"","mutation":""}`,
+		`{"schema":"input","context":"","mutation":{}}{}`,
+	}
+	for i, raw := range inputCases {
+		t.Run(fmt.Sprintf("input-strict-%d", i), func(t *testing.T) {
+			var input DBOSApplyInput
+			if err := json.Unmarshal([]byte(raw), &input); err == nil {
+				t.Fatal("malformed input passed strict UnmarshalJSON")
+			}
+			if _, err := decodeListedWorkflowInput(raw); err == nil {
+				t.Fatal("malformed listed workflow input passed shared strict decoder")
+			}
+		})
+	}
+	base := `{"schema":"provenance.dbos-step-outcome","operation_id":"boundary","mutation_digest":"bQ==","failure":{"kind":"genesis","message":"failure","operation_id":"boundary"}}`
+	cases := []struct {
+		name string
+		raw  string
+	}{
+		{name: "top-level-unknown", raw: `{"schema":"provenance.dbos-step-outcome","operation_id":"boundary","mutation_digest":"bQ==","unknown":1,"failure":{"kind":"genesis","message":"failure","operation_id":"boundary"}}`},
+		{name: "nested-unknown", raw: `{"schema":"provenance.dbos-step-outcome","operation_id":"boundary","mutation_digest":"bQ==","failure":{"kind":"genesis","message":"failure","operation_id":"boundary","unknown":1}}`},
+		{name: "duplicate-top-level", raw: `{"schema":"provenance.dbos-step-outcome","schema":"provenance.dbos-step-outcome","operation_id":"boundary","mutation_digest":"bQ==","failure":{"kind":"genesis","message":"failure","operation_id":"boundary"}}`},
+		{name: "trailing-value", raw: base + `{}`},
+		{name: "one-of-both", raw: `{"schema":"provenance.dbos-step-outcome","operation_id":"boundary","mutation_digest":"bQ==","success":{"anchor_journal_id":1,"emitted_events":[],"result_slots":[]},"failure":{"kind":"genesis","message":"failure","operation_id":"boundary"}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var outcome DBOSStepOutcome
+			err := json.Unmarshal([]byte(tc.raw), &outcome)
+			if tc.name == "one-of-both" {
+				if err != nil {
+					t.Fatalf("one-of-both was rejected before semantic decode: %v", err)
+				}
+				if _, err := decodeDBOSStepOutcome(contract, outcome); err == nil {
+					t.Fatal("one-of-both passed semantic one-of validation")
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("malformed %s passed strict UnmarshalJSON", tc.name)
+			}
+		})
+	}
+
+	oversized := DBOSStepOutcome{Schema: contract.outcomeSchema, OperationID: "boundary", MutationDigest: []byte("m"), Success: &CanonicalMutationResult{AnchorJournalID: 1, EmittedEvents: make([]int64, MaxCanonicalEffects+1)}}
+	for i := range oversized.Success.EmittedEvents {
+		oversized.Success.EmittedEvents[i] = int64(i + 2)
+	}
+	raw, err := json.Marshal(oversized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded DBOSStepOutcome
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeDBOSStepOutcome(contract, decoded); err == nil {
+		t.Fatal("over-limit emitted events passed outcome validation")
+	}
+
+	metadataCases := []struct {
+		name string
+		make func() *CanonicalApplyFailure
+	}{
+		{name: "condition-index-bound", make: func() *CanonicalApplyFailure {
+			index := MaxCanonicalConditions
+			kind, reason := journal.ConditionExactFact, journal.ConditionFactMissing
+			asserted, actual := int64(0), int64(0)
+			return &CanonicalApplyFailure{Kind: FailureConditionFailed, Message: "failure", OperationID: "boundary", ConditionIndex: &index, ConditionKind: &kind, ConditionReason: &reason, AssertedJournalID: &asserted, ActualJournalID: &actual}
+		}},
+		{name: "condition-impossible-combination", make: func() *CanonicalApplyFailure {
+			index := 0
+			kind, reason := journal.ConditionExactFact, journal.ConditionCurrentMismatch
+			asserted, actual := int64(0), int64(1)
+			return &CanonicalApplyFailure{Kind: FailureConditionFailed, Message: "failure", OperationID: "boundary", ConditionIndex: &index, ConditionKind: &kind, ConditionReason: &reason, AssertedJournalID: &asserted, ActualJournalID: &actual}
+		}},
+		{name: "effect-index-bound", make: func() *CanonicalApplyFailure {
+			axis, index := journal.ConflictEffect, MaxCanonicalEffects
+			return &CanonicalApplyFailure{Kind: FailureOperationConflict, Message: "failure", OperationID: "boundary", ConflictAxis: &axis, ConflictIndex: &index}
+		}},
+		{name: "activity-id", make: func() *CanonicalApplyFailure {
+			existing := int64(1)
+			return &CanonicalApplyFailure{Kind: FailureActivityConflict, Message: "failure", OperationID: "boundary", ActivityID: "not-an-activity", ExistingJournalID: &existing}
+		}},
+		{name: "activity-journal-id", make: func() *CanonicalApplyFailure {
+			return &CanonicalApplyFailure{Kind: FailureActivityConflict, Message: "failure", OperationID: "boundary", ActivityID: mustFixtureActivityID(t).String(), ExistingJournalID: new(int64)}
+		}},
+	}
+	for _, tc := range metadataCases {
+		t.Run(tc.name, func(t *testing.T) {
+			outcome := DBOSStepOutcome{Schema: contract.outcomeSchema, OperationID: "boundary", MutationDigest: []byte("m"), Failure: tc.make()}
+			if _, err := decodeDBOSStepOutcome(contract, outcome); err == nil {
+				t.Fatalf("malformed metadata %s passed outcome validation", tc.name)
+			}
+		})
+	}
+}
+
+func TestDBOSOutcomeDiffCoversTypedMetadata(t *testing.T) {
+	index, kind, reason := 0, journal.ConditionExactFact, journal.ConditionFactMissing
+	asserted, actual := int64(0), int64(0)
+	control := DBOSStepOutcome{Failure: &CanonicalApplyFailure{Kind: FailureConditionFailed, Message: "failure", OperationID: "boundary", ConditionIndex: &index, ConditionKind: &kind, ConditionReason: &reason, AssertedJournalID: &asserted, ActualJournalID: &actual}}
+	cases := []struct {
+		field  DBOSDiagnosticField
+		mutate func(*CanonicalApplyFailure)
+	}{
+		{DBOSDiagFieldConditionIndex, func(f *CanonicalApplyFailure) { value := 1; f.ConditionIndex = &value }},
+		{DBOSDiagFieldConditionKind, func(f *CanonicalApplyFailure) { value := journal.ConditionCurrentFact; f.ConditionKind = &value }},
+		{DBOSDiagFieldConditionReason, func(f *CanonicalApplyFailure) { value := journal.ConditionFactMismatch; f.ConditionReason = &value }},
+		{DBOSDiagFieldAssertedJournalID, func(f *CanonicalApplyFailure) { value := int64(1); f.AssertedJournalID = &value }},
+		{DBOSDiagFieldActualJournalID, func(f *CanonicalApplyFailure) { value := int64(1); f.ActualJournalID = &value }},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.field), func(t *testing.T) {
+			malformed := control
+			failure := *control.Failure
+			tc.mutate(&failure)
+			malformed.Failure = &failure
+			diffs := diffDBOSOutcomeFields(control, malformed)
+			if len(diffs) != 1 || diffs[0] != tc.field {
+				t.Fatalf("diffs=%v want [%s]", diffs, tc.field)
+			}
+		})
+	}
+
+	activity := mustFixtureActivityID(t).String()
+	existing := int64(17)
+	activityControl := DBOSStepOutcome{Failure: &CanonicalApplyFailure{Kind: FailureActivityConflict, Message: "failure", OperationID: "boundary", ActivityID: activity, ExistingJournalID: &existing}}
+	for _, tc := range []struct {
+		field  DBOSDiagnosticField
+		mutate func(*CanonicalApplyFailure)
+	}{{DBOSDiagFieldActivityID, func(f *CanonicalApplyFailure) { f.ActivityID = "other--018f0000-0000-7000-8000-000000000005" }}, {DBOSDiagFieldExistingJournalID, func(f *CanonicalApplyFailure) { value := int64(18); f.ExistingJournalID = &value }}} {
+		t.Run(string(tc.field), func(t *testing.T) {
+			malformed := activityControl
+			failure := *activityControl.Failure
+			tc.mutate(&failure)
+			malformed.Failure = &failure
+			diffs := diffDBOSOutcomeFields(activityControl, malformed)
+			if len(diffs) != 1 || diffs[0] != tc.field {
+				t.Fatalf("diffs=%v want [%s]", diffs, tc.field)
+			}
+		})
+	}
 }
 
 func TestDBOSOnlyKnownDomainFailuresAreCheckpointable(t *testing.T) {
@@ -257,5 +441,28 @@ func TestDBOSOnlyKnownDomainFailuresAreCheckpointable(t *testing.T) {
 	}
 	if outcome, err := checkpointDomainApplyResult(newDBOSContractSnapshot(), journal.OperationInput{OperationID: "multi", MutationDigest: []byte("m")}, journal.CommittedResult{}, joined); !errors.As(err, &ambiguous) || outcome.Failure != nil {
 		t.Fatalf("multi-match failure did not remain on Go-error channel: outcome=%#v err=%v", outcome, err)
+	}
+}
+
+func TestDBOSConflictCodecMetadataFiveAxes(t *testing.T) {
+	contract := newDBOSContractSnapshot()
+	for _, axis := range journal.ConflictAxes() {
+		axis := axis
+		index := -1
+		if axis >= journal.ConflictCondition {
+			index = 0
+		}
+		t.Run(axis.String(), func(t *testing.T) {
+			conflict := &journal.OperationConflict{OperationID: "codec-axis", Axis: axis, Index: index}
+			outcome, err := encodeDBOSApplyFailure(contract, "codec-axis", []byte("m"), conflict)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, decodedErr := decodeDBOSStepOutcome(contract, outcome)
+			var recovered *journal.OperationConflict
+			if !errors.As(decodedErr, &recovered) || recovered.Axis != axis || recovered.Index != index {
+				t.Fatalf("decoded conflict=%#v err=%v want axis=%s index=%d", recovered, decodedErr, axis, index)
+			}
+		})
 	}
 }

@@ -18,7 +18,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"strings"
 	"time"
 
@@ -364,6 +363,8 @@ func decodeListedWorkflowInput(input any) (DBOSApplyInput, error) {
 	var raw []byte
 	if encoded, ok := input.(string); ok {
 		raw = []byte(encoded)
+	} else if encoded, ok := input.([]byte); ok {
+		raw = append([]byte(nil), encoded...)
 	} else {
 		var err error
 		raw, err = json.Marshal(input)
@@ -371,92 +372,11 @@ func decodeListedWorkflowInput(input any) (DBOSApplyInput, error) {
 			return DBOSApplyInput{}, fmt.Errorf("encode DBOS listed workflow input: %w", err)
 		}
 	}
-	if err := validateUniqueJSONKeys(raw); err != nil {
-		return DBOSApplyInput{}, fmt.Errorf("validate DBOS listed workflow input: %w", err)
-	}
 	var decoded DBOSApplyInput
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&decoded); err != nil {
+	if err := decodeStrictDBOSJSON(raw, &decoded); err != nil {
 		return DBOSApplyInput{}, fmt.Errorf("decode DBOS listed workflow input: %w", err)
 	}
-	var trailing any
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return DBOSApplyInput{}, errors.New("decode DBOS listed workflow input: trailing JSON value")
-		}
-		return DBOSApplyInput{}, fmt.Errorf("decode DBOS listed workflow input trailing data: %w", err)
-	}
 	return decoded, nil
-}
-
-func validateUniqueJSONKeys(raw []byte) error {
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	if err := validateUniqueJSONValue(decoder); err != nil {
-		return err
-	}
-	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return errors.New("trailing JSON value")
-		}
-		return fmt.Errorf("read trailing JSON data: %w", err)
-	}
-	return nil
-}
-
-func validateUniqueJSONValue(decoder *json.Decoder) error {
-	token, err := decoder.Token()
-	if err != nil {
-		return fmt.Errorf("read JSON value: %w", err)
-	}
-	delim, ok := token.(json.Delim)
-	if !ok {
-		return nil
-	}
-	switch delim {
-	case '{':
-		keys := make(map[string]struct{})
-		for decoder.More() {
-			keyToken, err := decoder.Token()
-			if err != nil {
-				return fmt.Errorf("read JSON object key: %w", err)
-			}
-			key, ok := keyToken.(string)
-			if !ok {
-				return fmt.Errorf("JSON object key has type %T, want string", keyToken)
-			}
-			if _, exists := keys[key]; exists {
-				return fmt.Errorf("duplicate JSON object key %q", key)
-			}
-			keys[key] = struct{}{}
-			if err := validateUniqueJSONValue(decoder); err != nil {
-				return err
-			}
-		}
-		closing, err := decoder.Token()
-		if err != nil {
-			return fmt.Errorf("close JSON object: %w", err)
-		}
-		if closing != json.Delim('}') {
-			return fmt.Errorf("close JSON object with %q, want }", closing)
-		}
-	case '[':
-		for decoder.More() {
-			if err := validateUniqueJSONValue(decoder); err != nil {
-				return err
-			}
-		}
-		closing, err := decoder.Token()
-		if err != nil {
-			return fmt.Errorf("close JSON array: %w", err)
-		}
-		if closing != json.Delim(']') {
-			return fmt.Errorf("close JSON array with %q, want ]", closing)
-		}
-	default:
-		return fmt.Errorf("unexpected JSON delimiter %q", delim)
-	}
-	return nil
 }
 
 func reconcileDBOSAllocatedCreates(in journal.OperationInput, result journal.CommittedResult) (journal.OperationInput, error) {
@@ -586,9 +506,31 @@ func (a *DBOSAdapter) postValidate(in journal.OperationInput, outcome DBOSStepOu
 		}
 	}
 	success, decodeErr := decodeDBOSStepOutcome(a.contract, outcome)
+	if outcome.Failure != nil {
+		// A structurally valid failure is only authoritative after the journal
+		// confirms that no operation committed. Malformed failures still fail
+		// immediately at the outcome boundary and never consult journal state.
+		descriptor, known := failureDescriptor(outcome.Failure.Kind)
+		if !known || validateApplyFailureEnvelope(outcome.OperationID, outcome.Failure, descriptor) != nil {
+			return CommittedResult{}, decodeErr
+		}
+		looked, lookupErr := a.tracker.Journal().LookupCommitted(in.OperationID)
+		if lookupErr != nil {
+			return CommittedResult{}, checkpointFailureDivergence(in.OperationID,
+				"the journal could not confirm absence for a checkpointed domain failure",
+				"repair journal availability and reconcile the checkpoint with the same durable operation before retrying", lookupErr)
+		}
+		if looked.Kind != journal.CommittedAbsent {
+			return CommittedResult{}, checkpointFailureDivergence(in.OperationID,
+				fmt.Sprintf("the journal reports %s for a checkpointed domain failure", looked.Kind),
+				"do not trust the failure checkpoint; reconcile the journal operation and DBOS workflow from the same durable backup", fmt.Errorf("failure checkpoint requires CommittedAbsent, got %s", looked.Kind))
+		}
+		return CommittedResult{}, decodeErr
+	}
 	if decodeErr != nil {
-		// A failure outcome surfaces its typed journal error here (matrix
-		// present-failure-outcome row); a malformed outcome fails closed.
+		// A malformed success outcome fails closed before any journal result is
+		// trusted. Valid success results continue through the journal authority
+		// comparison below.
 		return CommittedResult{}, decodeErr
 	}
 
@@ -645,6 +587,16 @@ func (a *DBOSAdapter) postValidate(in journal.OperationInput, outcome DBOSStepOu
 			Fix:       "this indicates an unhandled CommittedResultKind; nothing is trusted",
 			Cause:     fmt.Errorf("unknown CommittedResultKind %d", int(looked.Kind)),
 		}
+	}
+}
+
+func checkpointFailureDivergence(operation OperationID, impact, fix string, cause error) error {
+	return &CheckpointDivergenceError{
+		Operation: operation,
+		Stage:     DBOSDiagStageCheckpointValidation,
+		Impact:    impact,
+		Fix:       fix,
+		Cause:     cause,
 	}
 }
 

@@ -154,6 +154,9 @@ func TestMatrix_AbsentConflict_TypedConflict(t *testing.T) {
 	if !errors.As(err, &oc) {
 		t.Errorf("conflict not errors.As-discoverable: %v", err)
 	}
+	if oc.Axis != provenance.ConflictCommand || oc.Index != -1 {
+		t.Fatalf("conflict metadata=%#v, want ConflictCommand/-1", oc)
+	}
 }
 
 // Row 4: present-success (DBOS) | exact equal canonical mutation → the read-only
@@ -457,6 +460,47 @@ func TestMatrix_PresentFailureOutcome_TypedFailurePermanent(t *testing.T) {
 	}
 	if c.attempts != attemptsAfterFirst {
 		t.Errorf("fold attempted again on re-Apply (%d→%d): failure not permanent", attemptsAfterFirst, c.attempts)
+	}
+}
+
+func TestMatrix_FailureCheckpointRejectsCommittedJournal(t *testing.T) {
+	t.Parallel()
+	variants := map[string]func() (provenance.CommittedResult, error){
+		"exact": func() (provenance.CommittedResult, error) {
+			return provenance.CommittedResult{Kind: provenance.CommittedExact, AnchorJournalID: 99}, nil
+		},
+		"conflict": func() (provenance.CommittedResult, error) {
+			return provenance.CommittedResult{Kind: provenance.CommittedConflict}, nil
+		},
+		"unknown": func() (provenance.CommittedResult, error) {
+			return provenance.CommittedResult{Kind: provenance.CommittedResultKind(99)}, nil
+		},
+		"unavailable": func() (provenance.CommittedResult, error) {
+			return provenance.CommittedResult{}, errors.New("journal unavailable during checkpoint reconciliation")
+		},
+	}
+	for name, terminal := range variants {
+		t.Run(name, func(t *testing.T) {
+			var lookups int
+			lookup := func(real provenance.CommittedResult, realErr error) (provenance.CommittedResult, error) {
+				lookups++
+				if lookups == 1 {
+					return provenance.CommittedResult{Kind: provenance.CommittedAbsent}, nil
+				}
+				return terminal()
+			}
+			s := stackWithJournal(t, nil, lookup)
+			op := s.createTaskOp("failure-checkpoint-"+name, "aura", name)
+			op.Conditions = []provenance.Condition{{Kind: provenance.ConditionExactFact, Selector: provenance.FactSelector{Kind: provenance.FactDecision, Filter: provenance.FactFilter{TaskScope: provenance.FactTaskScope{Kind: provenance.FactTaskAny}}, DecisionKind: "fixture.missing"}, AssertedJournalID: 1}}
+			_, err := s.adapter.Apply(context.Background(), op)
+			var divergence *provenance.CheckpointDivergenceError
+			if !errors.As(err, &divergence) || divergence.Operation != op.OperationID || divergence.Stage == "" || divergence.Impact == "" || divergence.Fix == "" || divergence.Cause == nil {
+				t.Fatalf("failure checkpoint variant %s err=%v divergence=%+v", name, err, divergence)
+			}
+			if errors.Is(err, provenance.ErrConditionFailed) {
+				t.Fatalf("failure checkpoint variant %s surfaced typed domain failure despite journal divergence: %v", name, err)
+			}
+		})
 	}
 }
 
