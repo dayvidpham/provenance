@@ -207,6 +207,8 @@ func (scope *connScope) deleteSpineRowCascade(jid int64) error {
 		"DELETE FROM journal_authorities WHERE journal_id = ?1",
 		"DELETE FROM journal_task_event_contexts WHERE event_journal_id = ?1",
 		"DELETE FROM journal_task_events WHERE journal_id = ?1",
+		"DELETE FROM journal_decision_contexts WHERE decision_journal_id = ?1",
+		"DELETE FROM journal_evidence_contexts WHERE evidence_journal_id = ?1",
 		"DELETE FROM journal_operations WHERE journal_id = ?1",
 		"DELETE FROM journal_decisions WHERE journal_id = ?1",
 		"DELETE FROM journal_evidence WHERE journal_id = ?1",

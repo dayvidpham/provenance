@@ -431,6 +431,9 @@ func (scope *connScope) replayProjections() (result journal.ReplayResult, err er
 	if err := scope.preflightSchema(); err != nil {
 		return journal.ReplayResult{}, err
 	}
+	if err := scope.verifyFactContextIntegrity(); err != nil {
+		return journal.ReplayResult{}, err
+	}
 	if err := scope.validateCanonicalOperations(); err != nil {
 		return journal.ReplayResult{}, err
 	}
@@ -543,6 +546,10 @@ func (shape canonicalColumnShape) seedLegacyTasksQuery() string {
 }
 
 func (scope *connScope) validateCanonicalOperations() error {
+	contextSchema, err := scope.classifyFactContextSchema()
+	if err != nil {
+		return err
+	}
 	var operations []canonicalStoredOperation
 	columns, err := scope.tableColumns("journal_operations")
 	if err != nil {
@@ -641,7 +648,7 @@ func (scope *connScope) validateCanonicalOperations() error {
 			return err
 		}
 		for i, effect := range effects {
-			if err := scope.validateCanonicalEffectRow(op, rows[i], effect); err != nil {
+			if err := scope.validateCanonicalEffectRow(op, rows[i], effect, contextSchema == factContextSchemaCanonical); err != nil {
 				return fmt.Errorf("operation %d effect %d: %w", op.anchor, i, err)
 			}
 		}
@@ -685,7 +692,7 @@ func canonicalCorruption(anchor int64, field, stored, canonical string) error {
 	return fmt.Errorf("%w: provenance: canonical operation %d field %s diverged — stored=%q canonical=%q; where: startup canonical validation; when: before accepting the database; impact: Open fails closed and no projection row is mutated; fix: restore the operation, canonical bytes, and subtype rows from the same committed backup", journal.ErrProjectionDivergence, anchor, field, stored, canonical)
 }
 
-func (scope *connScope) validateCanonicalEffectRow(op canonicalStoredOperation, jid int64, effect journal.Effect) error {
+func (scope *connScope) validateCanonicalEffectRow(op canonicalStoredOperation, jid int64, effect journal.Effect, validateFactContexts bool) error {
 	expectedKind, err := effect.Sort.JournalKind()
 	if err != nil {
 		return err
@@ -728,9 +735,29 @@ func (scope *connScope) validateCanonicalEffectRow(op canonicalStoredOperation, 
 	case journal.EffectAssignmentEnd:
 		return scope.compareSingleRow(op.anchor, jid, canonicalAssignmentEndRow, []string{string(effect.AssignmentID), strconv.Itoa(transitionEndedID)})
 	case journal.EffectDecision:
-		return scope.compareSingleRow(op.anchor, jid, canonicalDecisionRow, []string{string(effect.DecisionKind), optionalTaskString(effect.TaskID), string(effect.Payload)})
+		payload := effect.Payload
+		if len(payload) == 0 {
+			payload = []byte(`{}`)
+		}
+		if err := scope.compareSingleRow(op.anchor, jid, canonicalDecisionRow, []string{string(effect.DecisionKind), optionalTaskString(effect.TaskID), string(payload)}); err != nil {
+			return err
+		}
+		if validateFactContexts {
+			return scope.validateCanonicalFactContextSet(op.anchor, jid, factContextDecision, effect.Contexts)
+		}
+		return nil
 	case journal.EffectEvidence:
-		return scope.compareSingleRow(op.anchor, jid, canonicalEvidenceRow, []string{string(effect.EvidenceKind), optionalTaskString(effect.TaskID), strings.ToUpper(fmt.Sprintf("%x", effect.ContentDigest)), string(effect.Payload)})
+		payload := effect.Payload
+		if len(payload) == 0 {
+			payload = []byte(`{}`)
+		}
+		if err := scope.compareSingleRow(op.anchor, jid, canonicalEvidenceRow, []string{string(effect.EvidenceKind), optionalTaskString(effect.TaskID), strings.ToUpper(fmt.Sprintf("%x", effect.ContentDigest)), string(payload)}); err != nil {
+			return err
+		}
+		if validateFactContexts {
+			return scope.validateCanonicalFactContextSet(op.anchor, jid, factContextEvidence, effect.Contexts)
+		}
+		return nil
 	}
 	return nil
 }

@@ -62,7 +62,9 @@ var recognizedJournalSpineTables = map[string]struct{}{
 	"journal_authority_assignment_episodes":    {},
 	"journal_authority_assignment_transitions": {},
 	"journal_decisions":                        {},
+	"journal_decision_contexts":                {},
 	"journal_evidence":                         {},
+	"journal_evidence_contexts":                {},
 	"journal_activity_creations":               {},
 }
 

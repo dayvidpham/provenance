@@ -299,6 +299,9 @@ var (
 	// ErrSubtypeIntegrity is returned when a journal row violates class-table
 	// inheritance totality, exclusivity, or discriminator agreement (§10 rule 8).
 	ErrSubtypeIntegrity = errors.New("provenance: journal subtype integrity violated")
+	// ErrFactContextIntegrity is returned when a decision or evidence context row
+	// cannot be reconciled with its immutable subtype-owned fact parent.
+	ErrFactContextIntegrity = errors.New("provenance: fact context integrity violated")
 	// ErrActorPlacement is returned when a journal row violates the anchor-only
 	// actor-placement invariant (§2.1, §10 rule 5): a stored actor_id must be
 	// present iff the row is an anchor (produced_by_operation_journal_id IS NULL).

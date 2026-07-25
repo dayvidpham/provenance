@@ -770,6 +770,9 @@ func preflightExistingReadOnly(dbPath string, models []ptypes.ModelEntry) (bool,
 		return existing, err
 	}
 	if existing {
+		if _, err := preflight.classifyFactContextSchema(); err != nil {
+			return true, err
+		}
 		if err := preflight.preflightCanonicalColumnsReadOnly(); err != nil {
 			return true, err
 		}

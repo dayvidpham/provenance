@@ -102,6 +102,9 @@ func (scope *connScope) ensureOperationsSchema() error {
 	if err := scope.ensureGenericCanonicalConstraints(); err != nil {
 		return err
 	}
+	if err := scope.ensureFactContextRelations(); err != nil {
+		return err
+	}
 	if err := scope.ensureActivityCreationsSchema(); err != nil {
 		return err
 	}
@@ -1006,6 +1009,9 @@ func (scope *connScope) foldDecision(in journal.OperationInput, jid int64, eff j
 	if err := sqlitex.Execute(scope.conn, "INSERT INTO journal_decisions (journal_id, decision_kind, task_id, payload) VALUES (?1, ?2, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{jid, string(eff.DecisionKind), taskID, string(payload)}}); err != nil {
 		return fmt.Errorf("Apply: insert journal_decisions: %w", err)
 	}
+	if err := scope.persistFactContexts(factContextDecision, jid, eff.Contexts); err != nil {
+		return fmt.Errorf("Apply: persist decision contexts: %w", err)
+	}
 	return nil
 }
 
@@ -1026,6 +1032,9 @@ func (scope *connScope) foldEvidence(in journal.OperationInput, jid int64, eff j
 	}
 	if err := sqlitex.Execute(scope.conn, "INSERT INTO journal_evidence (journal_id, evidence_kind, task_id, content_digest, payload) VALUES (?1, ?2, ?3, ?4, ?5)", &sqlitex.ExecOptions{Args: []any{jid, string(eff.EvidenceKind), taskID, eff.ContentDigest, string(payload)}}); err != nil {
 		return fmt.Errorf("Apply: insert journal_evidence: %w", err)
+	}
+	if err := scope.persistFactContexts(factContextEvidence, jid, eff.Contexts); err != nil {
+		return fmt.Errorf("Apply: persist evidence contexts: %w", err)
 	}
 	return nil
 }

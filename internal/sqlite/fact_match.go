@@ -36,6 +36,18 @@ const (
 	factSelectorEvidence
 )
 
+// factMatchBinding is the static predicate/binding contract shared by Apply
+// conditions today and bounded fact pages in the next query vertical. It keeps
+// subtype dispatch, normalized scope/actor/operation/context filters, and the
+// snapshot/cursor bounds and argument layout in one package-private value.
+type factMatchBinding struct {
+	kind         factSelectorKind
+	contexts     factContextRelation
+	snapshotMax  journal.JournalID
+	afterJournal journal.JournalID
+	args         []any
+}
+
 // latestMatchSQL returns the static SQL to find the MAX(journal_id) matching
 // the selector. Uses positional parameters:
 //
@@ -61,8 +73,8 @@ func (k factSelectorKind) latestMatchSQL() string {
 			  AND (NOT ?4 OR ja.effective_actor_id IN (SELECT value FROM json_each(?5)))
 			  AND (NOT ?6 OR jo.operation_id IN (SELECT value FROM json_each(?7)))
 			  AND ((NOT ?8) OR (SELECT COUNT(*) FROM json_each(?9) f
-			       WHERE EXISTS (SELECT ?8 FROM journal_task_event_contexts c
-			                     WHERE c.event_journal_id = d.journal_id
+			       WHERE EXISTS (SELECT ?8 FROM journal_decision_contexts c
+			                     WHERE c.decision_journal_id = d.journal_id
 			                       AND c.context_kind = json_extract(f.value,?11)
 			                       AND c.context_identity = json_extract(f.value,?12))) = ?8)`
 	case factSelectorEvidence:
@@ -75,8 +87,8 @@ func (k factSelectorKind) latestMatchSQL() string {
 			  AND (NOT ?4 OR ja.effective_actor_id IN (SELECT value FROM json_each(?5)))
 			  AND (NOT ?6 OR jo.operation_id IN (SELECT value FROM json_each(?7)))
 			  AND ((NOT ?8) OR (SELECT COUNT(*) FROM json_each(?9) f
-			       WHERE EXISTS (SELECT ?8 FROM journal_task_event_contexts c
-			                     WHERE c.event_journal_id = e.journal_id
+			       WHERE EXISTS (SELECT ?8 FROM journal_evidence_contexts c
+			                     WHERE c.evidence_journal_id = e.journal_id
 			                       AND c.context_kind = json_extract(f.value,?11)
 			                       AND c.context_identity = json_extract(f.value,?12))) = ?8)`
 	default:
@@ -99,8 +111,8 @@ func (k factSelectorKind) exactMatchSQL() string {
 			  AND (NOT ?4 OR ja.effective_actor_id IN (SELECT value FROM json_each(?5)))
 			  AND (NOT ?6 OR jo.operation_id IN (SELECT value FROM json_each(?7)))
 			  AND ((NOT ?8) OR (SELECT COUNT(*) FROM json_each(?9) f
-			       WHERE EXISTS (SELECT ?8 FROM journal_task_event_contexts c
-			                     WHERE c.event_journal_id = d.journal_id
+			       WHERE EXISTS (SELECT ?8 FROM journal_decision_contexts c
+			                     WHERE c.decision_journal_id = d.journal_id
 			                       AND c.context_kind = json_extract(f.value,?11)
 			                       AND c.context_identity = json_extract(f.value,?12))) = ?8)`
 	case factSelectorEvidence:
@@ -113,8 +125,8 @@ func (k factSelectorKind) exactMatchSQL() string {
 			  AND (NOT ?4 OR ja.effective_actor_id IN (SELECT value FROM json_each(?5)))
 			  AND (NOT ?6 OR jo.operation_id IN (SELECT value FROM json_each(?7)))
 			  AND ((NOT ?8) OR (SELECT COUNT(*) FROM json_each(?9) f
-			       WHERE EXISTS (SELECT ?8 FROM journal_task_event_contexts c
-			                     WHERE c.event_journal_id = e.journal_id
+			       WHERE EXISTS (SELECT ?8 FROM journal_evidence_contexts c
+			                     WHERE c.evidence_journal_id = e.journal_id
 			                       AND c.context_kind = json_extract(f.value,?11)
 			                       AND c.context_identity = json_extract(f.value,?12))) = ?8)`
 	default:
@@ -130,13 +142,16 @@ func (k factSelectorKind) exactMatchSQL() string {
 //   - (latest, false, nil)   — asserted does not match; latest is the highest match
 //   - (0, false, nil)        — no row matches the selector at all
 func evaluateExactFactSelector(scope *connScope, sel journal.FactSelector, asserted journal.JournalID) (journal.JournalID, bool, error) {
-	kind, args, err := buildSelectorArgs(sel, 0)
+	if err := scope.verifyFactContextIntegrity(); err != nil {
+		return 0, false, err
+	}
+	binding, err := buildFactMatchBinding(sel, 0, 0)
 	if err != nil {
 		return 0, false, err
 	}
-	exactArgs := append(args, int64(asserted)) // ?13 (args already has ?11 and ?12)
+	exactArgs := append(binding.args, int64(asserted)) // ?13 (args already has ?11 and ?12)
 	found := false
-	if err := sqlitex.Execute(scope.conn, kind.exactMatchSQL(), &sqlitex.ExecOptions{
+	if err := sqlitex.Execute(scope.conn, binding.kind.exactMatchSQL(), &sqlitex.ExecOptions{
 		Args: exactArgs,
 		ResultFunc: func(*zs.Stmt) error {
 			found = true
@@ -148,7 +163,7 @@ func evaluateExactFactSelector(scope *connScope, sel journal.FactSelector, asser
 	if found {
 		return asserted, true, nil
 	}
-	latest, anyFound, err := latestFactSelector(scope, kind, args)
+	latest, anyFound, err := latestFactMatch(scope, binding)
 	if err != nil {
 		return 0, false, err
 	}
@@ -161,18 +176,25 @@ func evaluateExactFactSelector(scope *connScope, sel journal.FactSelector, asser
 // evaluateCurrentFactSelector resolves a FactSelector for a CurrentFact
 // condition using the caller-owned connection scope.
 func evaluateCurrentFactSelector(scope *connScope, sel journal.FactSelector) (journal.JournalID, bool, error) {
-	kind, args, err := buildSelectorArgs(sel, 0)
+	if err := scope.verifyFactContextIntegrity(); err != nil {
+		return 0, false, err
+	}
+	binding, err := buildFactMatchBinding(sel, 0, 0)
 	if err != nil {
 		return 0, false, err
 	}
-	return latestFactSelector(scope, kind, args)
+	return latestFactMatch(scope, binding)
 }
 
 func latestFactSelector(scope *connScope, kind factSelectorKind, args []any) (journal.JournalID, bool, error) {
+	return latestFactMatch(scope, factMatchBinding{kind: kind, contexts: kind.contextRelation(), args: args})
+}
+
+func latestFactMatch(scope *connScope, binding factMatchBinding) (journal.JournalID, bool, error) {
 	var latest journal.JournalID
 	found := false
-	if err := sqlitex.Execute(scope.conn, kind.latestMatchSQL(), &sqlitex.ExecOptions{
-		Args: args,
+	if err := sqlitex.Execute(scope.conn, binding.kind.latestMatchSQL(), &sqlitex.ExecOptions{
+		Args: binding.args,
 		ResultFunc: func(stmt *zs.Stmt) error {
 			if stmt.ColumnType(0) != zs.TypeNull {
 				latest = journal.JournalID(stmt.ColumnInt64(0))
@@ -184,6 +206,17 @@ func latestFactSelector(scope *connScope, kind factSelectorKind, args []any) (jo
 		return 0, false, fmt.Errorf("latestFactSelector: %w", err)
 	}
 	return latest, found, nil
+}
+
+func (k factSelectorKind) contextRelation() factContextRelation {
+	switch k {
+	case factSelectorDecision:
+		return factContextDecision
+	case factSelectorEvidence:
+		return factContextEvidence
+	default:
+		panic("unknown factSelectorKind")
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -317,4 +350,12 @@ func buildSelectorArgs(sel journal.FactSelector, snapshotMax journal.JournalID) 
 		// ?13 = asserted JournalID for exactMatchSQL (appended by caller)
 	}
 	return kind, args, nil
+}
+
+func buildFactMatchBinding(sel journal.FactSelector, snapshotMax, afterJournal journal.JournalID) (factMatchBinding, error) {
+	kind, args, err := buildSelectorArgs(sel, snapshotMax)
+	if err != nil {
+		return factMatchBinding{}, err
+	}
+	return factMatchBinding{kind: kind, contexts: kind.contextRelation(), snapshotMax: snapshotMax, afterJournal: afterJournal, args: args}, nil
 }

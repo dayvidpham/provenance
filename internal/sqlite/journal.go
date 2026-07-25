@@ -248,6 +248,9 @@ func (db *DB) VerifyIntegrity() error {
 func (scope *connScope) verifyIntegrity() (err error) {
 	endTx := sqlitex.Save(scope.conn)
 	defer endTx(&err)
+	if err := scope.verifyFactContextIntegrity(); err != nil {
+		return err
+	}
 	if err := scope.verifyForeignKeyTopology(); err != nil {
 		return err
 	}

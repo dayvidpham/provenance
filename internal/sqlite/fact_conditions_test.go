@@ -615,3 +615,103 @@ func TestConditionExactTaskScopeFilter(t *testing.T) {
 		t.Fatal("Exact scope for task2 found a row, expected none")
 	}
 }
+
+// TestFactConditionsRequireSubtypeOwnedContexts exercises CurrentFact and
+// ExactFact through Apply. RequiredContexts use ALL/subset semantics against
+// the decision/evidence relation selected by the shared fact matcher.
+func TestFactConditionsRequireSubtypeOwnedContexts(t *testing.T) {
+	t.Parallel()
+	env := newFactCondEnv(t)
+	taskContext, err := journal.TaskContext(env.task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actorContext, err := journal.ActorContext(env.act)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gitContext, err := journal.GitContext("0123456789012345678901234567890123456789")
+	if err != nil {
+		t.Fatal(err)
+	}
+	decisionOperation := journal.OperationInput{
+		OperationID: "context-decision-" + journal.OperationID(uuid.Must(uuid.NewV7()).String()),
+		ActorID:     env.act, AuthorityJournalID: &env.boot, CommandDigest: []byte("context-decision"),
+		Effects: []journal.Effect{{
+			Sort: journal.EffectDecision, ResultSlot: "decision", TaskID: env.task,
+			DecisionKind: "fixture.context.required", Payload: []byte(`{}`), Contexts: []journal.EventContext{taskContext},
+		}},
+	}
+	decisionResult, err := env.db.Apply(decisionOperation)
+	if err != nil {
+		t.Fatalf("Apply decision: %v", err)
+	}
+	decisionJID := factContextResultSlot(t, decisionResult, "decision")
+	evidenceOperation := journal.OperationInput{
+		OperationID: "context-evidence-" + journal.OperationID(uuid.Must(uuid.NewV7()).String()),
+		ActorID:     env.act, AuthorityJournalID: &env.boot, CommandDigest: []byte("context-evidence"),
+		Effects: []journal.Effect{{
+			Sort: journal.EffectEvidence, ResultSlot: "evidence", TaskID: env.task,
+			EvidenceKind: "fixture.context.required", ContentDigest: []byte("context-evidence"), Payload: []byte(`{}`), Contexts: []journal.EventContext{actorContext, taskContext},
+		}},
+	}
+	evidenceResult, err := env.db.Apply(evidenceOperation)
+	if err != nil {
+		t.Fatalf("Apply evidence: %v", err)
+	}
+	evidenceJID := factContextResultSlot(t, evidenceResult, "evidence")
+
+	decisionExact := journal.FactSelector{
+		Kind: journal.FactDecision, DecisionKind: "fixture.context.required",
+		Filter: journal.FactFilter{TaskScope: journal.FactTaskScope{Kind: journal.FactTaskExact, TaskID: env.task}, RequiredContexts: []journal.EventContext{taskContext}},
+	}
+	evidenceSubset := journal.FactSelector{
+		Kind: journal.FactEvidence, EvidenceKind: "fixture.context.required",
+		Filter: journal.FactFilter{TaskScope: journal.FactTaskScope{Kind: journal.FactTaskExact, TaskID: env.task}, RequiredContexts: []journal.EventContext{taskContext}},
+	}
+	evidenceFull := evidenceSubset
+	evidenceFull.Filter.RequiredContexts = []journal.EventContext{taskContext, actorContext}
+	for _, condition := range []journal.Condition{
+		{Kind: journal.ConditionExactFact, Selector: decisionExact, AssertedJournalID: decisionJID},
+		// Evidence has an extra actor context, but a required task-context subset matches.
+		{Kind: journal.ConditionCurrentFact, Selector: evidenceSubset, AssertedJournalID: evidenceJID},
+		{Kind: journal.ConditionExactFact, Selector: evidenceFull, AssertedJournalID: evidenceJID},
+	} {
+		if result, err := env.db.Apply(env.makeEventOp([]journal.Condition{condition})); err != nil || result.Kind != journal.CommittedExact {
+			t.Fatalf("context condition %+v: result=%+v err=%v", condition, result, err)
+		}
+	}
+
+	for _, selector := range []journal.FactSelector{
+		// The decision is missing actorContext, so this partial requirement cannot match.
+		{Kind: journal.FactDecision, DecisionKind: "fixture.context.required", Filter: journal.FactFilter{TaskScope: journal.FactTaskScope{Kind: journal.FactTaskExact, TaskID: env.task}, RequiredContexts: []journal.EventContext{taskContext, actorContext}}},
+		// A valid context in the wrong identity domain cannot match either fact.
+		{Kind: journal.FactEvidence, EvidenceKind: "fixture.context.required", Filter: journal.FactFilter{TaskScope: journal.FactTaskScope{Kind: journal.FactTaskExact, TaskID: env.task}, RequiredContexts: []journal.EventContext{gitContext}}},
+	} {
+		condition := journal.Condition{Kind: journal.ConditionCurrentFact, Selector: selector, AssertedJournalID: 0}
+		if result, err := env.db.Apply(env.makeEventOp([]journal.Condition{condition})); err != nil || result.Kind != journal.CommittedExact {
+			t.Fatalf("absence condition %+v: result=%+v err=%v", condition, result, err)
+		}
+	}
+
+	unscopedOperation := journal.OperationInput{
+		OperationID: "context-unscoped-" + journal.OperationID(uuid.Must(uuid.NewV7()).String()),
+		ActorID:     env.act, AuthorityJournalID: &env.boot, CommandDigest: []byte("context-unscoped"),
+		Effects: []journal.Effect{{
+			Sort: journal.EffectDecision, ResultSlot: "unscoped", DecisionKind: "fixture.context.scope", Payload: []byte(`{}`), Contexts: []journal.EventContext{taskContext},
+		}},
+	}
+	unscopedResult, err := env.db.Apply(unscopedOperation)
+	if err != nil {
+		t.Fatalf("Apply unscoped decision: %v", err)
+	}
+	unscopedJID := factContextResultSlot(t, unscopedResult, "unscoped")
+	for _, condition := range []journal.Condition{
+		{Kind: journal.ConditionCurrentFact, Selector: decisionExact, AssertedJournalID: decisionJID},
+		{Kind: journal.ConditionCurrentFact, Selector: journal.FactSelector{Kind: journal.FactDecision, DecisionKind: "fixture.context.scope", Filter: journal.FactFilter{TaskScope: journal.FactTaskScope{Kind: journal.FactTaskUnscoped}, RequiredContexts: []journal.EventContext{taskContext}}}, AssertedJournalID: unscopedJID},
+	} {
+		if result, err := env.db.Apply(env.makeEventOp([]journal.Condition{condition})); err != nil || result.Kind != journal.CommittedExact {
+			t.Fatalf("scope condition %+v: result=%+v err=%v", condition, result, err)
+		}
+	}
+}

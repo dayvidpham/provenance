@@ -745,6 +745,9 @@ func (scope *connScope) committedOutcomeForExisting(in journal.OperationInput, e
 		}
 		return journal.CommittedResult{}, err
 	}
+	if err := scope.verifyFactContextIntegrity(); err != nil {
+		return journal.CommittedResult{}, err
+	}
 	res, err := scope.reconstructAndValidateCommitted(existing.anchor)
 	if err != nil {
 		return journal.CommittedResult{}, err
