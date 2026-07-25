@@ -8,8 +8,9 @@
 //
 // # Connection model
 //
-// A [DB] owns exactly one sqlitex.Pool and its race-safe close lifecycle state.
-// It holds no connection of its own: every SQL statement runs on a [connScope]
+// A [DB] is the pool-backed SQLite database handle and persistence owner. It
+// owns exactly one sqlitex.Pool and its race-safe close lifecycle state. It
+// holds no connection of its own: every SQL statement runs on a [connScope]
 // whose ownership is explicit. There is exactly one runtime ownership entry
 // point, [DB.bindScope]: the restored `bindScope(ctx, target)` selector lets
 // ordinary operations lease a scope explicitly targeted at the live projection.
@@ -61,11 +62,12 @@ func (result *closeResult) do(closeFunc func() error) error {
 	return result.err
 }
 
-// DB wraps a SQLite connection pool for safe concurrent access.
-// Use [Open] to create a new DB instance.
+// DB is the pool-backed SQLite database handle and persistence owner for safe
+// concurrent access. It owns the runtime pool, schema lifecycle, transaction
+// paths, and shutdown boundary; individual operations lease [connScope]
+// connections from it. Use [Open] to create a new DB instance.
 //
-// A DB owns the runtime pool and its race-safe close lifecycle state, and
-// nothing else. It holds no connection, no mutex, and no projection selector:
+// It holds no connection, no mutex, and no projection selector:
 // connection ownership is always explicit and always lives on a [connScope].
 type DB struct {
 	// pool is the sole runtime connection source. Callers bind a connScope.
