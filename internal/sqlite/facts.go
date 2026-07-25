@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -11,65 +12,6 @@ import (
 	zs "zombiezen.com/go/sqlite"
 	"zombiezen.com/go/sqlite/sqlitex"
 )
-
-// factPageKind is the closed dispatch boundary for the two fact subtype page
-// queries. Keeping the SQL variants explicit prevents caller-controlled table
-// or column identifiers from reaching SQLite.
-type factPageKind uint8
-
-const (
-	factPageDecision factPageKind = iota + 1
-	factPageEvidence
-)
-
-func (kind factPageKind) pageSQL() string {
-	switch kind {
-	case factPageDecision:
-		return `SELECT d.journal_id, ja.recorded_at, d.task_id, d.decision_kind,
-       d.payload, ja.effective_actor_id, jo.operation_id,
-       ja.produced_by_operation_journal_id
-FROM journal_decisions d
-JOIN journal_attributed ja ON ja.journal_id = d.journal_id
-JOIN journal_operations jo ON jo.journal_id = ja.produced_by_operation_journal_id
-WHERE d.journal_id <= ?1
-  AND d.journal_id > ?2
-  AND d.decision_kind IN (SELECT value FROM json_each(?3))
-  AND (NOT ?4 OR d.task_id IS ?5)
-  AND (NOT ?6 OR ja.effective_actor_id IN (SELECT value FROM json_each(?7)))
-  AND (NOT ?8 OR jo.operation_id IN (SELECT value FROM json_each(?9)))
-  AND (NOT ?10 OR (SELECT COUNT(*) FROM json_each(?11) f
-       WHERE EXISTS (SELECT ?10 FROM journal_task_event_contexts c
-                     WHERE c.event_journal_id = d.journal_id
-                       AND c.attached_by_journal_id <= ?1
-                       AND c.context_kind = json_extract(f.value,?12)
-                       AND c.context_identity = json_extract(f.value,?13))) = ?10)
-ORDER BY d.journal_id ASC
-LIMIT ?14`
-	case factPageEvidence:
-		return `SELECT e.journal_id, ja.recorded_at, e.task_id, e.evidence_kind,
-       e.content_digest, e.payload, ja.effective_actor_id, jo.operation_id,
-       ja.produced_by_operation_journal_id
-FROM journal_evidence e
-JOIN journal_attributed ja ON ja.journal_id = e.journal_id
-JOIN journal_operations jo ON jo.journal_id = ja.produced_by_operation_journal_id
-WHERE e.journal_id <= ?1
-  AND e.journal_id > ?2
-  AND e.evidence_kind IN (SELECT value FROM json_each(?3))
-  AND (NOT ?4 OR e.task_id IS ?5)
-  AND (NOT ?6 OR ja.effective_actor_id IN (SELECT value FROM json_each(?7)))
-  AND (NOT ?8 OR jo.operation_id IN (SELECT value FROM json_each(?9)))
-  AND (NOT ?10 OR (SELECT COUNT(*) FROM json_each(?11) f
-       WHERE EXISTS (SELECT ?10 FROM journal_task_event_contexts c
-                     WHERE c.event_journal_id = e.journal_id
-                       AND c.attached_by_journal_id <= ?1
-                       AND c.context_kind = json_extract(f.value,?12)
-                       AND c.context_identity = json_extract(f.value,?13))) = ?10)
-ORDER BY e.journal_id ASC
-LIMIT ?14`
-	default:
-		panic("unknown fact page kind")
-	}
-}
 
 type factPageRow struct {
 	journalID                   journal.JournalID
@@ -94,15 +36,11 @@ func (db *DB) QueryDecisions(q journal.DecisionQuery) (journal.DecisionPage, err
 	if err := q.Validate(); err != nil {
 		return journal.DecisionPage{}, fmt.Errorf("QueryDecisions: %w", err)
 	}
-	filter, err := normalizeFactQueryFilter(q.Filter)
-	if err != nil {
-		return journal.DecisionPage{}, fmt.Errorf("QueryDecisions: %w", err)
-	}
 	kinds := make([]string, len(q.Kinds))
 	for i, kind := range q.Kinds {
 		kinds[i] = string(kind)
 	}
-	rows, snapshot, next, err := db.queryFacts(factPageDecision, q.Page, filter, kinds)
+	rows, snapshot, next, err := db.queryFacts(factSelectorDecision, q.Page, q.Filter, kinds)
 	if err != nil {
 		return journal.DecisionPage{}, fmt.Errorf("QueryDecisions: %w", err)
 	}
@@ -128,15 +66,11 @@ func (db *DB) QueryEvidence(q journal.EvidenceQuery) (journal.EvidencePage, erro
 	if err := q.Validate(); err != nil {
 		return journal.EvidencePage{}, fmt.Errorf("QueryEvidence: %w", err)
 	}
-	filter, err := normalizeFactQueryFilter(q.Filter)
-	if err != nil {
-		return journal.EvidencePage{}, fmt.Errorf("QueryEvidence: %w", err)
-	}
 	kinds := make([]string, len(q.Kinds))
 	for i, kind := range q.Kinds {
 		kinds[i] = string(kind)
 	}
-	rows, snapshot, next, err := db.queryFacts(factPageEvidence, q.Page, filter, kinds)
+	rows, snapshot, next, err := db.queryFacts(factSelectorEvidence, q.Page, q.Filter, kinds)
 	if err != nil {
 		return journal.EvidencePage{}, fmt.Errorf("QueryEvidence: %w", err)
 	}
@@ -159,6 +93,9 @@ func (db *DB) QueryEvidence(q journal.EvidenceQuery) (journal.EvidencePage, erro
 	return page, nil
 }
 
+// normalizeFactQueryFilter is retained as the matcher boundary used by
+// buildFactPageMatchBinding and condition selectors. Query execution itself
+// never binds filter dimensions independently of that shared binding.
 func normalizeFactQueryFilter(in journal.FactFilter) (journal.FactFilter, error) {
 	contexts, err := journal.CanonicalEventContexts(in.RequiredContexts)
 	if err != nil {
@@ -198,95 +135,44 @@ func deduplicateFactOperations(values []journal.OperationID) []journal.Operation
 	return result
 }
 
-func (db *DB) queryFacts(kind factPageKind, page journal.FactPageRequest, filter journal.FactFilter, kinds []string) ([]factPageRow, journal.JournalID, *journal.FactCursor, error) {
-	kindJSON, err := json.Marshal(kinds)
+func (db *DB) queryFacts(kind factSelectorKind, page journal.FactPageRequest, filter journal.FactFilter, kinds []string) (rows []factPageRow, snapshot journal.JournalID, next *journal.FactCursor, err error) {
+	binding, err := buildFactPageMatchBinding(kind, page, filter, kinds)
 	if err != nil {
-		return nil, 0, nil, fmt.Errorf("encode fact kinds: %w", err)
+		return nil, 0, nil, err
 	}
-	actorValues := make([]string, len(filter.EffectiveActorIDs))
-	for i, actor := range filter.EffectiveActorIDs {
-		actorValues[i] = actor.String()
-	}
-	actorJSON, err := json.Marshal(actorValues)
-	if err != nil {
-		return nil, 0, nil, fmt.Errorf("encode fact actor filters: %w", err)
-	}
-	operationValues := make([]string, len(filter.OperationIDs))
-	for i, operation := range filter.OperationIDs {
-		operationValues[i] = string(operation)
-	}
-	operationJSON, err := json.Marshal(operationValues)
-	if err != nil {
-		return nil, 0, nil, fmt.Errorf("encode fact operation filters: %w", err)
-	}
-	contextJSON, err := json.Marshal(filter.RequiredContexts)
-	if err != nil {
-		return nil, 0, nil, fmt.Errorf("encode fact context filters: %w", err)
-	}
-
-	filterTask := 0
-	var taskValue any
-	switch filter.TaskScope.Kind {
-	case journal.FactTaskAny:
-	case journal.FactTaskUnscoped:
-		filterTask = 1
-	case journal.FactTaskExact:
-		filterTask = 1
-		taskValue = filter.TaskScope.TaskID.String()
-	default:
-		return nil, 0, nil, fmt.Errorf("%w: unknown task scope kind %d", journal.ErrInvalidQuery, filter.TaskScope.Kind)
-	}
-	actorFilter := 0
-	if len(filter.EffectiveActorIDs) > 0 {
-		actorFilter = 1
-	}
-	operationFilter := 0
-	if len(filter.OperationIDs) > 0 {
-		operationFilter = 1
-	}
-
 	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
-		return nil, 0, nil, fmt.Errorf("lease connection: %w", err)
+		return nil, 0, nil, fmt.Errorf("lease connection for read-only fact page: %w", err)
 	}
 	defer scope.release()
-	var txErr error
-	endTx := sqlitex.Save(scope.conn)
-	defer endTx(&txErr)
 
-	snapshot := int64(page.SnapshotMaxJournalID)
-	if snapshot == 0 {
-		if txErr = sqlitex.Execute(scope.conn, "SELECT COALESCE(MAX(journal_id), ?1) FROM journal", &sqlitex.ExecOptions{
-			Args: []any{0},
-			ResultFunc: func(stmt *zs.Stmt) error {
-				snapshot = stmt.ColumnInt64(0)
-				return nil
-			},
-		}); txErr != nil {
-			return nil, 0, nil, fmt.Errorf("snapshot watermark: %w", txErr)
+	// Keep the snapshot lookup, topology validation, page fetch, and verified
+	// context loads on one read transaction. SQLite's WAL snapshot is therefore
+	// fixed at the connection-lease boundary instead of being inferred from
+	// separate pooled reads. The transaction is read-only and cannot change the
+	// database or its WAL/SHM sidecars.
+	endTx := sqlitex.Transaction(scope.conn)
+	defer endTx(&err)
+
+	if err = scope.resolveFactSnapshot(&page); err != nil {
+		return nil, 0, nil, err
+	}
+	snapshot = page.SnapshotMaxJournalID
+	if page.SnapshotMaxJournalID != binding.snapshotMax || page.AfterJournalID != binding.afterJournal {
+		if binding, err = buildFactPageMatchBinding(kind, page, filter, kinds); err != nil {
+			return nil, 0, nil, err
 		}
 	}
-
-	args := []any{
-		snapshot,
-		int64(page.AfterJournalID),
-		string(kindJSON),
-		filterTask,
-		taskValue,
-		actorFilter,
-		string(actorJSON),
-		operationFilter,
-		string(operationJSON),
-		len(filter.RequiredContexts),
-		string(contextJSON),
-		"$.kind",
-		"$.identity",
-		page.Limit + 1,
+	if err = scope.requireCanonicalFactContextSchema("bounded fact query"); err != nil {
+		return nil, 0, nil, err
+	}
+	if err = scope.verifyFactPageTopology(kind, snapshot); err != nil {
+		return nil, 0, nil, err
 	}
 
-	rows := make([]factPageRow, 0, page.Limit+1)
-	if txErr = sqlitex.Execute(scope.conn, kind.pageSQL(), &sqlitex.ExecOptions{
-		Args: args,
+	rows = make([]factPageRow, 0, page.Limit+1)
+	if err = sqlitex.Execute(scope.conn, binding.kind.pageMatchSQL(), &sqlitex.ExecOptions{
+		Args: binding.args,
 		ResultFunc: func(stmt *zs.Stmt) error {
 			row, scanErr := scanFactPageRow(stmt, kind)
 			if scanErr != nil {
@@ -295,84 +181,227 @@ func (db *DB) queryFacts(kind factPageKind, page journal.FactPageRequest, filter
 			rows = append(rows, row)
 			return nil
 		},
-	}); txErr != nil {
-		return nil, 0, nil, fmt.Errorf("page query: %w", txErr)
+	}); err != nil {
+		return nil, 0, nil, fmt.Errorf("bounded fact page SQL: %w", err)
 	}
 	for i := range rows {
-		contexts, contextErr := scope.loadFactContexts(int64(rows[i].journalID), snapshot)
+		contexts, contextErr := scope.loadVerifiedFactContexts(binding.contexts, int64(rows[i].journalID))
 		if contextErr != nil {
-			txErr = contextErr
 			return nil, 0, nil, contextErr
 		}
 		rows[i].contexts = contexts
 	}
 
-	var next *journal.FactCursor
 	if len(rows) > page.Limit {
 		rows = rows[:page.Limit]
 		last := rows[len(rows)-1]
-		next = &journal.FactCursor{SnapshotMaxJournalID: journal.JournalID(snapshot), AfterJournalID: last.journalID}
+		next = &journal.FactCursor{SnapshotMaxJournalID: snapshot, AfterJournalID: last.journalID}
 	}
-	return rows, journal.JournalID(snapshot), next, nil
+	return rows, snapshot, next, nil
 }
 
-func scanFactPageRow(stmt *zs.Stmt, kind factPageKind) (factPageRow, error) {
+// resolveFactSnapshot validates a caller-supplied watermark against a journal
+// row in the same read transaction used for the page. A nonzero watermark is
+// a positional boundary, not an unchecked integer supplied to page SQL.
+func (scope *connScope) resolveFactSnapshot(page *journal.FactPageRequest) error {
+	if page.SnapshotMaxJournalID == 0 {
+		var maxID int64
+		if err := sqlitex.Execute(scope.conn, "SELECT COALESCE(MAX(journal_id), ?1) FROM journal", &sqlitex.ExecOptions{
+			Args: []any{0},
+			ResultFunc: func(stmt *zs.Stmt) error {
+				maxID = stmt.ColumnInt64(0)
+				return nil
+			},
+		}); err != nil {
+			return fmt.Errorf("resolve fact snapshot: read committed journal maximum: %w", err)
+		}
+		page.SnapshotMaxJournalID = journal.JournalID(maxID)
+		return nil
+	}
+	var committed bool
+	if err := sqlitex.Execute(scope.conn, "SELECT journal_id FROM journal WHERE journal_id=?1", &sqlitex.ExecOptions{
+		Args: []any{int64(page.SnapshotMaxJournalID)},
+		ResultFunc: func(*zs.Stmt) error {
+			committed = true
+			return nil
+		},
+	}); err != nil {
+		return fmt.Errorf("resolve fact snapshot %d: validate committed journal boundary: %w", page.SnapshotMaxJournalID, err)
+	}
+	if !committed {
+		return fmt.Errorf("%w: snapshot watermark %d is not an existing committed journal boundary — where: fact query snapshot validation; when: before page SQL; impact: pagination could include facts appended after a forged boundary; fix: use the SnapshotMaxJournalID returned by an earlier page or leave it zero for a new positional query", journal.ErrInvalidQuery, page.SnapshotMaxJournalID)
+	}
+	return nil
+}
+
+// verifyFactPageTopology checks every candidate subtype row before the shared
+// page predicate is executed. Its left-join diagnostic makes a damaged
+// producer visible to this pass, so the shared page predicate cannot silently
+// omit it through an INNER JOIN.
+func (scope *connScope) verifyFactPageTopology(kind factSelectorKind, snapshot journal.JournalID) error {
+	expectedKind := journal.JournalKindDecision
+	if kind == factSelectorEvidence {
+		expectedKind = journal.JournalKindEvidence
+	}
+	if kind != factSelectorDecision && kind != factSelectorEvidence {
+		return factQueryIntegrityError(0, "unknown fact subtype", "use the closed decision or evidence selector")
+	}
+	if err := sqlitex.Execute(scope.conn, kind.pageTopologySQL(), &sqlitex.ExecOptions{
+		Args: []any{int64(snapshot)},
+		ResultFunc: func(stmt *zs.Stmt) error {
+			factID := journal.JournalID(stmt.ColumnInt64(0))
+			if factID <= 0 {
+				return factQueryIntegrityError(factID, "fact journal ID is not positive", "restore the fact and journal primary-key rows")
+			}
+			if stmt.ColumnType(1) == zs.TypeNull {
+				return factQueryIntegrityError(factID, "fact has no journal supertype row", "restore the journal row for the fact")
+			}
+			if journal.JournalKind(stmt.ColumnInt(2)) != expectedKind {
+				return factQueryIntegrityError(factID, "fact journal discriminator does not match its subtype table", "restore the matching journal kind and subtype row")
+			}
+			if stmt.ColumnType(3) == zs.TypeNull {
+				return factQueryIntegrityError(factID, "fact has no producing operation relationship", "restore the fact's producing operation journal ID")
+			}
+			producerID := journal.JournalID(stmt.ColumnInt64(3))
+			if producerID <= 0 {
+				return factQueryIntegrityError(factID, "fact has a non-positive producing operation journal ID", "restore the producing operation anchor")
+			}
+			if stmt.ColumnType(4) == zs.TypeNull {
+				return factQueryIntegrityError(factID, "journal_attributed has no row for the fact", "restore the attribution view and the fact journal row")
+			}
+			if journal.JournalKind(stmt.ColumnInt(5)) != expectedKind {
+				return factQueryIntegrityError(factID, "journal_attributed has the wrong subtype discriminator", "restore the fact journal kind and attribution relationship")
+			}
+			if stmt.ColumnType(6) == zs.TypeNull {
+				return factQueryIntegrityError(factID, "effective actor attribution is NULL", "restore the actor on the producing operation anchor")
+			}
+			if _, err := journalParseActor(stmt.ColumnText(6)); err != nil {
+				return factQueryIntegrityError(factID, "effective actor attribution is malformed", "restore the canonical actor ID on the producing operation anchor", err)
+			}
+			if stmt.ColumnType(7) == zs.TypeNull || journal.JournalID(stmt.ColumnInt64(7)) != producerID {
+				return factQueryIntegrityError(factID, "attribution points at a different producing operation", "restore journal_attributed to the fact journal relationship")
+			}
+			if stmt.ColumnType(8) == zs.TypeNull {
+				return factQueryIntegrityError(factID, "producing operation row is missing", "restore journal_operations for the producing operation journal ID")
+			}
+			if stmt.ColumnType(9) == zs.TypeNull {
+				return factQueryIntegrityError(factID, "producing operation ID is missing", "restore the operation identity on journal_operations")
+			}
+			if err := journal.ValidateOperationID(journal.OperationID(stmt.ColumnText(9))); err != nil {
+				return factQueryIntegrityError(factID, "producing operation ID is malformed", "restore the canonical operation identity", err)
+			}
+			if stmt.ColumnType(10) == zs.TypeNull || journal.JournalKind(stmt.ColumnInt(10)) != journal.JournalKindOperation {
+				return factQueryIntegrityError(factID, "producing operation is not an operation journal anchor", "restore the operation journal discriminator and subtype row")
+			}
+			return nil
+		},
+	}); err != nil {
+		if errors.Is(err, journal.ErrSubtypeIntegrity) {
+			return err
+		}
+		return factQueryIntegrityError(0, "cannot inspect fact producer and attribution topology", "restore the journal, attribution view, and operation rows before querying", err)
+	}
+	return nil
+}
+
+// factPageTopologySQL is a closed static diagnostic query. Unlike the shared
+// page predicate it is deliberately unfiltered: every candidate fact up to the
+// pinned watermark must have a visible producer and attribution relationship
+// before any predicate can select or omit it.
+func (kind factSelectorKind) pageTopologySQL() string {
+	switch kind {
+	case factSelectorDecision:
+		return `SELECT d.journal_id, j.journal_id, j.kind_id,
+       j.produced_by_operation_journal_id, ja.journal_id, ja.kind_id,
+       ja.effective_actor_id, ja.produced_by_operation_journal_id,
+       jo.journal_id, jo.operation_id, opj.kind_id
+FROM journal_decisions d
+LEFT JOIN journal j ON j.journal_id = d.journal_id
+LEFT JOIN journal_attributed ja ON ja.journal_id = d.journal_id
+LEFT JOIN journal_operations jo ON jo.journal_id = j.produced_by_operation_journal_id
+LEFT JOIN journal opj ON opj.journal_id = jo.journal_id
+WHERE d.journal_id <= ?1
+ORDER BY d.journal_id ASC`
+	case factSelectorEvidence:
+		return `SELECT e.journal_id, j.journal_id, j.kind_id,
+       j.produced_by_operation_journal_id, ja.journal_id, ja.kind_id,
+       ja.effective_actor_id, ja.produced_by_operation_journal_id,
+       jo.journal_id, jo.operation_id, opj.kind_id
+FROM journal_evidence e
+LEFT JOIN journal j ON j.journal_id = e.journal_id
+LEFT JOIN journal_attributed ja ON ja.journal_id = e.journal_id
+LEFT JOIN journal_operations jo ON jo.journal_id = j.produced_by_operation_journal_id
+LEFT JOIN journal opj ON opj.journal_id = jo.journal_id
+WHERE e.journal_id <= ?1
+ORDER BY e.journal_id ASC`
+	default:
+		panic("unknown factSelectorKind")
+	}
+}
+
+func factQueryIntegrityError(journalID journal.JournalID, problem, fix string, cause ...error) error {
+	where := "bounded fact query topology"
+	if journalID > 0 {
+		where = fmt.Sprintf("bounded fact query topology for journal %d", journalID)
+	}
+	message := fmt.Sprintf("%s — where: %s; when: read-only fact query; impact: the fact is rejected rather than omitted or returned partially; fix: %s", problem, where, fix)
+	if len(cause) > 0 && cause[0] != nil {
+		return fmt.Errorf("%w: %s: %w", journal.ErrSubtypeIntegrity, message, cause[0])
+	}
+	return fmt.Errorf("%w: %s", journal.ErrSubtypeIntegrity, message)
+}
+
+func scanFactPageRow(stmt *zs.Stmt, kind factSelectorKind) (factPageRow, error) {
 	row := factPageRow{
 		journalID:  journal.JournalID(stmt.ColumnInt64(0)),
 		recordedAt: time.Unix(0, stmt.ColumnInt64(1)).UTC(),
 		kind:       stmt.ColumnText(3),
 	}
 	if row.journalID <= 0 {
-		return factPageRow{}, fmt.Errorf("decode fact row: journal id %d is not positive", row.journalID)
+		return factPageRow{}, factQueryIntegrityError(row.journalID, "journal id is not positive", "restore the fact and journal primary-key rows")
 	}
 	if stmt.ColumnType(2) != zs.TypeNull {
 		taskID, err := journalParseTask(stmt.ColumnText(2))
 		if err != nil {
-			return factPageRow{}, err
+			return factPageRow{}, factQueryIntegrityError(row.journalID, "task ID cannot be decoded", "restore the canonical task ID in the fact row", err)
 		}
 		row.taskID = &taskID
 	}
 	payloadColumn := 4
-	if kind == factPageEvidence {
+	if kind == factSelectorEvidence {
 		row.digest = readBlob(stmt, 4)
 		payloadColumn = 5
 	}
+	if stmt.ColumnType(payloadColumn) == zs.TypeNull {
+		return factPageRow{}, factQueryIntegrityError(row.journalID, "payload is NULL", "restore the fact payload from its committed canonical row")
+	}
 	row.payload = []byte(stmt.ColumnText(payloadColumn))
 	if !json.Valid(row.payload) {
-		return factPageRow{}, fmt.Errorf("decode fact row %d: payload is not valid JSON", row.journalID)
+		return factPageRow{}, factQueryIntegrityError(row.journalID, "payload is not valid JSON", "restore the fact payload from its committed canonical row")
 	}
 	actorColumn := payloadColumn + 1
+	if stmt.ColumnType(actorColumn) == zs.TypeNull {
+		return factPageRow{}, factQueryIntegrityError(row.journalID, "effective actor attribution is missing", "restore journal_attributed and its producing anchor")
+	}
 	actor, err := journalParseActor(stmt.ColumnText(actorColumn))
 	if err != nil {
-		return factPageRow{}, err
+		return factPageRow{}, factQueryIntegrityError(row.journalID, "effective actor attribution cannot be decoded", "restore the canonical actor ID on the producing anchor", err)
 	}
 	row.effectiveActorID = actor
 	operationColumn := actorColumn + 1
+	if stmt.ColumnType(operationColumn) == zs.TypeNull {
+		return factPageRow{}, factQueryIntegrityError(row.journalID, "producing operation ID is missing", "restore the journal_operations row referenced by the fact")
+	}
 	row.producingOperationID = journal.OperationID(stmt.ColumnText(operationColumn))
 	if err := journal.ValidateOperationID(row.producingOperationID); err != nil {
-		return factPageRow{}, fmt.Errorf("decode fact row %d: producing operation: %w", row.journalID, err)
+		return factPageRow{}, factQueryIntegrityError(row.journalID, "producing operation ID is malformed", "restore the canonical operation identifier", err)
+	}
+	if stmt.ColumnType(operationColumn+1) == zs.TypeNull {
+		return factPageRow{}, factQueryIntegrityError(row.journalID, "producing operation journal ID is missing", "restore the journal operation anchor referenced by the fact")
 	}
 	row.producingOperationJournalID = journal.JournalID(stmt.ColumnInt64(operationColumn + 1))
 	if row.producingOperationJournalID <= 0 {
-		return factPageRow{}, fmt.Errorf("decode fact row %d: producing operation journal id %d is not positive", row.journalID, row.producingOperationJournalID)
+		return factPageRow{}, factQueryIntegrityError(row.journalID, "producing operation journal ID is not positive", "restore the journal operation anchor referenced by the fact")
 	}
 	return row, nil
-}
-
-func (scope *connScope) loadFactContexts(journalID, snapshot int64) ([]journal.EventContext, error) {
-	var contexts []journal.EventContext
-	if err := sqlitex.Execute(scope.conn, "SELECT context_kind, context_identity FROM journal_task_event_contexts WHERE event_journal_id = ?1 AND attached_by_journal_id <= ?2 ORDER BY context_kind, context_identity", &sqlitex.ExecOptions{
-		Args: []any{journalID, snapshot},
-		ResultFunc: func(stmt *zs.Stmt) error {
-			context, err := journal.DecodeStoredEventContext(journal.EventContextKind(stmt.ColumnText(0)), stmt.ColumnText(1))
-			if err != nil {
-				return err
-			}
-			contexts = append(contexts, context)
-			return nil
-		},
-	}); err != nil {
-		return nil, fmt.Errorf("load fact contexts %d: %w", journalID, err)
-	}
-	return contexts, nil
 }

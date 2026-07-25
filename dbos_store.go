@@ -350,6 +350,11 @@ type borrowedFactQueries struct {
 	owner *borrowedTracker
 }
 
+var (
+	_ FactQueryAPI = (*borrowedFactQueries)(nil)
+	_ Journal      = (*borrowedJournal)(nil)
+)
+
 func (q *borrowedFactQueries) QueryDecisions(in DecisionQuery) (DecisionPage, error) {
 	if err := q.owner.available("Journal.Facts.QueryDecisions"); err != nil {
 		return DecisionPage{}, err
