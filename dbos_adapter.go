@@ -510,8 +510,8 @@ func (a *DBOSAdapter) postValidate(in journal.OperationInput, outcome DBOSStepOu
 		// A structurally valid failure is only authoritative after the journal
 		// confirms that no operation committed. Malformed failures still fail
 		// immediately at the outcome boundary and never consult journal state.
-		descriptor, known := failureDescriptor(outcome.Failure.Kind)
-		if !known || validateApplyFailureEnvelope(outcome.OperationID, outcome.Failure, descriptor) != nil {
+		var diagnosticErr *DBOSDiagnosticError
+		if errors.As(decodeErr, &diagnosticErr) {
 			return CommittedResult{}, decodeErr
 		}
 		looked, lookupErr := a.tracker.Journal().LookupCommitted(in.OperationID)

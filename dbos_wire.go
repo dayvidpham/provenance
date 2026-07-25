@@ -77,12 +77,12 @@ func (in *DBOSApplyInput) UnmarshalJSON(raw []byte) error {
 }
 
 func decodeStrictDBOSJSON(raw []byte, target any) error {
+	if len(raw) > maxDBOSJSONBytes {
+		return fmt.Errorf("DBOS wire JSON is %d bytes, exceeds maximum %d", len(raw), maxDBOSJSONBytes)
+	}
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || trimmed[0] != '{' {
 		return errors.New("DBOS wire value must be one JSON object")
-	}
-	if len(trimmed) > maxDBOSJSONBytes {
-		return fmt.Errorf("DBOS wire JSON is %d bytes, exceeds maximum %d", len(trimmed), maxDBOSJSONBytes)
 	}
 	if err := validateUniqueJSONKeys(trimmed); err != nil {
 		return err

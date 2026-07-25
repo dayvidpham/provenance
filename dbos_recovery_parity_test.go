@@ -129,8 +129,13 @@ func TestDBOSRecoveredConditionAndActivityParity(t *testing.T) {
 	}
 	decisionID, _ := slotJournalID(decision, "decision")
 	collisionActivity := recoveryParityActivity("018f0000-0000-7000-8000-000000000011")
-	if _, err := first.tracker.Journal().Apply(OperationInput{OperationID: "recovery-parity-activity-seed", ActorID: actor, AuthorityJournalID: &auth, CommandDigest: []byte("activity-seed"), Effects: []Effect{{Sort: EffectActivityCreate, ResultSlot: "seed-activity", ActivityID: collisionActivity, ActivityAgentID: AgentID(actor), ActivityPhase: PhaseWorkerSlices, ActivityStage: StageInProgress}}}); err != nil {
+	activitySeed, err := first.tracker.Journal().Apply(OperationInput{OperationID: "recovery-parity-activity-seed", ActorID: actor, AuthorityJournalID: &auth, CommandDigest: []byte("activity-seed"), Effects: []Effect{{Sort: EffectActivityCreate, ResultSlot: "seed-activity", ActivityID: collisionActivity, ActivityAgentID: AgentID(actor), ActivityPhase: PhaseWorkerSlices, ActivityStage: StageInProgress}}})
+	if err != nil {
 		t.Fatal(err)
+	}
+	seedActivityJournalID, ok := slotJournalID(activitySeed, "seed-activity")
+	if !ok {
+		t.Fatal("activity seed did not produce its result slot")
 	}
 
 	conditionSuccessActivity := recoveryParityActivity("018f0000-0000-7000-8000-000000000012")
@@ -139,9 +144,10 @@ func TestDBOSRecoveredConditionAndActivityParity(t *testing.T) {
 		Conditions: []Condition{{Kind: ConditionExactFact, Selector: FactSelector{Kind: FactDecision, Filter: FactFilter{TaskScope: FactTaskScope{Kind: FactTaskAny}}, DecisionKind: "fixture.condition"}, AssertedJournalID: decisionID}},
 		Effects:    []Effect{{Sort: EffectActivityCreate, ResultSlot: "activity", ActivityID: conditionSuccessActivity, ActivityAgentID: AgentID(actor), ActivityPhase: PhaseWorkerSlices, ActivityStage: StageInProgress, ActivityNotes: "recovered"}},
 	}
+	futureAssertedID := decisionID + 100
 	conditionFailure := OperationInput{
 		OperationID: "recovery-parity-condition-failure", ActorID: actor, AuthorityJournalID: &auth, CommandDigest: []byte("condition-failure"),
-		Conditions: []Condition{{Kind: ConditionExactFact, Selector: FactSelector{Kind: FactDecision, Filter: FactFilter{TaskScope: FactTaskScope{Kind: FactTaskAny}}, DecisionKind: "fixture.missing"}, AssertedJournalID: 1}},
+		Conditions: []Condition{{Kind: ConditionCurrentFact, Selector: FactSelector{Kind: FactDecision, Filter: FactFilter{TaskScope: FactTaskScope{Kind: FactTaskAny}}, DecisionKind: "fixture.condition"}, AssertedJournalID: futureAssertedID}},
 		Effects:    []Effect{{Sort: EffectActivityCreate, ResultSlot: "never", ActivityID: recoveryParityActivity("018f0000-0000-7000-8000-000000000013"), ActivityAgentID: AgentID(actor), ActivityPhase: PhaseWorkerSlices, ActivityStage: StageInProgress}},
 	}
 	activityConflict := OperationInput{
@@ -157,7 +163,7 @@ func TestDBOSRecoveredConditionAndActivityParity(t *testing.T) {
 	_, firstActivityErr := first.adapter.Apply(context.Background(), activityConflict)
 	var firstCondition *ConditionFailure
 	var firstActivity *ActivityConflict
-	if !errors.As(firstConditionErr, &firstCondition) || !errors.As(firstActivityErr, &firstActivity) || firstCondition.Reason != ConditionFactMissing || firstCondition.ActualJournalID != 0 || firstActivity.ActivityID != collisionActivity || firstActivity.ExistingJournalID <= 0 {
+	if !errors.As(firstConditionErr, &firstCondition) || !errors.As(firstActivityErr, &firstActivity) || firstCondition.Index != 0 || firstCondition.Kind != ConditionCurrentFact || firstCondition.Reason != ConditionCurrentMismatch || firstCondition.AssertedJournalID != futureAssertedID || firstCondition.ActualJournalID != decisionID || firstActivity.ActivityID != collisionActivity || firstActivity.ExistingJournalID != seedActivityJournalID {
 		t.Fatalf("first typed failures condition=%v activity=%v", firstConditionErr, firstActivityErr)
 	}
 	if first.entries.Load() != 3 {

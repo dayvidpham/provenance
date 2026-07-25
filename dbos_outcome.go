@@ -195,14 +195,17 @@ func validateConditionFailure(failure *CanonicalApplyFailure) error {
 	if *failure.ConditionReason == journal.ConditionFactMissing && *failure.ActualJournalID != 0 {
 		return &conflictMetadataError{field: DBOSDiagFieldActualJournalID, reason: "FactMissing requires actual_journal_id 0"}
 	}
+	if *failure.ConditionKind == journal.ConditionCurrentFact && *failure.ConditionReason == journal.ConditionFactMissing && *failure.AssertedJournalID == 0 {
+		return &conflictMetadataError{field: DBOSDiagFieldAssertedJournalID, reason: "CurrentFact FactMissing requires a positive asserted_journal_id"}
+	}
 	if *failure.ConditionReason != journal.ConditionFactMissing && *failure.ActualJournalID <= 0 {
 		return &conflictMetadataError{field: DBOSDiagFieldActualJournalID, reason: "a mismatch reason requires a positive actual_journal_id"}
 	}
 	if *failure.ConditionReason == journal.ConditionFactMismatch && *failure.ActualJournalID == *failure.AssertedJournalID {
 		return &conflictMetadataError{field: DBOSDiagFieldActualJournalID, reason: "FactMismatch requires actual_journal_id different from asserted_journal_id"}
 	}
-	if *failure.ConditionReason == journal.ConditionCurrentMismatch && *failure.ActualJournalID <= *failure.AssertedJournalID {
-		return &conflictMetadataError{field: DBOSDiagFieldActualJournalID, reason: "CurrentMismatch requires a newer actual_journal_id than asserted_journal_id"}
+	if *failure.ConditionReason == journal.ConditionCurrentMismatch && *failure.ActualJournalID == *failure.AssertedJournalID {
+		return &conflictMetadataError{field: DBOSDiagFieldActualJournalID, reason: "CurrentMismatch requires actual_journal_id different from asserted_journal_id"}
 	}
 	return nil
 }
@@ -631,13 +634,13 @@ func validateApplyFailureEnvelope(outerOperation string, failure *CanonicalApply
 		return reject(field, reason, fix)
 	}
 	if descriptor.kind != FailureOperationConflict && (failure.ConflictAxis != nil || failure.ConflictIndex != nil) {
-		return metadataReject(DBOSDiagFieldConflictAxis, "operation conflict metadata is forbidden for this failure kind", failureRepairFix(descriptor.kind, DBOSDiagFieldConflictAxis))
+		return metadataReject(DBOSDiagFieldConflictAxis, "operation conflict metadata is forbidden for this failure kind", failureMetadataRemovalFix(DBOSDiagFieldConflictAxis))
 	}
 	if descriptor.kind != FailureConditionFailed && (failure.ConditionIndex != nil || failure.ConditionKind != nil || failure.ConditionReason != nil || failure.AssertedJournalID != nil || failure.ActualJournalID != nil) {
-		return metadataReject(DBOSDiagFieldConditionIndex, "condition failure metadata is forbidden for this failure kind", failureRepairFix(descriptor.kind, DBOSDiagFieldConditionIndex))
+		return metadataReject(DBOSDiagFieldConditionIndex, "condition failure metadata is forbidden for this failure kind", failureMetadataRemovalFix(DBOSDiagFieldConditionIndex))
 	}
 	if descriptor.kind != FailureActivityConflict && (failure.ActivityID != "" || failure.ExistingJournalID != nil) {
-		return metadataReject(DBOSDiagFieldActivityID, "activity conflict metadata is forbidden for this failure kind", failureRepairFix(descriptor.kind, DBOSDiagFieldActivityID))
+		return metadataReject(DBOSDiagFieldActivityID, "activity conflict metadata is forbidden for this failure kind", failureMetadataRemovalFix(DBOSDiagFieldActivityID))
 	}
 	if descriptor.validate != nil {
 		if err := descriptor.validate(failure); err != nil {
@@ -671,6 +674,19 @@ func failureRepairFix(kind ApplyFailureKind, field DBOSDiagnosticField) string {
 		default:
 			return "restore the complete metadata for the closed failure descriptor"
 		}
+	}
+}
+
+func failureMetadataRemovalFix(field DBOSDiagnosticField) string {
+	switch field {
+	case DBOSDiagFieldConflictAxis, DBOSDiagFieldConflictIndex:
+		return "remove operation-conflict metadata from this failure descriptor"
+	case DBOSDiagFieldConditionIndex, DBOSDiagFieldConditionKind, DBOSDiagFieldConditionReason, DBOSDiagFieldAssertedJournalID, DBOSDiagFieldActualJournalID:
+		return "remove condition-failure metadata from this failure descriptor"
+	case DBOSDiagFieldActivityID, DBOSDiagFieldExistingJournalID:
+		return "remove activity-conflict metadata from this failure descriptor"
+	default:
+		return "remove metadata that belongs to a different closed failure descriptor"
 	}
 }
 

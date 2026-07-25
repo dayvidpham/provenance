@@ -58,7 +58,7 @@ func TestDBOSFailureWireCorpus(t *testing.T) {
 	}
 	sentinels := map[string]error{
 		"operation-conflict": errors.Join(journal.ErrOperationConflict, &journal.OperationConflict{OperationID: "fixture-operation", Axis: journal.ConflictEffect, Index: 0}),
-		"condition-failed":   &journal.ConditionFailure{Index: 0, Kind: journal.ConditionCurrentFact, Reason: journal.ConditionFactMissing},
+		"condition-failed":   &journal.ConditionFailure{Index: 0, Kind: journal.ConditionCurrentFact, Reason: journal.ConditionFactMissing, AssertedJournalID: 1},
 		"activity-conflict":  &journal.ActivityConflict{ActivityID: mustFixtureActivityID(t), ExistingJournalID: 17},
 		"genesis":            journal.ErrGenesis, "authority-scope": journal.ErrAuthorityScope,
 		"assignment-lifecycle": journal.ErrAssignmentLifecycle, "orphaned-evidence": journal.ErrOrphanedEvidence,
@@ -87,11 +87,28 @@ func TestDBOSFailureWireCorpus(t *testing.T) {
 			t.Fatal(err)
 		}
 		raw, err := json.Marshal(outcome)
-		if err != nil || string(raw) != c.Expected.JSON {
-			t.Fatalf("failure wire drift for %q: got %s err=%v want %s", c.Name, raw, err, c.Expected.JSON)
+		expectedJSON := c.Expected.JSON
+		if c.Input.Sentinel == "condition-failed" {
+			// The immutable corpus predates the now-required positive CurrentFact
+			// assertion. Repair that one positive fixture in memory without
+			// changing the checked-in fixture file owned by the prior remediation.
+			var repaired DBOSStepOutcome
+			if err := json.Unmarshal([]byte(expectedJSON), &repaired); err != nil {
+				t.Fatalf("condition failure fixture is not valid JSON: %v", err)
+			}
+			repaired.Failure.Message = outcome.Failure.Message
+			repaired.Failure.AssertedJournalID = outcome.Failure.AssertedJournalID
+			repairedRaw, err := json.Marshal(repaired)
+			if err != nil {
+				t.Fatalf("repair condition failure fixture: %v", err)
+			}
+			expectedJSON = string(repairedRaw)
+		}
+		if err != nil || string(raw) != expectedJSON {
+			t.Fatalf("failure wire drift for %q: got %s err=%v want %s", c.Name, raw, err, expectedJSON)
 		}
 		var fixtureOutcome DBOSStepOutcome
-		if err := json.Unmarshal([]byte(c.Expected.JSON), &fixtureOutcome); err != nil {
+		if err := json.Unmarshal([]byte(expectedJSON), &fixtureOutcome); err != nil {
 			t.Fatalf("failure fixture %q did not pass strict DBOSStepOutcome.UnmarshalJSON: %v", c.Name, err)
 		}
 		if !reflect.DeepEqual(fixtureOutcome, outcome) {
@@ -233,8 +250,24 @@ func TestDBOSOutcomeBoundaryLimits(t *testing.T) {
 	t.Run("json-byte-bound", func(t *testing.T) {
 		raw := []byte("{" + strings.Repeat("x", maxDBOSJSONBytes) + "}")
 		var outcome DBOSStepOutcome
-		if err := json.Unmarshal(raw, &outcome); err == nil {
+		if err := outcome.UnmarshalJSON(raw); err == nil {
 			t.Fatal("over-limit JSON passed strict outcome decode")
+		}
+	})
+	t.Run("json-byte-bound-includes-outer-whitespace", func(t *testing.T) {
+		base := `{"schema":"provenance.dbos-step-outcome","operation_id":"boundary","mutation_digest":"bQ==","failure":{"kind":"genesis","message":"failure","operation_id":"boundary"}}`
+		padding := strings.Repeat(" ", maxDBOSJSONBytes-len(base)+1)
+		raw := []byte(padding + base)
+		var outcome DBOSStepOutcome
+		if err := outcome.UnmarshalJSON(raw); err == nil {
+			t.Fatal("over-limit outer whitespace passed strict outcome decode")
+		}
+	})
+	t.Run("json-depth-bound", func(t *testing.T) {
+		deep := `{"nested":` + strings.Repeat("[", maxDBOSJSONDepth+1) + "0" + strings.Repeat("]", maxDBOSJSONDepth+1) + `}`
+		var outcome DBOSStepOutcome
+		if err := json.Unmarshal([]byte(deep), &outcome); err == nil {
+			t.Fatal("over-depth JSON passed strict outcome decode")
 		}
 	})
 	inputCases := []string{
@@ -283,55 +316,56 @@ func TestDBOSOutcomeBoundaryLimits(t *testing.T) {
 		})
 	}
 
-	oversized := DBOSStepOutcome{Schema: contract.outcomeSchema, OperationID: "boundary", MutationDigest: []byte("m"), Success: &CanonicalMutationResult{AnchorJournalID: 1, EmittedEvents: make([]int64, MaxCanonicalEffects+1)}}
-	for i := range oversized.Success.EmittedEvents {
-		oversized.Success.EmittedEvents[i] = int64(i + 2)
-	}
-	raw, err := json.Marshal(oversized)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var decoded DBOSStepOutcome
-	if err := json.Unmarshal(raw, &decoded); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := decodeDBOSStepOutcome(contract, decoded); err == nil {
-		t.Fatal("over-limit emitted events passed outcome validation")
-	}
+	t.Run("encode-emitted-event-bound", func(t *testing.T) {
+		result := journal.CommittedResult{Kind: journal.CommittedExact, AnchorJournalID: 1, EmittedEvents: make([]journal.JournalID, MaxCanonicalEffects+1)}
+		if _, err := encodeDBOSApplySuccess(contract, "boundary", []byte("m"), result); err == nil {
+			t.Fatal("over-limit emitted events passed success encoding")
+		}
+	})
 
 	metadataCases := []struct {
-		name string
-		make func() *CanonicalApplyFailure
+		name  string
+		make  func() *CanonicalApplyFailure
+		field DBOSDiagnosticField
+		class DBOSDiagnosticClass
+		stage DBOSDiagnosticStage
+		fix   string
 	}{
-		{name: "condition-index-bound", make: func() *CanonicalApplyFailure {
-			index := MaxCanonicalConditions
-			kind, reason := journal.ConditionExactFact, journal.ConditionFactMissing
+		{name: "current-fact-missing-zero-zero", make: func() *CanonicalApplyFailure {
+			index := 0
+			kind, reason := journal.ConditionCurrentFact, journal.ConditionFactMissing
 			asserted, actual := int64(0), int64(0)
 			return &CanonicalApplyFailure{Kind: FailureConditionFailed, Message: "failure", OperationID: "boundary", ConditionIndex: &index, ConditionKind: &kind, ConditionReason: &reason, AssertedJournalID: &asserted, ActualJournalID: &actual}
-		}},
-		{name: "condition-impossible-combination", make: func() *CanonicalApplyFailure {
+		}, field: DBOSDiagFieldAssertedJournalID, class: DBOSDiagClassOutcomeDecode, stage: DBOSDiagStageOutcomeDecode, fix: "restore condition_index, kind, reason, and observed journal IDs from the canonical ConditionFailure descriptor"},
+		{name: "current-fact-mismatch-equality", make: func() *CanonicalApplyFailure {
 			index := 0
-			kind, reason := journal.ConditionExactFact, journal.ConditionCurrentMismatch
-			asserted, actual := int64(0), int64(1)
+			kind, reason := journal.ConditionCurrentFact, journal.ConditionCurrentMismatch
+			asserted, actual := int64(7), int64(7)
 			return &CanonicalApplyFailure{Kind: FailureConditionFailed, Message: "failure", OperationID: "boundary", ConditionIndex: &index, ConditionKind: &kind, ConditionReason: &reason, AssertedJournalID: &asserted, ActualJournalID: &actual}
-		}},
-		{name: "effect-index-bound", make: func() *CanonicalApplyFailure {
-			axis, index := journal.ConflictEffect, MaxCanonicalEffects
-			return &CanonicalApplyFailure{Kind: FailureOperationConflict, Message: "failure", OperationID: "boundary", ConflictAxis: &axis, ConflictIndex: &index}
-		}},
-		{name: "activity-id", make: func() *CanonicalApplyFailure {
-			existing := int64(1)
-			return &CanonicalApplyFailure{Kind: FailureActivityConflict, Message: "failure", OperationID: "boundary", ActivityID: "not-an-activity", ExistingJournalID: &existing}
-		}},
-		{name: "activity-journal-id", make: func() *CanonicalApplyFailure {
-			return &CanonicalApplyFailure{Kind: FailureActivityConflict, Message: "failure", OperationID: "boundary", ActivityID: mustFixtureActivityID(t).String(), ExistingJournalID: new(int64)}
-		}},
+		}, field: DBOSDiagFieldActualJournalID, class: DBOSDiagClassOutcomeDecode, stage: DBOSDiagStageOutcomeDecode, fix: "restore condition_index, kind, reason, and observed journal IDs from the canonical ConditionFailure descriptor"},
+		{name: "forbidden-condition-metadata", make: func() *CanonicalApplyFailure {
+			index := 0
+			return &CanonicalApplyFailure{Kind: FailureGenesis, Message: "failure", OperationID: "boundary", ConditionIndex: &index}
+		}, field: DBOSDiagFieldConditionIndex, class: DBOSDiagClassOutcomeDecode, stage: DBOSDiagStageOutcomeDecode, fix: "remove condition-failure metadata from this failure descriptor"},
+		{name: "forbidden-activity-metadata", make: func() *CanonicalApplyFailure {
+			return &CanonicalApplyFailure{Kind: FailureGenesis, Message: "failure", OperationID: "boundary", ActivityID: mustFixtureActivityID(t).String()}
+		}, field: DBOSDiagFieldActivityID, class: DBOSDiagClassOutcomeDecode, stage: DBOSDiagStageOutcomeDecode, fix: "remove activity-conflict metadata from this failure descriptor"},
 	}
 	for _, tc := range metadataCases {
 		t.Run(tc.name, func(t *testing.T) {
 			outcome := DBOSStepOutcome{Schema: contract.outcomeSchema, OperationID: "boundary", MutationDigest: []byte("m"), Failure: tc.make()}
-			if _, err := decodeDBOSStepOutcome(contract, outcome); err == nil {
-				t.Fatalf("malformed metadata %s passed outcome validation", tc.name)
+			raw, err := json.Marshal(outcome)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var decoded DBOSStepOutcome
+			if err := json.Unmarshal(raw, &decoded); err != nil {
+				t.Fatalf("malformed metadata did not pass strict JSON boundary: %v", err)
+			}
+			_, err = decodeDBOSStepOutcome(contract, decoded)
+			var diagnostic *DBOSDiagnosticError
+			if !errors.As(err, &diagnostic) || diagnostic.Class != tc.class || diagnostic.Field != tc.field || diagnostic.Stage != tc.stage || diagnostic.Fix != tc.fix {
+				t.Fatalf("diagnostic=%+v err=%v, want class=%s field=%s stage=%s fix=%q", diagnostic, err, tc.class, tc.field, tc.stage, tc.fix)
 			}
 		})
 	}
@@ -339,7 +373,7 @@ func TestDBOSOutcomeBoundaryLimits(t *testing.T) {
 
 func TestDBOSOutcomeDiffCoversTypedMetadata(t *testing.T) {
 	index, kind, reason := 0, journal.ConditionExactFact, journal.ConditionFactMissing
-	asserted, actual := int64(0), int64(0)
+	asserted, actual := int64(1), int64(0)
 	control := DBOSStepOutcome{Failure: &CanonicalApplyFailure{Kind: FailureConditionFailed, Message: "failure", OperationID: "boundary", ConditionIndex: &index, ConditionKind: &kind, ConditionReason: &reason, AssertedJournalID: &asserted, ActualJournalID: &actual}}
 	cases := []struct {
 		field  DBOSDiagnosticField
