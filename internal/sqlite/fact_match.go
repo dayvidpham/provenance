@@ -65,45 +65,73 @@ type factMatchBinding struct {
 func (k factSelectorKind) pageMatchSQL() string {
 	switch k {
 	case factSelectorDecision:
-		return `SELECT d.journal_id, ja.recorded_at, d.task_id, d.decision_kind,
+		return `WITH candidates AS (
+ SELECT d.journal_id
+ FROM journal_decisions d
+ LEFT JOIN journal_attributed ja ON ja.journal_id = d.journal_id
+ LEFT JOIN journal_operations jo ON jo.journal_id = ja.produced_by_operation_journal_id
+ WHERE d.journal_id <= ?1
+   AND d.journal_id > ?2
+   AND d.decision_kind IN (SELECT value FROM json_each(?3))
+   AND (NOT ?4 OR d.task_id IS ?5)
+   AND (NOT ?6 OR ja.effective_actor_id IN (SELECT value FROM json_each(?7)) OR ja.journal_id IS ?15 OR ja.effective_actor_id IS ?15)
+   AND (NOT ?8 OR jo.operation_id IN (SELECT value FROM json_each(?9)) OR ja.journal_id IS ?15 OR jo.journal_id IS ?15 OR jo.operation_id IS ?15)
+   AND (NOT ?10 OR (SELECT COUNT(*) FROM json_each(?11) f
+        WHERE EXISTS (SELECT ?10 FROM journal_decision_contexts c
+                      WHERE c.decision_journal_id = d.journal_id
+                        AND c.context_kind = json_extract(f.value,?12)
+                        AND c.context_identity = json_extract(f.value,?13))) = ?10)
+ ORDER BY d.journal_id ASC
+ LIMIT ?14
+)
+SELECT d.journal_id, j.recorded_at, d.task_id, d.decision_kind,
        d.payload, ja.effective_actor_id, jo.operation_id,
-       ja.produced_by_operation_journal_id
-FROM journal_decisions d
-JOIN journal_attributed ja ON ja.journal_id = d.journal_id
-JOIN journal_operations jo ON jo.journal_id = ja.produced_by_operation_journal_id
-WHERE d.journal_id <= ?1
-  AND d.journal_id > ?2
-  AND d.decision_kind IN (SELECT value FROM json_each(?3))
-  AND (NOT ?4 OR d.task_id IS ?5)
-  AND (NOT ?6 OR ja.effective_actor_id IN (SELECT value FROM json_each(?7)))
-  AND (NOT ?8 OR jo.operation_id IN (SELECT value FROM json_each(?9)))
-  AND (NOT ?10 OR (SELECT COUNT(*) FROM json_each(?11) f
-       WHERE EXISTS (SELECT ?10 FROM journal_decision_contexts c
-                     WHERE c.decision_journal_id = d.journal_id
-                       AND c.context_kind = json_extract(f.value,?12)
-                       AND c.context_identity = json_extract(f.value,?13))) = ?10)
-ORDER BY d.journal_id ASC
-LIMIT ?14`
+       ja.produced_by_operation_journal_id,
+       j.journal_id, j.kind_id, j.produced_by_operation_journal_id,
+       ja.journal_id, ja.kind_id, ja.effective_actor_id,
+       ja.produced_by_operation_journal_id,
+       jo.journal_id, jo.operation_id, opj.kind_id
+FROM candidates c
+JOIN journal_decisions d ON d.journal_id = c.journal_id
+LEFT JOIN journal j ON j.journal_id = d.journal_id
+LEFT JOIN journal_attributed ja ON ja.journal_id = d.journal_id
+LEFT JOIN journal_operations jo ON jo.journal_id = j.produced_by_operation_journal_id
+LEFT JOIN journal opj ON opj.journal_id = jo.journal_id
+ORDER BY d.journal_id ASC`
 	case factSelectorEvidence:
-		return `SELECT e.journal_id, ja.recorded_at, e.task_id, e.evidence_kind,
+		return `WITH candidates AS (
+ SELECT e.journal_id
+ FROM journal_evidence e
+ LEFT JOIN journal_attributed ja ON ja.journal_id = e.journal_id
+ LEFT JOIN journal_operations jo ON jo.journal_id = ja.produced_by_operation_journal_id
+ WHERE e.journal_id <= ?1
+   AND e.journal_id > ?2
+   AND e.evidence_kind IN (SELECT value FROM json_each(?3))
+   AND (NOT ?4 OR e.task_id IS ?5)
+   AND (NOT ?6 OR ja.effective_actor_id IN (SELECT value FROM json_each(?7)) OR ja.journal_id IS ?15 OR ja.effective_actor_id IS ?15)
+   AND (NOT ?8 OR jo.operation_id IN (SELECT value FROM json_each(?9)) OR ja.journal_id IS ?15 OR jo.journal_id IS ?15 OR jo.operation_id IS ?15)
+   AND (NOT ?10 OR (SELECT COUNT(*) FROM json_each(?11) f
+        WHERE EXISTS (SELECT ?10 FROM journal_evidence_contexts c
+                      WHERE c.evidence_journal_id = e.journal_id
+                        AND c.context_kind = json_extract(f.value,?12)
+                        AND c.context_identity = json_extract(f.value,?13))) = ?10)
+ ORDER BY e.journal_id ASC
+ LIMIT ?14
+)
+SELECT e.journal_id, j.recorded_at, e.task_id, e.evidence_kind,
        e.content_digest, e.payload, ja.effective_actor_id, jo.operation_id,
-       ja.produced_by_operation_journal_id
-FROM journal_evidence e
-JOIN journal_attributed ja ON ja.journal_id = e.journal_id
-JOIN journal_operations jo ON jo.journal_id = ja.produced_by_operation_journal_id
-WHERE e.journal_id <= ?1
-  AND e.journal_id > ?2
-  AND e.evidence_kind IN (SELECT value FROM json_each(?3))
-  AND (NOT ?4 OR e.task_id IS ?5)
-  AND (NOT ?6 OR ja.effective_actor_id IN (SELECT value FROM json_each(?7)))
-  AND (NOT ?8 OR jo.operation_id IN (SELECT value FROM json_each(?9)))
-  AND (NOT ?10 OR (SELECT COUNT(*) FROM json_each(?11) f
-       WHERE EXISTS (SELECT ?10 FROM journal_evidence_contexts c
-                     WHERE c.evidence_journal_id = e.journal_id
-                       AND c.context_kind = json_extract(f.value,?12)
-                       AND c.context_identity = json_extract(f.value,?13))) = ?10)
-ORDER BY e.journal_id ASC
-LIMIT ?14`
+       ja.produced_by_operation_journal_id,
+       j.journal_id, j.kind_id, j.produced_by_operation_journal_id,
+       ja.journal_id, ja.kind_id, ja.effective_actor_id,
+       ja.produced_by_operation_journal_id,
+       jo.journal_id, jo.operation_id, opj.kind_id
+FROM candidates c
+JOIN journal_evidence e ON e.journal_id = c.journal_id
+LEFT JOIN journal j ON j.journal_id = e.journal_id
+LEFT JOIN journal_attributed ja ON ja.journal_id = e.journal_id
+LEFT JOIN journal_operations jo ON jo.journal_id = j.produced_by_operation_journal_id
+LEFT JOIN journal opj ON opj.journal_id = jo.journal_id
+ORDER BY e.journal_id ASC`
 	default:
 		panic("unknown factSelectorKind")
 	}
@@ -470,7 +498,8 @@ func buildFactMatchBinding(sel journal.FactSelector, snapshotMax, afterJournal j
 // predicate/binding contract. The subtype remains a closed enum and the kind
 // set is data, capped by journal.MaxFactQueryKinds. Its positional arguments
 // are: snapshot, exclusive cursor, kind JSON, then the normalized filter slots
-// shared with buildSelectorArgs, followed by LIMIT.
+// shared with buildSelectorArgs, followed by LIMIT and a NULL sentinel used by
+// the fail-closed LEFT JOIN guards.
 func buildFactPageMatchBinding(kind factSelectorKind, page journal.FactPageRequest, filter journal.FactFilter, kinds []string) (factMatchBinding, error) {
 	if kind != factSelectorDecision && kind != factSelectorEvidence {
 		return factMatchBinding{}, fmt.Errorf("fact matcher: unknown page subtype %d — where: page binding; when: dispatch; impact: no page was queried; fix: use the closed decision or evidence subtype", kind)
@@ -508,6 +537,7 @@ func buildFactPageMatchBinding(kind factSelectorKind, page journal.FactPageReque
 	args = append(args, singleArgs[1:9]...)
 	args = append(args, singleArgs[10:]...)
 	args = append(args, page.Limit+1)
+	args = append(args, nil)
 	return factMatchBinding{
 		form: factMatchPage, kind: kind, contexts: kind.contextRelation(), snapshotMax: page.SnapshotMaxJournalID,
 		afterJournal: page.AfterJournalID, pageKinds: append([]string(nil), kinds...), pageLimit: page.Limit + 1,

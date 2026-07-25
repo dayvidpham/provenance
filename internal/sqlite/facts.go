@@ -3,7 +3,6 @@ package sqlite
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -12,6 +11,11 @@ import (
 	zs "zombiezen.com/go/sqlite"
 	"zombiezen.com/go/sqlite/sqlitex"
 )
+
+// factQuerySnapshotBarrierHook is nil in production. Package tests install it
+// around one deterministic reader/writer barrier to prove that the transaction
+// snapshot is acquired before the bounded page SQL runs.
+var factQuerySnapshotBarrierHook func(factSelectorKind, int64)
 
 type factPageRow struct {
 	journalID                   journal.JournalID
@@ -163,10 +167,10 @@ func (db *DB) queryFacts(kind factSelectorKind, page journal.FactPageRequest, fi
 			return nil, 0, nil, err
 		}
 	}
-	if err = scope.requireCanonicalFactContextSchema("bounded fact query"); err != nil {
-		return nil, 0, nil, err
+	if barrier := factQuerySnapshotBarrierHook; barrier != nil {
+		barrier(kind, int64(snapshot))
 	}
-	if err = scope.verifyFactPageTopology(kind, snapshot); err != nil {
+	if err = scope.requireCanonicalFactContextSchema("bounded fact query"); err != nil {
 		return nil, 0, nil, err
 	}
 
@@ -234,111 +238,6 @@ func (scope *connScope) resolveFactSnapshot(page *journal.FactPageRequest) error
 	return nil
 }
 
-// verifyFactPageTopology checks every candidate subtype row before the shared
-// page predicate is executed. Its left-join diagnostic makes a damaged
-// producer visible to this pass, so the shared page predicate cannot silently
-// omit it through an INNER JOIN.
-func (scope *connScope) verifyFactPageTopology(kind factSelectorKind, snapshot journal.JournalID) error {
-	expectedKind := journal.JournalKindDecision
-	if kind == factSelectorEvidence {
-		expectedKind = journal.JournalKindEvidence
-	}
-	if kind != factSelectorDecision && kind != factSelectorEvidence {
-		return factQueryIntegrityError(0, "unknown fact subtype", "use the closed decision or evidence selector")
-	}
-	if err := sqlitex.Execute(scope.conn, kind.pageTopologySQL(), &sqlitex.ExecOptions{
-		Args: []any{int64(snapshot)},
-		ResultFunc: func(stmt *zs.Stmt) error {
-			factID := journal.JournalID(stmt.ColumnInt64(0))
-			if factID <= 0 {
-				return factQueryIntegrityError(factID, "fact journal ID is not positive", "restore the fact and journal primary-key rows")
-			}
-			if stmt.ColumnType(1) == zs.TypeNull {
-				return factQueryIntegrityError(factID, "fact has no journal supertype row", "restore the journal row for the fact")
-			}
-			if journal.JournalKind(stmt.ColumnInt(2)) != expectedKind {
-				return factQueryIntegrityError(factID, "fact journal discriminator does not match its subtype table", "restore the matching journal kind and subtype row")
-			}
-			if stmt.ColumnType(3) == zs.TypeNull {
-				return factQueryIntegrityError(factID, "fact has no producing operation relationship", "restore the fact's producing operation journal ID")
-			}
-			producerID := journal.JournalID(stmt.ColumnInt64(3))
-			if producerID <= 0 {
-				return factQueryIntegrityError(factID, "fact has a non-positive producing operation journal ID", "restore the producing operation anchor")
-			}
-			if stmt.ColumnType(4) == zs.TypeNull {
-				return factQueryIntegrityError(factID, "journal_attributed has no row for the fact", "restore the attribution view and the fact journal row")
-			}
-			if journal.JournalKind(stmt.ColumnInt(5)) != expectedKind {
-				return factQueryIntegrityError(factID, "journal_attributed has the wrong subtype discriminator", "restore the fact journal kind and attribution relationship")
-			}
-			if stmt.ColumnType(6) == zs.TypeNull {
-				return factQueryIntegrityError(factID, "effective actor attribution is NULL", "restore the actor on the producing operation anchor")
-			}
-			if _, err := journalParseActor(stmt.ColumnText(6)); err != nil {
-				return factQueryIntegrityError(factID, "effective actor attribution is malformed", "restore the canonical actor ID on the producing operation anchor", err)
-			}
-			if stmt.ColumnType(7) == zs.TypeNull || journal.JournalID(stmt.ColumnInt64(7)) != producerID {
-				return factQueryIntegrityError(factID, "attribution points at a different producing operation", "restore journal_attributed to the fact journal relationship")
-			}
-			if stmt.ColumnType(8) == zs.TypeNull {
-				return factQueryIntegrityError(factID, "producing operation row is missing", "restore journal_operations for the producing operation journal ID")
-			}
-			if stmt.ColumnType(9) == zs.TypeNull {
-				return factQueryIntegrityError(factID, "producing operation ID is missing", "restore the operation identity on journal_operations")
-			}
-			if err := journal.ValidateOperationID(journal.OperationID(stmt.ColumnText(9))); err != nil {
-				return factQueryIntegrityError(factID, "producing operation ID is malformed", "restore the canonical operation identity", err)
-			}
-			if stmt.ColumnType(10) == zs.TypeNull || journal.JournalKind(stmt.ColumnInt(10)) != journal.JournalKindOperation {
-				return factQueryIntegrityError(factID, "producing operation is not an operation journal anchor", "restore the operation journal discriminator and subtype row")
-			}
-			return nil
-		},
-	}); err != nil {
-		if errors.Is(err, journal.ErrSubtypeIntegrity) {
-			return err
-		}
-		return factQueryIntegrityError(0, "cannot inspect fact producer and attribution topology", "restore the journal, attribution view, and operation rows before querying", err)
-	}
-	return nil
-}
-
-// factPageTopologySQL is a closed static diagnostic query. Unlike the shared
-// page predicate it is deliberately unfiltered: every candidate fact up to the
-// pinned watermark must have a visible producer and attribution relationship
-// before any predicate can select or omit it.
-func (kind factSelectorKind) pageTopologySQL() string {
-	switch kind {
-	case factSelectorDecision:
-		return `SELECT d.journal_id, j.journal_id, j.kind_id,
-       j.produced_by_operation_journal_id, ja.journal_id, ja.kind_id,
-       ja.effective_actor_id, ja.produced_by_operation_journal_id,
-       jo.journal_id, jo.operation_id, opj.kind_id
-FROM journal_decisions d
-LEFT JOIN journal j ON j.journal_id = d.journal_id
-LEFT JOIN journal_attributed ja ON ja.journal_id = d.journal_id
-LEFT JOIN journal_operations jo ON jo.journal_id = j.produced_by_operation_journal_id
-LEFT JOIN journal opj ON opj.journal_id = jo.journal_id
-WHERE d.journal_id <= ?1
-ORDER BY d.journal_id ASC`
-	case factSelectorEvidence:
-		return `SELECT e.journal_id, j.journal_id, j.kind_id,
-       j.produced_by_operation_journal_id, ja.journal_id, ja.kind_id,
-       ja.effective_actor_id, ja.produced_by_operation_journal_id,
-       jo.journal_id, jo.operation_id, opj.kind_id
-FROM journal_evidence e
-LEFT JOIN journal j ON j.journal_id = e.journal_id
-LEFT JOIN journal_attributed ja ON ja.journal_id = e.journal_id
-LEFT JOIN journal_operations jo ON jo.journal_id = j.produced_by_operation_journal_id
-LEFT JOIN journal opj ON opj.journal_id = jo.journal_id
-WHERE e.journal_id <= ?1
-ORDER BY e.journal_id ASC`
-	default:
-		panic("unknown factSelectorKind")
-	}
-}
-
 func factQueryIntegrityError(journalID journal.JournalID, problem, fix string, cause ...error) error {
 	where := "bounded fact query topology"
 	if journalID > 0 {
@@ -352,8 +251,16 @@ func factQueryIntegrityError(journalID journal.JournalID, problem, fix string, c
 }
 
 func scanFactPageRow(stmt *zs.Stmt, kind factSelectorKind) (factPageRow, error) {
+	rowID := journal.JournalID(stmt.ColumnInt64(0))
+	topologyStart := 8
+	if kind == factSelectorEvidence {
+		topologyStart = 9
+	}
+	if err := verifyFactPageTopologyRow(stmt, kind, rowID, topologyStart); err != nil {
+		return factPageRow{}, err
+	}
 	row := factPageRow{
-		journalID:  journal.JournalID(stmt.ColumnInt64(0)),
+		journalID:  rowID,
 		recordedAt: time.Unix(0, stmt.ColumnInt64(1)).UTC(),
 		kind:       stmt.ColumnText(3),
 	}
@@ -404,4 +311,65 @@ func scanFactPageRow(stmt *zs.Stmt, kind factSelectorKind) (factPageRow, error) 
 		return factPageRow{}, factQueryIntegrityError(row.journalID, "producing operation journal ID is not positive", "restore the journal operation anchor referenced by the fact")
 	}
 	return row, nil
+}
+
+// verifyFactPageTopologyRow validates only the bounded candidates returned by
+// the shared page matcher. The page SQL uses LEFT JOIN diagnostics so a broken
+// producer or attribution relationship is visible instead of being omitted by
+// an INNER JOIN. The candidate count is capped at Limit+1 by that same query.
+func verifyFactPageTopologyRow(stmt *zs.Stmt, kind factSelectorKind, factID journal.JournalID, start int) error {
+	expectedKind := journal.JournalKindDecision
+	if kind == factSelectorEvidence {
+		expectedKind = journal.JournalKindEvidence
+	}
+	if kind != factSelectorDecision && kind != factSelectorEvidence {
+		return factQueryIntegrityError(factID, "unknown fact subtype", "use the closed decision or evidence selector")
+	}
+	if factID <= 0 {
+		return factQueryIntegrityError(factID, "fact journal ID is not positive", "restore the fact and journal primary-key rows")
+	}
+	if stmt.ColumnType(start) == zs.TypeNull {
+		return factQueryIntegrityError(factID, "fact has no journal supertype row", "restore the journal row for the fact")
+	}
+	if journal.JournalID(stmt.ColumnInt64(start)) != factID {
+		return factQueryIntegrityError(factID, "fact journal relationship points at a different row", "restore the fact and journal primary-key rows")
+	}
+	if journal.JournalKind(stmt.ColumnInt(start+1)) != expectedKind {
+		return factQueryIntegrityError(factID, "fact journal discriminator does not match its subtype table", "restore the matching journal kind and subtype row")
+	}
+	if stmt.ColumnType(start+2) == zs.TypeNull {
+		return factQueryIntegrityError(factID, "fact has no producing operation relationship", "restore the fact's producing operation journal ID")
+	}
+	producerID := journal.JournalID(stmt.ColumnInt64(start + 2))
+	if producerID <= 0 {
+		return factQueryIntegrityError(factID, "fact has a non-positive producing operation journal ID", "restore the producing operation anchor")
+	}
+	if stmt.ColumnType(start+3) == zs.TypeNull {
+		return factQueryIntegrityError(factID, "journal_attributed has no row for the fact", "restore the attribution view and the fact journal row")
+	}
+	if journal.JournalKind(stmt.ColumnInt(start+4)) != expectedKind {
+		return factQueryIntegrityError(factID, "journal_attributed has the wrong subtype discriminator", "restore the fact journal kind and attribution relationship")
+	}
+	if stmt.ColumnType(start+5) == zs.TypeNull {
+		return factQueryIntegrityError(factID, "effective actor attribution is NULL", "restore the actor on the producing operation anchor")
+	}
+	if _, err := journalParseActor(stmt.ColumnText(start + 5)); err != nil {
+		return factQueryIntegrityError(factID, "effective actor attribution is malformed", "restore the canonical actor ID on the producing operation anchor", err)
+	}
+	if stmt.ColumnType(start+6) == zs.TypeNull || journal.JournalID(stmt.ColumnInt64(start+6)) != producerID {
+		return factQueryIntegrityError(factID, "attribution points at a different producing operation", "restore journal_attributed to the fact journal relationship")
+	}
+	if stmt.ColumnType(start+7) == zs.TypeNull {
+		return factQueryIntegrityError(factID, "producing operation row is missing", "restore journal_operations for the producing operation journal ID")
+	}
+	if stmt.ColumnType(start+8) == zs.TypeNull {
+		return factQueryIntegrityError(factID, "producing operation ID is missing", "restore the operation identity on journal_operations")
+	}
+	if err := journal.ValidateOperationID(journal.OperationID(stmt.ColumnText(start + 8))); err != nil {
+		return factQueryIntegrityError(factID, "producing operation ID is malformed", "restore the canonical operation identity", err)
+	}
+	if stmt.ColumnType(start+9) == zs.TypeNull || journal.JournalKind(stmt.ColumnInt(start+9)) != journal.JournalKindOperation {
+		return factQueryIntegrityError(factID, "producing operation is not an operation journal anchor", "restore the operation journal discriminator and subtype row")
+	}
+	return nil
 }
