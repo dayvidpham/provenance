@@ -88,22 +88,6 @@ func TestDBOSFailureWireCorpus(t *testing.T) {
 		}
 		raw, err := json.Marshal(outcome)
 		expectedJSON := c.Expected.JSON
-		if c.Input.Sentinel == "condition-failed" {
-			// The immutable corpus predates the now-required positive CurrentFact
-			// assertion. Repair that one positive fixture in memory without
-			// changing the checked-in fixture file owned by the prior remediation.
-			var repaired DBOSStepOutcome
-			if err := json.Unmarshal([]byte(expectedJSON), &repaired); err != nil {
-				t.Fatalf("condition failure fixture is not valid JSON: %v", err)
-			}
-			repaired.Failure.Message = outcome.Failure.Message
-			repaired.Failure.AssertedJournalID = outcome.Failure.AssertedJournalID
-			repairedRaw, err := json.Marshal(repaired)
-			if err != nil {
-				t.Fatalf("repair condition failure fixture: %v", err)
-			}
-			expectedJSON = string(repairedRaw)
-		}
 		if err != nil || string(raw) != expectedJSON {
 			t.Fatalf("failure wire drift for %q: got %s err=%v want %s", c.Name, raw, err, expectedJSON)
 		}

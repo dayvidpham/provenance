@@ -16,7 +16,7 @@ cases:
     expected:
       kind: condition_failed
       json: |-
-        {"schema":"provenance.dbos-step-outcome","operation_id":"fixture-operation","mutation_digest":"bQ==","failure":{"kind":"condition_failed","message":"fixture failure: provenance: journal condition failed: condition[0] kind=CurrentFact asserted journal row 0, observed 0 (reason=FactMissing) — where: Apply transaction-local condition evaluation; when: after exact replay lookup and before writes; impact: the operation was not committed; fix: refresh the selected fact and retry with its current JournalID","condition_index":0,"condition_kind":2,"condition_reason":0,"asserted_journal_id":0,"actual_journal_id":0,"operation_id":"fixture-operation"}}
+         {"schema":"provenance.dbos-step-outcome","operation_id":"fixture-operation","mutation_digest":"bQ==","failure":{"kind":"condition_failed","message":"fixture failure: provenance: journal condition failed: condition[0] kind=CurrentFact asserted journal row 1, observed 0 (reason=FactMissing) — where: Apply transaction-local condition evaluation; when: after exact replay lookup and before writes; impact: the operation was not committed; fix: refresh the selected fact and retry with its current JournalID","condition_index":0,"condition_kind":2,"condition_reason":0,"asserted_journal_id":1,"actual_journal_id":0,"operation_id":"fixture-operation"}}
   - name: activity-conflict
     classification: must-pass
     provenance: {source: requirement, ref: "DBOS typed failure contract"}

@@ -17,7 +17,7 @@ import (
 	"github.com/dayvidpham/provenance/internal/testcorpus"
 )
 
-func TestDBOSCorpusInventoryHasExactlyFourAuthorities(t *testing.T) {
+func TestDBOSCorpusInventoryHasExactlyFiveAuthorities(t *testing.T) {
 	entries, err := os.ReadDir("testdata/contract")
 	if err != nil {
 		t.Fatal(err)
