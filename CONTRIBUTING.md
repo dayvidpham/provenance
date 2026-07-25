@@ -96,7 +96,7 @@ Before committing, ensure all gates pass:
 ```bash
 make fmt    # Reformat code
 make lint   # Check for errors
-make test   # Run repeated normal and CGO_ENABLED=1 race tests
+make test   # Run the authoritative CGO_ENABLED=1 race-only suite
 make build  # Build with CGO_ENABLED=0
 ```
 
@@ -268,18 +268,18 @@ func TestTrackerCreateTask(t *testing.T) {
 ### Running Tests
 
 ```bash
-# Run both authoritative uncached suites
-go test -count=1 -shuffle=on -fullpath -timeout=10m ./...
-CGO_ENABLED=1 go test -race -count=1 -shuffle=on -fullpath -timeout=20m ./...
+# The single authoritative suite. Never pass -count: repeated execution is not
+# evidence of correctness, and neither is looping a test to hunt flakes.
+CGO_ENABLED=1 go test -race -shuffle=on -fullpath -timeout=20m ./...
 
-# Cached local iteration
-go test ./... -run TestTrackerCreateTask
+# Narrow the scope during iteration
+CGO_ENABLED=1 go test -race -run TestTrackerCreateTask ./...
 
-# Run local race tests with verbose output
+# Verbose output
 CGO_ENABLED=1 go test -race -timeout=20m -v ./...
 
-# Run local tests with coverage
-go test -cover ./...
+# Coverage
+CGO_ENABLED=1 go test -race -cover ./...
 ```
 
 ## Build Targets
@@ -289,9 +289,9 @@ All build targets are defined in the `Makefile`:
 ```bash
 make fmt    # Format all Go files with gofmt
 make lint   # go vet ./... + ast-grep scan
-make test   # strict normal scheduler matrix + CGO1 race gate
-make test-local # cached local iteration
-make build  # CGO_ENABLED=0 go build ./...
+make test   # one authoritative CGO_ENABLED=1 race-only suite
+make test-local # focused CGO_ENABLED=1 race-only iteration
+make build  # fmt + lint + race suite + CGO_ENABLED=0 build
 make clean  # Remove bin/ directory
 ```
 

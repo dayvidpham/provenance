@@ -60,9 +60,12 @@ func TestApplyOwnsOnePoolLeaseWhileWALReadersProceedAndWritersAreBounded(t *test
 	boot := genesisBoot(t, db, actor)
 	before := journalRowCount(t, db)
 
-	reader := takeApplyTestScope(t, db)
 	writer := takeApplyTestScope(t, db)
 	applyConn := takeApplyTestScope(t, db)
+	// The probe owns the reader and all remaining runtime leases derived from
+	// the scopes already held here. It keeps those leases held while Apply owns
+	// the trigger-carrying connection and while the contender return is proved.
+	contenderProbe := newApplyContenderLeaseProbe(t, db, writer, applyConn)
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	var enteredOnce sync.Once
@@ -95,7 +98,7 @@ func TestApplyOwnsOnePoolLeaseWhileWALReadersProceedAndWritersAreBounded(t *test
 	waitApplySignal(t, "Apply transaction barrier", entered)
 
 	var during int
-	if err := sqlitex.Execute(reader.conn, "SELECT COUNT(*) FROM journal", &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
+	if err := sqlitex.Execute(contenderProbe.readerConn(), "SELECT COUNT(*) FROM journal", &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 		during = stmt.ColumnInt(0)
 		return nil
 	}}); err != nil {
@@ -116,17 +119,98 @@ func TestApplyOwnsOnePoolLeaseWhileWALReadersProceedAndWritersAreBounded(t *test
 	if code := zs.ErrCode(busyErr); code != zs.ResultBusy {
 		t.Fatalf("competing Apply error=%v code=%v, want SQLITE_BUSY", busyErr, code)
 	}
-	// The owner and reader still hold the other available leases, so successfully
-	// binding here proves the failed contender returned its lease.
-	returnedContender := takeApplyTestScope(t, db)
-	returnedContender.release()
+	// Apply owns applyConn while it is stopped at the trigger. The probe still
+	// owns the reader and every spare scope, so its bind is the only operation
+	// that can observe a free lease. A successful bind therefore proves the
+	// SQLITE_BUSY contender returned its lease; a leaked contender makes this
+	// bind fail loudly instead of letting an early reader release make it
+	// vacuous. The probe owns the bind and keeps its holders until this point.
+	contenderProbe.proveContenderReturned(t)
 
 	close(release)
 	if err := waitApplyError(t, "barrier Apply", applyDone); err != nil {
 		t.Fatalf("barrier Apply: %v", err)
 	}
-	reader.release()
+	contenderProbe.releaseAfterApply(t)
 	assertApplyPoolLeasesAvailable(t, db)
+}
+
+// applyContenderLeaseProbe owns the reader and spare leases that must stay
+// held while the barrier Apply owns its trigger-carrying connection. It exposes
+// the reader connection for the WAL observation, but keeps scope release inside
+// the probe protocol so a holder cannot be released before the contender bind.
+type applyContenderLeaseProbe struct {
+	db     *DB
+	reader *connScope
+	spares []*connScope
+	probed bool
+}
+
+func newApplyContenderLeaseProbe(t *testing.T, db *DB, held ...*connScope) *applyContenderLeaseProbe {
+	t.Helper()
+	reader := takeApplyTestScope(t, db)
+	t.Cleanup(reader.release)
+	held = append(held, reader)
+	probe := &applyContenderLeaseProbe{
+		db:     db,
+		reader: reader,
+		spares: holdRemainingApplyLeases(t, db, held...),
+	}
+	t.Cleanup(probe.releaseHeld)
+	return probe
+}
+
+func (probe *applyContenderLeaseProbe) readerConn() *zs.Conn {
+	return probe.reader.conn
+}
+
+func (probe *applyContenderLeaseProbe) proveContenderReturned(t *testing.T) {
+	t.Helper()
+	returnedContender := takeApplyTestScope(t, probe.db)
+	returnedContender.release()
+	probe.probed = true
+}
+
+func (probe *applyContenderLeaseProbe) releaseAfterApply(t *testing.T) {
+	t.Helper()
+	if !probe.probed {
+		t.Fatal("releaseAfterApply: cannot release reader and spare leases before the contender-return probe succeeds")
+	}
+	probe.releaseHeld()
+}
+
+func (probe *applyContenderLeaseProbe) releaseHeld() {
+	probe.reader.release()
+	releaseScopes(probe.spares)
+}
+
+// holdRemainingApplyLeases takes every runtime lease the caller has not already
+// taken, so that once the caller returns one of its own scopes the pool's free
+// capacity is exactly one connection.
+//
+// The already-held count is DERIVED from the scopes the caller passes in, never
+// restated as a literal: a restated count silently drifts when a scope is added
+// or dropped above the call site, and drift either over-subscribes the pool
+// (turning an assertion into a bindScope timeout) or leaves a second lease free
+// (making the "the barrier connection is the only lease Apply can acquire"
+// precondition vacuously true while the test still passes).
+func holdRemainingApplyLeases(t *testing.T, db *DB, held ...*connScope) []*connScope {
+	t.Helper()
+	remaining := runtimePoolSize - len(held)
+	if remaining <= 0 {
+		t.Fatalf(
+			"holdRemainingApplyLeases: caller already holds %d of the %d runtime leases, so no lease is left to hold; "+
+				"the pool would already be fully subscribed and the 'exactly one free lease' precondition cannot be established, "+
+				"making the probe that depends on it vacuous; "+
+				"fix: drop a takeApplyTestScope above this call site or raise runtimePoolSize",
+			len(held), runtimePoolSize,
+		)
+	}
+	spares := make([]*connScope, 0, remaining)
+	for range remaining {
+		spares = append(spares, takeApplyTestScope(t, db))
+	}
+	return spares
 }
 
 func TestApplyRollsBackBeforeReturningFailedLease(t *testing.T) {
@@ -146,6 +230,15 @@ func TestApplyRollsBackBeforeReturningFailedLease(t *testing.T) {
 	}
 	applyConn := takeApplyTestScope(t, db)
 	defer applyConn.release()
+	// Hold the rest of the pool so the failure-trigger connection is the only
+	// lease the Apply under test can acquire once applyConn is returned. The
+	// outstanding set is built from the scopes actually taken above rather than
+	// restated as a count, so the helper cannot drift out of agreement with it.
+	outstanding := make([]*connScope, 0, len(held)+1)
+	outstanding = append(outstanding, held...)
+	outstanding = append(outstanding, applyConn)
+	spares := holdRemainingApplyLeases(t, db, outstanding...)
+	defer releaseScopes(spares)
 	if err := sqlitex.ExecuteTransient(applyConn.conn, `CREATE TEMP TRIGGER apply_test_fail_trigger
 		BEFORE INSERT ON main.journal WHEN NEW.kind_id != 0
 		BEGIN SELECT RAISE(ABORT, 'injected subordinate-row failure'); END`, nil); err != nil {
@@ -164,6 +257,7 @@ func TestApplyRollsBackBeforeReturningFailedLease(t *testing.T) {
 	for _, scope := range held {
 		scope.release()
 	}
+	releaseScopes(spares)
 	if after := journalRowCount(t, db); after != before {
 		t.Fatalf("failed Apply left durable delta: before=%d after=%d", before, after)
 	}
@@ -178,7 +272,7 @@ func takeApplyTestScope(t *testing.T, db *DB) *connScope {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), applyPoolTestTimeout)
 	t.Cleanup(cancel)
-	scope, err := db.bindConn(ctx)
+	scope, err := db.bindScope(ctx, projectionTargetLive)
 	if err != nil {
 		t.Fatalf("take Apply test scope: %v", err)
 	}
@@ -187,8 +281,8 @@ func takeApplyTestScope(t *testing.T, db *DB) *connScope {
 
 func assertApplyPoolLeasesAvailable(t *testing.T, db *DB) {
 	t.Helper()
-	scopes := make([]*connScope, 0, runtimePoolSize-1)
-	for range runtimePoolSize - 1 {
+	scopes := make([]*connScope, 0, runtimePoolSize)
+	for range runtimePoolSize {
 		scopes = append(scopes, takeApplyTestScope(t, db))
 	}
 	for _, scope := range scopes {

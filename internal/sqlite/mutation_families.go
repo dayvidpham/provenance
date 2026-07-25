@@ -19,7 +19,7 @@ import (
 // The split mirrors the rest of the reducer: the FOLD (Apply-only) authorizes the effect
 // against the operation's authority (§9.3, exactly like a task_event), cycle-checks a
 // blocked_by edge-add, and writes the journal row + payload — it does NOT touch the
-// domain tables. The PROJECTION step (projectMutationFamilyRowLocked, the single shared
+// domain tables. The PROJECTION step (projectMutationFamilyRow, the single shared
 // reducer step Apply and Open both run, §9.2) reads the journaled row and folds it into
 // the edges/labels/comments domain projection, targeting the real tables during a live
 // Apply and the shadow tables during a from-empty replay derivation (§15). Because every
@@ -30,13 +30,13 @@ import (
 // Fold (Apply-only): authorize + cycle-check + journal the row
 // ---------------------------------------------------------------------------
 
-// foldMutationFamilyLocked journals one relationship/annotation mutation family row. The
-// supertype journal row is already inserted by foldEffectLocked (kind task_event); this
+// foldMutationFamily journals one relationship/annotation mutation family row. The
+// supertype journal row is already inserted by foldEffect (kind task_event); this
 // step authorizes the effect against the operation's authority at its own JournalID
 // (§9.3), validates a blocked_by edge-add for cycles, and writes the journal_task_events
 // subtype row with the fixed per-family kind and the operand payload. The domain write is
 // deferred to the shared projection step so it is reproducible from history.
-func (scope *connScope) foldMutationFamilyLocked(in journal.OperationInput, jid int64, eff journal.Effect) error {
+func (scope *connScope) foldMutationFamily(in journal.OperationInput, jid int64, eff journal.Effect) error {
 	if eff.TaskID.Namespace == "" {
 		return fmt.Errorf(
 			"provenance: operation %q %s effect has an empty subject task id — where: mutation-family fold "+
@@ -45,7 +45,7 @@ func (scope *connScope) foldMutationFamilyLocked(in journal.OperationInput, jid 
 	}
 	// Same per-effect authorization discipline as a task_event (§9.3): the committing
 	// authority must govern the subject/source task at this effect's own JournalID.
-	if err := scope.requireAuthorityGovernsLocked(in, jid, eff.TaskID); err != nil {
+	if err := scope.requireAuthorityGoverns(in, jid, eff.TaskID); err != nil {
 		return err
 	}
 	kind, ok := journal.MutationFamilyKindForSort(eff.Sort)
@@ -61,7 +61,7 @@ func (scope *connScope) foldMutationFamilyLocked(in journal.OperationInput, jid 
 	// so a cycle-free journal keeps the graph acyclic. Replay never re-validates — it only
 	// reconstructs — so the check lives here, not in the projection step.
 	if eff.Sort == journal.EffectEdgeAdd && eff.EdgeRelKind == ptypes.EdgeBlockedBy {
-		creates, cerr := scope.edgeCreatesCycleLocked(eff.TaskID.String(), eff.EdgeTargetID)
+		creates, cerr := scope.edgeCreatesCycle(eff.TaskID.String(), eff.EdgeTargetID)
 		if cerr != nil {
 			return cerr
 		}
@@ -109,16 +109,12 @@ func encodeMutationFamilyPayload(eff journal.Effect) ([]byte, error) {
 	}
 }
 
-func (db *DB) encodeMutationFamilyPayload(eff journal.Effect) ([]byte, error) {
-	return encodeMutationFamilyPayload(eff)
-}
-
-// edgeCreatesCycleLocked reports whether adding a blocked_by edge source→target would
+// edgeCreatesCycle reports whether adding a blocked_by edge source→target would
 // create a cycle in the blocked_by subgraph: it does iff source is already reachable FROM
 // target through blocked_by edges (a self-edge source==target is the degenerate cycle).
 // The bounded recursive walk reads the projection edges table (real during Apply), the
 // same table the graph store reads, so journal and graph stay consistent (§6).
-func (scope *connScope) edgeCreatesCycleLocked(source, target string) (bool, error) {
+func (scope *connScope) edgeCreatesCycle(source, target string) (bool, error) {
 	found := false
 	if err := sqlitex.Execute(scope.conn, scope.projectionTarget.edgeCycleQuery(),
 		&sqlitex.ExecOptions{
@@ -134,13 +130,13 @@ func (scope *connScope) edgeCreatesCycleLocked(source, target string) (bool, err
 // Projection (shared by Apply and Open replay): fold the row into the domain table
 // ---------------------------------------------------------------------------
 
-// projectMutationFamilyRowLocked folds one journaled relationship/annotation row into the
+// projectMutationFamilyRow folds one journaled relationship/annotation row into the
 // edges/labels/comments domain projection (§6, §15). It targets the real base table during
 // a live Apply and the shadow table during a from-empty replay derivation, so the domain
 // tables are re-derivable solely from ordered journal history and the §15 convergence
 // check covers them. The committing-actor attribution and watermark advance are handled by
-// the caller (projectTaskEventRowLocked) around this step, exactly as for any task_event.
-func (scope *connScope) projectMutationFamilyRowLocked(task journal.TaskID, kind journal.EventKind, payload []byte, jid, recordedAt int64) error {
+// the caller (projectTaskEventRow) around this step, exactly as for any task_event.
+func (scope *connScope) projectMutationFamilyRow(task journal.TaskID, kind journal.EventKind, payload []byte, jid, recordedAt int64) error {
 	switch kind {
 	case journal.EventKindEdgeAdded:
 		p, err := journal.DecodeEdgeMutationPayload(payload)
@@ -198,11 +194,7 @@ func (scope *connScope) projectMutationFamilyRowLocked(task journal.TaskID, kind
 	default:
 		return fmt.Errorf("provenance: %q is not a journaled mutation-family kind (§6)", kind)
 	}
-	return scope.advanceWatermarkLocked(task, jid)
-}
-
-func (db *DB) projectMutationFamilyRowLocked(task journal.TaskID, kind journal.EventKind, payload []byte, jid, recordedAt int64) error {
-	return borrowConnScope(db.conn, db.projectionTarget).projectMutationFamilyRowLocked(task, kind, payload, jid, recordedAt)
+	return scope.advanceWatermark(task, jid)
 }
 
 func (target projectionTarget) edgeCycleQuery() string {

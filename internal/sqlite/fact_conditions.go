@@ -30,7 +30,7 @@ func checkConditions(scope *connScope, in journal.OperationInput) error {
 	return nil
 }
 
-// checkOneConditionLocked evaluates one condition and returns a typed
+// checkOneCondition evaluates one condition and returns a typed
 // *journal.ConditionFailure when the assertion is not satisfied.
 func checkOneCondition(scope *connScope, cond journal.Condition, index int) error {
 	switch cond.Kind {
@@ -41,7 +41,7 @@ func checkOneCondition(scope *connScope, cond journal.Condition, index int) erro
 	default:
 		// Canonical validation rejects unknown kinds before Apply; treat as internal error.
 		return fmt.Errorf(
-			"checkOneConditionLocked: unrecognized condition kind %s at index %d — "+
+			"checkOneCondition: unrecognized condition kind %s at index %d — "+
 				"where: Apply condition evaluation; when: before effects; "+
 				"impact: operation rejected; "+
 				"fix: use ConditionExactFact or ConditionCurrentFact",

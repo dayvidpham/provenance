@@ -148,7 +148,7 @@ func TestApplyReplayAxisAndIndexMatrixHasZeroDurableDelta(t *testing.T) {
 	actor, task := seedActorAndTask(t, db)
 	authority := genesisBoot(t, db, actor)
 	other, _ := ptypes.ParseActorID("fixture--018f0000-0000-7000-8000-000000000099")
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		t.Fatalf("bind alternate actor seed scope: %v", err)
 	}
@@ -343,7 +343,7 @@ func TestApplyConditionCurrentFactAbsenceSucceeds(t *testing.T) {
 
 func journalRowCount(t *testing.T, db *DB) int {
 	t.Helper()
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		t.Fatalf("bind journal row count scope: %v", err)
 	}
@@ -364,7 +364,7 @@ func assertApplyZeroDelta(t *testing.T, db *DB, rows int) {
 
 func persistAndLoadStoredIdentity(t *testing.T, db *DB, input storedOperationReplayIdentity) storedOperationReplayIdentity {
 	t.Helper()
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		t.Fatalf("bind operation identity fixture scope: %v", err)
 	}

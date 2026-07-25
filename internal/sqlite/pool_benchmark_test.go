@@ -32,7 +32,7 @@ func openBenchmarkPoolDB(b *testing.B) (*DB, ptypes.AgentID) {
 		b.Fatalf("register benchmark actor: %v", err)
 	}
 
-	scope, err := db.bindConn(b.Context())
+	scope, err := db.bindScope(b.Context(), projectionTargetLive)
 	if err != nil {
 		b.Fatalf("lease connection to verify benchmark WAL mode: %v", err)
 	}

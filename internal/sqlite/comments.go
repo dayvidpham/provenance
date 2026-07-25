@@ -23,7 +23,7 @@ func (db *DB) AddComment(id ptypes.TaskID, authorID ptypes.AgentID, body string)
 		CreatedAt: now,
 	}
 
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return ptypes.Comment{}, fmt.Errorf("sqlite.AddComment on task %q: %w", id.String(), err)
 	}
@@ -44,7 +44,7 @@ func (db *DB) AddComment(id ptypes.TaskID, authorID ptypes.AgentID, body string)
 // GetComment returns one comment by id. found is false when no such comment exists.
 // Used by the journaled Session.AddComment read-back path.
 func (db *DB) GetComment(id ptypes.CommentID) (ptypes.Comment, bool, error) {
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return ptypes.Comment{}, false, fmt.Errorf("sqlite.GetComment %q: %w", id.String(), err)
 	}
@@ -72,7 +72,7 @@ func (db *DB) GetComment(id ptypes.CommentID) (ptypes.Comment, bool, error) {
 
 // GetComments returns all comments on a task in chronological order.
 func (db *DB) GetComments(id ptypes.TaskID) ([]ptypes.Comment, error) {
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite.GetComments %q: %w", id.String(), err)
 	}

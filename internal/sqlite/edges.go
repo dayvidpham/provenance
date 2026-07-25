@@ -12,7 +12,7 @@ import (
 
 // InsertEdge inserts a typed edge.
 func (db *DB) InsertEdge(sourceID ptypes.TaskID, targetID string, kind ptypes.EdgeKind, now time.Time) error {
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return fmt.Errorf("sqlite.InsertEdge %q -> %q: %w", sourceID.String(), targetID, err)
 	}
@@ -22,7 +22,7 @@ func (db *DB) InsertEdge(sourceID ptypes.TaskID, targetID string, kind ptypes.Ed
 
 // DeleteEdge deletes an edge.
 func (db *DB) DeleteEdge(sourceID ptypes.TaskID, targetID string, kind ptypes.EdgeKind) error {
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return fmt.Errorf("sqlite.DeleteEdge %q -> %q: %w", sourceID.String(), targetID, err)
 	}
@@ -33,7 +33,7 @@ func (db *DB) DeleteEdge(sourceID ptypes.TaskID, targetID string, kind ptypes.Ed
 // GetEdges returns edges originating from sourceID, optionally filtered by kind.
 // Pass nil for kind to get all edge kinds.
 func (db *DB) GetEdges(sourceID ptypes.TaskID, kind *ptypes.EdgeKind) ([]ptypes.Edge, error) {
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite.GetEdges %q: %w", sourceID.String(), err)
 	}
@@ -64,7 +64,7 @@ func (db *DB) GetEdges(sourceID ptypes.TaskID, kind *ptypes.EdgeKind) ([]ptypes.
 
 // GetBlockedByEdges returns all EdgeBlockedBy edges in the database.
 func (db *DB) GetBlockedByEdges() ([]ptypes.Edge, error) {
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite.GetBlockedByEdges: %w", err)
 	}
@@ -90,7 +90,7 @@ func (db *DB) GetBlockedByEdges() ([]ptypes.Edge, error) {
 // GetDepTree returns all blocked-by edges reachable from rootID via DFS.
 // The result is in DFS traversal order.
 func (db *DB) GetDepTree(rootID ptypes.TaskID) ([]ptypes.Edge, error) {
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite.GetDepTree %q: %w", rootID.String(), err)
 	}

@@ -1085,7 +1085,7 @@ func loadSQLiteFixtures(t *testing.T) sqliteFixtures {
 // ---------------------------------------------------------------------------
 
 // TestFoldUpdate_YAMLPermutations exercises the production fold's dynamic materialized-
-// column SET construction (materializeTaskEventColumnsLocked) over every combination of
+// column SET construction (materializeTaskEventColumns) over every combination of
 // the metadata columns a provenance.task.updated event carries — title, description,
 // priority, phase, notes. It drives db.Apply directly, the same fold Session.Update
 // reaches; the retired db.UpdateTask direct-write mutator is gone. status and owner are

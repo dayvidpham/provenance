@@ -1356,8 +1356,9 @@ func TestFoldEvidenceEnforcesAuthorityGovernance(t *testing.T) {
 // anchor insert loses a concurrent same-new-OperationID UNIQUE race, the reducer
 // re-reads the winner's committed row and returns the typed idempotent result (on
 // an exact identity match) or the typed CommittedConflict (on a mismatch), never a
-// raw SQLite constraint error. Under the in-process db.mu the live path is
-// unreachable, so the translation is driven through the adversarial seam.
+// raw SQLite constraint error. BEGIN IMMEDIATE serializes pooled writers before
+// the §9.4 lookup, so the live path is not reachable deterministically; the
+// translation is driven through the adversarial seam instead.
 func TestResolveOperationIDInsertRaceTranslatesToTypedOutcome(t *testing.T) {
 	t.Parallel()
 	env := newOpsEnv(t)

@@ -11,7 +11,7 @@ import (
 
 // AddLabel attaches a label to a task. Idempotent (INSERT OR IGNORE).
 func (db *DB) AddLabel(id ptypes.TaskID, label string) error {
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return fmt.Errorf("sqlite.AddLabel %q: %w", id.String(), err)
 	}
@@ -21,7 +21,7 @@ func (db *DB) AddLabel(id ptypes.TaskID, label string) error {
 
 // RemoveLabel detaches a label from a task. Idempotent (no error if not present).
 func (db *DB) RemoveLabel(id ptypes.TaskID, label string) error {
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return fmt.Errorf("sqlite.RemoveLabel %q: %w", id.String(), err)
 	}
@@ -31,7 +31,7 @@ func (db *DB) RemoveLabel(id ptypes.TaskID, label string) error {
 
 // GetLabels returns all labels attached to a task, sorted alphabetically.
 func (db *DB) GetLabels(id ptypes.TaskID) ([]string, error) {
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite.GetLabels %q: %w", id.String(), err)
 	}

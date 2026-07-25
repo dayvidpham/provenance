@@ -202,18 +202,22 @@ func (id TaskID) Hash() string {
 
 ### Mandatory flags
 ```bash
-# Cached local iteration
-go test ./...
+# The single authoritative suite — local, focused, CI readiness, and landing
+CGO_ENABLED=1 go test -race -shuffle=on -fullpath -timeout=20m ./...
 
-# CI readiness / landing evidence
-go test -count=1 -shuffle=on -fullpath -timeout=10m ./...
-CGO_ENABLED=1 go test -race -count=1 -shuffle=on -fullpath -timeout=20m ./...
+# Narrow the scope during iteration
+CGO_ENABLED=1 go test -race -run TestName ./internal/sqlite
 ```
-Both suites are mandatory for CI readiness and landing. `-count=1` requests one
-uncached execution; it does not select CPUs. `-cpu`, `-p`, and `-parallel`
-control scheduler, package, and `t.Parallel` concurrency respectively; CI leaves
-them unset to use the runner's available processors. The race gate uses
-`CGO_ENABLED=1` and `-race` to detect concurrent access issues.
+There is one suite, and it always uses the race detector under
+`CGO_ENABLED=1`. There is no separate non-race wave.
+
+**Never pass `-count`.** Repeated execution is not evidence of correctness:
+determinism must be argued from synchronization structure, not sampled by
+re-running. The same applies to wrapping a test in a shell loop to hunt flakes.
+
+`-cpu`, `-p`, and `-parallel` control scheduler, package, and `t.Parallel`
+concurrency respectively; CI leaves them unset to use the runner's available
+processors.
 Production builds use `CGO_ENABLED=0`; do not run tests with `CGO_ENABLED=0`.
 
 ### Test file conventions
@@ -226,7 +230,7 @@ Production builds use `CGO_ENABLED=0`; do not run tests with `CGO_ENABLED=0`.
 ```bash
 make fmt    # gofmt — fails if any file needs formatting
 make lint   # go vet ./... + ast-grep scan
-make test   # strict normal scheduler matrix, then CGO_ENABLED=1 race gate
+make test   # one authoritative CGO_ENABLED=1 race-only suite
 make build  # CGO_ENABLED=0 go build ./...
 ```
 
@@ -235,12 +239,13 @@ make build  # CGO_ENABLED=0 go build ./...
 ```bash
 make fmt            # gofmt -w .
 make lint           # go vet ./... + ast-grep scan
-make test           # repeated normal and CGO_ENABLED=1 race suites
+make test           # one authoritative CGO_ENABLED=1 race-only suite
 make build          # runs fmt + lint + test, then CGO_ENABLED=0 go build ./...
 make clean          # rm -rf bin/
 ```
 
-`make build` is the full quality gate — it depends on `fmt`, `lint`, and `test` before invoking `go build`.
+`make build` is the full quality gate — it depends on `fmt`, `lint`, and the
+single race-only `test` target before invoking `go build`.
 
 Cross-compilation:
 ```bash

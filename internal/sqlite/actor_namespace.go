@@ -29,7 +29,7 @@ func (db *DB) RegisterFixedSoftwareAgent(reg journal.FixedSoftwareAgentRegistrat
 		Name:  reg.AgentName, Version: reg.Version, Source: reg.Source,
 	}
 
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return ptypes.SoftwareAgent{}, fixedAgentActivationError(fixedAgentLeaseError{cause: err},
 			"the activation transaction could not start", "a pooled connection could not be leased",
@@ -317,7 +317,7 @@ func (db *DB) RegisterNamespaceClaim(claim journal.ActorNamespaceClaim) error {
 		return err
 	}
 
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return fmt.Errorf("RegisterNamespaceClaim %q: lease connection: %w", claim.Namespace, err)
 	}
@@ -382,7 +382,7 @@ func (db *DB) RegisterFixedActorEntry(entry journal.FixedActorEntry) error {
 		metadata = "{}"
 	}
 
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return fmt.Errorf("RegisterFixedActorEntry %q: lease connection: %w", entry.ActorID.String(), err)
 	}
@@ -412,7 +412,7 @@ func (db *DB) RegisterFixedActorEntry(entry journal.FixedActorEntry) error {
 
 // NamespaceClaims returns every registered claim, namespace-ordered.
 func (db *DB) NamespaceClaims() ([]journal.ActorNamespaceClaim, error) {
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return nil, fmt.Errorf("NamespaceClaims: lease connection: %w", err)
 	}

@@ -19,7 +19,7 @@
 # through db.Apply (the production path Session.Update reaches), re-fetches, and
 # verifies every changed column materialized and every unset column was preserved.
 #
-# These are exactly the columns the fold's materializeTaskEventColumnsLocked writes.
+# These are exactly the columns the fold's materializeTaskEventColumns writes.
 # status and owner are NOT here: they are reducer-exclusive projections advanced by
 # lifecycle events / assignment episodes, never this materialization SET, and are
 # covered by the Session lifecycle/assignment tests.

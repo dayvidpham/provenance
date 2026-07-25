@@ -19,9 +19,9 @@ import (
 // transaction (§9.5): it folds the operation's effects one at a time in caller
 // list order (§9.3.1), authorizing each against the state produced by all
 // earlier effects of the same operation (§9.3), and short-circuits an exact
-// same-OperationID replay (§9.4). The per-effect validation is written as
-// reusable *Locked reducer steps so the Open/replay reducer
-// folds onto them rather than duplicating a second switch (§9.2).
+// same-OperationID replay (§9.4). The per-effect validation is expressed as
+// reusable fold/reducer steps, so the Open/replay reducer folds onto the same
+// steps rather than duplicating a second switch (§9.2).
 
 // Closed-lookup integer ids, matching the Go enum iota values so the SQL lookup
 // and the typed enum cannot drift.
@@ -106,12 +106,6 @@ func (scope *connScope) ensureOperationsSchema() error {
 		return err
 	}
 	return scope.completeJournalOperationFK()
-}
-
-// ensureOperationsSchema preserves the activation-owned connection seam until
-// Open is migrated to pass its borrowed scope directly.
-func (db *DB) ensureOperationsSchema() error {
-	return borrowConnScope(db.conn, db.projectionTarget).ensureOperationsSchema()
 }
 
 // ensureCanonicalMutationColumns upgrades operation rows without rewriting them.
@@ -216,7 +210,7 @@ func (scope *connScope) ensureGenericCanonicalConstraints() error {
 }
 
 func (scope *connScope) preflightCanonicalColumnsReadOnly() error {
-	columns, err := scope.boundDB().tableColumnsLocked("journal_operations")
+	columns, err := scope.tableColumns("journal_operations")
 	if err != nil {
 		return canonicalStartupPreflightError(fmt.Errorf("%w: %v", journal.ErrProjectionDivergence, err), "journal_operations canonical column shape could not be read", "SQLite rejected the read-only table-info query: "+err.Error(), "repair the journal_operations schema from a known-good backup, then retry Open")
 	}
@@ -282,10 +276,6 @@ func (scope *connScope) preflightCanonicalColumnsReadOnly() error {
 		return canonicalStartupPreflightError(fmt.Errorf("%w: %v", journal.ErrProjectionDivergence, err), "canonical operation rows could not be inspected", "SQLite rejected the read-only canonical operation scan: "+err.Error(), "repair journal_operations from a known-good backup, then retry Open")
 	}
 	return nil
-}
-
-func (db *DB) preflightCanonicalColumnsReadOnly() error {
-	return borrowConnScope(db.conn, db.projectionTarget).preflightCanonicalColumnsReadOnly()
 }
 
 func canonicalColumnState(stmt *zs.Stmt, column int) string {
@@ -436,7 +426,7 @@ func (db *DB) Apply(in journal.OperationInput) (res journal.CommittedResult, err
 			}
 		}
 	}()
-	res, err = scope.applyPreparedLocked(in, prepared, callerMutationDigest, nil)
+	res, err = scope.foldPreparedOperation(in, prepared, callerMutationDigest, nil)
 	return res, err
 }
 
@@ -457,7 +447,7 @@ func (scope *connScope) beginWriteOwnership() error {
 }
 
 // validateApplyInput runs the pre-transaction input checks shared by the public
-// Apply and the internal applyLocked callers (migration, replay).
+// Apply and the internal foldOperation callers (migration, replay).
 func validateApplyInput(in journal.OperationInput) error {
 	if err := journal.ValidateOperationID(in.OperationID); err != nil {
 		return fmt.Errorf("Apply: %w", err)
@@ -474,16 +464,17 @@ func validateApplyInput(in journal.OperationInput) error {
 	return nil
 }
 
-// applyLocked is the lease-free core of Apply: it assumes the caller exclusively
-// owns scope.conn, either as a pooled scope or through the legacy migration seam,
-// and folds one operation as a nested SQLite savepoint transaction (§9.5). It is
-// reused by migration (which spans many per-task operations in one outer transaction) and
-// exposes an optional faultHook so the adversarial corpus can inject a
-// crash/cancellation between effects and observe the fail-closed rollback (§9.5) —
-// production callers pass nil. faultHook, when non-nil, is invoked after each
-// effect index is folded; a non-nil return aborts and rolls back the whole
+// foldOperation canonicalizes raw operation input and delegates to
+// foldPreparedOperation. It assumes the caller exclusively owns scope.conn for
+// the whole operation. Migration reuses it for many per-task operations in one
+// outer transaction, and it exposes an optional faultHook so the adversarial
+// corpus can inject a crash/cancellation between effects and observe the
+// fail-closed rollback (§9.5) — production callers pass nil. Public DB.Apply
+// canonicalizes before BEGIN IMMEDIATE and calls foldPreparedOperation directly
+// after acquiring write ownership. faultHook, when non-nil, is invoked after
+// each effect index is folded; a non-nil return aborts and rolls back the whole
 // operation, committing nothing.
-func (scope *connScope) applyLocked(in journal.OperationInput, faultHook func(effectIndex int) error) (journal.CommittedResult, error) {
+func (scope *connScope) foldOperation(in journal.OperationInput, faultHook func(effectIndex int) error) (journal.CommittedResult, error) {
 	callerMutationDigest := append([]byte(nil), in.MutationDigest...)
 	prepared, err := journal.Canonicalize(in)
 	if err != nil {
@@ -492,28 +483,24 @@ func (scope *connScope) applyLocked(in journal.OperationInput, faultHook func(ef
 	in.Conditions = prepared.NormalizedConditions()
 	in.Effects = prepared.NormalizedEffects()
 	in.MutationDigest = prepared.DerivedDigest()
-	return scope.applyPreparedLocked(in, prepared, callerMutationDigest, faultHook)
+	return scope.foldPreparedOperation(in, prepared, callerMutationDigest, faultHook)
 }
 
-// applyLocked is the narrow adapter for migration and adversarial callers that
-// still own the legacy reserved connection.
-func (db *DB) applyLocked(in journal.OperationInput, faultHook func(effectIndex int) error) (journal.CommittedResult, error) {
-	return borrowConnScope(db.conn, db.projectionTarget).applyLocked(in, faultHook)
-}
-
-func (scope *connScope) applyPreparedLocked(in journal.OperationInput, prepared journal.CanonicalMutation, callerMutationDigest []byte, faultHook func(effectIndex int) error) (journal.CommittedResult, error) {
-	// SAVEPOINT (not BEGIN) so applyLocked composes as a nested transaction when
+// foldPreparedOperation owns the savepoint-based fold. Public DB.Apply calls it
+// after BEGIN IMMEDIATE acquires write ownership; foldOperation calls it after
+// canonicalizing raw input.
+func (scope *connScope) foldPreparedOperation(in journal.OperationInput, prepared journal.CanonicalMutation, callerMutationDigest []byte, faultHook func(effectIndex int) error) (journal.CommittedResult, error) {
+	// SAVEPOINT (not BEGIN) so foldOperation composes as a nested transaction when
 	// migration folds many per-task operations inside one outer savepoint (§9.5,
 	// §13 whole-batch atomicity); standalone it behaves as an ordinary atomic
 	// transaction.
 	var txErr error
 	endTx := sqlitex.Save(scope.conn)
 	defer endTx(&txErr)
-	replayBridge := scope.boundDB()
 
 	// §9.4: OperationID-presence short-circuit, evaluated before any
 	// operation-kind-specific validity check (genesis rule 6 included, §4.6).
-	existing, found, lookErr := scope.lookupOperationLocked(in.OperationID)
+	existing, found, lookErr := scope.lookupOperation(in.OperationID)
 	if lookErr != nil {
 		txErr = lookErr
 		return journal.CommittedResult{}, txErr
@@ -523,7 +510,7 @@ func (scope *connScope) applyPreparedLocked(in journal.OperationInput, prepared 
 		// identity match short-circuits (§9.4), any mismatch is the typed
 		// CommittedConflict (§11). Either way no effect is folded and nothing is
 		// written; on a conflict txErr is set so the transaction rolls back.
-		res, err := scope.committedOutcomeForExistingLocked(in, existing, callerMutationDigest)
+		res, err := scope.committedOutcomeForExisting(in, existing, callerMutationDigest)
 		if err != nil {
 			txErr = err
 		}
@@ -541,22 +528,22 @@ func (scope *connScope) applyPreparedLocked(in journal.OperationInput, prepared 
 	// New operation: genesis discipline (§4.6, §10 rules 6-7).
 	genesis := in.AuthorityJournalID == nil
 	if genesis {
-		if err := scope.validateGenesisLocked(in); err != nil {
+		if err := scope.validateGenesis(in); err != nil {
 			txErr = err
 			return journal.CommittedResult{}, txErr
 		}
-	} else if err := scope.requireAuthorityExistsLocked(*in.AuthorityJournalID); err != nil {
+	} else if err := scope.requireAuthorityExists(*in.AuthorityJournalID); err != nil {
 		txErr = err
 		return journal.CommittedResult{}, txErr
 	}
 
 	// Anchor row (§10 rule 1): kind=operation, PBOJID=NULL.
-	anchorJID, err := scope.insertJournalRowLocked(journal.JournalKindOperation, in.ActorID, in.RecordedAt, nil)
+	anchorJID, err := scope.insertJournalRow(journal.JournalKindOperation, in.ActorID, in.RecordedAt, nil)
 	if err != nil {
 		txErr = err
 		return journal.CommittedResult{}, txErr
 	}
-	if err := scope.insertOperationRowLocked(anchorJID, in, prepared); err != nil {
+	if err := scope.insertOperationRow(anchorJID, in, prepared); err != nil {
 		if isUniqueViolation(err) {
 			// §9.6 bullet 2 (defense-in-depth): a concurrent writer committed this
 			// new OperationID first, so the anchor insert violates
@@ -565,7 +552,7 @@ func (scope *connScope) applyPreparedLocked(in journal.OperationInput, prepared 
 			// promised — never a raw SQLite error. BEGIN IMMEDIATE serializes SQLite
 			// writers before the §9.4 lookup, while each caller retains its own pool
 			// lease for the complete transaction.
-			res, rErr := scope.resolveOperationIDInsertRaceLocked(in, callerMutationDigest)
+			res, rErr := scope.resolveOperationIDInsertRace(in, callerMutationDigest)
 			txErr = rErr
 			return res, rErr
 		}
@@ -577,7 +564,7 @@ func (scope *connScope) applyPreparedLocked(in journal.OperationInput, prepared 
 	// state produced by all earlier effects of this same operation (§9.3).
 	for i := range in.Effects {
 		eff := in.Effects[i]
-		producedJID, err := scope.foldEffectLocked(in, anchorJID, eff, i)
+		producedJID, err := scope.foldEffect(in, anchorJID, eff, i)
 		if err != nil {
 			txErr = err
 			return journal.CommittedResult{}, txErr
@@ -586,12 +573,12 @@ func (scope *connScope) applyPreparedLocked(in journal.OperationInput, prepared 
 		// full replay also uses (§9.2): one fold, no second switch. Projection is
 		// derived from the just-committed row, exactly as replay derives it from a
 		// persisted row.
-		if err := replayBridge.projectJournalRowLocked(producedJID); err != nil {
+		if err := scope.projectJournalRow(producedJID); err != nil {
 			txErr = err
 			return journal.CommittedResult{}, txErr
 		}
 		if eff.ResultSlot != "" {
-			if err := scope.insertResultSlotLocked(anchorJID, eff.ResultSlot, producedJID); err != nil {
+			if err := scope.insertResultSlot(anchorJID, eff.ResultSlot, producedJID); err != nil {
 				txErr = err
 				return journal.CommittedResult{}, txErr
 			}
@@ -609,17 +596,17 @@ func (scope *connScope) applyPreparedLocked(in journal.OperationInput, prepared 
 	// Post-fold gates: subtype integrity (§10 rule 8), anchor-only actor placement
 	// (§2.1, §10 rule 5), and close-ends-assignment (§8.1 / owner_responsibility
 	// regression c).
-	if txErr = replayBridge.verifySubtypeIntegrityLocked(); txErr != nil {
+	if txErr = scope.verifySubtypeIntegrity(); txErr != nil {
 		return journal.CommittedResult{}, txErr
 	}
-	if txErr = replayBridge.verifyActorPlacementLocked(); txErr != nil {
+	if txErr = scope.verifyActorPlacement(); txErr != nil {
 		return journal.CommittedResult{}, txErr
 	}
-	if txErr = scope.validateClosesEndAssignmentsLocked(anchorJID, in.Effects); txErr != nil {
+	if txErr = scope.validateClosesEndAssignments(anchorJID, in.Effects); txErr != nil {
 		return journal.CommittedResult{}, txErr
 	}
 
-	res, err := scope.reconstructAndValidateCommittedLocked(anchorJID)
+	res, err := scope.reconstructAndValidateCommitted(anchorJID)
 	if err != nil {
 		txErr = err
 		return journal.CommittedResult{}, txErr
@@ -631,12 +618,12 @@ func (scope *connScope) applyPreparedLocked(in journal.OperationInput, prepared 
 // Per-effect fold (§9.3) — the reusable reducer step
 // ---------------------------------------------------------------------------
 
-// foldEffectLocked validates and persists one effect, returning its produced
+// foldEffect validates and persists one effect, returning its produced
 // journal row's JournalID. It enforces anchor-only actor placement (§10 rule 5)
 // on the input and dispatches to the sort-specific reducer step, each of which
 // authorizes against current transaction state (all earlier effects already
 // inserted, §9.3).
-func (scope *connScope) foldEffectLocked(in journal.OperationInput, anchorJID int64, eff journal.Effect, index int) (int64, error) {
+func (scope *connScope) foldEffect(in journal.OperationInput, anchorJID int64, eff journal.Effect, index int) (int64, error) {
 	// A subordinate (operation-produced) row carries no stored actor: the committing
 	// actor lives once on the anchor and is derived (§2.1, §8.5). Apply therefore
 	// rejects any input effect that would stamp an actor on a produced row — the
@@ -659,45 +646,45 @@ func (scope *connScope) foldEffectLocked(in journal.OperationInput, anchorJID in
 	if eff.RecordedAtOverride != nil {
 		recordedAt = *eff.RecordedAtOverride
 	}
-	jid, err := scope.insertJournalRowLocked(kind, in.ActorID, recordedAt, &anchorJID)
+	jid, err := scope.insertJournalRow(kind, in.ActorID, recordedAt, &anchorJID)
 	if err != nil {
 		return 0, err
 	}
 	switch eff.Sort {
 	case journal.EffectTaskCreate, journal.EffectTaskCreateAllocated:
-		return jid, scope.foldTaskCreateLocked(in, jid, eff)
+		return jid, scope.foldTaskCreate(in, jid, eff)
 	case journal.EffectTaskEvent:
-		return jid, scope.foldTaskEventLocked(in, jid, eff)
+		return jid, scope.foldTaskEvent(in, jid, eff)
 	case journal.EffectBootstrapAuthority:
-		return jid, scope.foldBootstrapAuthorityLocked(jid, eff)
+		return jid, scope.foldBootstrapAuthority(jid, eff)
 	case journal.EffectAssignmentStart:
-		return jid, scope.foldAssignmentStartLocked(in, jid, eff)
+		return jid, scope.foldAssignmentStart(in, jid, eff)
 	case journal.EffectAssignmentEnd:
-		return jid, scope.foldAssignmentEndLocked(in, jid, eff)
+		return jid, scope.foldAssignmentEnd(in, jid, eff)
 	case journal.EffectDecision:
-		return jid, scope.foldDecisionLocked(in, jid, eff)
+		return jid, scope.foldDecision(in, jid, eff)
 	case journal.EffectEvidence:
-		return jid, scope.foldEvidenceLocked(in, jid, eff)
+		return jid, scope.foldEvidence(in, jid, eff)
 	case journal.EffectEdgeAdd, journal.EffectEdgeRemove,
 		journal.EffectLabelAdd, journal.EffectLabelRemove, journal.EffectCommentAdd:
-		return jid, scope.foldMutationFamilyLocked(in, jid, eff)
+		return jid, scope.foldMutationFamily(in, jid, eff)
 	case journal.EffectActivityCreate:
-		return jid, scope.foldActivityCreateLocked(in, jid, eff)
+		return jid, scope.foldActivityCreate(in, jid, eff)
 	default:
 		return 0, fmt.Errorf("Apply: operation %q effect %d has unknown sort %s", in.OperationID, index, eff.Sort)
 	}
 }
 
-// foldTaskCreateLocked journals the birth of a task (§8.1, §9.3): it authorizes the
+// foldTaskCreate journals the birth of a task (§8.1, §9.3): it authorizes the
 // creation against the operation's authority at this effect's own JournalID, INSERTs
 // the tasks row (status Open, watermark = this effect's journal id, so the row is
 // born with a non-NULL last_journal_id), then writes the provenance.task.created
 // journal_task_events row. The tasks INSERT precedes the journal_task_events INSERT
 // because journal_task_events.task_id references tasks(id). The shared reducer's
-// projectJournalRowLocked (run after the fold) seeds the status projection and the
+// projectJournalRow (run after the fold) seeds the status projection and the
 // creator attribution from this same created event, so Open's from-empty replay
 // re-derives the identical projection (§9.2).
-func (scope *connScope) foldTaskCreateLocked(in journal.OperationInput, jid int64, eff journal.Effect) error {
+func (scope *connScope) foldTaskCreate(in journal.OperationInput, jid int64, eff journal.Effect) error {
 	if eff.TaskID.Namespace == "" {
 		return fmt.Errorf(
 			"%w: operation %q task-create effect has an empty task id/namespace — where: task-create "+
@@ -715,7 +702,7 @@ func (scope *connScope) foldTaskCreateLocked(in journal.OperationInput, jid int6
 	// task_event (§9.3): a brand-new task is reached only by a system-root bootstrap
 	// authority (an assignment authority governs no task without an episode), so a
 	// create under a non-governing authority fails closed with ErrAuthorityScope.
-	if err := scope.requireAuthorityGovernsLocked(in, jid, eff.TaskID); err != nil {
+	if err := scope.requireAuthorityGoverns(in, jid, eff.TaskID); err != nil {
 		return err
 	}
 	// Existence guard: creating a task id that already has a row is a typed conflict,
@@ -772,11 +759,11 @@ func (scope *connScope) foldTaskCreateLocked(in journal.OperationInput, jid int6
 	return nil
 }
 
-func (scope *connScope) foldTaskEventLocked(in journal.OperationInput, jid int64, eff journal.Effect) error {
+func (scope *connScope) foldTaskEvent(in journal.OperationInput, jid int64, eff journal.Effect) error {
 	if err := journal.ValidateEventKind(eff.EventKind); err != nil {
 		return err
 	}
-	if err := scope.requireAuthorityGovernsLocked(in, jid, eff.TaskID); err != nil {
+	if err := scope.requireAuthorityGoverns(in, jid, eff.TaskID); err != nil {
 		return err
 	}
 	payload := eff.Payload
@@ -813,22 +800,22 @@ func (scope *connScope) foldTaskEventLocked(in journal.OperationInput, jid int64
 	}
 	// Materialize the complete tasks-row state carried by update/close events. Startup
 	// independently re-derives and compares these fields from canonical effects.
-	if err := scope.materializeTaskEventColumnsLocked(in, jid, eff); err != nil {
+	if err := scope.materializeTaskEventColumns(in, jid, eff); err != nil {
 		return err
 	}
 	// Projections (attribution, watermark, and any lifecycle-status transition)
-	// are advanced by the shared reducer step projectJournalRowLocked after this
+	// are advanced by the shared reducer step projectJournalRow after this
 	// row is inserted — the single fold Apply and Open both run (§9.2).
 	return nil
 }
 
-// materializeTaskEventColumnsLocked writes the journal-reproducible tasks-row columns a
+// materializeTaskEventColumns writes the journal-reproducible tasks-row columns a
 // task_event carries (§8.1): the provenance.task.updated metadata columns and the
 // provenance.task.closed close_reason. It touches nothing when the effect carries no
 // such column (a plain caller-domain event), and it updates updated_at to the effect's
 // recorded time so the mutable row's display timestamp stays honest. It runs only on
 // the live Apply fold; replay derives the equivalent shadow state separately.
-func (scope *connScope) materializeTaskEventColumnsLocked(in journal.OperationInput, jid int64, eff journal.Effect) error {
+func (scope *connScope) materializeTaskEventColumns(in journal.OperationInput, jid int64, eff journal.Effect) error {
 	recordedAt := in.RecordedAt
 	if eff.RecordedAtOverride != nil {
 		recordedAt = *eff.RecordedAtOverride
@@ -876,7 +863,7 @@ func (scope *connScope) materializeTaskEventColumnsLocked(in journal.OperationIn
 	return nil
 }
 
-func (scope *connScope) foldBootstrapAuthorityLocked(jid int64, eff journal.Effect) error {
+func (scope *connScope) foldBootstrapAuthority(jid int64, eff journal.Effect) error {
 	authorityID := string(eff.OperationAuthorityID)
 	if authorityID == "" {
 		authorityID = fmt.Sprintf("authority--bootstrap--%d", jid)
@@ -896,8 +883,8 @@ func (scope *connScope) foldBootstrapAuthorityLocked(jid int64, eff journal.Effe
 	return nil
 }
 
-func (scope *connScope) foldAssignmentStartLocked(in journal.OperationInput, jid int64, eff journal.Effect) error {
-	if err := scope.requireAuthorityGovernsLocked(in, jid, eff.TaskID); err != nil {
+func (scope *connScope) foldAssignmentStart(in journal.OperationInput, jid int64, eff journal.Effect) error {
+	if err := scope.requireAuthorityGoverns(in, jid, eff.TaskID); err != nil {
 		return err
 	}
 	occupant := eff.Occupant
@@ -911,7 +898,7 @@ func (scope *connScope) foldAssignmentStartLocked(in journal.OperationInput, jid
 	// Orphaned/multiply-consumed predecessor evidence (§14.2, §14.3).
 	var predecessor any
 	if eff.Predecessor != "" {
-		ended, exists, err := scope.episodeEndedLocked(eff.Predecessor)
+		ended, exists, err := scope.episodeEnded(eff.Predecessor)
 		if err != nil {
 			return err
 		}
@@ -933,7 +920,7 @@ func (scope *connScope) foldAssignmentStartLocked(in journal.OperationInput, jid
 	// jid, distinct from the predecessor (succession) checks above.
 	var parent any
 	if eff.Parent != "" {
-		if err := scope.requireParentCitationValidLocked(eff.AssignmentID, eff.Parent, jid); err != nil {
+		if err := scope.requireParentCitationValid(eff.AssignmentID, eff.Parent, jid); err != nil {
 			return err
 		}
 		parent = string(eff.Parent)
@@ -950,13 +937,13 @@ func (scope *connScope) foldAssignmentStartLocked(in journal.OperationInput, jid
 	}
 	// The transition row's occupant/owner projection (attribution to the episode
 	// occupant, current owner-responsibility recompute) is advanced by the shared
-	// reducer step projectJournalRowLocked after this row is inserted (§8.2, §9.2).
-	return scope.insertAuthorityAssignmentTransitionLocked(jid, eff.AssignmentID, transitionStartedID)
+	// reducer step projectJournalRow after this row is inserted (§8.2, §9.2).
+	return scope.insertAuthorityAssignmentTransition(jid, eff.AssignmentID, transitionStartedID)
 }
 
-func (scope *connScope) foldAssignmentEndLocked(in journal.OperationInput, jid int64, eff journal.Effect) error {
+func (scope *connScope) foldAssignmentEnd(in journal.OperationInput, jid int64, eff journal.Effect) error {
 	// Lifecycle order (§14.4): a started transition must precede the ended one.
-	started, err := scope.episodeStartedLocked(eff.AssignmentID)
+	started, err := scope.episodeStarted(eff.AssignmentID)
 	if err != nil {
 		return err
 	}
@@ -967,7 +954,7 @@ func (scope *connScope) foldAssignmentEndLocked(in journal.OperationInput, jid i
 				"fix: a started transition must be committed with a strictly smaller JournalID first",
 			journal.ErrAssignmentLifecycle, eff.AssignmentID)
 	}
-	ended, _, err := scope.episodeEndedLocked(eff.AssignmentID)
+	ended, _, err := scope.episodeEnded(eff.AssignmentID)
 	if err != nil {
 		return err
 	}
@@ -981,7 +968,7 @@ func (scope *connScope) foldAssignmentEndLocked(in journal.OperationInput, jid i
 				"fix: the episode was ended by a concurrent winning transfer; re-read current state and retry",
 			journal.ErrStaleEpisode, eff.AssignmentID)
 	}
-	task, err := scope.episodeTaskLocked(eff.AssignmentID)
+	task, err := scope.episodeTask(eff.AssignmentID)
 	if err != nil {
 		return err
 	}
@@ -991,23 +978,23 @@ func (scope *connScope) foldAssignmentEndLocked(in journal.OperationInput, jid i
 	if _, err := slotDBID(eff.SlotID); err != nil {
 		return err
 	}
-	if err := scope.requireAuthorityGovernsLocked(in, jid, task); err != nil {
+	if err := scope.requireAuthorityGoverns(in, jid, task); err != nil {
 		return err
 	}
 	// The owner-responsibility recompute (cleared when this ends the active owner
-	// episode, §8.1) is advanced by the shared reducer step projectJournalRowLocked
+	// episode, §8.1) is advanced by the shared reducer step projectJournalRow
 	// after this row is inserted (§9.2).
-	return scope.insertAuthorityAssignmentTransitionLocked(jid, eff.AssignmentID, transitionEndedID)
+	return scope.insertAuthorityAssignmentTransition(jid, eff.AssignmentID, transitionEndedID)
 }
 
-func (scope *connScope) foldDecisionLocked(in journal.OperationInput, jid int64, eff journal.Effect) error {
+func (scope *connScope) foldDecision(in journal.OperationInput, jid int64, eff journal.Effect) error {
 	// §9.3 names journal_decisions as a consuming effect: a task-scoped decision is
 	// authorized against the operation's authority at this effect's own JournalID,
 	// exactly like a task_event. An untasked decision (§6.1 permits a NULL task_id)
 	// legitimately skips the governance check.
 	var taskID any
 	if eff.TaskID.Namespace != "" {
-		if err := scope.requireAuthorityGovernsLocked(in, jid, eff.TaskID); err != nil {
+		if err := scope.requireAuthorityGoverns(in, jid, eff.TaskID); err != nil {
 			return err
 		}
 		taskID = eff.TaskID.String()
@@ -1022,13 +1009,13 @@ func (scope *connScope) foldDecisionLocked(in journal.OperationInput, jid int64,
 	return nil
 }
 
-func (scope *connScope) foldEvidenceLocked(in journal.OperationInput, jid int64, eff journal.Effect) error {
+func (scope *connScope) foldEvidence(in journal.OperationInput, jid int64, eff journal.Effect) error {
 	// §9.3 names journal_evidence as a consuming effect: a task-scoped evidence row
 	// is authorized against the operation's authority at this effect's own
 	// JournalID. An untasked evidence row (§6.2 permits a NULL task_id) skips it.
 	var taskID any
 	if eff.TaskID.Namespace != "" {
-		if err := scope.requireAuthorityGovernsLocked(in, jid, eff.TaskID); err != nil {
+		if err := scope.requireAuthorityGoverns(in, jid, eff.TaskID); err != nil {
 			return err
 		}
 		taskID = eff.TaskID.String()

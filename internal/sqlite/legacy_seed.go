@@ -28,7 +28,7 @@ import (
 // the low-level seam the internal SQL-layer suites use in place of the retired
 // production task-creation path (graph.Store.AddVertex / db.InsertTask); the sole
 // PRODUCTION tasks-row INSERT is the fold's own watermark-carrying insert
-// (foldTaskCreateLocked). Callers that only need a legacy status/timestamp shape use
+// (foldTaskCreate). Callers that only need a legacy status/timestamp shape use
 // SeedLegacyTask; callers that assert specific title/type/priority/phase/etc. supply a
 // full ptypes.Task here.
 func (db *DB) SeedLegacyTaskRow(task ptypes.Task) error {
@@ -38,12 +38,12 @@ func (db *DB) SeedLegacyTaskRow(task ptypes.Task) error {
 				"test seeding seam (§13); when: before migration; impact: nothing seeded; fix: supply a " +
 				"TaskID with a non-empty namespace")
 	}
-	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return fmt.Errorf("SeedLegacyTaskRow: lease connection: %w", err)
 	}
 	defer scope.release()
-	return scope.insertLegacyTaskRowLocked(task)
+	return scope.insertLegacyTaskRow(task)
 }
 
 // SeedLegacyTask raw-inserts one pre-journal (OLD-schema) task row so migration can
@@ -73,21 +73,21 @@ func (db *DB) SeedLegacyTask(row journal.LegacyTaskRow) error {
 		UpdatedAt: row.UpdatedAt.UTC(),
 		ClosedAt:  row.ClosedAt,
 	}
-	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return fmt.Errorf("SeedLegacyTask: lease connection: %w", err)
 	}
 	defer scope.release()
-	return scope.insertLegacyTaskRowLocked(task)
+	return scope.insertLegacyTaskRow(task)
 }
 
-// insertLegacyTaskRowLocked is the single raw OLD-schema task-row INSERT both legacy
+// insertLegacyTaskRow is the single raw OLD-schema task-row INSERT both legacy
 // seams share (§13). It first DOWNGRADES the tasks table to the legacy nullable-watermark
 // shape (a no-op once already legacy-shaped), mirroring a pre-tightening database on
 // disk, so the legacy row can be written with no watermark (NULL); migration anchors it
-// and populates the watermark. Assumes db.conn is operation-owned.
-func (db *connScope) insertLegacyTaskRowLocked(task ptypes.Task) error {
-	if err := db.downgradeTasksWatermarkToLegacyLocked(); err != nil {
+// and populates the watermark. Assumes the caller owns scope.conn for the operation.
+func (scope *connScope) insertLegacyTaskRow(task ptypes.Task) error {
+	if err := scope.downgradeTasksWatermarkToLegacy(); err != nil {
 		return fmt.Errorf("provenance: SeedLegacyTaskRow downgrade tasks to legacy shape: %w", err)
 	}
 	var ownerVal any
@@ -98,7 +98,7 @@ func (db *connScope) insertLegacyTaskRowLocked(task ptypes.Task) error {
 	if task.ClosedAt != nil {
 		closedAt = task.ClosedAt.UTC().UnixNano()
 	}
-	if err := sqlitex.Execute(db.conn, "INSERT INTO tasks\n\t\t\t(id, namespace, title, description, status_id, priority_id, type_id,\n\t\t\t phase_id, owner_id, notes, created_at, updated_at, closed_at, close_reason)\n\t\t VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)", &sqlitex.ExecOptions{Args: []any{
+	if err := sqlitex.Execute(scope.conn, "INSERT INTO tasks\n\t\t\t(id, namespace, title, description, status_id, priority_id, type_id,\n\t\t\t phase_id, owner_id, notes, created_at, updated_at, closed_at, close_reason)\n\t\t VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)", &sqlitex.ExecOptions{Args: []any{
 		task.ID.String(), task.ID.Namespace, task.Title, task.Description,
 		int(task.Status), int(task.Priority), int(task.Type), int(task.Phase),
 		ownerVal, task.Notes,

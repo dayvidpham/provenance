@@ -11,9 +11,9 @@ import (
 
 // Every PRODUCTION tasks-row WRITE flows through the journaled reducer fold, never a
 // direct un-journaled *DB mutator. Creation is the fold's own watermark-carrying INSERT
-// (foldTaskCreateLocked in operations.go), reached only through a journaled
+// (foldTaskCreate in operations.go), reached only through a journaled
 // EffectTaskCreate (Session.Create / an Atomic op). Metadata updates and closure are the
-// fold's materialization step (materializeTaskEventColumnsLocked), reached through a
+// fold's materialization step (materializeTaskEventColumns), reached through a
 // journaled EffectTaskEvent (Session.Update / Session.CloseTask); status and owner are
 // reducer-exclusive projections advanced only by lifecycle events and assignment
 // episodes. The former direct-write mutators were retired for this single path:
@@ -27,7 +27,7 @@ import (
 // GetTask retrieves a task by ID. Returns (task, true, nil) if found,
 // (zero, false, nil) if not found, or (zero, false, err) on error.
 func (db *DB) GetTask(id ptypes.TaskID) (ptypes.Task, bool, error) {
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return ptypes.Task{}, false, fmt.Errorf("sqlite.GetTask %q: %w", id.String(), err)
 	}
@@ -56,7 +56,7 @@ func (db *DB) GetTask(id ptypes.TaskID) (ptypes.Task, bool, error) {
 // ListTasks returns tasks matching the given filter. An empty filter returns all
 // tasks ordered by creation time (ascending).
 func (db *DB) ListTasks(filter ptypes.ListFilter) ([]ptypes.Task, error) {
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite.ListTasks: %w", err)
 	}
@@ -110,7 +110,7 @@ func (db *DB) ListTasks(filter ptypes.ListFilter) ([]ptypes.Task, error) {
 // TaskCount returns the total number of tasks via COUNT(*).
 // This is O(1) in SQLite (index scan).
 func (db *DB) TaskCount() (int, error) {
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return 0, fmt.Errorf("sqlite.TaskCount: %w", err)
 	}
@@ -131,7 +131,7 @@ func (db *DB) TaskCount() (int, error) {
 
 // ReadyTasks returns tasks that are not closed and have no open blockers.
 func (db *DB) ReadyTasks() ([]ptypes.Task, error) {
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite.ReadyTasks: %w", err)
 	}
@@ -157,7 +157,7 @@ func (db *DB) ReadyTasks() ([]ptypes.Task, error) {
 
 // BlockedTasks returns tasks that are not closed and have at least one open blocker.
 func (db *DB) BlockedTasks() ([]ptypes.Task, error) {
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite.BlockedTasks: %w", err)
 	}

@@ -147,9 +147,9 @@ func TestTaskGraphPoolDistinctReadersDoNotBlockWALWriter(t *testing.T) {
 	entered := make(chan collationEntry, len(readerTasks))
 	releaseReaders := make(chan struct{})
 	armed := make(chan struct{})
-	var reported [runtimePoolSize - 1]atomic.Bool
-	setupScopes := make([]*connScope, 0, runtimePoolSize-1)
-	for range runtimePoolSize - 1 {
+	var reported [runtimePoolSize]atomic.Bool
+	setupScopes := make([]*connScope, 0, runtimePoolSize)
+	for range runtimePoolSize {
 		setupScopes = append(setupScopes, takePoolScope(t, db))
 	}
 	const collationName = "task_graph_binary_barrier"
@@ -243,8 +243,8 @@ func TestTaskGraphPoolDistinctReadersDoNotBlockWALWriter(t *testing.T) {
 			t.Fatalf("concurrent GetTask = (%+v, %t, %v), want found task", result.task, result.found, result.err)
 		}
 	}
-	cleanupScopes := make([]*connScope, 0, runtimePoolSize-1)
-	for range runtimePoolSize - 1 {
+	cleanupScopes := make([]*connScope, 0, runtimePoolSize)
+	for range runtimePoolSize {
 		cleanupScopes = append(cleanupScopes, takePoolScope(t, db))
 	}
 	for i, scope := range cleanupScopes {
@@ -275,8 +275,8 @@ func TestTaskGraphPoolCloseInterruptsActiveExportedCRUDAndDrains(t *testing.T) {
 	var releaseMarker sync.Once
 	release := func() { releaseMarker.Do(func() { close(markerRelease) }) }
 	defer release()
-	setupScopes := make([]*connScope, 0, runtimePoolSize-1)
-	for range runtimePoolSize - 1 {
+	setupScopes := make([]*connScope, 0, runtimePoolSize)
+	for range runtimePoolSize {
 		setupScopes = append(setupScopes, takePoolScope(t, db))
 	}
 	for i, scope := range setupScopes {

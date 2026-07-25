@@ -21,8 +21,8 @@ import (
 //     birth attribution and returns typed *ActivityConflict.
 //  4. After a fresh activity insert, inserts journal_activity_creations.
 //
-// The result-slot recording (insertResultSlotLocked) is the caller's
-// responsibility (foldEffectLocked in operations.go), consistent with all other
+// The result-slot recording (insertResultSlot) is the caller's
+// responsibility (foldEffect in operations.go), consistent with all other
 // effect kinds.
 //
 // ActivityID collision semantics: every pre-existing ActivityID conflicts,
@@ -48,9 +48,9 @@ func (scope *connScope) ensureActivityCreationsSchema() error {
 	return nil
 }
 
-// foldActivityCreateLocked folds one EffectActivityCreate inside Apply's write
+// foldActivityCreate folds one EffectActivityCreate inside Apply's write
 // transaction. The caller owns scope.conn and the enclosing Apply savepoint.
-func (scope *connScope) foldActivityCreateLocked(in journal.OperationInput, jid int64, eff journal.Effect) error {
+func (scope *connScope) foldActivityCreate(in journal.OperationInput, jid int64, eff journal.Effect) error {
 	activityID := eff.ActivityID
 	if activityID.Namespace == "" {
 		return fmt.Errorf(
@@ -129,10 +129,10 @@ func (scope *connScope) foldActivityCreateLocked(in journal.OperationInput, jid 
 	return nil
 }
 
-// lookupActivityIDForJournalRowLocked retrieves the ActivityID for a
+// lookupActivityIDForJournalRow retrieves the ActivityID for a
 // journal_activity_creations row by journal_id. Used by result-slot reconstruction.
 // The caller owns scope.conn and its transaction.
-func (scope *connScope) lookupActivityIDForJournalRowLocked(jid int64) (ptypes.ActivityID, bool, error) {
+func (scope *connScope) lookupActivityIDForJournalRow(jid int64) (ptypes.ActivityID, bool, error) {
 	var actID ptypes.ActivityID
 	found := false
 	if err := sqlitex.Execute(scope.conn,
@@ -149,7 +149,7 @@ func (scope *connScope) lookupActivityIDForJournalRowLocked(jid int64) (ptypes.A
 				return nil
 			},
 		}); err != nil {
-		return ptypes.ActivityID{}, false, fmt.Errorf("lookupActivityIDForJournalRowLocked(%d): %w", jid, err)
+		return ptypes.ActivityID{}, false, fmt.Errorf("lookupActivityIDForJournalRow(%d): %w", jid, err)
 	}
 	return actID, found, nil
 }

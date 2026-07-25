@@ -66,7 +66,7 @@ func (e *factCondEnv) makeEventOp(conditions []journal.Condition) journal.Operat
 
 func latestFactInLeasedTransaction(t *testing.T, db *DB, sel journal.FactSelector) (journal.JournalID, bool) {
 	t.Helper()
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		t.Fatalf("bind fact matcher connection: %v", err)
 	}
@@ -441,8 +441,8 @@ func TestConditionTaskScopeUnscoped(t *testing.T) {
 	}
 }
 
-// TestFactMatcherOnLeasedTransaction verifies match and mismatch through the
-// explicit P0 scope while its caller owns a transaction.
+// TestFactMatcherOnLeasedTransaction verifies match and mismatch through an
+// explicitly leased scope while its caller owns a transaction.
 func TestFactMatcherOnLeasedTransaction(t *testing.T) {
 	t.Parallel()
 	env := newFactCondEnv(t)
@@ -459,7 +459,7 @@ func TestFactMatcherOnLeasedTransaction(t *testing.T) {
 		Filter:       journal.FactFilter{TaskScope: journal.FactTaskScope{Kind: journal.FactTaskAny}},
 	}
 
-	scope, err := env.db.bindConn(context.Background())
+	scope, err := env.db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		t.Fatalf("bind matcher connection: %v", err)
 	}
@@ -498,7 +498,7 @@ func TestFactConditionsObserveSuppliedTransactionAndRollback(t *testing.T) {
 		t.Fatal("committed decision not found")
 	}
 
-	scope, err := env.db.bindConn(context.Background())
+	scope, err := env.db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		t.Fatalf("bind condition connection: %v", err)
 	}
@@ -543,7 +543,7 @@ func TestFactMatcherLookupFailureRollsBackCleanly(t *testing.T) {
 	sel := journal.FactSelector{Kind: journal.FactDecision, DecisionKind: "fixture.decision.v1",
 		Filter: journal.FactFilter{TaskScope: journal.FactTaskScope{Kind: journal.FactTaskAny}}}
 
-	scope, err := env.db.bindConn(context.Background())
+	scope, err := env.db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		t.Fatalf("bind matcher connection: %v", err)
 	}

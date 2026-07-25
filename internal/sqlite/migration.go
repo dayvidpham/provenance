@@ -70,19 +70,19 @@ var recognizedJournalSpineTables = map[string]struct{}{
 // read-only check that runs in its own snapshot before any write transaction opens; any mismatch is
 // a typed SchemaPreflightError and no row of any kind is written.
 func (db *DB) PreflightSchema() (err error) {
-	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return fmt.Errorf("PreflightSchema: lease connection: %w", err)
 	}
 	defer scope.release()
 	endTx := sqlitex.Save(scope.conn)
 	defer endTx(&err)
-	return scope.preflightSchemaLocked()
+	return scope.preflightSchema()
 }
 
-func (db *connScope) preflightSchemaLocked() error {
+func (scope *connScope) preflightSchema() error {
 	for _, want := range expectedJournalShape {
-		present, err := db.tableExistsLocked(want.name)
+		present, err := scope.tableExists(want.name)
 		if err != nil {
 			return err
 		}
@@ -97,7 +97,7 @@ func (db *connScope) preflightSchemaLocked() error {
 				Fix:           "restore the expected schema shape or run the correct forward migration, then re-open",
 			}
 		}
-		actual, err := db.tableColumnsLocked(want.name)
+		actual, err := scope.tableColumns(want.name)
 		if err != nil {
 			return err
 		}
@@ -110,7 +110,7 @@ func (db *connScope) preflightSchemaLocked() error {
 	}
 	// Extra-table direction (§13): every live `journal`-prefixed table must be a
 	// recognized journal-spine relation. An unrecognized one fails closed.
-	return db.preflightNoUnexpectedSpineTableLocked()
+	return scope.preflightNoUnexpectedSpineTable()
 }
 
 func isLegacyOperationsColumnSet(actual map[string]struct{}) bool {
@@ -126,14 +126,14 @@ func isLegacyOperationsColumnSet(actual map[string]struct{}) bool {
 	return true
 }
 
-// preflightNoUnexpectedSpineTableLocked enumerates every live table whose name
+// preflightNoUnexpectedSpineTable enumerates every live table whose name
 // follows the journal-spine convention (name = 'journal' or name LIKE 'journal_%')
 // and fails closed with a typed SchemaPreflightError on any name outside the
 // closed recognizedJournalSpineTables set — the extra-table direction §13's prose
 // promises alongside the extra-column direction (§13, checkColumns).
-func (db *connScope) preflightNoUnexpectedSpineTableLocked() error {
+func (scope *connScope) preflightNoUnexpectedSpineTable() error {
 	var unexpected string
-	if err := sqlitex.Execute(db.conn, "SELECT name FROM sqlite_master WHERE type=?1\n\t\t   AND (name = ?2 OR name LIKE ?3 ESCAPE ?4)\n\t\t ORDER BY name ASC", &sqlitex.ExecOptions{Args: []any{"table", "journal", `journal\_%`, `\`}, ResultFunc: func(stmt *zs.Stmt) error {
+	if err := sqlitex.Execute(scope.conn, "SELECT name FROM sqlite_master WHERE type=?1\n\t\t   AND (name = ?2 OR name LIKE ?3 ESCAPE ?4)\n\t\t ORDER BY name ASC", &sqlitex.ExecOptions{Args: []any{"table", "journal", `journal\_%`, `\`}, ResultFunc: func(stmt *zs.Stmt) error {
 		name := stmt.ColumnText(0)
 		if _, ok := recognizedJournalSpineTables[name]; !ok && unexpected == "" {
 			unexpected = name
@@ -191,9 +191,9 @@ func checkColumns(want expectedTable, actual map[string]struct{}) error {
 	return nil
 }
 
-func (db *connScope) tableExistsLocked(table string) (bool, error) {
+func (scope *connScope) tableExists(table string) (bool, error) {
 	present := false
-	if err := sqlitex.Execute(db.conn,
+	if err := sqlitex.Execute(scope.conn,
 		"SELECT ?3 FROM sqlite_master WHERE type=?1 AND name=?2",
 		&sqlitex.ExecOptions{Args: []any{"table", table, 1}, ResultFunc: func(*zs.Stmt) error { present = true; return nil }}); err != nil {
 		return false, fmt.Errorf("preflight: probe table %q: %w", table, err)
@@ -201,25 +201,15 @@ func (db *connScope) tableExistsLocked(table string) (bool, error) {
 	return present, nil
 }
 
-func (db *connScope) tableColumnsLocked(table string) (map[string]struct{}, error) {
+func (scope *connScope) tableColumns(table string) (map[string]struct{}, error) {
 	cols := map[string]struct{}{}
-	if err := sqlitex.Execute(db.conn, "SELECT name FROM pragma_table_info(?1)", &sqlitex.ExecOptions{Args: []any{table}, ResultFunc: func(stmt *zs.Stmt) error {
+	if err := sqlitex.Execute(scope.conn, "SELECT name FROM pragma_table_info(?1)", &sqlitex.ExecOptions{Args: []any{table}, ResultFunc: func(stmt *zs.Stmt) error {
 		cols[stmt.ColumnText(0)] = struct{}{}
 		return nil
 	}}); err != nil {
 		return nil, fmt.Errorf("preflight: read columns of %q: %w", table, err)
 	}
 	return cols, nil
-}
-
-// P2 compatibility adapters for db.go and the unchanged Apply slice. The
-// callers already own db.conn for their full activation/operation lifetime.
-func (db *DB) tableExistsLocked(table string) (bool, error) {
-	return borrowConnScope(db.conn, db.projectionTarget).tableExistsLocked(table)
-}
-
-func (db *DB) tableColumnsLocked(table string) (map[string]struct{}, error) {
-	return borrowConnScope(db.conn, db.projectionTarget).tableColumnsLocked(table)
 }
 
 // ---------------------------------------------------------------------------
@@ -235,17 +225,17 @@ func (db *DB) tableColumnsLocked(table string) (map[string]struct{}, error) {
 // task (§13 item 4, §9.5). The deterministic per-task OperationID makes a re-run
 // idempotent (§9.4).
 func (db *DB) MigrateLegacyBaseline(in journal.MigrationInput) (journal.MigrationResult, error) {
-	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return journal.MigrationResult{}, fmt.Errorf("MigrateLegacyBaseline: lease connection: %w", err)
 	}
 	defer scope.release()
-	return scope.migrateLockedWithFault(in, nil)
+	return scope.migrateWithFault(in, nil)
 }
 
-func (db *connScope) migrateLockedWithFault(in journal.MigrationInput, faultHook func(taskIndex int) error) (journal.MigrationResult, error) {
+func (scope *connScope) migrateWithFault(in journal.MigrationInput, faultHook func(taskIndex int) error) (journal.MigrationResult, error) {
 	// Preflight strictly before any write transaction opens (§13).
-	if err := db.preflightSchemaLocked(); err != nil {
+	if err := scope.preflightSchema(); err != nil {
 		return journal.MigrationResult{}, err
 	}
 
@@ -253,7 +243,7 @@ func (db *connScope) migrateLockedWithFault(in journal.MigrationInput, faultHook
 	// column added (nullable, with the journal FK) before any row is anchored, so the
 	// anchoring projection has a column to write each row's watermark into. Idempotent —
 	// a no-op when the column is already present (the pre-tightening nullable shape).
-	if err := db.ensureTasksWatermarkColumnLocked(); err != nil {
+	if err := scope.ensureTasksWatermarkColumn(); err != nil {
 		return journal.MigrationResult{}, err
 	}
 
@@ -294,7 +284,7 @@ func (db *connScope) migrateLockedWithFault(in journal.MigrationInput, faultHook
 	}
 
 	// Anchor every legacy row in one whole-batch transaction (§9.5, §13).
-	result, err := db.anchorLegacyBaselinesLocked(in, ordered, resolved, faultHook)
+	result, err := scope.anchorLegacyBaselines(in, ordered, resolved, faultHook)
 	if err != nil {
 		return journal.MigrationResult{}, err
 	}
@@ -314,12 +304,12 @@ func (db *connScope) migrateLockedWithFault(in journal.MigrationInput, faultHook
 	// anchor savepoint — still on the single operation lease, so no other writer observes the
 	// intermediate shape. Should the rebuild itself fail, the committed anchors are left in
 	// the valid legacy nullable shape; a re-run is idempotent (§9.4) and re-applies it.
-	unanchored, err := db.countUnanchoredTasksLocked()
+	unanchored, err := scope.countUnanchoredTasks()
 	if err != nil {
 		return journal.MigrationResult{}, err
 	}
 	if unanchored == 0 {
-		if err := db.rebuildTasksWatermarkLocked(tasksWatermarkNative); err != nil {
+		if err := scope.rebuildTasksWatermark(tasksWatermarkNative); err != nil {
 			return journal.MigrationResult{}, fmt.Errorf(
 				"MigrateLegacyBaseline: re-tighten tasks.last_journal_id to NOT NULL — where: post-anchor "+
 					"schema re-tightening (§8.1, §13); when: after every legacy row was anchored and its "+
@@ -332,17 +322,17 @@ func (db *connScope) migrateLockedWithFault(in journal.MigrationInput, faultHook
 	return result, nil
 }
 
-// anchorLegacyBaselinesLocked folds one deterministic baseline operation per legacy task
+// anchorLegacyBaselines folds one deterministic baseline operation per legacy task
 // as a single whole-batch savepoint transaction (§9.5, §13): a fault (an injected
 // faultHook or any apply error) rolls back every baseline written so far, committing
 // nothing for any task in the run. On success the savepoint commits when this function
 // returns, so the caller's subsequent watermark re-tightening rebuild — which needs the
 // foreign-keys pragma that is a no-op inside a transaction — runs cleanly against the
-// committed, fully-anchored table. Assumes db.conn is operation-owned; ordered/resolved are the
+// committed, fully-anchored table. Assumes the caller owns scope.conn; ordered/resolved are the
 // deterministically-ordered legacy rows and their pre-resolved owners.
-func (db *connScope) anchorLegacyBaselinesLocked(in journal.MigrationInput, ordered []journal.LegacyTaskRow, resolved []*journal.ActorID, faultHook func(taskIndex int) error) (journal.MigrationResult, error) {
+func (scope *connScope) anchorLegacyBaselines(in journal.MigrationInput, ordered []journal.LegacyTaskRow, resolved []*journal.ActorID, faultHook func(taskIndex int) error) (journal.MigrationResult, error) {
 	var txErr error
-	endTx := sqlitex.Save(db.conn) // whole-batch savepoint (§9.5, §13)
+	endTx := sqlitex.Save(scope.conn) // whole-batch savepoint (§9.5, §13)
 	defer endTx(&txErr)
 
 	result := journal.MigrationResult{TasksMigrated: len(ordered)}
@@ -358,7 +348,7 @@ func (db *connScope) anchorLegacyBaselinesLocked(in journal.MigrationInput, orde
 			txErr = err
 			return journal.MigrationResult{}, txErr
 		}
-		res, err := db.boundDB().applyLocked(op, nil)
+		res, err := scope.foldOperation(op, nil)
 		if err != nil {
 			txErr = err
 			return journal.MigrationResult{}, fmt.Errorf("MigrateLegacyBaseline: baseline for task %s: %w", lt.ID.String(), err)
@@ -478,7 +468,7 @@ func assertHonestBaselineTimestamps(lt journal.LegacyTaskRow, op journal.Operati
 // anchors (their OperationID carries the deterministic migration prefix, §13). It
 // is an audit/read helper proving a re-run created no duplicate baseline.
 func (db *DB) CountBaselineAnchors() (n int, err error) {
-	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return 0, fmt.Errorf("CountBaselineAnchors: lease connection: %w", err)
 	}
@@ -495,7 +485,7 @@ func (db *DB) CountBaselineAnchors() (n int, err error) {
 // started transition of a migration episode, so a corpus history can assert the
 // honest legacy timestamp was used (§13). ok is false when no such episode exists.
 func (db *DB) EpisodeTransitionRecordedAt(assignment journal.AssignmentID, started bool) (recordedAt int64, found bool, err error) {
-	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return 0, false, fmt.Errorf("EpisodeTransitionRecordedAt: lease connection: %w", err)
 	}
@@ -519,18 +509,18 @@ func (db *DB) EpisodeTransitionRecordedAt(assignment journal.AssignmentID, start
 // EpisodeActive reports whether an episode has a started transition and no ended
 // transition (§8.4), so a corpus history can assert a migrated episode's activity.
 func (db *DB) EpisodeActive(assignment journal.AssignmentID) (active bool, err error) {
-	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return false, fmt.Errorf("EpisodeActive: lease connection: %w", err)
 	}
 	defer scope.release()
 	endTx := sqlitex.Save(scope.conn)
 	defer endTx(&err)
-	started, err := scope.boundDB().transitionExistsLocked(assignment, transitionStartedID)
+	started, err := scope.transitionExists(assignment, transitionStartedID)
 	if err != nil {
 		return false, err
 	}
-	ended, err := scope.boundDB().transitionExistsLocked(assignment, transitionEndedID)
+	ended, err := scope.transitionExists(assignment, transitionEndedID)
 	if err != nil {
 		return false, err
 	}
@@ -540,7 +530,7 @@ func (db *DB) EpisodeActive(assignment journal.AssignmentID) (active bool, err e
 // CountEpisodesForTask returns how many owner-responsibility episodes exist for a
 // task, so a corpus history can assert episodesCreated (§13).
 func (db *DB) CountEpisodesForTask(task journal.TaskID) (n int, err error) {
-	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return 0, fmt.Errorf("CountEpisodesForTask: lease connection: %w", err)
 	}

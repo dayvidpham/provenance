@@ -31,7 +31,7 @@ func newJournalDB(t *testing.T) *DB {
 func seedActorAndTask(t *testing.T, db *DB) (journal.ActorID, journal.TaskID) {
 	t.Helper()
 	actor := ptypes.ActorID{Namespace: "provenance-test", UUID: uuid.New()}
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		t.Fatalf("bind agent seed scope: %v", err)
 	}
@@ -213,7 +213,7 @@ func TestQueryTaskEventsTreatsHostileTaskAndContextFiltersAsData(t *testing.T) {
 func TestJournalKindsSeededMatchGoEnum(t *testing.T) {
 	db := newJournalDB(t)
 	got := map[int]string{}
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		t.Fatalf("bind journal-kind inspection scope: %v", err)
 	}
@@ -257,7 +257,7 @@ func TestAppendTaskEventAdvancesProjections(t *testing.T) {
 
 	// Watermark advanced on the projection to this event's JournalID.
 	var watermark int64
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		t.Fatalf("bind watermark inspection scope: %v", err)
 	}
@@ -640,7 +640,7 @@ func TestVerifyIntegrityRejectsBareJournalRow(t *testing.T) {
 // reducer fold, which always carries the watermark.
 func TestTasksWatermarkSchemaIsNotNull(t *testing.T) {
 	db := newJournalDB(t)
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		t.Fatalf("bind watermark constraint scope: %v", err)
 	}
@@ -658,7 +658,7 @@ func TestTasksWatermarkSchemaIsNotNull(t *testing.T) {
 func registerSoftwareActor(t *testing.T, db *DB, name string) journal.ActorID {
 	t.Helper()
 	actor := ptypes.ActorID{Namespace: "provenance-test", UUID: uuid.New()}
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		t.Fatalf("bind software actor registration scope: %v", err)
 	}
@@ -694,11 +694,11 @@ func TestMigrationReTightensWatermarkToNotNull(t *testing.T) {
 	if err := db.DowngradeTasksToColumnlessLegacy(); err != nil {
 		t.Fatalf("downgrade to column-less legacy: %v", err)
 	}
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		t.Fatalf("bind pre-migration schema scope: %v", err)
 	}
-	present, _, err := scope.boundDB().tasksWatermarkColumnInfoLocked()
+	present, _, err := scope.tasksWatermarkColumnInfo()
 	scope.release()
 	if err != nil {
 		t.Fatalf("watermark column info (pre-migration): %v", err)
@@ -726,11 +726,11 @@ func TestMigrationReTightensWatermarkToNotNull(t *testing.T) {
 
 	// The core assertion: the DDL is schema-level NOT NULL again post-migration, matching
 	// a fresh native database — not merely data-level satisfied.
-	scope, err = db.bindConn(context.Background())
+	scope, err = db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		t.Fatalf("bind post-migration schema scope: %v", err)
 	}
-	present, notNull, err := scope.boundDB().tasksWatermarkColumnInfoLocked()
+	present, notNull, err := scope.tasksWatermarkColumnInfo()
 	scope.release()
 	if err != nil {
 		t.Fatalf("watermark column info (post-migration): %v", err)
@@ -741,7 +741,7 @@ func TestMigrationReTightensWatermarkToNotNull(t *testing.T) {
 
 	// And every migrated row is anchored: it carries a non-null, non-zero watermark.
 	var watermark int64
-	scope, err = db.bindConn(context.Background())
+	scope, err = db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		t.Fatalf("bind migrated watermark scope: %v", err)
 	}
@@ -761,7 +761,7 @@ func TestMigrationReTightensWatermarkToNotNull(t *testing.T) {
 
 	// The schema is now tight, so a bare watermark-less insert is rejected at the schema
 	// level exactly as on a fresh database (the fresh-vs-migrated asymmetry is closed).
-	scope, err = db.bindConn(context.Background())
+	scope, err = db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		t.Fatalf("bind post-migration constraint scope: %v", err)
 	}

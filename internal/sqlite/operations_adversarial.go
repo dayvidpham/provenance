@@ -13,7 +13,7 @@ import (
 // shape while preserving all rows and other constraints. It exists only for the
 // end-to-end migration and rollback corpus.
 func (db *DB) AdversarialRemoveJournalOperationFK() (err error) {
-	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return fmt.Errorf("AdversarialRemoveJournalOperationFK: lease connection: %w", err)
 	}
@@ -44,7 +44,7 @@ func (db *DB) AdversarialRemoveJournalOperationFK() (err error) {
 // AdversarialInstallV1OperationConstraint recreates the schema emitted by the
 // previous release so migration tests can prove its V1-specific SQL authority is removed.
 func (db *DB) AdversarialInstallV1OperationConstraint() (err error) {
-	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return fmt.Errorf("AdversarialInstallV1OperationConstraint: lease connection: %w", err)
 	}
@@ -82,7 +82,7 @@ func (db *DB) AdversarialInstallV1OperationConstraint() (err error) {
 // gives it rows in BOTH journal_decisions and journal_evidence, violating
 // subtype exclusivity (§10 rule 8). Returns the offending JournalID.
 func (db *DB) AdversarialJournalRowTwoSubtypes(actor journal.ActorID) (journal.JournalID, error) {
-	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return 0, fmt.Errorf("AdversarialJournalRowTwoSubtypes: lease connection: %w", err)
 	}
@@ -90,7 +90,7 @@ func (db *DB) AdversarialJournalRowTwoSubtypes(actor journal.ActorID) (journal.J
 	var txErr error
 	endTx := sqlitex.Transaction(scope.conn)
 	defer endTx(&txErr)
-	jid, err := scope.boundDB().insertJournalRowLocked(journal.JournalKindDecision, actor, 0, nil)
+	jid, err := scope.insertJournalRow(journal.JournalKindDecision, actor, 0, nil)
 	if err != nil {
 		txErr = err
 		return 0, txErr
@@ -107,7 +107,7 @@ func (db *DB) AdversarialJournalRowTwoSubtypes(actor journal.ActorID) (journal.J
 // AdversarialSubordinateRowCarryingActor writes a valid operation anchor and then
 // a SUBORDINATE task_event row (produced_by_operation_journal_id = the anchor) that
 // illegally carries a stored actor_id — the anchor-only-actor-placement violation
-// (§2.1, §10 rule 5) a production writer never emits (insertJournalRowLocked writes
+// (§2.1, §10 rule 5) a production writer never emits (insertJournalRow writes
 // NULL on produced rows). The journal CHECK constraint normally blocks such a row,
 // so this seam sets PRAGMA ignore_check_constraints around the insert to land the
 // row past the CHECK, exercising the production VerifyIntegrity placement guard
@@ -116,7 +116,7 @@ func (db *DB) AdversarialJournalRowTwoSubtypes(actor journal.ActorID) (journal.J
 // subtype totality. Returns the offending subordinate JournalID; the caller is
 // expected to VerifyIntegrity and observe ErrActorPlacement.
 func (db *DB) AdversarialSubordinateRowCarryingActor(actor journal.ActorID, task journal.TaskID) (journal.JournalID, error) {
-	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return 0, fmt.Errorf("AdversarialSubordinateRowCarryingActor: lease connection: %w", err)
 	}
@@ -134,7 +134,7 @@ func (db *DB) AdversarialSubordinateRowCarryingActor(actor journal.ActorID, task
 
 	// Valid operation anchor (actor stored, PBOJID NULL) so the subordinate row's
 	// producing-operation FK resolves.
-	anchorJID, err := scope.boundDB().insertJournalRowLocked(journal.JournalKindOperation, actor, 0, nil)
+	anchorJID, err := scope.insertJournalRow(journal.JournalKindOperation, actor, 0, nil)
 	if err != nil {
 		txErr = err
 		return 0, txErr
@@ -143,7 +143,7 @@ func (db *DB) AdversarialSubordinateRowCarryingActor(actor journal.ActorID, task
 		return 0, txErr
 	}
 	// Subordinate task_event row carrying an actor it must not: PBOJID set AND
-	// actor_id set. insertJournalRowLocked would write NULL, so insert directly.
+	// actor_id set. insertJournalRow would write NULL, so insert directly.
 	if txErr = sqlitex.Execute(scope.conn, "INSERT INTO journal (kind_id, actor_id, recorded_at, produced_by_operation_journal_id) VALUES (?1, ?2, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{int(journal.JournalKindTaskEvent), actor.String(), int64(0), anchorJID}}); txErr != nil {
 		return 0, txErr
 	}
@@ -160,7 +160,7 @@ func (db *DB) AdversarialSubordinateRowCarryingActor(actor journal.ActorID, task
 // (in addition to its matching journal_decisions row) carries a journal_operations
 // subtype row, violating discriminator agreement (§10 rule 8).
 func (db *DB) AdversarialSubtypeMismatchingKind(actor journal.ActorID) (journal.JournalID, error) {
-	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return 0, fmt.Errorf("AdversarialSubtypeMismatchingKind: lease connection: %w", err)
 	}
@@ -168,7 +168,7 @@ func (db *DB) AdversarialSubtypeMismatchingKind(actor journal.ActorID) (journal.
 	var txErr error
 	endTx := sqlitex.Transaction(scope.conn)
 	defer endTx(&txErr)
-	jid, err := scope.boundDB().insertJournalRowLocked(journal.JournalKindDecision, actor, 0, nil)
+	jid, err := scope.insertJournalRow(journal.JournalKindDecision, actor, 0, nil)
 	if err != nil {
 		txErr = err
 		return 0, txErr
@@ -187,7 +187,7 @@ func (db *DB) AdversarialSubtypeMismatchingKind(actor journal.ActorID) (journal.
 // transition row to it, violating authority-level discriminator agreement
 // (§10 rule 8, second inheritance level). task must be an existing task.
 func (db *DB) AdversarialAuthorityDetailMismatch(actor journal.ActorID, task journal.TaskID) (journal.JournalID, error) {
-	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return 0, fmt.Errorf("AdversarialAuthorityDetailMismatch: lease connection: %w", err)
 	}
@@ -195,7 +195,7 @@ func (db *DB) AdversarialAuthorityDetailMismatch(actor journal.ActorID, task jou
 	var txErr error
 	endTx := sqlitex.Transaction(scope.conn)
 	defer endTx(&txErr)
-	jid, err := scope.boundDB().insertJournalRowLocked(journal.JournalKindAuthority, actor, 0, nil)
+	jid, err := scope.insertJournalRow(journal.JournalKindAuthority, actor, 0, nil)
 	if err != nil {
 		txErr = err
 		return 0, txErr
@@ -224,17 +224,17 @@ func (db *DB) AdversarialAuthorityDetailMismatch(actor journal.ActorID, task jou
 // names a produced row belonging to a different operation, returning the typed
 // ErrResultSlotIntegrity the reducer would raise before commit. It writes nothing.
 func (db *DB) AdversarialForeignResultSlotRejected(anchorOp, foreignProduced journal.JournalID) error {
-	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return fmt.Errorf("AdversarialForeignResultSlotRejected: lease connection: %w", err)
 	}
 	defer scope.release()
-	return scope.boundDB().requireResultSlotOwnOperationLocked(int64(anchorOp), int64(foreignProduced))
+	return scope.requireResultSlotOwnOperation(int64(anchorOp), int64(foreignProduced))
 }
 
 // AdversarialApplyWithFault applies one operation but injects a fault immediately
 // after the effect at faultAfterEffectIndex is folded, exercising §9.5 fail-closed
-// atomicity through the production applyLocked path: the whole operation, including
+// atomicity through the production foldOperation path: the whole operation, including
 // its anchor, must roll back with nothing committed. It writes nothing on return.
 // Production Apply passes no fault hook; this seam is used only by the corpus to
 // drive crash/cancellation-mid-batch and transfer-crash histories.
@@ -242,7 +242,7 @@ func (db *DB) AdversarialApplyWithFault(in journal.OperationInput, faultAfterEff
 	if err := validateApplyInput(in); err != nil {
 		return journal.CommittedResult{}, err
 	}
-	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return journal.CommittedResult{}, fmt.Errorf("AdversarialApplyWithFault: lease connection: %w", err)
 	}
@@ -253,7 +253,7 @@ func (db *DB) AdversarialApplyWithFault(in journal.OperationInput, faultAfterEff
 		}
 		return nil
 	}
-	return scope.boundDB().applyLocked(in, hook)
+	return scope.foldOperation(in, hook)
 }
 
 // AdversarialMigrateWithFault runs a legacy-baseline migration but injects a fault
@@ -262,7 +262,7 @@ func (db *DB) AdversarialApplyWithFault(in journal.OperationInput, faultAfterEff
 // migration path: every baseline written so far, not just the faulted task, must
 // roll back atomically. It writes nothing on return.
 func (db *DB) AdversarialMigrateWithFault(in journal.MigrationInput, faultAfterTaskIndex int) (journal.MigrationResult, error) {
-	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return journal.MigrationResult{}, fmt.Errorf("AdversarialMigrateWithFault: lease connection: %w", err)
 	}
@@ -273,7 +273,7 @@ func (db *DB) AdversarialMigrateWithFault(in journal.MigrationInput, faultAfterT
 		}
 		return nil
 	}
-	return scope.migrateLockedWithFault(in, hook)
+	return scope.migrateWithFault(in, hook)
 }
 
 // AdversarialAddColumn adds an unreviewed extra column to a journal table,
@@ -293,7 +293,7 @@ func (addition AdversarialColumnAddition) query() string {
 }
 
 func (db *DB) AdversarialAddColumn(addition AdversarialColumnAddition) error {
-	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return fmt.Errorf("AdversarialAddColumn: lease connection: %w", err)
 	}
@@ -323,7 +323,7 @@ func (drop AdversarialColumnDrop) query() string {
 }
 
 func (db *DB) AdversarialDropColumn(drop AdversarialColumnDrop) error {
-	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return fmt.Errorf("AdversarialDropColumn: lease connection: %w", err)
 	}
@@ -354,7 +354,7 @@ func (drop AdversarialTableDrop) query() string {
 }
 
 func (db *DB) AdversarialDropTable(drop AdversarialTableDrop) error {
-	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return fmt.Errorf("AdversarialDropTable: lease connection: %w", err)
 	}
@@ -377,12 +377,12 @@ func (db *DB) AdversarialDropTable(drop AdversarialTableDrop) error {
 // ErrDishonestMigrationTimestamp before any write; nothing is committed. The input
 // must carry exactly one closed, owned legacy task.
 func (db *DB) AdversarialMigrateFabricatedEndedTimestamp(in journal.MigrationInput, wallClockNanos int64) (journal.MigrationResult, error) {
-	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return journal.MigrationResult{}, fmt.Errorf("AdversarialMigrateFabricatedEndedTimestamp: lease connection: %w", err)
 	}
 	defer scope.release()
-	if err := scope.preflightSchemaLocked(); err != nil {
+	if err := scope.preflightSchema(); err != nil {
 		return journal.MigrationResult{}, err
 	}
 	if len(in.Legacy) != 1 {
@@ -433,7 +433,7 @@ func (addition AdversarialTableAddition) query() string {
 }
 
 func (db *DB) AdversarialAddTable(addition AdversarialTableAddition) error {
-	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return fmt.Errorf("AdversarialAddTable: lease connection: %w", err)
 	}
@@ -462,11 +462,11 @@ const (
 // convergence check exists to detect (analogous to the AdversarialAddColumn schema
 // seams). It is the seam that proves ReplayProjections' ProjectionDivergenceError
 // actually fires: a production writer only ever advances tasks.* through
-// projectJournalRowLocked, so this deliberately installs a value no ordered journal
+// projectJournalRow, so this deliberately installs a value no ordered journal
 // history would derive. The field comes from the closed AdversarialProjectionField
 // set, never free-form caller input.
 func (db *DB) AdversarialCorruptTaskProjection(task journal.TaskID, field AdversarialProjectionField, value any) error {
-	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return fmt.Errorf("AdversarialCorruptTaskProjection: lease connection: %w", err)
 	}
@@ -501,11 +501,11 @@ func (field AdversarialProjectionField) query() string {
 // the §15 FULL-TUPLE convergence check exists to detect on a fold-derived comment (a
 // key-only check reads the tampered body back unchanged and falsely reports convergence).
 // A production writer only ever materializes comments.body through
-// projectMutationFamilyRowLocked from the journaled comment payload, so this installs a
+// projectMutationFamilyRow from the journaled comment payload, so this installs a
 // body no ordered journal history would derive. The comment id comes from the caller's
 // committed row; body is the corpus's chosen tamper value, never a column identifier.
 func (db *DB) AdversarialCorruptCommentBody(commentID, body string) error {
-	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return fmt.Errorf("AdversarialCorruptCommentBody: lease connection: %w", err)
 	}
@@ -520,7 +520,7 @@ func (db *DB) AdversarialCorruptCommentBody(commentID, body string) error {
 // BYPASSING the shared reducer, so the corpus can prove ReplayProjections detects a
 // spurious attribution edge no ordered journal history would derive (§8.2, §15).
 func (db *DB) AdversarialInsertSpuriousAttribution(task journal.TaskID, actor journal.ActorID, jid journal.JournalID) error {
-	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return fmt.Errorf("AdversarialInsertSpuriousAttribution: lease connection: %w", err)
 	}
@@ -532,7 +532,7 @@ func (db *DB) AdversarialInsertSpuriousAttribution(task journal.TaskID, actor jo
 }
 
 // AdversarialResolveOperationIDInsertRace drives the §9.6-bullet-2 race-translation
-// path (resolveOperationIDInsertRaceLocked) directly. Before pool migration that
+// path (resolveOperationIDInsertRace) directly. Before pool migration that
 // path was unreachable — Apply's §9.4 lookup always observed a concurrent
 // writer's committed row before reaching the anchor insert — so this seam invokes
 // the translation the reducer runs when the anchor insert loses the UNIQUE race:
@@ -548,12 +548,12 @@ func (db *DB) AdversarialResolveOperationIDInsertRace(in journal.OperationInput)
 	callerMutationDigest := append([]byte(nil), in.MutationDigest...)
 	in.MutationDigest = prepared.DerivedDigest()
 	in.Effects = prepared.NormalizedEffects()
-	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return journal.CommittedResult{}, fmt.Errorf("AdversarialResolveOperationIDInsertRace: lease connection: %w", err)
 	}
 	defer scope.release()
-	return scope.boundDB().resolveOperationIDInsertRaceLocked(in, callerMutationDigest)
+	return scope.resolveOperationIDInsertRace(in, callerMutationDigest)
 }
 
 // AdversarialCyclicParentChain seeds a CORRUPT cyclic parent-citation chain that
@@ -567,7 +567,7 @@ func (db *DB) AdversarialResolveOperationIDInsertRace(in journal.OperationInput)
 // Z's authority governs taskX; the §14.5 governance walk must fail closed with
 // ErrCorruptParentChain (bounded, visited-tracked traversal) rather than looping.
 func (db *DB) AdversarialCyclicParentChain(actor journal.ActorID, taskX, taskY, taskZ journal.TaskID) (zAuth journal.JournalID, target journal.TaskID, beforeJID journal.JournalID, err error) {
-	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return 0, journal.TaskID{}, 0, fmt.Errorf("AdversarialCyclicParentChain: lease connection: %w", err)
 	}
@@ -575,10 +575,10 @@ func (db *DB) AdversarialCyclicParentChain(actor journal.ActorID, taskX, taskY, 
 	var txErr error
 	endTx := sqlitex.Transaction(scope.conn)
 	defer endTx(&txErr)
-	if _, txErr = scope.seedActiveEpisodeLocked(actor, taskX, "cyclic-parent-X", nil); txErr != nil {
+	if _, txErr = scope.seedActiveEpisode(actor, taskX, "cyclic-parent-X", nil); txErr != nil {
 		return 0, journal.TaskID{}, 0, txErr
 	}
-	if _, txErr = scope.seedActiveEpisodeLocked(actor, taskY, "cyclic-parent-Y", "cyclic-parent-X"); txErr != nil {
+	if _, txErr = scope.seedActiveEpisode(actor, taskY, "cyclic-parent-Y", "cyclic-parent-X"); txErr != nil {
 		return 0, journal.TaskID{}, 0, txErr
 	}
 	// Close the cycle: X.parent = Y. A production start effect can never write this
@@ -587,7 +587,7 @@ func (db *DB) AdversarialCyclicParentChain(actor journal.ActorID, taskX, taskY, 
 		return 0, journal.TaskID{}, 0, txErr
 	}
 	var jz int64
-	if jz, txErr = scope.seedActiveEpisodeLocked(actor, taskZ, "cyclic-parent-Z", nil); txErr != nil {
+	if jz, txErr = scope.seedActiveEpisode(actor, taskZ, "cyclic-parent-Z", nil); txErr != nil {
 		return 0, journal.TaskID{}, 0, txErr
 	}
 	var maxJID int64
@@ -598,20 +598,20 @@ func (db *DB) AdversarialCyclicParentChain(actor journal.ActorID, taskX, taskY, 
 	return journal.JournalID(jz), taskX, journal.JournalID(maxJID + 1), nil
 }
 
-// seedActiveEpisodeLocked writes one active episode (a started transition + its
+// seedActiveEpisode writes one active episode (a started transition + its
 // journal_authorities row + the episode row) on `task`, optionally citing a
 // parent, and returns the started transition's authority JournalID. It is the
 // shared adversarial builder for the §14.5 cycle seam; production episodes are
-// only ever written through foldAssignmentStartLocked.
-func (db *connScope) seedActiveEpisodeLocked(actor journal.ActorID, task journal.TaskID, assignment journal.AssignmentID, parent any) (int64, error) {
-	jid, err := db.boundDB().insertJournalRowLocked(journal.JournalKindAuthority, actor, 0, nil)
+// only ever written through foldAssignmentStart.
+func (scope *connScope) seedActiveEpisode(actor journal.ActorID, task journal.TaskID, assignment journal.AssignmentID, parent any) (int64, error) {
+	jid, err := scope.insertJournalRow(journal.JournalKindAuthority, actor, 0, nil)
 	if err != nil {
 		return 0, err
 	}
-	if err := sqlitex.Execute(db.conn, "INSERT INTO journal_authority_assignment_episodes (assignment_id, task_id, slot_id, actor_id, predecessor_assignment_id, parent_assignment_id)\n\t\t VALUES (?1, ?2, ?3, ?4, ?6, ?5)", &sqlitex.ExecOptions{Args: []any{string(assignment), task.String(), slotOwnerResponsibilityID, actor.String(), parent, nil}}); err != nil {
+	if err := sqlitex.Execute(scope.conn, "INSERT INTO journal_authority_assignment_episodes (assignment_id, task_id, slot_id, actor_id, predecessor_assignment_id, parent_assignment_id)\n\t\t VALUES (?1, ?2, ?3, ?4, ?6, ?5)", &sqlitex.ExecOptions{Args: []any{string(assignment), task.String(), slotOwnerResponsibilityID, actor.String(), parent, nil}}); err != nil {
 		return 0, fmt.Errorf("seed episode %q: %w", assignment, err)
 	}
-	if err := db.boundDB().insertAuthorityAssignmentTransitionLocked(jid, assignment, transitionStartedID); err != nil {
+	if err := scope.insertAuthorityAssignmentTransition(jid, assignment, transitionStartedID); err != nil {
 		return 0, err
 	}
 	return jid, nil

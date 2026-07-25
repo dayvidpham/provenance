@@ -60,8 +60,8 @@ func fixedRegistration(namespace string, min, max, ordinal uint64) journal.Fixed
 
 func takeIdentityRuntimeScopes(t *testing.T, db *DB) []*connScope {
 	t.Helper()
-	scopes := make([]*connScope, 0, runtimePoolSize-1)
-	for range runtimePoolSize - 1 {
+	scopes := make([]*connScope, 0, runtimePoolSize)
+	for range runtimePoolSize {
 		scopes = append(scopes, takePoolScope(t, db))
 	}
 	return scopes
@@ -82,7 +82,7 @@ type identityReadBarrier struct {
 
 func installIdentityReadBarrier(t *testing.T, db *DB, target string) *identityReadBarrier {
 	t.Helper()
-	barrier := &identityReadBarrier{entered: make(chan int, runtimePoolSize-1), release: make(chan struct{}), db: db}
+	barrier := &identityReadBarrier{entered: make(chan int, runtimePoolSize), release: make(chan struct{}), db: db}
 	scopes := takeIdentityRuntimeScopes(t, db)
 	for id, scope := range scopes {
 		id := id
@@ -133,7 +133,7 @@ const identityWriterTrigger = "identity_activity_hold_claim_insert"
 func installIdentityWriterBarrier(t *testing.T, db *DB) *identityWriterBarrier {
 	t.Helper()
 	barrier := &identityWriterBarrier{
-		begin: make(chan int, 16), entered: make(chan int, runtimePoolSize-1),
+		begin: make(chan int, 16), entered: make(chan int, runtimePoolSize),
 		release: make(chan struct{}), db: db,
 	}
 	scopes := takeIdentityRuntimeScopes(t, db)

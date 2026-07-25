@@ -21,7 +21,7 @@ func runTransaction(conn *zs.Conn, operation func() error) (err error) {
 // RegisterHumanAgent registers a new human agent with a UUIDv7 ID.
 func (db *DB) RegisterHumanAgent(namespace, name, contact string) (ptypes.HumanAgent, error) {
 	id := ptypes.AgentID{Namespace: namespace, UUID: uuid.Must(uuid.NewV7())}
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return ptypes.HumanAgent{}, fmt.Errorf("sqlite.RegisterHumanAgent: lease connection: %w", err)
 	}
@@ -48,7 +48,7 @@ func (db *DB) RegisterHumanAgent(namespace, name, contact string) (ptypes.HumanA
 // RegisterMLAgent registers a new ML agent. The (provider, modelName) pair must
 // exist in the ml_models seed table; returns ptypes.ErrNotFound if unknown.
 func (db *DB) RegisterMLAgent(namespace string, role ptypes.Role, provider ptypes.Provider, modelName ptypes.ModelID) (ptypes.MLAgent, error) {
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return ptypes.MLAgent{}, fmt.Errorf("sqlite.RegisterMLAgent: lease connection: %w", err)
 	}
@@ -91,7 +91,7 @@ func (db *DB) RegisterMLAgent(namespace string, role ptypes.Role, provider ptype
 // RegisterSoftwareAgent registers a new software agent with a UUIDv7 ID.
 func (db *DB) RegisterSoftwareAgent(namespace, name, version, source string) (ptypes.SoftwareAgent, error) {
 	id := ptypes.AgentID{Namespace: namespace, UUID: uuid.Must(uuid.NewV7())}
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return ptypes.SoftwareAgent{}, fmt.Errorf("sqlite.RegisterSoftwareAgent: lease connection: %w", err)
 	}
@@ -119,7 +119,7 @@ func (db *DB) RegisterSoftwareAgent(namespace, name, version, source string) (pt
 // GetAgent returns the base agent (kind only) by ID.
 // Returns ptypes.ErrNotFound if the agent does not exist.
 func (db *DB) GetAgent(id ptypes.AgentID) (ptypes.Agent, error) {
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return ptypes.Agent{}, fmt.Errorf("sqlite.GetAgent: lease connection: %w", err)
 	}
@@ -150,7 +150,7 @@ func (db *DB) GetAgent(id ptypes.AgentID) (ptypes.Agent, error) {
 // GetHumanAgent returns the human agent by ID.
 // Returns ptypes.ErrNotFound if not found or if the agent is a different kind.
 func (db *DB) GetHumanAgent(id ptypes.AgentID) (ptypes.HumanAgent, error) {
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return ptypes.HumanAgent{}, fmt.Errorf("sqlite.GetHumanAgent: lease connection: %w", err)
 	}
@@ -185,7 +185,7 @@ func (db *DB) GetHumanAgent(id ptypes.AgentID) (ptypes.HumanAgent, error) {
 // GetMLAgent returns the ML agent by ID.
 // Returns ptypes.ErrNotFound if not found or if the agent is a different kind.
 func (db *DB) GetMLAgent(id ptypes.AgentID) (ptypes.MLAgent, error) {
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return ptypes.MLAgent{}, fmt.Errorf("sqlite.GetMLAgent: lease connection: %w", err)
 	}
@@ -224,7 +224,7 @@ func (db *DB) GetMLAgent(id ptypes.AgentID) (ptypes.MLAgent, error) {
 // GetSoftwareAgent returns the software agent by ID.
 // Returns ptypes.ErrNotFound if not found or if the agent is a different kind.
 func (db *DB) GetSoftwareAgent(id ptypes.AgentID) (ptypes.SoftwareAgent, error) {
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return ptypes.SoftwareAgent{}, fmt.Errorf("sqlite.GetSoftwareAgent: lease connection: %w", err)
 	}

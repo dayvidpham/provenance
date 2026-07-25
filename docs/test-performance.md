@@ -2,21 +2,26 @@
 
 This document records measured test-suite costs and candidate optimizations. It
 is a planning aid, not evidence that an optimization has already landed. It
-complements the comprehensive [test-infrastructure guide](../TESTING.md). The
-authoritative test gates remain:
+complements the comprehensive [test-infrastructure guide](../TESTING.md), which
+is the single source of truth for test gates. There is exactly one authoritative
+suite and it is race-only:
 
 ```bash
-go test -count=1 -shuffle=on -fullpath -timeout=10m ./...
-CGO_ENABLED=1 go test -race -count=1 -shuffle=on -fullpath -timeout=20m ./...
+CGO_ENABLED=1 go test -race -shuffle=on -fullpath -timeout=20m ./...
 ```
 
-Local iteration normally uses cached `go test ./...`. `-count=1` means one
-uncached execution; it does not select CPUs. Historical measurements below keep
-their original commands for comparability.
+There is no non-race wave, and no invocation specifies `-count`, `-p`, or
+`-parallel`. Local iteration uses the same command narrowed with `-run` or a
+package path, never with `-race` or `CGO_ENABLED=1` dropped. `CGO_ENABLED=0` is
+a build-only gate. See [TESTING.md](../TESTING.md#authoritative-gates).
+
+Historical measurements below keep their original commands for comparability:
+they record what was actually run at the time and must not be rewritten. They
+are evidence, not instructions.
 
 Performance work must preserve the production code paths, SQLite durability
-checks, corruption-byte invariants, concurrent-writer coverage, and uncached
-race run.
+checks, corruption-byte invariants, concurrent-writer coverage, and the single
+uncached race run.
 
 ## Recorded baseline
 
@@ -192,32 +197,32 @@ Reproduce the baseline before and after each change. Run one experiment at a
 time and retain the uncached full-suite result.
 
 ```bash
-# Authoritative wall clock and correctness gates.
-time go test -count=1 -shuffle=on -fullpath -timeout=10m ./...
-time CGO_ENABLED=1 go test -race -count=1 -shuffle=on -fullpath -timeout=20m ./...
+# Authoritative wall clock and correctness gate (one race suite, no -count).
+time CGO_ENABLED=1 go test -race -shuffle=on -fullpath -timeout=20m ./...
 
-# Package-level attribution.
-time CGO_ENABLED=1 go test -race -cpu=2 -count=1 -timeout=20m .
-time CGO_ENABLED=1 go test -race -cpu=2 -count=1 -timeout=20m ./internal/sqlite
+# Package-level attribution. -cpu is pinned here because this is a documented
+# measurement experiment, not a gate.
+time CGO_ENABLED=1 go test -race -cpu=2 -timeout=20m .
+time CGO_ENABLED=1 go test -race -cpu=2 -timeout=20m ./internal/sqlite
 
 # Representative root-package costs.
-time CGO_ENABLED=1 go test -race -cpu=2 -count=1 -timeout=20m . \
+time CGO_ENABLED=1 go test -race -cpu=2 -timeout=20m . \
   -run '^TestStartupCorruptionMatrixLeavesBytesUnchanged$'
-time CGO_ENABLED=1 go test -race -cpu=2 -count=1 -timeout=20m . \
+time CGO_ENABLED=1 go test -race -cpu=2 -timeout=20m . \
   -run '^TestContractCorpus'
-time CGO_ENABLED=1 go test -race -cpu=2 -count=1 -timeout=20m . \
+time CGO_ENABLED=1 go test -race -cpu=2 -timeout=20m . \
   -run 'Authority.*Race|Concurrent.*Operation|Concurrent.*Session'
-time CGO_ENABLED=1 go test -race -cpu=2 -count=1 -timeout=20m . \
+time CGO_ENABLED=1 go test -race -cpu=2 -timeout=20m . \
   -run '^TestDBOS'
 ```
 
-Use `go test -race -cpu=2 -count=1 -timeout=20m -v` when comparing individual test durations to
+Use `CGO_ENABLED=1 go test -race -cpu=2 -timeout=20m -v` when comparing individual test durations to
 wall time. Similar totals indicate a serial critical path; a much larger sum
 indicates useful overlap. Use CPU profiles to attribute setup cost rather than
 assuming SQLite itself is the bottleneck:
 
 ```bash
-CGO_ENABLED=1 go test -cpu=2 -count=1 -cpuprofile=cpu.prof .
+CGO_ENABLED=1 go test -race -cpu=2 -cpuprofile=cpu.prof .
 go tool pprof -top -cum cpu.prof
 ```
 
@@ -235,7 +240,7 @@ contributed. Future contributors should avoid reintroducing these patterns.
 
 | Regression trap | Why it inflated runtime | Evidence observed here | Prevention rule |
 |---|---|---|---|
-| Treating `-count` as a CPU setting | `-count=N` executes every selected test N times; it does not allocate N CPUs. | `-count=2` race runs exceeded 560-650 seconds, and the proposed `-count=16` command would have repeated the complete suite sixteen times. | Keep authoritative gates at `-count=1`. Leave `-cpu`, `-p`, and `-parallel` unset unless a documented experiment needs them. |
+| Treating `-count` as a CPU setting | `-count=N` executes every selected test N times; it does not allocate N CPUs. | `-count=2` race runs exceeded 560-650 seconds, and the proposed `-count=16` command would have repeated the complete suite sixteen times. | Authoritative gates specify no `-count` at all. Leave `-cpu`, `-p`, and `-parallel` unset unless a documented experiment needs them. |
 | DBOS's one-second default result polling in test harnesses | Every durable-result observation paid coarse polling latency even when the local result was already available. | The two main retry families took about 19 seconds each at one second, versus 4-6 seconds with 50 ms polling. | Keep Provenance's validated zero-value `ResultPollingInterval` default at 50 ms. Use explicit intervals only when testing the interval contract, and do not replace polling with sleeps. |
 | Rebuilding and reopening a complete valid SQLite fixture for every corruption case | Schema creation, migrations, fixture writes, integrity verification, WAL handling, and production reopen were repeated before each one-row mutation. | The startup corruption family repeatedly appeared as a 53-63 second race hotspot before validated baseline copying; raw per-copy mutation reduced its focused repeated race measurement by 73.51%. | Build, production-validate, checkpoint, close, and digest one immutable baseline; byte-copy it to a private path per case. Never use the baseline for tests whose contract is creation, migration, crash recovery, or shared-WAL behavior. |
 | Recreating a tracker and schema inside every iteration of one race scenario | Forty race attempts paid full `OpenMemory`, schema, actor, and bootstrap setup forty times. | The two authority races fell to 4.412 seconds together after reusing one tracker with unique per-iteration identities. | Reuse setup only within one test when every iteration uses distinct task, assignment, and operation IDs and accumulated state cannot alter the invariant. Keep independent tests isolated. |
@@ -300,7 +305,7 @@ borrowed attempt per DBOS callback without elapsed-time or sleep-sequence checks
 
 Run the full uncached race suite once per authoritative gate. Local workflows
 may use narrow package runs while iterating, but a narrow run does not replace
-the final configured `go test -race ... -count=1 ... ./...` result. CI jobs should not repeat an
+the final configured `CGO_ENABLED=1 go test -race ... ./...` result. CI jobs should not repeat an
 identical full race invocation unless they run on a materially different target
 or configuration.
 

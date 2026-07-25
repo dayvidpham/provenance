@@ -12,15 +12,6 @@ import (
 	"zombiezen.com/go/sqlite/sqlitex"
 )
 
-// bindJournalScope leases one runtime connection or borrows the activation-owned
-// connection. Activation never takes a lease from the runtime pool.
-func (db *DB) bindJournalScope(ctx context.Context, target projectionTarget) (*connScope, error) {
-	if db.pool == nil {
-		return borrowConnScope(db.conn, target), nil
-	}
-	return db.bindScope(ctx, target)
-}
-
 // journalParseActor / journalParseTask resolve stored wire-format IDs into the
 // single typed identity domain, so a corrupt stored ID surfaces as a decode
 // error rather than a silent zero value.
@@ -78,7 +69,7 @@ const insertJournalAuthoritySQL = "INSERT INTO journal_authorities (journal_id, 
 // ensureJournalSchema creates the journal-base relations and seeds the closed
 // journal_kinds lookup. Idempotent (CREATE TABLE IF NOT EXISTS / INSERT OR
 // IGNORE), mirroring the existing reference-data discipline.
-func (db *connScope) ensureJournalSchema() error {
+func (scope *connScope) ensureJournalSchema() error {
 	ddl := []string{
 		"CREATE TABLE IF NOT EXISTS journal_kinds (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT",
 		`CREATE TABLE IF NOT EXISTS journal (
@@ -97,7 +88,7 @@ func (db *connScope) ensureJournalSchema() error {
 		journalAttributedViewDDL,
 	}
 	for _, stmt := range ddl {
-		if err := sqlitex.ExecuteTransient(db.conn, stmt, nil); err != nil {
+		if err := sqlitex.ExecuteTransient(scope.conn, stmt, nil); err != nil {
 			return fmt.Errorf("ensureJournalSchema: statement %q: %w", stmt, err)
 		}
 	}
@@ -105,25 +96,11 @@ func (db *connScope) ensureJournalSchema() error {
 	// Seed journal_kinds from the single source of truth in the journal package,
 	// so the SQL lookup and the Go enum can never drift.
 	for _, k := range journal.JournalKinds() {
-		if err := sqlitex.Execute(db.conn, "INSERT OR IGNORE INTO journal_kinds (id, name) VALUES (?1, ?2)", &sqlitex.ExecOptions{Args: []any{int(k), k.String()}}); err != nil {
+		if err := sqlitex.Execute(scope.conn, "INSERT OR IGNORE INTO journal_kinds (id, name) VALUES (?1, ?2)", &sqlitex.ExecOptions{Args: []any{int(k), k.String()}}); err != nil {
 			return fmt.Errorf("ensureJournalSchema: seed journal_kinds %s: %w", k, err)
 		}
 	}
 	return nil
-}
-
-// P2 compatibility adapters for activation and the unchanged Apply slice. They
-// borrow the caller-owned connection and never acquire or release a pool lease.
-func (db *DB) ensureJournalSchema() error {
-	return borrowConnScope(db.conn, db.projectionTarget).ensureJournalSchema()
-}
-
-func (db *DB) verifySubtypeIntegrityLocked() error {
-	return borrowConnScope(db.conn, db.projectionTarget).verifySubtypeIntegrityLocked()
-}
-
-func (db *DB) verifyActorPlacementLocked() error {
-	return borrowConnScope(db.conn, db.projectionTarget).verifyActorPlacementLocked()
 }
 
 // ---------------------------------------------------------------------------
@@ -155,7 +132,7 @@ func (db *DB) AppendTaskEvent(in journal.AppendTaskEventInput) (journal.TaskEven
 	}
 	recordedAt := in.RecordedAt.UTC()
 
-	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return journal.TaskEventRow{}, fmt.Errorf("AppendTaskEvent: lease connection: %w", err)
 	}
@@ -194,7 +171,7 @@ func (db *DB) AppendTaskEvent(in journal.AppendTaskEventInput) (journal.TaskEven
 	}
 
 	// Reducer subtype-integrity gate (§10 rule 8) before the projections.
-	if txErr = scope.verifySubtypeIntegrityLocked(); txErr != nil {
+	if txErr = scope.verifySubtypeIntegrity(); txErr != nil {
 		return journal.TaskEventRow{}, txErr
 	}
 
@@ -231,7 +208,7 @@ func (db *DB) AppendTaskEvent(in journal.AppendTaskEventInput) (journal.TaskEven
 // later slices) always write the subtype row atomically. The caller is expected
 // to VerifyIntegrity and roll back.
 func (db *DB) AppendBareJournalRow(kind journal.JournalKind, actorID journal.ActorID, recordedAt time.Time) (journal.JournalID, error) {
-	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return 0, fmt.Errorf("AppendBareJournalRow: lease connection: %w", err)
 	}
@@ -255,21 +232,29 @@ func (db *DB) AppendBareJournalRow(kind journal.JournalKind, actorID journal.Act
 // discriminator agreement (a subtype row's table matches journal.kind_id). It is
 // the §15 convergence tool Open uses and the gate AppendTaskEvent runs before
 // commit. Returns journal.ErrSubtypeIntegrity on any violation.
-func (db *DB) VerifyIntegrity() (err error) {
-	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
+func (db *DB) VerifyIntegrity() error {
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return fmt.Errorf("VerifyIntegrity: lease connection: %w", err)
 	}
 	defer scope.release()
+	return scope.verifyIntegrity()
+}
+
+// verifyIntegrity is the scope-owned core of [DB.VerifyIntegrity]. Startup runs
+// it on its single borrowed activation scope; runtime callers run it on a
+// pooled lease. It opens its own savepoint so it composes inside an enclosing
+// activation transaction.
+func (scope *connScope) verifyIntegrity() (err error) {
 	endTx := sqlitex.Save(scope.conn)
 	defer endTx(&err)
-	if err := scope.verifyForeignKeyTopologyLocked(); err != nil {
+	if err := scope.verifyForeignKeyTopology(); err != nil {
 		return err
 	}
-	if err := scope.verifySubtypeIntegrityLocked(); err != nil {
+	if err := scope.verifySubtypeIntegrity(); err != nil {
 		return err
 	}
-	if err := scope.verifyActorPlacementLocked(); err != nil {
+	if err := scope.verifyActorPlacement(); err != nil {
 		return err
 	}
 	// Watermark presence is checked LAST: it is the §8.1 tightening (no un-journaled
@@ -278,13 +263,13 @@ func (db *DB) VerifyIntegrity() (err error) {
 	// journal violation. Ordering it last lets the adversarial corpus assert those
 	// journal-row violations by their own sentinel without a coexisting legacy task
 	// row masking them.
-	return scope.verifyWatermarkPresenceLocked()
+	return scope.verifyWatermarkPresence()
 }
 
-func (db *connScope) verifyForeignKeyTopologyLocked() error {
+func (scope *connScope) verifyForeignKeyTopology() error {
 	var table, parent string
 	var rowID int64
-	if err := sqlitex.Execute(db.conn, "PRAGMA foreign_key_check", &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
+	if err := sqlitex.Execute(scope.conn, "PRAGMA foreign_key_check", &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
 		if table == "" {
 			table, rowID, parent = stmt.ColumnText(0), stmt.ColumnInt64(1), stmt.ColumnText(2)
 		}
@@ -296,14 +281,14 @@ func (db *connScope) verifyForeignKeyTopologyLocked() error {
 		return fmt.Errorf("%w: table %s row %d references missing parent %s — where: read-only startup topology preflight; impact: activation stopped before persistent pragmas or writes; fix: restore the missing canonical support/supertype row", journal.ErrSubtypeIntegrity, table, rowID, parent)
 	}
 	var produced int64
-	if err := sqlitex.Execute(db.conn, "SELECT j.journal_id FROM journal j LEFT JOIN journal_operations o ON o.journal_id=j.produced_by_operation_journal_id WHERE j.produced_by_operation_journal_id IS NOT ?1 AND o.journal_id IS ?2 LIMIT ?3", &sqlitex.ExecOptions{Args: []any{nil, nil, 1}, ResultFunc: func(stmt *zs.Stmt) error { produced = stmt.ColumnInt64(0); return nil }}); err != nil {
+	if err := sqlitex.Execute(scope.conn, "SELECT j.journal_id FROM journal j LEFT JOIN journal_operations o ON o.journal_id=j.produced_by_operation_journal_id WHERE j.produced_by_operation_journal_id IS NOT ?1 AND o.journal_id IS ?2 LIMIT ?3", &sqlitex.ExecOptions{Args: []any{nil, nil, 1}, ResultFunc: func(stmt *zs.Stmt) error { produced = stmt.ColumnInt64(0); return nil }}); err != nil {
 		return fmt.Errorf("verify operation producer topology: %w", err)
 	}
 	if produced != 0 {
 		return fmt.Errorf("%w: journal row %d references a missing producing operation — where: read-only startup topology preflight; impact: activation stopped before writes; fix: restore its journal_operations anchor", journal.ErrSubtypeIntegrity, produced)
 	}
 	var orphanEpisode string
-	if err := sqlitex.Execute(db.conn, "SELECT e.assignment_id FROM journal_authority_assignment_episodes e LEFT JOIN journal_authority_assignment_transitions t ON t.assignment_id=e.assignment_id WHERE t.journal_id IS ?1 LIMIT ?2", &sqlitex.ExecOptions{Args: []any{nil, 1}, ResultFunc: func(stmt *zs.Stmt) error { orphanEpisode = stmt.ColumnText(0); return nil }}); err != nil {
+	if err := sqlitex.Execute(scope.conn, "SELECT e.assignment_id FROM journal_authority_assignment_episodes e LEFT JOIN journal_authority_assignment_transitions t ON t.assignment_id=e.assignment_id WHERE t.journal_id IS ?1 LIMIT ?2", &sqlitex.ExecOptions{Args: []any{nil, 1}, ResultFunc: func(stmt *zs.Stmt) error { orphanEpisode = stmt.ColumnText(0); return nil }}); err != nil {
 		return fmt.Errorf("verify assignment episode topology: %w", err)
 	}
 	if orphanEpisode != "" {
@@ -312,13 +297,13 @@ func (db *connScope) verifyForeignKeyTopologyLocked() error {
 	return nil
 }
 
-// verifyWatermarkPresenceLocked enforces the §8.1 watermark tightening over stored
+// verifyWatermarkPresence enforces the §8.1 watermark tightening over stored
 // rows: every tasks row must carry a last_journal_id (no un-journaled task). It is a
 // no-op on an even-older legacy database whose tasks table predates the column entirely
 // (that database is not yet migrated; migration adds the column and anchors its rows,
 // §13). Returns journal.ErrWatermarkMissing on the first un-anchored row.
-func (db *connScope) verifyWatermarkPresenceLocked() error {
-	present, _, err := db.tasksWatermarkColumnInfoLocked()
+func (scope *connScope) verifyWatermarkPresence() error {
+	present, _, err := scope.tasksWatermarkColumnInfo()
 	if err != nil {
 		return err
 	}
@@ -326,7 +311,7 @@ func (db *connScope) verifyWatermarkPresenceLocked() error {
 		return nil
 	}
 	var badID string
-	if err := sqlitex.Execute(db.conn, "SELECT id FROM tasks WHERE last_journal_id IS ?1 LIMIT ?2", &sqlitex.ExecOptions{Args: []any{nil, 1}, ResultFunc: func(stmt *zs.Stmt) error { badID = stmt.ColumnText(0); return nil }}); err != nil {
+	if err := sqlitex.Execute(scope.conn, "SELECT id FROM tasks WHERE last_journal_id IS ?1 LIMIT ?2", &sqlitex.ExecOptions{Args: []any{nil, 1}, ResultFunc: func(stmt *zs.Stmt) error { badID = stmt.ColumnText(0); return nil }}); err != nil {
 		return fmt.Errorf("verifyWatermarkPresence: %w", err)
 	}
 	if badID != "" {
@@ -340,7 +325,7 @@ func (db *connScope) verifyWatermarkPresenceLocked() error {
 	return nil
 }
 
-// verifyActorPlacementLocked enforces the anchor-only actor-placement invariant
+// verifyActorPlacement enforces the anchor-only actor-placement invariant
 // (§2.1, §10 rule 5): a stored actor_id is present iff the row is an anchor
 // (produced_by_operation_journal_id IS NULL). It rejects a subordinate row that
 // carries an actor (the new-model violation the retired committing-actor-agreement
@@ -348,13 +333,13 @@ func (db *connScope) verifyWatermarkPresenceLocked() error {
 // anchor row missing one. It backs the journal CHECK constraint that also enforces
 // this, and is the §15 convergence tool's placement guard. Returns
 // journal.ErrActorPlacement on any violation.
-func (db *connScope) verifyActorPlacementLocked() error {
+func (scope *connScope) verifyActorPlacement() error {
 	var (
 		badJID   int64
 		subord   bool
 		violated bool
 	)
-	if err := sqlitex.Execute(db.conn, "SELECT journal_id, produced_by_operation_journal_id IS NOT ?1\n\t\t FROM journal\n\t\t WHERE (produced_by_operation_journal_id IS NOT ?2 AND actor_id IS NOT ?3)\n\t\t    OR (produced_by_operation_journal_id IS ?4     AND actor_id IS ?5)\n\t\t LIMIT ?6", &sqlitex.ExecOptions{Args: []any{nil, nil, nil, nil, nil, 1}, ResultFunc: func(stmt *zs.Stmt) error {
+	if err := sqlitex.Execute(scope.conn, "SELECT journal_id, produced_by_operation_journal_id IS NOT ?1\n\t\t FROM journal\n\t\t WHERE (produced_by_operation_journal_id IS NOT ?2 AND actor_id IS NOT ?3)\n\t\t    OR (produced_by_operation_journal_id IS ?4     AND actor_id IS ?5)\n\t\t LIMIT ?6", &sqlitex.ExecOptions{Args: []any{nil, nil, nil, nil, nil, 1}, ResultFunc: func(stmt *zs.Stmt) error {
 		violated = true
 		badJID = stmt.ColumnInt64(0)
 		subord = stmt.ColumnInt64(1) == 1
@@ -548,11 +533,11 @@ var subtypeExclusivityPairs = []subtypeExclusivityPair{
 // exist in the live schema, so this guard extends automatically as later slices add
 // operation/authority/decision/evidence tables without weakening the check for the kinds
 // present today.
-func (db *connScope) subtypeTablesPresent() (map[journal.JournalKind]subtypeTable, error) {
+func (scope *connScope) subtypeTablesPresent() (map[journal.JournalKind]subtypeTable, error) {
 	present := make(map[journal.JournalKind]subtypeTable, len(subtypeAllTables))
 	for kind, table := range subtypeAllTables {
 		var exists bool
-		if err := sqlitex.Execute(db.conn,
+		if err := sqlitex.Execute(scope.conn,
 			"SELECT ?3 FROM sqlite_master WHERE type=?1 AND name=?2",
 			&sqlitex.ExecOptions{
 				Args:       []any{"table", table.label(), 1},
@@ -568,15 +553,15 @@ func (db *connScope) subtypeTablesPresent() (map[journal.JournalKind]subtypeTabl
 	return present, nil
 }
 
-func (db *connScope) verifySubtypeIntegrityLocked() error {
-	tables, err := db.subtypeTablesPresent()
+func (scope *connScope) verifySubtypeIntegrity() error {
+	tables, err := scope.subtypeTablesPresent()
 	if err != nil {
 		return err
 	}
 	for kind, table := range tables {
 		// Totality: a journal row of this kind with no subtype row.
 		var missing int64
-		if err := sqlitex.Execute(db.conn, table.totalityQuery(),
+		if err := sqlitex.Execute(scope.conn, table.totalityQuery(),
 			&sqlitex.ExecOptions{
 				Args:       []any{int(kind), nil, 1},
 				ResultFunc: func(stmt *zs.Stmt) error { missing = stmt.ColumnInt64(0); return nil },
@@ -597,7 +582,7 @@ func (db *connScope) verifySubtypeIntegrityLocked() error {
 		// carries a different kind_id (or a JournalID present in a foreign
 		// subtype table).
 		var mismatch int64
-		if err := sqlitex.Execute(db.conn, table.discriminatorQuery(),
+		if err := sqlitex.Execute(scope.conn, table.discriminatorQuery(),
 			&sqlitex.ExecOptions{
 				Args:       []any{int(kind), 1},
 				ResultFunc: func(stmt *zs.Stmt) error { mismatch = stmt.ColumnInt64(0); return nil },
@@ -618,18 +603,18 @@ func (db *connScope) verifySubtypeIntegrityLocked() error {
 	// most one subtype table. Checked explicitly so a second subtype row whose own
 	// discriminator happens to agree is still rejected (the per-table discriminator
 	// pass above only rejects a row disagreeing with its supertype).
-	if err := db.verifySubtypeExclusivityLocked(tables); err != nil {
+	if err := scope.verifySubtypeExclusivity(tables); err != nil {
 		return err
 	}
 	// Authority-level class-table inheritance (§10 rule 8, second level):
 	// journal_authorities → its bootstrap/assignment detail rows.
-	return db.verifyAuthorityDetailIntegrityLocked()
+	return scope.verifyAuthorityDetailIntegrity()
 }
 
-// verifySubtypeExclusivityLocked rejects a JournalID present in two subtype
+// verifySubtypeExclusivity rejects a JournalID present in two subtype
 // tables at once (§10 rule 8 exclusivity). The subtype PKs are all JournalID, so
 // a pairwise existence probe over the present tables is exact.
-func (db *connScope) verifySubtypeExclusivityLocked(tables map[journal.JournalKind]subtypeTable) error {
+func (scope *connScope) verifySubtypeExclusivity(tables map[journal.JournalKind]subtypeTable) error {
 	// Walk the pre-built closed pair set, probing only pairs whose BOTH tables are present
 	// in the live schema — so the check is the exact subset of pairs the former dynamic
 	// double loop covered, with no per-call SQL construction.
@@ -640,7 +625,7 @@ func (db *connScope) verifySubtypeExclusivityLocked(tables map[journal.JournalKi
 			continue
 		}
 		var dup int64
-		if err := sqlitex.Execute(db.conn, p.query.query(),
+		if err := sqlitex.Execute(scope.conn, p.query.query(),
 			&sqlitex.ExecOptions{Args: []any{1}, ResultFunc: func(stmt *zs.Stmt) error { dup = stmt.ColumnInt64(0); return nil }},
 		); err != nil {
 			return fmt.Errorf("verifySubtypeExclusivity %s/%s: %w", ta.label(), tb.label(), err)
@@ -656,13 +641,13 @@ func (db *connScope) verifySubtypeExclusivityLocked(tables map[journal.JournalKi
 	return nil
 }
 
-// verifyAuthorityDetailIntegrityLocked enforces authority-level discriminator
+// verifyAuthorityDetailIntegrity enforces authority-level discriminator
 // agreement (§10 rule 8): a bootstrap authority carries a bootstrap detail row
 // and no assignment transition; an assignment authority carries a transition and
 // no bootstrap detail.
-func (db *connScope) verifyAuthorityDetailIntegrityLocked() error {
+func (scope *connScope) verifyAuthorityDetailIntegrity() error {
 	var present bool
-	if err := sqlitex.Execute(db.conn,
+	if err := sqlitex.Execute(scope.conn,
 		"SELECT ?3 FROM sqlite_master WHERE type=?1 AND name=?2",
 		&sqlitex.ExecOptions{Args: []any{"table", "journal_authorities", 1}, ResultFunc: func(*zs.Stmt) error { present = true; return nil }}); err != nil {
 		return fmt.Errorf("verifyAuthorityDetailIntegrity: probe journal_authorities: %w", err)
@@ -686,7 +671,7 @@ func (db *connScope) verifyAuthorityDetailIntegrityLocked() error {
 		if c.query == authorityBootstrapMissing || c.query == authorityAssignmentMissing {
 			args = []any{c.want, nil, 1}
 		}
-		if err := sqlitex.Execute(db.conn, c.query.query(),
+		if err := sqlitex.Execute(scope.conn, c.query.query(),
 			&sqlitex.ExecOptions{Args: args, ResultFunc: func(stmt *zs.Stmt) error { bad = stmt.ColumnInt64(0); return nil }},
 		); err != nil {
 			return fmt.Errorf("verifyAuthorityDetailIntegrity %s: %w", c.label, err)
@@ -721,7 +706,7 @@ func (db *DB) QueryTaskEvents(q journal.JournalQueryV1) (page journal.JournalTas
 		return journal.JournalTaskEventPageV1{}, err
 	}
 
-	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return journal.JournalTaskEventPageV1{}, fmt.Errorf("QueryTaskEvents: lease connection: %w", err)
 	}
@@ -821,7 +806,7 @@ func (db *DB) QueryTaskEvents(q journal.JournalQueryV1) (page journal.JournalTas
 	}
 	// Attach each row's canonical context set.
 	for i := range rows {
-		ctxs, err := scope.loadContextsLocked(int64(rows[i].JournalID))
+		ctxs, err := scope.loadContexts(int64(rows[i].JournalID))
 		if err != nil {
 			return journal.JournalTaskEventPageV1{}, err
 		}
@@ -853,9 +838,9 @@ func scanTaskEventRow(stmt *zs.Stmt) (journal.TaskEventRow, error) {
 	}, nil
 }
 
-func (db *connScope) loadContextsLocked(journalID int64) ([]journal.EventContext, error) {
+func (scope *connScope) loadContexts(journalID int64) ([]journal.EventContext, error) {
 	var ctxs []journal.EventContext
-	if err := sqlitex.Execute(db.conn, "SELECT context_kind, context_identity FROM journal_task_event_contexts\n\t\t WHERE event_journal_id = ?1 ORDER BY context_kind, context_identity", &sqlitex.ExecOptions{
+	if err := sqlitex.Execute(scope.conn, "SELECT context_kind, context_identity FROM journal_task_event_contexts\n\t\t WHERE event_journal_id = ?1 ORDER BY context_kind, context_identity", &sqlitex.ExecOptions{
 		Args: []any{journalID},
 		ResultFunc: func(stmt *zs.Stmt) error {
 			ctx, decErr := journal.DecodeStoredEventContext(
@@ -879,7 +864,7 @@ func (db *connScope) loadContextsLocked(journalID int64) ([]journal.EventContext
 // TaskAttributions returns the cumulative attribution edges for a task in
 // ascending FirstJournalID order.
 func (db *DB) TaskAttributions(taskID journal.TaskID) (out []journal.TaskAttribution, err error) {
-	scope, err := db.bindJournalScope(context.Background(), projectionTargetLive)
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return nil, fmt.Errorf("TaskAttributions: lease connection: %w", err)
 	}

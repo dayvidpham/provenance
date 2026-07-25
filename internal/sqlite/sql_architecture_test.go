@@ -75,7 +75,7 @@ func TestApplyDelegatesExactlyOnceWithoutLoop(t *testing.T) {
 					loops++
 				case *ast.CallExpr:
 					selector, ok := node.Fun.(*ast.SelectorExpr)
-					if ok && selector.Sel.Name == "applyPreparedLocked" {
+					if ok && selector.Sel.Name == "foldPreparedOperation" {
 						preparedCalls++
 					}
 				}
@@ -84,7 +84,7 @@ func TestApplyDelegatesExactlyOnceWithoutLoop(t *testing.T) {
 		}
 	}
 	if applyMethods != 1 || preparedCalls != 1 || loops != 0 {
-		t.Fatalf("DB.Apply source contract: methods=%d applyPreparedLocked calls=%d loops=%d, want 1/1/0", applyMethods, preparedCalls, loops)
+		t.Fatalf("DB.Apply source contract: methods=%d foldPreparedOperation calls=%d loops=%d, want 1/1/0", applyMethods, preparedCalls, loops)
 	}
 }
 

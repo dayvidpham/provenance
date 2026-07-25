@@ -11,18 +11,18 @@ import (
 // result_slots.go owns the complete committed-result reconstruction with
 // ActivityID slot support and the ValidateResultSlotBinding call-through.
 //
-// reconstructAndValidateCommittedLocked replaces the prior inline reconstruction
+// reconstructAndValidateCommitted replaces the prior inline reconstruction
 // in operations_helpers.go. The new version resolves ActivityID for
-// JournalKindActivity result slots using lookupActivityIDForJournalRowLocked
+// JournalKindActivity result slots using lookupActivityIDForJournalRow
 // (activity_replay.go) and then validates all bindings via
 // journal.ValidateResultSlotBinding.
 
-// reconstructAndValidateCommittedLocked builds the complete CommittedResult for
+// reconstructAndValidateCommitted builds the complete CommittedResult for
 // an anchor journal_id, resolves all result slot bindings (including ActivityID
 // for JournalKindActivity slots), validates each binding, and returns the result.
 // It does NOT set ShortCircuited — the caller sets that for replay paths.
 // The caller owns scope.conn and its transaction.
-func (scope *connScope) reconstructAndValidateCommittedLocked(anchor int64) (journal.CommittedResult, error) {
+func (scope *connScope) reconstructAndValidateCommitted(anchor int64) (journal.CommittedResult, error) {
 	res := journal.CommittedResult{Kind: journal.CommittedExact, AnchorJournalID: journal.JournalID(anchor)}
 
 	// EmittedEvents: flat task_event closure in JournalID order (§2.1, §3.2).
@@ -68,7 +68,7 @@ func (scope *connScope) reconstructAndValidateCommittedLocked(anchor int64) (jou
 			continue
 		}
 		jid := int64(res.ResultSlots[i].ProducedJournalID)
-		actID, found, err := scope.lookupActivityIDForJournalRowLocked(jid)
+		actID, found, err := scope.lookupActivityIDForJournalRow(jid)
 		if err != nil {
 			return journal.CommittedResult{}, fmt.Errorf(
 				"reconstruct activity result slot %q (journal row %d): %w",

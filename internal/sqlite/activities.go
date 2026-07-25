@@ -24,7 +24,7 @@ func (db *DB) StartActivity(agentID ptypes.AgentID, phase ptypes.Phase, stage pt
 		Notes:     notes,
 	}
 
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return ptypes.Activity{}, fmt.Errorf("sqlite.StartActivity: lease connection: %w", err)
 	}
@@ -52,7 +52,7 @@ func (db *DB) StartActivity(agentID ptypes.AgentID, phase ptypes.Phase, stage pt
 // over the workflow's logical identity) collapses the duplicate to one row.
 func (db *DB) StartActivityWithID(id ptypes.ActivityID, agentID ptypes.AgentID, phase ptypes.Phase, stage ptypes.Stage, notes string) (ptypes.Activity, error) {
 	now := time.Now().UTC()
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return ptypes.Activity{}, fmt.Errorf("sqlite.StartActivityWithID: lease connection: %w", err)
 	}
@@ -93,7 +93,7 @@ func (db *DB) StartActivityWithID(id ptypes.ActivityID, agentID ptypes.AgentID, 
 // Returns ptypes.ErrNotFound if the activity does not exist.
 func (db *DB) EndActivity(id ptypes.ActivityID) (ptypes.Activity, error) {
 	endTime := time.Now().UTC()
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return ptypes.Activity{}, fmt.Errorf("sqlite.EndActivity: lease connection: %w", err)
 	}
@@ -131,7 +131,7 @@ func (db *DB) EndActivity(id ptypes.ActivityID) (ptypes.Activity, error) {
 // GetActivities returns all activities, optionally filtered by agent.
 // Pass nil to return activities for all agents.
 func (db *DB) GetActivities(agentID *ptypes.AgentID) ([]ptypes.Activity, error) {
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite.GetActivities: lease connection: %w", err)
 	}

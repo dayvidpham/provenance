@@ -28,7 +28,7 @@ func TestQueryTaskEventsUsesPoolLeaseIndependentOfHeldScope(t *testing.T) {
 		recordedAt: time.Now().UTC(),
 	}})
 
-	held, err := db.bindConn(context.Background())
+	held, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		t.Fatalf("bind independent held scope: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestMigrationWriterPreservesConcurrentWALReadSnapshot(t *testing.T) {
 		t.Fatalf("SeedLegacyTask: %v", err)
 	}
 
-	reader, err := db.bindConn(context.Background())
+	reader, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		t.Fatalf("bind reader: %v", err)
 	}
@@ -145,7 +145,7 @@ func TestMigrationWriterPreservesConcurrentWALReadSnapshot(t *testing.T) {
 		t.Fatalf("reader snapshot changed during migration: before=%d during=%d", before, during)
 	}
 
-	fresh, err := db.bindConn(context.Background())
+	fresh, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		t.Fatalf("bind fresh reader: %v", err)
 	}
@@ -404,14 +404,14 @@ func (held *heldRuntimeScopes) release() {
 func takeAllRuntimeScopes(t *testing.T, db *DB, operation string) *heldRuntimeScopes {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), poolTestTimeout)
-	scopes := make([]*connScope, 0, runtimePoolSize-1)
-	seen := make(map[*zs.Conn]struct{}, runtimePoolSize-1)
-	for len(scopes) < runtimePoolSize-1 {
-		scope, err := db.bindConn(ctx)
+	scopes := make([]*connScope, 0, runtimePoolSize)
+	seen := make(map[*zs.Conn]struct{}, runtimePoolSize)
+	for len(scopes) < runtimePoolSize {
+		scope, err := db.bindScope(ctx, projectionTargetLive)
 		if err != nil {
 			releaseScopes(scopes)
 			cancel()
-			t.Fatalf("acquire runtime scope %d/%d %s: %v", len(scopes)+1, runtimePoolSize-1, operation, err)
+			t.Fatalf("acquire runtime scope %d/%d %s: %v", len(scopes)+1, runtimePoolSize, operation, err)
 		}
 		if _, duplicate := seen[scope.conn]; duplicate {
 			scope.release()
@@ -435,7 +435,7 @@ type durableTableSnapshot map[string][]string
 
 func snapshotAllDurableTables(t *testing.T, db *DB) durableTableSnapshot {
 	t.Helper()
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		t.Fatalf("bind durable snapshot scope: %v", err)
 	}
@@ -488,7 +488,7 @@ type durableTaskTuple struct {
 
 func snapshotLegacyTaskTuple(t *testing.T, db *DB, task journal.TaskID) durableTaskTuple {
 	t.Helper()
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		t.Fatalf("bind legacy task snapshot: %v", err)
 	}
@@ -514,7 +514,7 @@ func snapshotLegacyTaskTuple(t *testing.T, db *DB, task journal.TaskID) durableT
 
 func assertMigrationOperationAbsent(t *testing.T, db *DB, operation journal.OperationID) {
 	t.Helper()
-	scope, err := db.bindConn(context.Background())
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		t.Fatalf("bind migration OperationID check: %v", err)
 	}
