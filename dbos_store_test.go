@@ -191,6 +191,12 @@ func TestBorrowed_PostShutdown_StoreUnavailable(t *testing.T) {
 	_, lookErr := tr.Journal().LookupCommitted("op-x")
 	mustStoreUnavailable(t, lookErr, "Journal.LookupCommitted")
 
+	facts := tr.Journal().Facts()
+	_, decisionErr := facts.QueryDecisions(provenance.DecisionQuery{})
+	mustStoreUnavailable(t, decisionErr, "Journal.Facts.QueryDecisions")
+	_, evidenceErr := facts.QueryEvidence(provenance.EvidenceQuery{})
+	mustStoreUnavailable(t, evidenceErr, "Journal.Facts.QueryEvidence")
+
 	// Cleanup after shutdown is safe and repeat-safe (closes only the bridge).
 	if err := tr.Close(); err != nil {
 		t.Errorf("first Close after shutdown: %v", err)

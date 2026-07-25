@@ -76,7 +76,7 @@ func (db *DB) AdversarialInstallV1OperationConstraint() (err error) {
 // corpus can drive the production VerifyIntegrity guard (§10 rule 8) and the
 // rule-9 result-slot integrity check (§3.2) against real violations. Production
 // paths (Apply) always write consistent rows; these seams are used only by the
-// corpus and are never part of the JournalAPI surface.
+// corpus and are never part of the Journal surface.
 
 // AdversarialJournalRowTwoSubtypes writes one journal row of kind=decision and
 // gives it rows in BOTH journal_decisions and journal_evidence, violating

@@ -21,7 +21,7 @@ import (
 var errScriptedJournalFault = errors.New("scripted borrowed-journal dependency fault")
 
 type scriptedRetryJournal struct {
-	JournalAPI
+	Journal
 	mu          sync.Mutex
 	failures    int64
 	fault       error
@@ -59,7 +59,7 @@ func (j *scriptedRetryJournal) Apply(input OperationInput) (CommittedResult, err
 		}
 		return CommittedResult{}, fmt.Errorf("%w on attempt %d", fault, attempt)
 	}
-	result, err := j.JournalAPI.Apply(input)
+	result, err := j.Journal.Apply(input)
 	if err == nil {
 		j.writes.Add(1)
 	}
@@ -74,7 +74,7 @@ func (j *scriptedRetryJournal) LookupCommitted(operation OperationID) (Committed
 	if fault != nil {
 		return CommittedResult{}, fault
 	}
-	return j.JournalAPI.LookupCommitted(operation)
+	return j.Journal.LookupCommitted(operation)
 }
 
 type scriptedRetryTracker struct {
@@ -82,7 +82,7 @@ type scriptedRetryTracker struct {
 	journal *scriptedRetryJournal
 }
 
-func (t *scriptedRetryTracker) Journal() JournalAPI { return t.journal }
+func (t *scriptedRetryTracker) Journal() Journal { return t.journal }
 
 type retryTerminalStack struct {
 	root      dbos.DBOSContext
@@ -119,7 +119,7 @@ func newRetryTerminalStack(t *testing.T, name string, options DBOSStepOptions) *
 		t.Fatal(err)
 	}
 	authority, _ := slotJournalID(genesis, "authority")
-	journal := &scriptedRetryJournal{JournalAPI: borrowed.Journal()}
+	journal := &scriptedRetryJournal{Journal: borrowed.Journal()}
 	tracker := &scriptedRetryTracker{Tracker: borrowed, journal: journal}
 	adapter, err := NewDBOSAdapter(root, tracker, DBOSAdapterConfig{StepOptions: options})
 	if err != nil {

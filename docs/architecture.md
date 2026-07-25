@@ -38,7 +38,7 @@ provenance.Tracker -------------------- ModelRegistry
   |                    +-----------------+-----------------+
   |                    |                                   |
   |                    v                                   v
-  |             JournalAPI.Apply                    DBOSAdapter.Apply
+  |             Journal.Apply                      DBOSAdapter.Apply
   |                    |                                   |
   |                    +-----------------+-----------------+
   |                                      v
@@ -107,7 +107,7 @@ an ambiguous response must pin and reuse a stable `OperationID`. Session methods
 that accept `ApplyOption` support `WithOperationID` directly. The edge, label,
 and comment convenience methods do not accept options; retry-safe callers use
 `Session.Atomic` with `WithOperationID`, or construct a direct
-`JournalAPI.Apply`. An exact retry returns the committed result; reuse with
+`Journal.Apply`. An exact retry returns the committed result; reuse with
 changed canonical input returns a typed conflict.
 
 ## Global Journal And Projections
@@ -205,7 +205,7 @@ packages.
 
 ## DBOS Durable Execution
 
-DBOS is optional. Standalone trackers commit through `JournalAPI.Apply`; callers
+DBOS is optional. Standalone trackers commit through `Journal.Apply`; callers
 that need crash-resumable execution use `DBOSAdapter.Apply`. Both paths converge
 on the same journal reducer and SQLite projections.
 

@@ -93,8 +93,8 @@ type ConditionFailureReason uint8
 
 const (
 	ConditionFactMissing     ConditionFailureReason = iota // no matching fact row exists
-	ConditionFactMismatch                                   // ExactFact: stored JournalID ≠ asserted
-	ConditionCurrentMismatch                                // CurrentFact: a newer instance exists
+	ConditionFactMismatch                                  // ExactFact: stored JournalID ≠ asserted
+	ConditionCurrentMismatch                               // CurrentFact: a newer instance exists
 )
 
 var conditionFailureReasonNames = [...]string{"FactMissing", "FactMismatch", "CurrentMismatch"}
@@ -172,8 +172,8 @@ type EvidencePage struct {
 	Next                 *FactCursor
 }
 
-// FactQueryAPI is implemented by the bounded read layer independently of the
-// mutation JournalAPI, so existing stores need no placeholder query methods.
+// FactQueryAPI is implemented by the bounded read layer and exposed from the
+// mutation Journal through its lifecycle-owned Facts accessor.
 type FactQueryAPI interface {
 	QueryDecisions(DecisionQuery) (DecisionPage, error)
 	QueryEvidence(EvidenceQuery) (EvidencePage, error)

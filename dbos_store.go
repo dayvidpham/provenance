@@ -172,7 +172,7 @@ func (b *borrowedTracker) As(actor ActorID, authority JournalID) *Session {
 }
 
 // Journal returns the liveness-gated ordered global-journal surface.
-func (b *borrowedTracker) Journal() JournalAPI {
+func (b *borrowedTracker) Journal() Journal {
 	return &borrowedJournal{inner: b.inner.Journal(), owner: b}
 }
 
@@ -331,12 +331,37 @@ func (b *borrowedTracker) Activities(agentID *AgentID) ([]Activity, error) {
 }
 
 // ---------------------------------------------------------------------------
-// borrowedJournal — liveness-gated JournalAPI
+// borrowedJournal — liveness-gated Journal
 // ---------------------------------------------------------------------------
 
 type borrowedJournal struct {
-	inner JournalAPI
+	inner Journal
 	owner *borrowedTracker
+}
+
+// Facts returns a liveness-gated reader over the same borrowed journal. The
+// accessor itself has no error result, so each query performs the owner check.
+func (j *borrowedJournal) Facts() FactQueryAPI {
+	return &borrowedFactQueries{inner: j.inner.Facts(), owner: j.owner}
+}
+
+type borrowedFactQueries struct {
+	inner FactQueryAPI
+	owner *borrowedTracker
+}
+
+func (q *borrowedFactQueries) QueryDecisions(in DecisionQuery) (DecisionPage, error) {
+	if err := q.owner.available("Journal.Facts.QueryDecisions"); err != nil {
+		return DecisionPage{}, err
+	}
+	return q.inner.QueryDecisions(in)
+}
+
+func (q *borrowedFactQueries) QueryEvidence(in EvidenceQuery) (EvidencePage, error) {
+	if err := q.owner.available("Journal.Facts.QueryEvidence"); err != nil {
+		return EvidencePage{}, err
+	}
+	return q.inner.QueryEvidence(in)
 }
 
 func (j *borrowedJournal) QueryTaskEvents(q JournalQueryV1) (JournalTaskEventPageV1, error) {

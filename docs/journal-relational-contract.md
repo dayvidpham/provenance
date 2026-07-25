@@ -1062,7 +1062,7 @@ boundary, before returning to the caller.
    marker), so the only thing the `CHECK` rejects is the retired bare NULL-producer
    append; the base primitive's method shape is unchanged (the layering holds
    because only *which callers remain legal* changes under `#5`'s schema), and the
-   bare-append public path is retired from the operations-layer `JournalAPI`.
+   bare-append public path is retired from the operations-layer `Journal`.
    `VerifyIntegrity`'s §10 rule 8 subtype-integrity guard is orthogonal to rule 2.
 3. Common fields (`JournalKind`, `ActorID`, `RecordedAt`) are never
    duplicated on a subtype row; a subtype row's only own attributes are the

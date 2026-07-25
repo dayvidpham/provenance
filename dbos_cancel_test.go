@@ -19,7 +19,7 @@ import (
 // blockingJournal gates the FIRST domain fold on a release channel so a test can
 // cancel the caller while the adapter awaits, then let the durable step complete.
 type blockingJournal struct {
-	provenance.JournalAPI
+	provenance.Journal
 	started   chan struct{}
 	release   chan struct{}
 	startOnce sync.Once
@@ -28,7 +28,7 @@ type blockingJournal struct {
 func (b *blockingJournal) Apply(in provenance.OperationInput) (provenance.CommittedResult, error) {
 	b.startOnce.Do(func() { close(b.started) })
 	<-b.release
-	return b.JournalAPI.Apply(in)
+	return b.Journal.Apply(in)
 }
 
 type blockingTracker struct {
@@ -36,7 +36,7 @@ type blockingTracker struct {
 	journal *blockingJournal
 }
 
-func (b *blockingTracker) Journal() provenance.JournalAPI { return b.journal }
+func (b *blockingTracker) Journal() provenance.Journal { return b.journal }
 
 func TestCancel_AlreadyCancelled_StartsNothing(t *testing.T) {
 	s := newDBOSStack(t, nil)
@@ -62,9 +62,9 @@ func TestCancel_WhileGated_DurableWorkContinues(t *testing.T) {
 	var bj *blockingJournal
 	s := newDBOSStack(t, func(real provenance.Tracker) provenance.Tracker {
 		bj = &blockingJournal{
-			JournalAPI: real.Journal(),
-			started:    make(chan struct{}),
-			release:    make(chan struct{}),
+			Journal: real.Journal(),
+			started: make(chan struct{}),
+			release: make(chan struct{}),
 		}
 		return &blockingTracker{Tracker: real, journal: bj}
 	})
@@ -142,9 +142,9 @@ func TestCancel_DeadlineWhileGated(t *testing.T) {
 	var bj *blockingJournal
 	s := newDBOSStack(t, func(real provenance.Tracker) provenance.Tracker {
 		bj = &blockingJournal{
-			JournalAPI: real.Journal(),
-			started:    make(chan struct{}),
-			release:    make(chan struct{}),
+			Journal: real.Journal(),
+			started: make(chan struct{}),
+			release: make(chan struct{}),
 		}
 		return &blockingTracker{Tracker: real, journal: bj}
 	})

@@ -25,7 +25,7 @@ import (
 // on-disk-corruption / partial-write shape), which is the class of damage §15's
 // from-empty convergence and §10's whole-journal scan exist to catch. Production
 // paths (Apply, migration) never delete or renumber committed rows; these seams are
-// used only by the corpus and are never part of the JournalAPI surface.
+// used only by the corpus and are never part of the Journal surface.
 
 // AdversarialDeleteSubtypeRow deletes the subtype row for a surviving supertype
 // journal row (an "orphaned anchor" — the subtype row deleted out from under it),

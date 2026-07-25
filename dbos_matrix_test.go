@@ -17,13 +17,13 @@ import (
 	"github.com/google/uuid"
 )
 
-// fakeJournal wraps a real JournalAPI, counting fold ATTEMPTS (every Apply call,
+// fakeJournal wraps a real Journal, counting fold ATTEMPTS (every Apply call,
 // which the step skips entirely on a §9.4/DBOS replay) and successful COMMITS (the
 // "execute once" oracle, tolerant of DBOS retry attempts that do not commit),
 // and optionally transforming LookupCommitted to inject a matrix
 // divergence.
 type fakeJournal struct {
-	provenance.JournalAPI
+	provenance.Journal
 	attempts *int
 	commits  *int
 	lookup   func(real provenance.CommittedResult, realErr error) (provenance.CommittedResult, error)
@@ -33,7 +33,7 @@ func (f *fakeJournal) Apply(in provenance.OperationInput) (provenance.CommittedR
 	if f.attempts != nil {
 		*f.attempts++
 	}
-	res, err := f.JournalAPI.Apply(in)
+	res, err := f.Journal.Apply(in)
 	if err == nil && f.commits != nil {
 		*f.commits++
 	}
@@ -41,7 +41,7 @@ func (f *fakeJournal) Apply(in provenance.OperationInput) (provenance.CommittedR
 }
 
 func (f *fakeJournal) LookupCommitted(op provenance.OperationID) (provenance.CommittedResult, error) {
-	real, err := f.JournalAPI.LookupCommitted(op)
+	real, err := f.Journal.LookupCommitted(op)
 	if f.lookup != nil {
 		return f.lookup(real, err)
 	}
@@ -54,7 +54,7 @@ type wrappedTracker struct {
 	journal *fakeJournal
 }
 
-func (w *wrappedTracker) Journal() provenance.JournalAPI { return w.journal }
+func (w *wrappedTracker) Journal() provenance.Journal { return w.journal }
 
 // counters holds the attempt/commit counters a matrix test asserts against.
 type counters struct {
@@ -74,7 +74,7 @@ func stackWithJournal(t *testing.T, c *counters, lookup func(provenance.Committe
 func stackWithJournalUnlaunched(t *testing.T, c *counters, lookup func(provenance.CommittedResult, error) (provenance.CommittedResult, error)) *dbosStack {
 	t.Helper()
 	return newDBOSStackUnlaunched(t, func(real provenance.Tracker) provenance.Tracker {
-		fj := &fakeJournal{JournalAPI: real.Journal(), lookup: lookup}
+		fj := &fakeJournal{Journal: real.Journal(), lookup: lookup}
 		if c != nil {
 			fj.attempts = &c.attempts
 			fj.commits = &c.commits

@@ -12,7 +12,7 @@ type Tracker interface {
 	// (docs/journal-relational-contract.md): task-event append, JournalID-ordered
 	// queries, the cumulative attribution projection, subtype-integrity
 	// verification, and the actor-namespace reservation registry.
-	Journal() JournalAPI
+	Journal() Journal
 
 	// As binds a committing actor and a governing authority (a bootstrap or
 	// assignment authority's JournalID, obtained from a genesis operation or a

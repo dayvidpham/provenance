@@ -228,14 +228,14 @@ var (
 	DecodeLabelMutationPayload   = journal.DecodeLabelMutationPayload
 	DecodeCommentMutationPayload = journal.DecodeCommentMutationPayload
 	// Canonicalize is the sole public preparation boundary.
-	Canonicalize            = journal.Canonicalize
-	DecodeCanonicalMutation = journal.DecodeCanonicalMutation
-	ValidateResultSlotBinding    = journal.ValidateResultSlotBinding
+	Canonicalize              = journal.Canonicalize
+	DecodeCanonicalMutation   = journal.DecodeCanonicalMutation
+	ValidateResultSlotBinding = journal.ValidateResultSlotBinding
 	// ConflictAxes returns the closed five-axis set. All axes are nonzero.
-	ConflictAxes = journal.ConflictAxes
-	FactTaskScopeKinds           = journal.FactTaskScopeKinds
-	ConditionKinds               = journal.ConditionKinds
-	ConditionFailureReasons      = journal.ConditionFailureReasons
+	ConflictAxes            = journal.ConflictAxes
+	FactTaskScopeKinds      = journal.FactTaskScopeKinds
+	ConditionKinds          = journal.ConditionKinds
+	ConditionFailureReasons = journal.ConditionFailureReasons
 )
 
 // Status-FSM typed error + sentinel (§8.1).
@@ -244,6 +244,7 @@ type InvalidStatusTransition = journal.InvalidStatusTransition
 // Journal sentinel errors, re-exported for errors.Is at call sites.
 var (
 	ErrUnsupportedOrderDimension = journal.ErrUnsupportedOrderDimension
+	ErrInvalidQuery              = journal.ErrInvalidQuery
 	ErrSubtypeIntegrity          = journal.ErrSubtypeIntegrity
 	ErrActorPlacement            = journal.ErrActorPlacement
 	ErrNamespaceRange            = journal.ErrNamespaceRange
@@ -275,8 +276,9 @@ var (
 	ErrCanonicalMutation           = journal.ErrCanonicalMutation
 )
 
-// JournalAPI is the ordered global-journal surface.
-type JournalAPI interface {
+// Journal is the ordered global-journal surface.
+type Journal interface {
+	Facts() FactQueryAPI
 	QueryTaskEvents(q JournalQueryV1) (JournalTaskEventPageV1, error)
 	TaskAttributions(taskID TaskID) ([]TaskAttribution, error)
 	VerifyIntegrity() error
@@ -293,4 +295,4 @@ type JournalAPI interface {
 
 // Journal returns the ordered global-journal surface backed by the same SQLite
 // connection as the task tracker.
-func (t *sqliteTracker) Journal() JournalAPI { return t.db }
+func (t *sqliteTracker) Journal() Journal { return t.db }

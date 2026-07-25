@@ -9,11 +9,6 @@ import (
 	"github.com/google/uuid"
 )
 
-// externalFactReader proves the FactQueryAPI interface is reachable from external packages.
-type externalFactReader interface {
-	provenance.FactQueryAPI
-}
-
 // TestExternalAtomicJournalContractCompiles proves all public DTOs and typed errors
 // introduced by this vertical are usable from an external package without any
 // internal helpers. This is requirement 9 from the acceptance criteria.
@@ -61,7 +56,7 @@ func TestExternalAtomicJournalContractCompiles(t *testing.T) {
 		}
 	}
 
-	// Prove fact query types compile and validate from external package.
+	// Prove fact query types compile and validate from an external package.
 	query := provenance.DecisionQuery{
 		Filter: provenance.FactFilter{
 			TaskScope:         provenance.FactTaskScope{Kind: provenance.FactTaskExact, TaskID: task},
@@ -73,7 +68,21 @@ func TestExternalAtomicJournalContractCompiles(t *testing.T) {
 	if err := query.Validate(); err != nil {
 		t.Fatalf("external query contract: %v", err)
 	}
-	var _ externalFactReader
+	tracker, err := provenance.OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	defer tracker.Close()
+	var _ provenance.Journal = tracker.Journal()
+	if _, err := tracker.Journal().Facts().QueryDecisions(query); err != nil {
+		t.Fatalf("Tracker.Journal().Facts().QueryDecisions: %v", err)
+	}
+	if _, err := tracker.Journal().Facts().QueryEvidence(provenance.EvidenceQuery{
+		Kinds: []provenance.EvidenceKind{"fixture.evidence"},
+		Page:  provenance.FactPageRequest{Limit: 1},
+	}); err != nil {
+		t.Fatalf("Tracker.Journal().Facts().QueryEvidence: %v", err)
+	}
 
 	// Prove ConflictAxes (five broad axes, no SemanticOperand taxonomy) is accessible.
 	axes := provenance.ConflictAxes()

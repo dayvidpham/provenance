@@ -19,7 +19,7 @@ import (
 // path was retired for the Session SDK). Modelling a legacy row faithfully requires a
 // raw write that bypasses the journal, exactly mirroring a legacy database whose tasks
 // predate the reducer. Like the adversarial seams in operations_adversarial.go these
-// are narrow, test-only *DB methods, never part of the JournalAPI surface.
+// are narrow, test-only *DB methods, never part of the Journal surface.
 
 // SeedLegacyTaskRow raw-inserts one full pre-journal (OLD-schema) task row so a
 // base-layer test can exercise the SQL layer over an on-disk row, or migration can

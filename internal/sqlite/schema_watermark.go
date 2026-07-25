@@ -187,7 +187,7 @@ func (scope *connScope) downgradeTasksWatermarkToLegacy() error {
 // shape that predates the last_journal_id column entirely (§13), so a test can drive
 // MigrateLegacyBaseline's column-add path against a genuinely column-less database. Like
 // SeedLegacyTask it is a narrow, test-only *DB seam that models a legacy database on
-// disk, never part of the JournalAPI surface. Existing base-column rows are preserved.
+// disk, never part of the Journal surface. Existing base-column rows are preserved.
 func (db *DB) DowngradeTasksToColumnlessLegacy() error {
 	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
