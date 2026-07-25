@@ -57,6 +57,8 @@ func TestDBOSFailureWireCorpus(t *testing.T) {
 	}
 	sentinels := map[string]error{
 		"operation-conflict": errors.Join(journal.ErrOperationConflict, &journal.OperationConflict{OperationID: "fixture-operation", Axis: journal.ConflictEffect, Index: 0}),
+		"condition-failed":   &journal.ConditionFailure{Index: 0, Kind: journal.ConditionCurrentFact, Reason: journal.ConditionFactMissing},
+		"activity-conflict":  &journal.ActivityConflict{ActivityID: mustFixtureActivityID(t), ExistingJournalID: 17},
 		"genesis":            journal.ErrGenesis, "authority-scope": journal.ErrAuthorityScope,
 		"assignment-lifecycle": journal.ErrAssignmentLifecycle, "orphaned-evidence": journal.ErrOrphanedEvidence,
 		"stale-episode": journal.ErrStaleEpisode, "result-slot-integrity": journal.ErrResultSlotIntegrity,
@@ -91,6 +93,10 @@ func TestDBOSFailureWireCorpus(t *testing.T) {
 		expectedSentinel := sentinel
 		if c.Input.Sentinel == "operation-conflict" {
 			expectedSentinel = journal.ErrOperationConflict
+		} else if c.Input.Sentinel == "condition-failed" {
+			expectedSentinel = journal.ErrConditionFailed
+		} else if c.Input.Sentinel == "activity-conflict" {
+			expectedSentinel = journal.ErrActivityConflict
 		}
 		if !errors.Is(decodedErr, expectedSentinel) {
 			t.Fatalf("decoded %q error=%v does not preserve %v", c.Name, decodedErr, sentinel)
@@ -99,6 +105,15 @@ func TestDBOSFailureWireCorpus(t *testing.T) {
 	if len(seen) != len(descriptors) {
 		t.Fatalf("failure wire covers %d kinds, want %d", len(seen), len(descriptors))
 	}
+}
+
+func mustFixtureActivityID(t *testing.T) ptypes.ActivityID {
+	t.Helper()
+	activity, err := ptypes.ParseActivityID("fixture--018f0000-0000-7000-8000-000000000004")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return activity
 }
 
 func assertMalformedDBOSOutcome(t *testing.T, c testcorpus.Case[dbosOutcomeInput, dbosOutcomeExpected]) {
@@ -180,7 +195,7 @@ func diffDBOSOutcomeFields(control, malformed DBOSStepOutcome) []DBOSDiagnosticF
 		if !reflect.DeepEqual(control.Failure.ConflictIndex, malformed.Failure.ConflictIndex) {
 			diffs = append(diffs, DBOSDiagFieldConflictIndex)
 		}
-// ConflictOperand removed in corrected 5-axis model
+		// ConflictOperand removed in corrected 5-axis model
 	}
 	return diffs
 }

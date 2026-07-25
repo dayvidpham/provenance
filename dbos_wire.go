@@ -10,6 +10,7 @@ package provenance
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -54,12 +55,51 @@ type DBOSApplyInput struct {
 	Mutation DBOSMutationBytes         `json:"mutation"`
 }
 
+// UnmarshalJSON keeps DBOS's callback boundary closed as well as the explicit
+// decodeApplyInput boundary. DBOS v0.16 otherwise ignores unknown fields and
+// accepts duplicate JSON object keys before invoking a registered callback.
+func (in *DBOSApplyInput) UnmarshalJSON(raw []byte) error {
+	type wire DBOSApplyInput
+	var decoded wire
+	if err := decodeStrictDBOSJSON(raw, &decoded); err != nil {
+		return fmt.Errorf("decode DBOS apply input JSON: %w", err)
+	}
+	*in = DBOSApplyInput(decoded)
+	return nil
+}
+
+func decodeStrictDBOSJSON(raw []byte, target any) error {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return errors.New("DBOS wire value must be one JSON object")
+	}
+	if err := validateUniqueJSONKeys(trimmed); err != nil {
+		return err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(trimmed))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("DBOS wire value contains a trailing JSON value")
+		}
+		return fmt.Errorf("read trailing DBOS wire JSON: %w", err)
+	}
+	return nil
+}
+
 func encodeApplyInput(contract dbosContractSnapshot, in journal.OperationInput) (DBOSApplyInput, journal.OperationInput, error) {
 	prepared, err := journal.Canonicalize(in)
 	if err != nil {
 		return DBOSApplyInput{}, journal.OperationInput{}, err
 	}
 	in.Conditions = prepared.NormalizedConditions()
+	if len(in.Conditions) == 0 {
+		in.Conditions = nil
+	}
 	in.Effects = prepared.NormalizedEffects()
 	in.MutationDigest = prepared.DerivedDigest()
 	contextBytes, err := encodeDBOSContext(contract, in)
@@ -83,6 +123,14 @@ func decodeApplyInput(contract dbosContractSnapshot, input DBOSApplyInput) (jour
 	prepared, err := journal.DecodeCanonicalMutation(input.Mutation)
 	if err != nil {
 		return journal.OperationInput{}, fmt.Errorf("provenance: decode apply-input canonical mutation: %w", err)
+	}
+	// Conditions are part of the canonical mutation bytes. Keep the callback's
+	// OperationInput complete so DBOS recovery invokes the same Apply contract as
+	// the direct caller; dropping them here would silently turn a conditional
+	// operation into an unconditional one.
+	in.Conditions = prepared.NormalizedConditions()
+	if len(in.Conditions) == 0 {
+		in.Conditions = nil
 	}
 	in.Effects = prepared.NormalizedEffects()
 	in.MutationDigest = prepared.DerivedDigest()
@@ -111,6 +159,9 @@ func encodeDBOSContext(contract dbosContractSnapshot, in journal.OperationInput)
 	if in.AuthorityJournalID == nil {
 		fields = append(fields, contextField{DBOSDiagFieldAuthority, []byte{0}})
 	} else {
+		if *in.AuthorityJournalID <= 0 {
+			return nil, dbosContextFrameError(DBOSDiagFieldAuthority, DBOSDiagStageContextEncode, fmt.Sprintf("present authority %d is not positive", *in.AuthorityJournalID), "supply a positive committed journal authority or use nil for genesis")
+		}
 		var authority [9]byte
 		authority[0] = 1
 		binary.BigEndian.PutUint64(authority[1:], uint64(*in.AuthorityJournalID))
@@ -208,6 +259,9 @@ func decodeDBOSContext(contract dbosContractSnapshot, data []byte) (journal.Oper
 			return journal.OperationInput{}, dbosContextFrameError(DBOSDiagFieldAuthority, DBOSDiagStageContextDecode, fmt.Sprintf("invalid present tag %d", values[3][0]), "restore tag 1 followed by the original eight-byte journal authority")
 		}
 		value := journal.JournalID(int64(binary.BigEndian.Uint64(values[3][1:])))
+		if value <= 0 {
+			return journal.OperationInput{}, dbosContextFrameError(DBOSDiagFieldAuthority, DBOSDiagStageContextDecode, fmt.Sprintf("present authority %d is not positive", value), "restore a positive committed journal authority or use the one-byte absent form for genesis")
+		}
 		authority = &value
 	default:
 		return journal.OperationInput{}, dbosContextFrameError(DBOSDiagFieldAuthority, DBOSDiagStageContextDecode, fmt.Sprintf("length %d is neither 1 nor 9", len(values[3])), "restore the one-byte absent form or nine-byte present form")

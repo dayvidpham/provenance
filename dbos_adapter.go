@@ -724,7 +724,7 @@ func terminalDBOSCause(err error, workflowID string) error {
 // struct's own == -- never spuriously diverges a legitimate replay against its own
 // committed record.
 func canonicalResultsEqual(a, b CanonicalMutationResult) bool {
-	if validateCanonicalResultSlots(a.ResultSlots) != nil || validateCanonicalResultSlots(b.ResultSlots) != nil {
+	if validateCanonicalMutationResult(a.AnchorJournalID, a.EmittedEvents, a.ResultSlots) != nil || validateCanonicalMutationResult(b.AnchorJournalID, b.EmittedEvents, b.ResultSlots) != nil {
 		return false
 	}
 	if a.AnchorJournalID != b.AnchorJournalID {

@@ -7,7 +7,25 @@ cases:
     expected:
       kind: operation_conflict
       json: |-
-        {"schema":"provenance.dbos-step-outcome","operation_id":"fixture-operation","mutation_digest":"bQ==","failure":{"kind":"operation_conflict","message":"fixture failure: provenance: operation identity conflict\nprovenance: operation identity conflict: OperationID \"fixture-operation\" differs on Effect[0] — where: Apply exact replay comparison; when: before writes; impact: nothing was committed; fix: retry with the identical actor, authority, command digest, and canonical mutation, or use a new OperationID for a different operation","conflict_axis":5,"conflict_index":0,"operation_id":"fixture-operation"}}
+         {"schema":"provenance.dbos-step-outcome","operation_id":"fixture-operation","mutation_digest":"bQ==","failure":{"kind":"operation_conflict","message":"fixture failure: provenance: operation identity conflict\nprovenance: operation identity conflict: OperationID \"fixture-operation\" differs on Effect[0] — where: Apply exact replay comparison; when: before writes; impact: nothing was committed; fix: retry with the identical actor, authority, command digest, and canonical mutation, or use a new OperationID for a different operation","conflict_axis":5,"conflict_index":0,"operation_id":"fixture-operation"}}
+  - name: condition-failed
+    classification: must-pass
+    provenance: {source: requirement, ref: "DBOS typed failure contract"}
+    mutation: {description: "condition failure preserves its reason and observed IDs.", operator: condition-failed}
+    input: {sentinel: condition-failed}
+    expected:
+      kind: condition_failed
+      json: |-
+        {"schema":"provenance.dbos-step-outcome","operation_id":"fixture-operation","mutation_digest":"bQ==","failure":{"kind":"condition_failed","message":"fixture failure: provenance: journal condition failed: condition[0] kind=CurrentFact asserted journal row 0, observed 0 (reason=FactMissing) — where: Apply transaction-local condition evaluation; when: after exact replay lookup and before writes; impact: the operation was not committed; fix: refresh the selected fact and retry with its current JournalID","condition_index":0,"condition_kind":2,"condition_reason":0,"asserted_journal_id":0,"actual_journal_id":0,"operation_id":"fixture-operation"}}
+  - name: activity-conflict
+    classification: must-pass
+    provenance: {source: requirement, ref: "DBOS typed failure contract"}
+    mutation: {description: "activity conflict preserves its allocated identity and owner row.", operator: activity-conflict}
+    input: {sentinel: activity-conflict}
+    expected:
+      kind: activity_conflict
+      json: |-
+        {"schema":"provenance.dbos-step-outcome","operation_id":"fixture-operation","mutation_digest":"bQ==","failure":{"kind":"activity_conflict","message":"fixture failure: provenance: activity identity conflict: ActivityID \"fixture--018f0000-0000-7000-8000-000000000004\" already belongs to journal row 17 — where: ActivityCreate fold; when: before operation commit; impact: the operation was rolled back; fix: retry the original OperationID or choose a new ActivityID","activity_id":"fixture--018f0000-0000-7000-8000-000000000004","existing_journal_id":17,"operation_id":"fixture-operation"}}
   - name: genesis
     classification: must-pass
     provenance: {source: requirement, ref: "DBOS typed failure contract"}
