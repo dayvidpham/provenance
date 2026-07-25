@@ -382,7 +382,7 @@ func TestDBOSOutcomeDiffCoversTypedMetadata(t *testing.T) {
 		{DBOSDiagFieldConditionIndex, func(f *CanonicalApplyFailure) { value := 1; f.ConditionIndex = &value }},
 		{DBOSDiagFieldConditionKind, func(f *CanonicalApplyFailure) { value := journal.ConditionCurrentFact; f.ConditionKind = &value }},
 		{DBOSDiagFieldConditionReason, func(f *CanonicalApplyFailure) { value := journal.ConditionFactMismatch; f.ConditionReason = &value }},
-		{DBOSDiagFieldAssertedJournalID, func(f *CanonicalApplyFailure) { value := int64(1); f.AssertedJournalID = &value }},
+		{DBOSDiagFieldAssertedJournalID, func(f *CanonicalApplyFailure) { value := int64(2); f.AssertedJournalID = &value }},
 		{DBOSDiagFieldActualJournalID, func(f *CanonicalApplyFailure) { value := int64(1); f.ActualJournalID = &value }},
 	}
 	for _, tc := range cases {
