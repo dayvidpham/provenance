@@ -36,16 +36,77 @@ const (
 	factSelectorEvidence
 )
 
+type factMatchForm uint8
+
+const (
+	factMatchSelected factMatchForm = iota + 1
+	factMatchPage
+)
+
 // factMatchBinding is the static predicate/binding contract shared by Apply
 // conditions today and bounded fact pages in the next query vertical. It keeps
 // subtype dispatch, normalized scope/actor/operation/context filters, and the
 // snapshot/cursor bounds and argument layout in one package-private value.
 type factMatchBinding struct {
+	form         factMatchForm
 	kind         factSelectorKind
 	contexts     factContextRelation
 	snapshotMax  journal.JournalID
 	afterJournal journal.JournalID
+	pageKinds    []string
+	pageLimit    int
 	args         []any
+}
+
+// pageMatchSQL is the bounded multi-kind form of the shared matcher. The
+// subtype and context relation come only from the closed enum; kind values are
+// data in a bounded JSON array. The result shape is the page-row shape that the
+// .1.4 query layer can scan without reimplementing predicates or bindings.
+func (k factSelectorKind) pageMatchSQL() string {
+	switch k {
+	case factSelectorDecision:
+		return `SELECT d.journal_id, ja.recorded_at, d.task_id, d.decision_kind,
+       d.payload, ja.effective_actor_id, jo.operation_id,
+       ja.produced_by_operation_journal_id
+FROM journal_decisions d
+JOIN journal_attributed ja ON ja.journal_id = d.journal_id
+JOIN journal_operations jo ON jo.journal_id = ja.produced_by_operation_journal_id
+WHERE d.journal_id <= ?1
+  AND d.journal_id > ?2
+  AND d.decision_kind IN (SELECT value FROM json_each(?3))
+  AND (NOT ?4 OR d.task_id IS ?5)
+  AND (NOT ?6 OR ja.effective_actor_id IN (SELECT value FROM json_each(?7)))
+  AND (NOT ?8 OR jo.operation_id IN (SELECT value FROM json_each(?9)))
+  AND (NOT ?10 OR (SELECT COUNT(*) FROM json_each(?11) f
+       WHERE EXISTS (SELECT ?10 FROM journal_decision_contexts c
+                     WHERE c.decision_journal_id = d.journal_id
+                       AND c.context_kind = json_extract(f.value,?12)
+                       AND c.context_identity = json_extract(f.value,?13))) = ?10)
+ORDER BY d.journal_id ASC
+LIMIT ?14`
+	case factSelectorEvidence:
+		return `SELECT e.journal_id, ja.recorded_at, e.task_id, e.evidence_kind,
+       e.content_digest, e.payload, ja.effective_actor_id, jo.operation_id,
+       ja.produced_by_operation_journal_id
+FROM journal_evidence e
+JOIN journal_attributed ja ON ja.journal_id = e.journal_id
+JOIN journal_operations jo ON jo.journal_id = ja.produced_by_operation_journal_id
+WHERE e.journal_id <= ?1
+  AND e.journal_id > ?2
+  AND e.evidence_kind IN (SELECT value FROM json_each(?3))
+  AND (NOT ?4 OR e.task_id IS ?5)
+  AND (NOT ?6 OR ja.effective_actor_id IN (SELECT value FROM json_each(?7)))
+  AND (NOT ?8 OR jo.operation_id IN (SELECT value FROM json_each(?9)))
+  AND (NOT ?10 OR (SELECT COUNT(*) FROM json_each(?11) f
+       WHERE EXISTS (SELECT ?10 FROM journal_evidence_contexts c
+                     WHERE c.evidence_journal_id = e.journal_id
+                       AND c.context_kind = json_extract(f.value,?12)
+                       AND c.context_identity = json_extract(f.value,?13))) = ?10)
+ORDER BY e.journal_id ASC
+LIMIT ?14`
+	default:
+		panic("unknown factSelectorKind")
+	}
 }
 
 // latestMatchSQL returns the static SQL to find the MAX(journal_id) matching
@@ -142,7 +203,7 @@ func (k factSelectorKind) exactMatchSQL() string {
 //   - (latest, false, nil)   — asserted does not match; latest is the highest match
 //   - (0, false, nil)        — no row matches the selector at all
 func evaluateExactFactSelector(scope *connScope, sel journal.FactSelector, asserted journal.JournalID) (journal.JournalID, bool, error) {
-	if err := scope.verifyFactContextIntegrity(); err != nil {
+	if err := scope.requireCanonicalFactContextSchema("ExactFact condition evaluation"); err != nil {
 		return 0, false, err
 	}
 	binding, err := buildFactMatchBinding(sel, 0, 0)
@@ -161,6 +222,9 @@ func evaluateExactFactSelector(scope *connScope, sel journal.FactSelector, asser
 		return 0, false, fmt.Errorf("evaluateExactFactSelector (%v): %w", sel.Kind, err)
 	}
 	if found {
+		if _, err := scope.verifySelectedFactContext(binding.contexts, int64(asserted)); err != nil {
+			return 0, false, err
+		}
 		return asserted, true, nil
 	}
 	latest, anyFound, err := latestFactMatch(scope, binding)
@@ -170,24 +234,34 @@ func evaluateExactFactSelector(scope *connScope, sel journal.FactSelector, asser
 	if !anyFound {
 		return 0, false, nil
 	}
+	if _, err := scope.verifySelectedFactContext(binding.contexts, int64(latest)); err != nil {
+		return 0, false, err
+	}
 	return latest, false, nil
 }
 
 // evaluateCurrentFactSelector resolves a FactSelector for a CurrentFact
 // condition using the caller-owned connection scope.
 func evaluateCurrentFactSelector(scope *connScope, sel journal.FactSelector) (journal.JournalID, bool, error) {
-	if err := scope.verifyFactContextIntegrity(); err != nil {
+	if err := scope.requireCanonicalFactContextSchema("CurrentFact condition evaluation"); err != nil {
 		return 0, false, err
 	}
 	binding, err := buildFactMatchBinding(sel, 0, 0)
 	if err != nil {
 		return 0, false, err
 	}
-	return latestFactMatch(scope, binding)
+	latest, found, err := latestFactMatch(scope, binding)
+	if err != nil || !found {
+		return latest, found, err
+	}
+	if _, err := scope.verifySelectedFactContext(binding.contexts, int64(latest)); err != nil {
+		return 0, false, err
+	}
+	return latest, true, nil
 }
 
 func latestFactSelector(scope *connScope, kind factSelectorKind, args []any) (journal.JournalID, bool, error) {
-	return latestFactMatch(scope, factMatchBinding{kind: kind, contexts: kind.contextRelation(), args: args})
+	return latestFactMatch(scope, factMatchBinding{form: factMatchSelected, kind: kind, contexts: kind.contextRelation(), args: args})
 }
 
 func latestFactMatch(scope *connScope, binding factMatchBinding) (journal.JournalID, bool, error) {
@@ -219,6 +293,34 @@ func (k factSelectorKind) contextRelation() factContextRelation {
 	}
 }
 
+// normalizeFactSelectorForMatch validates and canonicalizes every filter
+// dimension before it is turned into SQL arguments. Keeping this at the shared
+// matcher boundary makes the condition and page forms agree on scope, actor,
+// operation, and required-context semantics.
+func normalizeFactSelectorForMatch(sel journal.FactSelector) (journal.FactSelector, factSelectorKind, error) {
+	var kind factSelectorKind
+	var validation error
+	switch sel.Kind {
+	case journal.FactDecision:
+		kind = factSelectorDecision
+		validation = (journal.DecisionQuery{Filter: sel.Filter, Kinds: []journal.DecisionKind{sel.DecisionKind}, Page: journal.FactPageRequest{Limit: 1}}).Validate()
+	case journal.FactEvidence:
+		kind = factSelectorEvidence
+		validation = (journal.EvidenceQuery{Filter: sel.Filter, Kinds: []journal.EvidenceKind{sel.EvidenceKind}, Page: journal.FactPageRequest{Limit: 1}}).Validate()
+	default:
+		return journal.FactSelector{}, 0, fmt.Errorf("fact matcher: unknown FactSelector kind %d — where: matcher input; when: normalization; impact: no fact was selected; fix: use FactDecision or FactEvidence", sel.Kind)
+	}
+	if validation != nil {
+		return journal.FactSelector{}, 0, fmt.Errorf("fact matcher: invalid selector: %w", validation)
+	}
+	normalized, err := normalizeFactQueryFilter(sel.Filter)
+	if err != nil {
+		return journal.FactSelector{}, 0, err
+	}
+	sel.Filter = normalized
+	return sel, kind, nil
+}
+
 // ---------------------------------------------------------------------------
 // Argument builder (10 base args + optional 11th for exactMatchSQL)
 // ---------------------------------------------------------------------------
@@ -236,7 +338,11 @@ func (k factSelectorKind) contextRelation() factContextRelation {
 //	?9  JSON context array [{kind,identity},...] (ignored when ?8=0)
 //	?10 kind discriminator string (decision_kind or evidence_kind value)
 func buildSelectorArgs(sel journal.FactSelector, snapshotMax journal.JournalID) (factSelectorKind, []any, error) {
-	var kind factSelectorKind
+	normalized, kind, err := normalizeFactSelectorForMatch(sel)
+	if err != nil {
+		return 0, nil, err
+	}
+	sel = normalized
 	var discriminator string
 
 	switch sel.Kind {
@@ -357,5 +463,54 @@ func buildFactMatchBinding(sel journal.FactSelector, snapshotMax, afterJournal j
 	if err != nil {
 		return factMatchBinding{}, err
 	}
-	return factMatchBinding{kind: kind, contexts: kind.contextRelation(), snapshotMax: snapshotMax, afterJournal: afterJournal, args: args}, nil
+	return factMatchBinding{form: factMatchSelected, kind: kind, contexts: kind.contextRelation(), snapshotMax: snapshotMax, afterJournal: afterJournal, args: args}, nil
+}
+
+// buildFactPageMatchBinding is the bounded multi-kind form of the same static
+// predicate/binding contract. The subtype remains a closed enum and the kind
+// set is data, capped by journal.MaxFactQueryKinds. Its positional arguments
+// are: snapshot, exclusive cursor, kind JSON, then the normalized filter slots
+// shared with buildSelectorArgs, followed by LIMIT.
+func buildFactPageMatchBinding(kind factSelectorKind, page journal.FactPageRequest, filter journal.FactFilter, kinds []string) (factMatchBinding, error) {
+	if kind != factSelectorDecision && kind != factSelectorEvidence {
+		return factMatchBinding{}, fmt.Errorf("fact matcher: unknown page subtype %d — where: page binding; when: dispatch; impact: no page was queried; fix: use the closed decision or evidence subtype", kind)
+	}
+	if err := page.Validate(); err != nil {
+		return factMatchBinding{}, fmt.Errorf("fact matcher: invalid page: %w", err)
+	}
+	if len(kinds) == 0 || len(kinds) > journal.MaxFactQueryKinds {
+		return factMatchBinding{}, fmt.Errorf("fact matcher: page kind set must contain 1..%d values — where: page binding; when: normalization; impact: no page was queried; fix: pass a bounded non-empty kind set", journal.MaxFactQueryKinds)
+	}
+	for _, value := range kinds {
+		if err := journal.ValidateEventKind(journal.EventKind(value)); err != nil {
+			return factMatchBinding{}, fmt.Errorf("fact matcher: invalid page kind %q: %w", value, err)
+		}
+	}
+	normalizedFilter, err := normalizeFactQueryFilter(filter)
+	if err != nil {
+		return factMatchBinding{}, err
+	}
+	var selector journal.FactSelector
+	if kind == factSelectorDecision {
+		selector = journal.FactSelector{Kind: journal.FactDecision, DecisionKind: journal.DecisionKind(kinds[0]), Filter: normalizedFilter}
+	} else {
+		selector = journal.FactSelector{Kind: journal.FactEvidence, EvidenceKind: journal.EvidenceKind(kinds[0]), Filter: normalizedFilter}
+	}
+	_, singleArgs, err := buildSelectorArgs(selector, page.SnapshotMaxJournalID)
+	if err != nil {
+		return factMatchBinding{}, err
+	}
+	kindJSON, err := json.Marshal(kinds)
+	if err != nil {
+		return factMatchBinding{}, fmt.Errorf("fact matcher: encode page kind set: %w", err)
+	}
+	args := []any{singleArgs[0], int64(page.AfterJournalID), string(kindJSON)}
+	args = append(args, singleArgs[1:9]...)
+	args = append(args, singleArgs[10:]...)
+	args = append(args, page.Limit+1)
+	return factMatchBinding{
+		form: factMatchPage, kind: kind, contexts: kind.contextRelation(), snapshotMax: page.SnapshotMaxJournalID,
+		afterJournal: page.AfterJournalID, pageKinds: append([]string(nil), kinds...), pageLimit: page.Limit + 1,
+		args: args,
+	}, nil
 }

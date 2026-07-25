@@ -770,17 +770,28 @@ func preflightExistingReadOnly(dbPath string, models []ptypes.ModelEntry) (bool,
 		return existing, err
 	}
 	if existing {
-		if _, err := preflight.classifyFactContextSchema(); err != nil {
+		contextSchema, err := preflight.classifyFactContextSchema()
+		if err != nil {
 			return true, err
 		}
 		if err := preflight.preflightCanonicalColumnsReadOnly(); err != nil {
 			return true, err
 		}
-		if err := preflight.verifyIntegrity(); err != nil {
+		if contextSchema == factContextSchemaLegacy {
+			if err := preflight.verifyIntegrityReadOnlyLegacyCompatible(); err != nil {
+				return true, err
+			}
+		} else if err := preflight.verifyIntegrity(); err != nil {
 			return true, err
 		}
-		if _, err := preflight.replayProjections(); err != nil {
-			return true, err
+		var replayErr error
+		if contextSchema == factContextSchemaLegacy {
+			_, replayErr = preflight.replayProjectionsReadOnlyLegacyCompatible()
+		} else {
+			_, replayErr = preflight.replayProjections()
+		}
+		if replayErr != nil {
+			return true, replayErr
 		}
 	}
 	if err := preflightActivationClone(conn, models); err != nil {

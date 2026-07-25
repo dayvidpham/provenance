@@ -426,13 +426,30 @@ func (db *DB) ReplayProjections() (journal.ReplayResult, error) {
 // pooled lease. It opens its own savepoint so it composes inside an enclosing
 // activation transaction.
 func (scope *connScope) replayProjections() (result journal.ReplayResult, err error) {
+	return scope.replayProjectionsMode(false)
+}
+
+// replayProjectionsReadOnlyLegacyCompatible is reserved for the pre-activation
+// e66 compatibility pass. Activation creates and validates both context
+// relations before the normal strict replay path is entered.
+func (scope *connScope) replayProjectionsReadOnlyLegacyCompatible() (result journal.ReplayResult, err error) {
+	return scope.replayProjectionsMode(true)
+}
+
+func (scope *connScope) replayProjectionsMode(allowLegacyFactContexts bool) (result journal.ReplayResult, err error) {
 	endTx := sqlitex.Save(scope.conn)
 	defer endTx(&err)
 	if err := scope.preflightSchema(); err != nil {
 		return journal.ReplayResult{}, err
 	}
-	if err := scope.verifyFactContextIntegrity(); err != nil {
-		return journal.ReplayResult{}, err
+	var factContextErr error
+	if allowLegacyFactContexts {
+		factContextErr = scope.verifyFactContextIntegrityReadOnlyLegacyCompatible()
+	} else {
+		factContextErr = scope.verifyFactContextIntegrity()
+	}
+	if factContextErr != nil {
+		return journal.ReplayResult{}, factContextErr
 	}
 	if err := scope.validateCanonicalOperations(); err != nil {
 		return journal.ReplayResult{}, err

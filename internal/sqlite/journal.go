@@ -246,10 +246,27 @@ func (db *DB) VerifyIntegrity() error {
 // pooled lease. It opens its own savepoint so it composes inside an enclosing
 // activation transaction.
 func (scope *connScope) verifyIntegrity() (err error) {
+	return scope.verifyIntegrityMode(false)
+}
+
+// verifyIntegrityReadOnlyLegacyCompatible is the pre-activation compatibility
+// check for e66 files. It must not be used by a live DB or by runtime callers:
+// an activated store is required to have both fact-context relations.
+func (scope *connScope) verifyIntegrityReadOnlyLegacyCompatible() (err error) {
+	return scope.verifyIntegrityMode(true)
+}
+
+func (scope *connScope) verifyIntegrityMode(allowLegacyFactContexts bool) (err error) {
 	endTx := sqlitex.Save(scope.conn)
 	defer endTx(&err)
-	if err := scope.verifyFactContextIntegrity(); err != nil {
-		return err
+	var factContextErr error
+	if allowLegacyFactContexts {
+		factContextErr = scope.verifyFactContextIntegrityReadOnlyLegacyCompatible()
+	} else {
+		factContextErr = scope.verifyFactContextIntegrity()
+	}
+	if factContextErr != nil {
+		return factContextErr
 	}
 	if err := scope.verifyForeignKeyTopology(); err != nil {
 		return err

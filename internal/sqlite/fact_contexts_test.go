@@ -178,7 +178,12 @@ func TestFactContextLegacyActivationBackfillsCanonicalOnly(t *testing.T) {
 			t.Fatalf("activate e66 opaque file: %v", err)
 		}
 		t.Cleanup(func() { _ = db.Close() })
-		assertStoredFactContexts(t, db, factContextEvidence, evidenceJID, nil)
+		scope = takePoolScope(t, db)
+		_, loadErr := scope.loadVerifiedFactContexts(factContextEvidence, int64(evidenceJID))
+		scope.release()
+		if !errors.Is(loadErr, journal.ErrFactContextIntegrity) {
+			t.Fatalf("opaque legacy verified load error = %v, want ErrFactContextIntegrity", loadErr)
+		}
 		if err := db.VerifyIntegrity(); err != nil {
 			t.Fatalf("VerifyIntegrity opaque legacy activation: %v", err)
 		}
@@ -262,6 +267,107 @@ func TestFactContextStartupFailuresPreserveFiles(t *testing.T) {
 	})
 }
 
+func TestFactContextRowStartupFailuresPreserveFiles(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		corrupt func(t *testing.T, conn *zs.Conn, result journal.CommittedResult, actor journal.ActorID, taskContext journal.EventContext)
+	}{
+		{
+			name: "missing",
+			corrupt: func(t *testing.T, conn *zs.Conn, result journal.CommittedResult, _ journal.ActorID, _ journal.EventContext) {
+				if err := sqlitex.Execute(conn, "DELETE FROM journal_decision_contexts WHERE decision_journal_id=?1", &sqlitex.ExecOptions{Args: []any{int64(factContextResultSlot(t, result, "decision"))}}); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "extra",
+			corrupt: func(t *testing.T, conn *zs.Conn, result journal.CommittedResult, actor journal.ActorID, _ journal.EventContext) {
+				ctx, err := journal.ActorContext(actor)
+				if err != nil {
+					t.Fatal(err)
+				}
+				kind, identity, err := journal.EncodeStoredEventContext(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := sqlitex.Execute(conn, "INSERT INTO journal_decision_contexts (decision_journal_id,context_kind,context_identity) VALUES (?1,?2,?3)", &sqlitex.ExecOptions{Args: []any{int64(factContextResultSlot(t, result, "decision")), string(kind), identity}}); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "opaque-legacy",
+			corrupt: func(t *testing.T, conn *zs.Conn, result journal.CommittedResult, _ journal.ActorID, _ journal.EventContext) {
+				if err := sqlitex.Execute(conn, "UPDATE journal_operations SET mutation_encoding_version=?1,canonical_mutation=?2 WHERE journal_id=?3", &sqlitex.ExecOptions{Args: []any{nil, nil, int64(result.AnchorJournalID)}}); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "cross-subtype",
+			corrupt: func(t *testing.T, conn *zs.Conn, result journal.CommittedResult, _ journal.ActorID, taskContext journal.EventContext) {
+				decisionJID := factContextResultSlot(t, result, "decision")
+				if err := sqlitex.Execute(conn, "INSERT INTO journal_evidence (journal_id,evidence_kind,task_id,content_digest,payload) VALUES (?1,?2,?3,?4,?5)", &sqlitex.ExecOptions{Args: []any{int64(decisionJID), "fixture.context.cross", nil, []byte("cross"), "{}"}}); err != nil {
+					t.Fatal(err)
+				}
+				kind, identity, err := journal.EncodeStoredEventContext(taskContext)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := sqlitex.Execute(conn, "INSERT INTO journal_evidence_contexts (evidence_journal_id,context_kind,context_identity) VALUES (?1,?2,?3)", &sqlitex.ExecOptions{Args: []any{int64(decisionJID), string(kind), identity}}); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := t.TempDir() + "/row-corruption.db"
+			db, actor, task, boot := openFactContextFixture(t, path)
+			ctx, err := journal.TaskContext(task)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := db.Apply(journal.OperationInput{
+				OperationID: "startup-row-corruption-" + journal.OperationID(test.name), ActorID: actor, AuthorityJournalID: &boot, CommandDigest: []byte(test.name),
+				Effects: []journal.Effect{{Sort: journal.EffectDecision, ResultSlot: "decision", TaskID: task, DecisionKind: "fixture.startup.corruption", Payload: []byte(`{}`), Contexts: []journal.EventContext{ctx}}},
+			})
+			if err != nil {
+				t.Fatalf("Apply: %v", err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+			conn, err := zs.OpenConn(path, zs.OpenReadWrite)
+			if err != nil {
+				t.Fatalf("open raw fixture: %v", err)
+			}
+			test.corrupt(t, conn, result, actor, ctx)
+			if err := conn.Close(); err != nil {
+				t.Fatalf("close raw fixture: %v", err)
+			}
+			assertOpenFactContextFailurePreservesBytes(t, path)
+		})
+	}
+}
+
+func TestFactContextRuntimeRejectsMissingRelationsAfterActivation(t *testing.T) {
+	db := newJournalDB(t)
+	dropFactContextRelations(t, db)
+	if err := db.VerifyIntegrity(); !errors.Is(err, journal.ErrFactContextIntegrity) {
+		t.Fatalf("VerifyIntegrity with both relations missing = %v, want ErrFactContextIntegrity", err)
+	}
+	if _, err := db.ReplayProjections(); !errors.Is(err, journal.ErrFactContextIntegrity) {
+		t.Fatalf("ReplayProjections with both relations missing = %v, want ErrFactContextIntegrity", err)
+	}
+	scope := takePoolScope(t, db)
+	_, err := scope.loadVerifiedFactContexts(factContextDecision, 1)
+	scope.release()
+	if !errors.Is(err, journal.ErrFactContextIntegrity) {
+		t.Fatalf("runtime selected-fact verification with both relations missing = %v, want ErrFactContextIntegrity", err)
+	}
+}
+
 func TestFactContextIntegrityRejectsStoredCorruption(t *testing.T) {
 	for _, test := range []struct {
 		name    string
@@ -288,6 +394,28 @@ func TestFactContextIntegrityRejectsStoredCorruption(t *testing.T) {
 				scope := takePoolScope(t, db)
 				defer scope.release()
 				if err := sqlitex.Execute(scope.conn, "INSERT INTO journal_decision_contexts (decision_journal_id,context_kind,context_identity) VALUES (?1,?2,?3)", &sqlitex.ExecOptions{Args: []any{int64(factContextResultSlot(t, result, "decision")), string(kind), identity}}); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "mismatched",
+			corrupt: func(t *testing.T, db *DB, result journal.CommittedResult, actor journal.ActorID) {
+				decisionJID := factContextResultSlot(t, result, "decision")
+				ctx, err := journal.ActorContext(actor)
+				if err != nil {
+					t.Fatal(err)
+				}
+				kind, identity, err := journal.EncodeStoredEventContext(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				scope := takePoolScope(t, db)
+				defer scope.release()
+				if err := sqlitex.Execute(scope.conn, "DELETE FROM journal_decision_contexts WHERE decision_journal_id=?1", &sqlitex.ExecOptions{Args: []any{int64(decisionJID)}}); err != nil {
+					t.Fatal(err)
+				}
+				if err := sqlitex.Execute(scope.conn, "INSERT INTO journal_decision_contexts (decision_journal_id,context_kind,context_identity) VALUES (?1,?2,?3)", &sqlitex.ExecOptions{Args: []any{int64(decisionJID), string(kind), identity}}); err != nil {
 					t.Fatal(err)
 				}
 			},
@@ -342,6 +470,12 @@ func TestFactContextIntegrityRejectsStoredCorruption(t *testing.T) {
 				t.Fatalf("Apply: %v", err)
 			}
 			test.corrupt(t, db, result, actor)
+			scope := takePoolScope(t, db)
+			_, loadErr := scope.loadVerifiedFactContexts(factContextDecision, int64(factContextResultSlot(t, result, "decision")))
+			scope.release()
+			if !errors.Is(loadErr, journal.ErrFactContextIntegrity) {
+				t.Fatalf("verified selected-fact load error = %v, want ErrFactContextIntegrity", loadErr)
+			}
 			if err := db.VerifyIntegrity(); !errors.Is(err, journal.ErrFactContextIntegrity) {
 				t.Fatalf("VerifyIntegrity error = %v, want ErrFactContextIntegrity", err)
 			}
