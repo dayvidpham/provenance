@@ -233,6 +233,32 @@ result-slot, race, and migration/versioning work. It must remain a constrained
 child-allocation primitive, not a general relaxation allowing assignment
 authorities to create arbitrary tasks.
 
+## Decision
+
+First-class parent-authorized allocation is the selected long-term contract.
+Governed task creation is a recurring foundation for review rounds, severity
+groups, findings, implementation slices, candidates, replacements, and future
+workflow-generated task families. Treating each occurrence as a bootstrap
+exception would spread privileged choreography throughout consumers and make
+the authority model harder to audit and maintain.
+
+The accepted direction is therefore one closed typed Provenance primitive that:
+
+- cites the exact active parent assignment as the operation authority;
+- allocates only a new child task, never adopts an unrelated existing task;
+- creates the child assignment and parent citation atomically with task birth;
+- preserves independent committing-actor attribution;
+- serializes allocation against parent revocation using journal order;
+- returns complete deterministic task and authority result bindings;
+- participates in canonical immediate and reopened replay;
+- rejects changed input with a typed operation conflict; and
+- supplies DBOS and direct-SQLite behavior through the same canonical contract.
+
+Bootstrap remains the authority base case and may establish root authority, but
+application workflows do not use it as an allocation exception for delegated
+work. The new primitive must preserve least privilege rather than generally
+expanding what assignment authorities may create.
+
 ## Future Maintenance Rules
 
 - Keep attribution and authorization independently queryable.
