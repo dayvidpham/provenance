@@ -4,7 +4,10 @@ This document describes Provenance's runtime layers, persistence model, and the
 boundaries between its domain API, global journal, SQLite projections, and DBOS
 durable execution. For domain terminology and PROV-O correspondence, see
 [`CONCEPTS.md`](../CONCEPTS.md). The normative relational details are in
-[`journal-relational-contract.md`](journal-relational-contract.md).
+[`journal-relational-contract.md`](journal-relational-contract.md). For the
+motivation-to-invariant chain behind actor attribution, assignment authority,
+delegation, and governed task allocation, see
+[`attribution-authorization-design.md`](attribution-authorization-design.md).
 
 ## Design Goals
 
