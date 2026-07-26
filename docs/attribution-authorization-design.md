@@ -259,6 +259,46 @@ application workflows do not use it as an allocation exception for delegated
 work. The new primitive must preserve least privilege rather than generally
 expanding what assignment authorities may create.
 
+## Prior Art Alignment
+
+No single external system supplies the complete governed-allocation contract.
+The selected design composes established principles while keeping Provenance's
+journal as the sole authority source.
+
+| Prior art | Principle adopted | Boundary |
+|---|---|---|
+| Object capabilities | Explicit child-scoped delegation, least authority, and no ambient privilege | Object references alone do not provide durable revocation, transactional creation, or replay. |
+| Confused-deputy prevention | Execute with request-specific delegated authority instead of service authority | Caller identity or a privileged process identity is not a substitute for authority. |
+| Macaroons | Delegated authority may only be attenuated by additional restrictions | Bearer caveats alone do not eliminate revocation or check/use races. |
+| Zanzibar | Explicit relationships and causally ordered authorization state | A remote authorization check followed by a local write is not atomic and must not become a second authority model. |
+| Serializable transactions | Validate authority and create all governed state in one serialization order | Authorization state and resource creation must share the transaction boundary. |
+| DBOS | Durable transaction completion, workflow recovery, and recorded operation results | DBOS does not define delegation, authority attenuation, or canonical invocation equality. |
+
+The resulting rule is:
+
+```text
+authenticate at ingress
+         |
+         v
+bind actor + parent authority + child intent + operation identity
+         |
+         v
+validate authority AT COMMIT in the same serializable transaction
+         |
+         +--> create child task
+         +--> create child assignment and parent citation
+         +--> persist canonical invocation and result bindings
+         |
+         v
+DBOS may durably invoke/recover this transaction,
+but Provenance remains the sole authorization authority
+```
+
+Capability credentials, consistency tokens, workflow IDs, and role decorators
+may carry or protect inputs. None may independently authorize governed creation.
+If an external side effect follows allocation, use a transactional outbox or
+downstream idempotency key rather than extending the local atomicity claim.
+
 ## Future Maintenance Rules
 
 - Keep attribution and authorization independently queryable.
@@ -285,3 +325,15 @@ expanding what assignment authorities may create.
   governance, replay, and projection invariants.
 - [`test-performance.md`](test-performance.md) records the measured constraints
   for authority race and concurrency tests.
+- Dennis and Van Horn, [Programming Semantics for Multiprogrammed
+  Computations](https://dl.acm.org/doi/10.1145/365230.365252), and Hardy,
+  [The Confused Deputy](http://www.cap-lore.com/CapTheory/ConfusedDeputy.html),
+  motivate explicit capability delegation and the rejection of ambient service
+  authority.
+- Pang et al., [Zanzibar: Google's Consistent, Global Authorization
+  System](https://www.usenix.org/conference/atc19/presentation/pang), motivates
+  causally ordered authorization state while remaining outside the transaction
+  boundary used here.
+- [DBOS durable execution documentation](https://docs.dbos.dev/) describes the
+  transaction and workflow recovery substrate; it does not replace the
+  Provenance authority model.
