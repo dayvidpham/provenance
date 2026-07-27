@@ -1,12 +1,12 @@
 package sqlite
 
 import (
+	"database/sql"
+	"errors"
 	"fmt"
 	"strconv"
 
 	"github.com/dayvidpham/provenance/internal/journal"
-	zs "zombiezen.com/go/sqlite"
-	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 // factContextRelation is the closed subtype dispatch for immutable fact
@@ -205,6 +205,32 @@ func factContextIntegrityError(problem, where, fix string) error {
 	return fmt.Errorf("%w: %s — where: %s; when: fact-context validation; impact: the database is rejected rather than returning or replaying an incomplete fact; fix: %s", journal.ErrFactContextIntegrity, problem, where, fix)
 }
 
+func forEachFactContextRow(scope *connScope, query string, args []any, visit func(*sql.Rows) error) error {
+	rows, err := scope.conn.QueryContext(scope.ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		if err := visit(rows); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
+func factContextExists(scope *connScope, query string, args ...any) (bool, error) {
+	var present int
+	err := scope.conn.QueryRowContext(scope.ctx, query, args...).Scan(&present)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // classifyFactContextSchema is deliberately read-only. Open calls it before
 // ensureSchema so a partial or malformed deployment never reaches CREATE TABLE.
 func (scope *connScope) classifyFactContextSchema() (factContextSchemaState, error) {
@@ -227,35 +253,30 @@ func (scope *connScope) classifyFactContextSchema() (factContextSchemaState, err
 		}
 		return factContextSchemaCanonical, nil
 	default:
-		return 0, factContextIntegrityError(
-			"only one subtype-owned fact-context relation is present",
-			"read-only fact-context schema classification",
-			"restore both journal_decision_contexts and journal_evidence_contexts from the same schema generation")
+		return 0, factContextIntegrityError("only one subtype-owned fact-context relation is present", "read-only fact-context schema classification", "restore both journal_decision_contexts and journal_evidence_contexts from the same schema generation")
 	}
 }
 
 func (scope *connScope) validateFactContextTableShape(relation factContextRelation) error {
 	type column struct {
-		name     string
-		typeName string
-		pk       int
+		name, typeName string
+		pk             int
 	}
-	expected := []column{
-		{name: relation.parentColumn(), typeName: "INTEGER", pk: 1},
-		{name: "context_kind", typeName: "TEXT", pk: 2},
-		{name: "context_identity", typeName: "TEXT", pk: 3},
-	}
+	expected := []column{{relation.parentColumn(), "INTEGER", 1}, {"context_kind", "TEXT", 2}, {"context_identity", "TEXT", 3}}
 	var actual []column
 	var nullable string
-	if err := sqlitex.Execute(scope.conn, "SELECT * FROM pragma_table_info(?1)", &sqlitex.ExecOptions{
-		Args: []any{relation.tableName()},
-		ResultFunc: func(stmt *zs.Stmt) error {
-			actual = append(actual, column{name: stmt.ColumnText(1), typeName: stmt.ColumnText(2), pk: stmt.ColumnInt(5)})
-			if stmt.ColumnInt(3) == 0 {
-				nullable = stmt.ColumnText(1)
-			}
-			return nil
-		},
+	if err := forEachFactContextRow(scope, "SELECT * FROM pragma_table_info(?1)", []any{relation.tableName()}, func(row *sql.Rows) error {
+		var cid, notNull, pk int
+		var name, typeName string
+		var defaultValue any
+		if err := row.Scan(&cid, &name, &typeName, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		actual = append(actual, column{name, typeName, pk})
+		if notNull == 0 {
+			nullable = name
+		}
+		return nil
 	}); err != nil {
 		return factContextIntegrityError("could not inspect "+relation.tableName()+" columns", "fact-context schema classification", "restore the relation from a known-good schema: "+err.Error())
 	}
@@ -270,43 +291,32 @@ func (scope *connScope) validateFactContextTableShape(relation factContextRelati
 	if nullable != "" {
 		return factContextIntegrityError("malformed nullable "+relation.tableName()+"."+nullable, "fact-context schema classification", "restore NOT NULL columns in the immutable context relation")
 	}
-
-	strict, withoutRowID := false, false
-	if err := sqlitex.Execute(scope.conn, "SELECT wr,strict FROM pragma_table_list WHERE schema=?1 AND name=?2", &sqlitex.ExecOptions{
-		Args: []any{"main", relation.tableName()},
-		ResultFunc: func(stmt *zs.Stmt) error {
-			withoutRowID = stmt.ColumnInt(0) == 1
-			strict = stmt.ColumnInt(1) == 1
-			return nil
-		},
-	}); err != nil {
+	var withoutRowID, strict int
+	err := scope.conn.QueryRowContext(scope.ctx, "SELECT wr,strict FROM pragma_table_list WHERE schema=?1 AND name=?2", "main", relation.tableName()).Scan(&withoutRowID, &strict)
+	if err != nil {
 		return factContextIntegrityError("could not inspect "+relation.tableName()+" table options", "fact-context schema classification", "restore the relation as STRICT, WITHOUT ROWID: "+err.Error())
 	}
-	if !strict || !withoutRowID {
+	if strict != 1 || withoutRowID != 1 {
 		return factContextIntegrityError("malformed "+relation.tableName()+" storage mode", "fact-context schema classification", "restore the relation as STRICT, WITHOUT ROWID")
 	}
-
-	fkCount := 0
-	fkValid := false
-	if err := sqlitex.Execute(scope.conn, "SELECT * FROM pragma_foreign_key_list(?1)", &sqlitex.ExecOptions{
-		Args: []any{relation.tableName()},
-		ResultFunc: func(stmt *zs.Stmt) error {
-			fkCount++
-			fkValid = stmt.ColumnText(2) == relation.parentTable() && stmt.ColumnText(3) == relation.parentColumn() && stmt.ColumnText(4) == "journal_id"
-			return nil
-		},
+	fkCount, fkValid := 0, false
+	if err := forEachFactContextRow(scope, "SELECT * FROM pragma_foreign_key_list(?1)", []any{relation.tableName()}, func(row *sql.Rows) error {
+		var id, seq int
+		var table, from, to, onUpdate, onDelete, match string
+		if err := row.Scan(&id, &seq, &table, &from, &to, &onUpdate, &onDelete, &match); err != nil {
+			return err
+		}
+		fkCount++
+		fkValid = table == relation.parentTable() && from == relation.parentColumn() && to == "journal_id"
+		return nil
 	}); err != nil {
 		return factContextIntegrityError("could not inspect "+relation.tableName()+" foreign key", "fact-context schema classification", "restore the subtype-owned parent foreign key: "+err.Error())
 	}
 	if fkCount != 1 || !fkValid {
 		return factContextIntegrityError("malformed "+relation.tableName()+" parent foreign key", "fact-context schema classification", "reference only "+relation.parentTable()+"(journal_id) from "+relation.parentColumn())
 	}
-
 	var triggers int
-	if err := sqlitex.Execute(scope.conn, "SELECT COUNT(*) FROM sqlite_master WHERE type=?1 AND tbl_name=?2", &sqlitex.ExecOptions{
-		Args:       []any{"trigger", relation.tableName()},
-		ResultFunc: func(stmt *zs.Stmt) error { triggers = stmt.ColumnInt(0); return nil },
-	}); err != nil {
+	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT COUNT(*) FROM sqlite_master WHERE type=?1 AND tbl_name=?2", "trigger", relation.tableName()).Scan(&triggers); err != nil {
 		return factContextIntegrityError("could not inspect "+relation.tableName()+" triggers", "fact-context schema classification", "restore the relation without triggers: "+err.Error())
 	}
 	if triggers != 0 {
@@ -317,24 +327,53 @@ func (scope *connScope) validateFactContextTableShape(relation factContextRelati
 
 // ensureFactContextRelations activates the two relations together. Legacy files
 // have neither relation; canonical files already have both and are validated,
-// never repaired. The caller owns Open's surrounding savepoint.
+// never repaired. The caller owns Open's surrounding transaction.
 func (scope *connScope) ensureFactContextRelations() error {
 	state, err := scope.classifyFactContextSchema()
-	if err != nil {
+	if err != nil || state == factContextSchemaCanonical {
 		return err
 	}
-	if state == factContextSchemaCanonical {
-		return nil
-	}
 	for _, relation := range []factContextRelation{factContextDecision, factContextEvidence} {
-		if err := sqlitex.ExecuteTransient(scope.conn, relation.createDDL(), nil); err != nil {
+		if _, err := scope.conn.ExecContext(scope.ctx, relation.createDDL()); err != nil {
 			return fmt.Errorf("create %s: %w", relation.tableName(), err)
 		}
 	}
-	if err := scope.backfillLegacyFactContexts(); err != nil {
-		return err
+	return scope.backfillLegacyFactContexts()
+}
+
+type canonicalFactOperation struct {
+	anchor int64
+	wire   []byte
+}
+
+func (scope *connScope) canonicalFactOperations(where string) ([]canonicalFactOperation, error) {
+	operations := make([]canonicalFactOperation, 0)
+	err := forEachFactContextRow(scope, "SELECT journal_id,canonical_mutation FROM journal_operations WHERE canonical_mutation IS NOT ?1 ORDER BY journal_id", []any{nil}, func(row *sql.Rows) error {
+		var operation canonicalFactOperation
+		if err := row.Scan(&operation.anchor, &operation.wire); err != nil {
+			return err
+		}
+		operation.wire = append([]byte(nil), operation.wire...)
+		operations = append(operations, operation)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("enumerate canonical operations for %s: %w", where, err)
 	}
-	return nil
+	return operations, nil
+}
+
+func (scope *connScope) producedFactRows(anchor int64) ([]int64, error) {
+	rows := make([]int64, 0)
+	err := forEachFactContextRow(scope, "SELECT journal_id FROM journal WHERE produced_by_operation_journal_id=?1 ORDER BY journal_id", []any{anchor}, func(row *sql.Rows) error {
+		var journalID int64
+		if err := row.Scan(&journalID); err != nil {
+			return err
+		}
+		rows = append(rows, journalID)
+		return nil
+	})
+	return rows, err
 }
 
 // backfillLegacyFactContexts derives rows only from canonical operation bytes.
@@ -342,27 +381,12 @@ func (scope *connScope) ensureFactContextRelations() error {
 // no synthetic context rows.
 func (scope *connScope) backfillLegacyFactContexts() error {
 	columns, err := scope.tableColumns("journal_operations")
-	if err != nil {
+	if err != nil || isLegacyOperationsColumnSet(columns) {
 		return err
 	}
-	if isLegacyOperationsColumnSet(columns) {
-		return nil
-	}
-	var operations []struct {
-		anchor int64
-		wire   []byte
-	}
-	if err := sqlitex.Execute(scope.conn, "SELECT journal_id,canonical_mutation FROM journal_operations WHERE canonical_mutation IS NOT ?1 ORDER BY journal_id", &sqlitex.ExecOptions{
-		Args: []any{nil},
-		ResultFunc: func(stmt *zs.Stmt) error {
-			operations = append(operations, struct {
-				anchor int64
-				wire   []byte
-			}{anchor: stmt.ColumnInt64(0), wire: readBlob(stmt, 1)})
-			return nil
-		},
-	}); err != nil {
-		return fmt.Errorf("enumerate canonical operations for fact-context backfill: %w", err)
+	operations, err := scope.canonicalFactOperations("fact-context backfill")
+	if err != nil {
+		return err
 	}
 	for _, operation := range operations {
 		prepared, err := journal.DecodeCanonicalMutation(operation.wire)
@@ -370,11 +394,8 @@ func (scope *connScope) backfillLegacyFactContexts() error {
 			return fmt.Errorf("decode canonical operation %d for fact-context backfill: %w", operation.anchor, err)
 		}
 		effects := prepared.NormalizedEffects()
-		var rows []int64
-		if err := sqlitex.Execute(scope.conn, "SELECT journal_id FROM journal WHERE produced_by_operation_journal_id=?1 ORDER BY journal_id", &sqlitex.ExecOptions{
-			Args:       []any{operation.anchor},
-			ResultFunc: func(stmt *zs.Stmt) error { rows = append(rows, stmt.ColumnInt64(0)); return nil },
-		}); err != nil {
+		rows, err := scope.producedFactRows(operation.anchor)
+		if err != nil {
 			return fmt.Errorf("enumerate operation %d rows for fact-context backfill: %w", operation.anchor, err)
 		}
 		if len(rows) != len(effects) {
@@ -382,11 +403,10 @@ func (scope *connScope) backfillLegacyFactContexts() error {
 		}
 		for i, effect := range effects {
 			relation, ok := factContextRelationForEffect(effect)
-			if !ok {
-				continue
-			}
-			if err := scope.persistFactContexts(relation, rows[i], effect.Contexts); err != nil {
-				return fmt.Errorf("backfill canonical operation %d effect %d: %w", operation.anchor, i, err)
+			if ok {
+				if err := scope.persistFactContexts(relation, rows[i], effect.Contexts); err != nil {
+					return fmt.Errorf("backfill canonical operation %d effect %d: %w", operation.anchor, i, err)
+				}
 			}
 		}
 	}
@@ -403,7 +423,7 @@ func (scope *connScope) persistFactContexts(relation factContextRelation, journa
 		if err != nil {
 			return fmt.Errorf("encode %s context: %w", relation.tableName(), err)
 		}
-		if err := sqlitex.Execute(scope.conn, relation.insertSQL(), &sqlitex.ExecOptions{Args: []any{journalID, string(kind), identity}}); err != nil {
+		if _, err := scope.conn.ExecContext(scope.ctx, relation.insertSQL(), journalID, string(kind), identity); err != nil {
 			return fmt.Errorf("insert %s context for journal %d: %w", relation.tableName(), journalID, err)
 		}
 	}
@@ -417,16 +437,9 @@ func (scope *connScope) loadVerifiedFactContexts(relation factContextRelation, j
 	if err := scope.requireCanonicalFactContextSchema("verified fact-context load"); err != nil {
 		return nil, err
 	}
-	contexts, err := scope.verifySelectedFactContext(relation, journalID)
-	if err != nil {
-		return nil, err
-	}
-	return contexts, nil
+	return scope.verifySelectedFactContext(relation, journalID)
 }
 
-// requireCanonicalFactContextSchema is the runtime guard. The legacy state is
-// only accepted by the read-only startup compatibility path before activation;
-// a live store must always have both subtype-owned context relations.
 func (scope *connScope) requireCanonicalFactContextSchema(where string) error {
 	state, err := scope.classifyFactContextSchema()
 	if err != nil {
@@ -439,88 +452,65 @@ func (scope *connScope) requireCanonicalFactContextSchema(where string) error {
 }
 
 // verifySelectedFactContext validates only one candidate fact. It resolves the
-// fact's immutable producing operation and effect, compares the complete
-// canonical context set (including the empty set), and returns the decoded
-// stored set only after that comparison succeeds. It intentionally does not
-// enumerate unrelated journal history; startup, VerifyIntegrity, and replay
-// retain those whole-database checks.
+// immutable producing operation and effect, compares its complete canonical
+// context set, and returns the stored set only after that comparison succeeds.
 func (scope *connScope) verifySelectedFactContext(relation factContextRelation, journalID int64) ([]journal.EventContext, error) {
-	var oppositeParent, oppositeContext bool
-	if err := sqlitex.Execute(scope.conn, relation.oppositeParentSQL(), &sqlitex.ExecOptions{
-		Args:       []any{journalID, 1},
-		ResultFunc: func(*zs.Stmt) error { oppositeParent = true; return nil },
-	}); err != nil {
+	oppositeParent, err := factContextExists(scope, relation.oppositeParentSQL(), journalID, 1)
+	if err != nil {
 		return nil, factContextIntegrityError("could not inspect the opposite fact subtype for journal "+strconv.FormatInt(journalID, 10), "selected fact-context validation", "restore the fact to exactly one subtype table: "+err.Error())
 	}
-	if err := sqlitex.Execute(scope.conn, relation.oppositeContextSQL(), &sqlitex.ExecOptions{
-		Args:       []any{journalID, 1},
-		ResultFunc: func(*zs.Stmt) error { oppositeContext = true; return nil },
-	}); err != nil {
+	oppositeContext, err := factContextExists(scope, relation.oppositeContextSQL(), journalID, 1)
+	if err != nil {
 		return nil, factContextIntegrityError("could not inspect opposite context rows for journal "+strconv.FormatInt(journalID, 10), "selected fact-context validation", "restore contexts only in the selected subtype relation: "+err.Error())
 	}
 	if oppositeParent || oppositeContext {
 		return nil, factContextIntegrityError("cross-subtype fact or context row for journal "+strconv.FormatInt(journalID, 10), "selected fact-context validation", "remove the opposite subtype row and retain only the selected fact relation")
 	}
 
-	var (
-		found               bool
-		kindID              int
-		operationRecordedAt int64
-		producer            int64
-		operationID         int64
-		version             string
-		wire                []byte
-	)
-	if err := sqlitex.Execute(scope.conn, relation.selectedParentSQL(), &sqlitex.ExecOptions{
-		Args: []any{journalID},
-		ResultFunc: func(stmt *zs.Stmt) error {
-			found = true
-			kindID = stmt.ColumnInt(1)
-			if stmt.ColumnType(3) == zs.TypeNull || stmt.ColumnType(4) == zs.TypeNull {
-				return factContextIntegrityError("fact journal "+strconv.FormatInt(journalID, 10)+" has no producing operation", "selected fact-context validation", "restore the fact's producing operation and canonical mutation")
-			}
-			producer = stmt.ColumnInt64(3)
-			operationID = stmt.ColumnInt64(4)
-			if stmt.ColumnType(5) == zs.TypeNull || stmt.ColumnType(6) == zs.TypeNull {
-				return factContextIntegrityError("opaque legacy operation owns selected fact journal "+strconv.FormatInt(journalID, 10), "selected fact-context validation", "restore canonical operation bytes or remove the legacy fact before querying it")
-			}
-			version = stmt.ColumnText(5)
-			wire = readBlob(stmt, 6)
-			if stmt.ColumnType(7) == zs.TypeNull {
-				return factContextIntegrityError("selected fact journal "+strconv.FormatInt(journalID, 10)+" has no canonical operation timestamp", "selected fact-context validation", "restore the producing operation journal anchor")
-			}
-			operationRecordedAt = stmt.ColumnInt64(7)
-			return nil
-		},
-	}); err != nil {
-		return nil, err
-	}
-	if !found {
+	var kindID, ignoredJournalID, ignoredRecordedAt sql.NullInt64
+	var producer, operationID, operationRecordedAt sql.NullInt64
+	var version sql.NullString
+	var wire []byte
+	err = scope.conn.QueryRowContext(scope.ctx, relation.selectedParentSQL(), journalID).Scan(&ignoredJournalID, &kindID, &ignoredRecordedAt, &producer, &operationID, &version, &wire, &operationRecordedAt)
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, factContextIntegrityError("selected fact journal "+strconv.FormatInt(journalID, 10)+" has no "+relation.parentTable()+" parent", "selected fact-context validation", "restore the subtype parent row before querying its contexts")
 	}
-	if kindID != int(relation.journalKind()) {
-		return nil, factContextIntegrityError("selected fact journal "+strconv.FormatInt(journalID, 10)+" has kind "+strconv.Itoa(kindID)+" but belongs to "+relation.parentTable(), "selected fact-context validation", "restore the journal discriminator and matching subtype row")
+	if err != nil {
+		return nil, err
 	}
-	if version == "" || len(wire) == 0 {
+	if !producer.Valid || !operationID.Valid {
+		return nil, factContextIntegrityError("fact journal "+strconv.FormatInt(journalID, 10)+" has no producing operation", "selected fact-context validation", "restore the fact's producing operation and canonical mutation")
+	}
+	if !version.Valid || wire == nil {
+		return nil, factContextIntegrityError("opaque legacy operation owns selected fact journal "+strconv.FormatInt(journalID, 10), "selected fact-context validation", "restore canonical operation bytes or remove the legacy fact before querying it")
+	}
+	if !operationRecordedAt.Valid {
+		return nil, factContextIntegrityError("selected fact journal "+strconv.FormatInt(journalID, 10)+" has no canonical operation timestamp", "selected fact-context validation", "restore the producing operation journal anchor")
+	}
+	if !kindID.Valid || kindID.Int64 != int64(relation.journalKind()) {
+		kindValue := "NULL"
+		if kindID.Valid {
+			kindValue = strconv.FormatInt(kindID.Int64, 10)
+		}
+		return nil, factContextIntegrityError("selected fact journal "+strconv.FormatInt(journalID, 10)+" has kind "+kindValue+" but belongs to "+relation.parentTable(), "selected fact-context validation", "restore the journal discriminator and matching subtype row")
+	}
+	if version.String == "" || len(wire) == 0 {
 		return nil, factContextIntegrityError("selected fact journal "+strconv.FormatInt(journalID, 10)+" has an empty canonical operation", "selected fact-context validation", "restore both canonical mutation columns from the same committed operation")
 	}
 	prepared, err := journal.DecodeCanonicalMutation(wire)
 	if err != nil {
-		return nil, factContextIntegrityError("cannot decode producing operation "+strconv.FormatInt(operationID, 10)+" for selected fact "+strconv.FormatInt(journalID, 10), "selected fact-context validation", "restore the operation's canonical mutation bytes: "+err.Error())
+		return nil, factContextIntegrityError("cannot decode producing operation "+strconv.FormatInt(operationID.Int64, 10)+" for selected fact "+strconv.FormatInt(journalID, 10), "selected fact-context validation", "restore the operation's canonical mutation bytes: "+err.Error())
 	}
-	if version != prepared.EncodingVersion().String() {
-		return nil, factContextIntegrityError("selected fact journal "+strconv.FormatInt(journalID, 10)+" has canonical encoding version "+version+" but decoded operation requires "+prepared.EncodingVersion().String(), "selected fact-context validation", "restore mutation_encoding_version together with canonical_mutation")
+	if version.String != prepared.EncodingVersion().String() {
+		return nil, factContextIntegrityError("selected fact journal "+strconv.FormatInt(journalID, 10)+" has canonical encoding version "+version.String+" but decoded operation requires "+prepared.EncodingVersion().String(), "selected fact-context validation", "restore mutation_encoding_version together with canonical_mutation")
 	}
 	effects := prepared.NormalizedEffects()
-	var rows []int64
-	if err := sqlitex.Execute(scope.conn, "SELECT journal_id FROM journal WHERE produced_by_operation_journal_id=?1 ORDER BY journal_id", &sqlitex.ExecOptions{
-		Args:       []any{producer},
-		ResultFunc: func(stmt *zs.Stmt) error { rows = append(rows, stmt.ColumnInt64(0)); return nil },
-	}); err != nil {
-		return nil, factContextIntegrityError("could not load effect rows for producing operation "+strconv.FormatInt(producer, 10), "selected fact-context validation", "restore the operation's journal row closure: "+err.Error())
+	rows, err := scope.producedFactRows(producer.Int64)
+	if err != nil {
+		return nil, factContextIntegrityError("could not load effect rows for producing operation "+strconv.FormatInt(producer.Int64, 10), "selected fact-context validation", "restore the operation's journal row closure: "+err.Error())
 	}
 	if len(rows) != len(effects) {
-		return nil, factContextIntegrityError("producing operation "+strconv.FormatInt(producer, 10)+" has "+strconv.Itoa(len(rows))+" effect rows for "+strconv.Itoa(len(effects))+" canonical effects, selected fact "+strconv.FormatInt(journalID, 10), "selected fact-context validation", "restore the operation and all of its produced rows from one committed backup")
+		return nil, factContextIntegrityError("producing operation "+strconv.FormatInt(producer.Int64, 10)+" has "+strconv.Itoa(len(rows))+" effect rows for "+strconv.Itoa(len(effects))+" canonical effects, selected fact "+strconv.FormatInt(journalID, 10), "selected fact-context validation", "restore the operation and all of its produced rows from one committed backup")
 	}
 	effectIndex := -1
 	for i, rowID := range rows {
@@ -530,14 +520,14 @@ func (scope *connScope) verifySelectedFactContext(relation factContextRelation, 
 		}
 	}
 	if effectIndex < 0 {
-		return nil, factContextIntegrityError("selected fact journal "+strconv.FormatInt(journalID, 10)+" is not produced by operation "+strconv.FormatInt(producer, 10), "selected fact-context validation", "restore the producing-operation pointer and effect-row closure")
+		return nil, factContextIntegrityError("selected fact journal "+strconv.FormatInt(journalID, 10)+" is not produced by operation "+strconv.FormatInt(producer.Int64, 10), "selected fact-context validation", "restore the producing-operation pointer and effect-row closure")
 	}
 	effect := effects[effectIndex]
 	expectedRelation, ok := factContextRelationForEffect(effect)
 	if !ok || expectedRelation != relation {
 		return nil, factContextIntegrityError("selected fact journal "+strconv.FormatInt(journalID, 10)+" has canonical effect subtype "+effect.Sort.String()+" but was loaded as "+relation.parentTable(), "selected fact-context validation", "restore the canonical effect and matching subtype relation")
 	}
-	if err := scope.validateCanonicalEffectRow(canonicalStoredOperation{anchor: producer, recordedAt: operationRecordedAt}, journalID, effect, false); err != nil {
+	if err := scope.validateCanonicalEffectRow(canonicalStoredOperation{anchor: producer.Int64, recordedAt: operationRecordedAt.Int64}, journalID, effect, false); err != nil {
 		return nil, factContextIntegrityError("selected fact parent does not match its canonical effect", "selected fact-context validation", "restore the subtype parent from the producing operation: "+err.Error())
 	}
 	canonical, err := journal.CanonicalEventContexts(effect.Contexts)
@@ -548,25 +538,27 @@ func (scope *connScope) verifySelectedFactContext(relation factContextRelation, 
 	if err != nil {
 		return nil, err
 	}
-	if err := compareFactContextSets(producer, journalID, canonical, actual); err != nil {
+	if err := compareFactContextSets(producer.Int64, journalID, canonical, actual); err != nil {
 		return nil, err
 	}
 	return actual, nil
 }
 
 func (scope *connScope) loadFactContextsFromRelation(relation factContextRelation, journalID int64) ([]journal.EventContext, error) {
-	var contexts []journal.EventContext
-	if err := sqlitex.Execute(scope.conn, relation.loadSQL(), &sqlitex.ExecOptions{
-		Args: []any{journalID},
-		ResultFunc: func(stmt *zs.Stmt) error {
-			context, err := journal.DecodeStoredEventContext(journal.EventContextKind(stmt.ColumnText(0)), stmt.ColumnText(1))
-			if err != nil {
-				return factContextIntegrityError("malformed "+relation.tableName()+" row for journal "+strconv.FormatInt(journalID, 10), "verified fact-context load", "restore a canonical context kind and identity: "+err.Error())
-			}
-			contexts = append(contexts, context)
-			return nil
-		},
-	}); err != nil {
+	contexts := make([]journal.EventContext, 0)
+	err := forEachFactContextRow(scope, relation.loadSQL(), []any{journalID}, func(row *sql.Rows) error {
+		var kind, identity string
+		if err := row.Scan(&kind, &identity); err != nil {
+			return err
+		}
+		context, err := journal.DecodeStoredEventContext(journal.EventContextKind(kind), identity)
+		if err != nil {
+			return factContextIntegrityError("malformed "+relation.tableName()+" row for journal "+strconv.FormatInt(journalID, 10), "verified fact-context load", "restore a canonical context kind and identity: "+err.Error())
+		}
+		contexts = append(contexts, context)
+		return nil
+	})
+	if err != nil {
 		return nil, fmt.Errorf("load %s contexts for journal %d: %w", relation.tableName(), journalID, err)
 	}
 	return contexts, nil
@@ -577,8 +569,7 @@ func (scope *connScope) verifyFactContextIntegrity() error {
 }
 
 // verifyFactContextIntegrityReadOnlyLegacyCompatible is used only by the
-// pre-activation, read-only compatibility pass for e66 files. Once activation
-// has created the subtype relations, all callers use the strict method above.
+// pre-activation, read-only compatibility pass for e66 files.
 func (scope *connScope) verifyFactContextIntegrityReadOnlyLegacyCompatible() error {
 	return scope.verifyFactContextIntegrityMode(true)
 }
@@ -615,59 +606,49 @@ func (scope *connScope) verifyFactContextIntegrityMode(allowLegacy bool) error {
 }
 
 func (scope *connScope) verifyFactContextParents(relation factContextRelation, canonicalColumns bool) error {
-	result := func(stmt *zs.Stmt) error {
-		journalID := stmt.ColumnInt64(0)
-		if stmt.ColumnType(3) == zs.TypeNull {
+	query, args := relation.parentIntegritySQL(), []any(nil)
+	if !canonicalColumns {
+		query, args = relation.legacyParentIntegritySQL(), []any{nil, nil}
+	}
+	return forEachFactContextRow(scope, query, args, func(row *sql.Rows) error {
+		var journalID int64
+		var contextKind, contextIdentity string
+		var parent, kindID, producer, operationID sql.NullInt64
+		var version sql.NullString
+		var wire []byte
+		if err := row.Scan(&journalID, &contextKind, &contextIdentity, &parent, &kindID, &producer, &operationID, &version, &wire); err != nil {
+			return err
+		}
+		if !parent.Valid {
 			return factContextIntegrityError("context row for journal "+strconv.FormatInt(journalID, 10)+" has no "+relation.parentTable()+" parent", "fact-context topology verification", "restore the subtype parent row or remove the corrupt context row")
 		}
-		if stmt.ColumnType(4) == zs.TypeNull || stmt.ColumnInt(4) != int(relation.journalKind()) {
+		if !kindID.Valid || kindID.Int64 != int64(relation.journalKind()) {
 			return factContextIntegrityError("cross-subtype context row for journal "+strconv.FormatInt(journalID, 10), "fact-context topology verification", "attach the context only to its matching "+relation.parentTable()+" parent")
 		}
-		if stmt.ColumnType(5) == zs.TypeNull || stmt.ColumnType(6) == zs.TypeNull {
+		if !producer.Valid || !operationID.Valid {
 			return factContextIntegrityError("context row for journal "+strconv.FormatInt(journalID, 10)+" has no producing operation", "fact-context topology verification", "restore the fact's producing operation and canonical mutation together")
 		}
-		versionNull := stmt.ColumnType(7) == zs.TypeNull
-		wireNull := stmt.ColumnType(8) == zs.TypeNull
-		if versionNull && wireNull {
+		if !version.Valid && wire == nil {
 			return factContextIntegrityError("opaque legacy operation owns a context row for journal "+strconv.FormatInt(journalID, 10), "fact-context topology verification", "remove the synthetic context row; opaque legacy operations have no reconstructable contexts")
 		}
-		if versionNull != wireNull {
+		if version.Valid != (wire != nil) {
 			return factContextIntegrityError("canonical operation has malformed version/bytes pair for context journal "+strconv.FormatInt(journalID, 10), "fact-context topology verification", "restore both canonical columns from the same committed operation")
 		}
-		if _, err := journal.DecodeStoredEventContext(journal.EventContextKind(stmt.ColumnText(1)), stmt.ColumnText(2)); err != nil {
+		if _, err := journal.DecodeStoredEventContext(journal.EventContextKind(contextKind), contextIdentity); err != nil {
 			return factContextIntegrityError("malformed context row for journal "+strconv.FormatInt(journalID, 10), "fact-context topology verification", "restore a canonical context kind and identity: "+err.Error())
 		}
 		return nil
-	}
-	if canonicalColumns {
-		return sqlitex.Execute(scope.conn, relation.parentIntegritySQL(), &sqlitex.ExecOptions{ResultFunc: result})
-	}
-	return sqlitex.Execute(scope.conn, relation.legacyParentIntegritySQL(), &sqlitex.ExecOptions{Args: []any{nil, nil}, ResultFunc: result})
+	})
 }
 
 func (scope *connScope) validateCanonicalFactContextSets() error {
 	columns, err := scope.tableColumns("journal_operations")
-	if err != nil {
+	if err != nil || isLegacyOperationsColumnSet(columns) {
 		return err
 	}
-	if isLegacyOperationsColumnSet(columns) {
-		return nil
-	}
-	var operations []struct {
-		anchor int64
-		wire   []byte
-	}
-	if err := sqlitex.Execute(scope.conn, "SELECT journal_id,canonical_mutation FROM journal_operations WHERE canonical_mutation IS NOT ?1 ORDER BY journal_id", &sqlitex.ExecOptions{
-		Args: []any{nil},
-		ResultFunc: func(stmt *zs.Stmt) error {
-			operations = append(operations, struct {
-				anchor int64
-				wire   []byte
-			}{anchor: stmt.ColumnInt64(0), wire: readBlob(stmt, 1)})
-			return nil
-		},
-	}); err != nil {
-		return fmt.Errorf("enumerate canonical operations for fact-context validation: %w", err)
+	operations, err := scope.canonicalFactOperations("fact-context validation")
+	if err != nil {
+		return err
 	}
 	for _, operation := range operations {
 		prepared, err := journal.DecodeCanonicalMutation(operation.wire)
@@ -675,24 +656,19 @@ func (scope *connScope) validateCanonicalFactContextSets() error {
 			return fmt.Errorf("decode canonical operation %d for fact-context validation: %w", operation.anchor, err)
 		}
 		effects := prepared.NormalizedEffects()
-		var rows []int64
-		if err := sqlitex.Execute(scope.conn, "SELECT journal_id FROM journal WHERE produced_by_operation_journal_id=?1 ORDER BY journal_id", &sqlitex.ExecOptions{
-			Args:       []any{operation.anchor},
-			ResultFunc: func(stmt *zs.Stmt) error { rows = append(rows, stmt.ColumnInt64(0)); return nil },
-		}); err != nil {
+		rows, err := scope.producedFactRows(operation.anchor)
+		if err != nil {
 			return err
 		}
 		if len(rows) != len(effects) {
-			// validateCanonicalOperations reports the primary row-closure corruption.
 			continue
 		}
 		for i, effect := range effects {
 			relation, ok := factContextRelationForEffect(effect)
-			if !ok {
-				continue
-			}
-			if err := scope.validateCanonicalFactContextSet(operation.anchor, rows[i], relation, effect.Contexts); err != nil {
-				return err
+			if ok {
+				if err := scope.validateCanonicalFactContextSet(operation.anchor, rows[i], relation, effect.Contexts); err != nil {
+					return err
+				}
 			}
 		}
 	}

@@ -5,8 +5,6 @@ import (
 	"fmt"
 
 	"github.com/dayvidpham/provenance/internal/journal"
-	zs "zombiezen.com/go/sqlite"
-	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 // AdversarialRemoveJournalOperationFK recreates the supported pre-FK journal
@@ -18,25 +16,28 @@ func (db *DB) AdversarialRemoveJournalOperationFK() (err error) {
 		return fmt.Errorf("AdversarialRemoveJournalOperationFK: lease connection: %w", err)
 	}
 	defer scope.release()
-	if err = sqlitex.ExecuteTransient(scope.conn, "PRAGMA foreign_keys=OFF", nil); err != nil {
+	if _, err = scope.conn.ExecContext(scope.ctx, "PRAGMA foreign_keys=OFF"); err != nil {
 		return err
 	}
-	defer func() { _ = sqlitex.ExecuteTransient(scope.conn, "PRAGMA foreign_keys=ON", nil) }()
-	end := sqlitex.Transaction(scope.conn)
-	defer end(&err)
-	if err = sqlitex.ExecuteTransient(scope.conn, "DROP VIEW IF EXISTS journal_attributed", nil); err != nil {
-		return fmt.Errorf("remove journal operation FK fixture: drop view: %w", err)
-	}
-	if err = sqlitex.ExecuteTransient(scope.conn, "CREATE TABLE journal_legacy (journal_id INTEGER PRIMARY KEY AUTOINCREMENT,kind_id INTEGER NOT NULL REFERENCES journal_kinds(id),actor_id TEXT REFERENCES agents(id),recorded_at INTEGER NOT NULL,produced_by_operation_journal_id INTEGER,CHECK ((actor_id IS NULL) = (produced_by_operation_journal_id IS NOT NULL)),CHECK (kind_id <> 1 OR produced_by_operation_journal_id IS NOT NULL)) STRICT", nil); err != nil {
-		return fmt.Errorf("remove journal operation FK fixture: create legacy table: %w", err)
-	}
-	if err = sqlitex.Execute(scope.conn, "INSERT INTO journal_legacy SELECT * FROM journal", nil); err != nil {
-		return fmt.Errorf("remove journal operation FK fixture: copy rows: %w", err)
-	}
-	for _, ddl := range []string{"DROP TABLE journal", "ALTER TABLE journal_legacy RENAME TO journal", "CREATE INDEX idx_journal_kind ON journal(kind_id)", "CREATE INDEX idx_journal_actor ON journal(actor_id)", "CREATE INDEX idx_journal_pboj ON journal(produced_by_operation_journal_id)", "CREATE INDEX idx_journal_recorded_at ON journal(recorded_at,journal_id)", journalAttributedViewDDL} {
-		if err = sqlitex.ExecuteTransient(scope.conn, ddl, nil); err != nil {
-			return fmt.Errorf("remove journal operation FK fixture: %w", err)
+	defer func() { _, _ = scope.conn.ExecContext(scope.ctx, "PRAGMA foreign_keys=ON") }()
+	if err = runScopedTransaction(scope.ctx, scope.conn, "BEGIN", func() error {
+		if _, err := scope.conn.ExecContext(scope.ctx, "DROP VIEW IF EXISTS journal_attributed"); err != nil {
+			return fmt.Errorf("remove journal operation FK fixture: drop view: %w", err)
 		}
+		if _, err := scope.conn.ExecContext(scope.ctx, "CREATE TABLE journal_legacy (journal_id INTEGER PRIMARY KEY AUTOINCREMENT,kind_id INTEGER NOT NULL REFERENCES journal_kinds(id),actor_id TEXT REFERENCES agents(id),recorded_at INTEGER NOT NULL,produced_by_operation_journal_id INTEGER,CHECK ((actor_id IS NULL) = (produced_by_operation_journal_id IS NOT NULL)),CHECK (kind_id <> 1 OR produced_by_operation_journal_id IS NOT NULL)) STRICT"); err != nil {
+			return fmt.Errorf("remove journal operation FK fixture: create legacy table: %w", err)
+		}
+		if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO journal_legacy SELECT * FROM journal"); err != nil {
+			return fmt.Errorf("remove journal operation FK fixture: copy rows: %w", err)
+		}
+		for _, ddl := range []string{"DROP TABLE journal", "ALTER TABLE journal_legacy RENAME TO journal", "CREATE INDEX idx_journal_kind ON journal(kind_id)", "CREATE INDEX idx_journal_actor ON journal(actor_id)", "CREATE INDEX idx_journal_pboj ON journal(produced_by_operation_journal_id)", "CREATE INDEX idx_journal_recorded_at ON journal(recorded_at,journal_id)", journalAttributedViewDDL} {
+			if _, err := scope.conn.ExecContext(scope.ctx, ddl); err != nil {
+				return fmt.Errorf("remove journal operation FK fixture: %w", err)
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	return nil
 }
@@ -49,24 +50,28 @@ func (db *DB) AdversarialInstallV1OperationConstraint() (err error) {
 		return fmt.Errorf("AdversarialInstallV1OperationConstraint: lease connection: %w", err)
 	}
 	defer scope.release()
-	if err = sqlitex.ExecuteTransient(scope.conn, "PRAGMA foreign_keys=OFF", nil); err != nil {
+	if _, err = scope.conn.ExecContext(scope.ctx, "PRAGMA foreign_keys=OFF"); err != nil {
 		return err
 	}
-	defer func() { _ = sqlitex.ExecuteTransient(scope.conn, "PRAGMA foreign_keys=ON", nil) }()
-	end := sqlitex.Transaction(scope.conn)
-	defer end(&err)
-	for _, ddl := range []string{"DROP TRIGGER IF EXISTS journal_operations_canonical_insert", "DROP TRIGGER IF EXISTS journal_operations_canonical_update", "CREATE TABLE journal_operations_v1 (journal_id INTEGER PRIMARY KEY REFERENCES journal(journal_id),operation_id TEXT NOT NULL UNIQUE,authority_journal_id INTEGER REFERENCES journal_authorities(journal_id),command_digest BLOB NOT NULL,mutation_digest BLOB NOT NULL,mutation_encoding_version TEXT,canonical_mutation BLOB,CHECK ((mutation_encoding_version IS NULL AND canonical_mutation IS NULL) OR (mutation_encoding_version='provenance.mutation.v1' AND length(canonical_mutation)>0))) STRICT"} {
-		if err = sqlitex.ExecuteTransient(scope.conn, ddl, nil); err != nil {
-			return fmt.Errorf("install V1 operation constraint fixture: %w", err)
+	defer func() { _, _ = scope.conn.ExecContext(scope.ctx, "PRAGMA foreign_keys=ON") }()
+	err = runScopedTransaction(scope.ctx, scope.conn, "BEGIN", func() error {
+		for _, ddl := range []string{"DROP TRIGGER IF EXISTS journal_operations_canonical_insert", "DROP TRIGGER IF EXISTS journal_operations_canonical_update", "CREATE TABLE journal_operations_v1 (journal_id INTEGER PRIMARY KEY REFERENCES journal(journal_id),operation_id TEXT NOT NULL UNIQUE,authority_journal_id INTEGER REFERENCES journal_authorities(journal_id),command_digest BLOB NOT NULL,mutation_digest BLOB NOT NULL,mutation_encoding_version TEXT,canonical_mutation BLOB,CHECK ((mutation_encoding_version IS NULL AND canonical_mutation IS NULL) OR (mutation_encoding_version='provenance.mutation.v1' AND length(canonical_mutation)>0))) STRICT"} {
+			if _, err := scope.conn.ExecContext(scope.ctx, ddl); err != nil {
+				return fmt.Errorf("install V1 operation constraint fixture: %w", err)
+			}
 		}
-	}
-	if err = sqlitex.Execute(scope.conn, "INSERT INTO journal_operations_v1 SELECT * FROM journal_operations", nil); err != nil {
-		return fmt.Errorf("install V1 operation constraint fixture: copy rows: %w", err)
-	}
-	for _, ddl := range []string{"DROP TABLE journal_operations", "ALTER TABLE journal_operations_v1 RENAME TO journal_operations", "CREATE TRIGGER journal_operations_canonical_insert BEFORE INSERT ON journal_operations WHEN NEW.mutation_encoding_version IS NOT NULL AND NEW.mutation_encoding_version!='provenance.mutation.v1' BEGIN SELECT RAISE(ABORT,'V1 only'); END", "CREATE TRIGGER journal_operations_canonical_update BEFORE UPDATE OF mutation_encoding_version ON journal_operations WHEN NEW.mutation_encoding_version IS NOT NULL AND NEW.mutation_encoding_version!='provenance.mutation.v1' BEGIN SELECT RAISE(ABORT,'V1 only'); END"} {
-		if err = sqlitex.ExecuteTransient(scope.conn, ddl, nil); err != nil {
-			return fmt.Errorf("install V1 operation constraint fixture: %w", err)
+		if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO journal_operations_v1 SELECT * FROM journal_operations"); err != nil {
+			return fmt.Errorf("install V1 operation constraint fixture: copy rows: %w", err)
 		}
+		for _, ddl := range []string{"DROP TABLE journal_operations", "ALTER TABLE journal_operations_v1 RENAME TO journal_operations", "CREATE TRIGGER journal_operations_canonical_insert BEFORE INSERT ON journal_operations WHEN NEW.mutation_encoding_version IS NOT NULL AND NEW.mutation_encoding_version!='provenance.mutation.v1' BEGIN SELECT RAISE(ABORT,'V1 only'); END", "CREATE TRIGGER journal_operations_canonical_update BEFORE UPDATE OF mutation_encoding_version ON journal_operations WHEN NEW.mutation_encoding_version IS NOT NULL AND NEW.mutation_encoding_version!='provenance.mutation.v1' BEGIN SELECT RAISE(ABORT,'V1 only'); END"} {
+			if _, err := scope.conn.ExecContext(scope.ctx, ddl); err != nil {
+				return fmt.Errorf("install V1 operation constraint fixture: %w", err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 	return nil
 }
@@ -87,19 +92,22 @@ func (db *DB) AdversarialJournalRowTwoSubtypes(actor journal.ActorID) (journal.J
 		return 0, fmt.Errorf("AdversarialJournalRowTwoSubtypes: lease connection: %w", err)
 	}
 	defer scope.release()
-	var txErr error
-	endTx := sqlitex.Transaction(scope.conn)
-	defer endTx(&txErr)
-	jid, err := scope.insertJournalRow(journal.JournalKindDecision, actor, 0, nil)
-	if err != nil {
-		txErr = err
-		return 0, txErr
-	}
-	if txErr = sqlitex.Execute(scope.conn, "INSERT INTO journal_decisions (journal_id, decision_kind, task_id, payload) VALUES (?1, ?2, ?4, ?3)", &sqlitex.ExecOptions{Args: []any{jid, "pasture.review.vote", "{}", nil}}); txErr != nil {
-		return 0, txErr
-	}
-	if txErr = sqlitex.Execute(scope.conn, "INSERT INTO journal_evidence (journal_id, evidence_kind, task_id, content_digest, payload) VALUES (?1, ?2, ?5, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{jid, "pasture.git.commit", []byte("x"), "{}", nil}}); txErr != nil {
-		return 0, txErr
+	var jid int64
+	if err := runScopedTransaction(scope.ctx, scope.conn, "BEGIN", func() error {
+		var err error
+		jid, err = scope.insertJournalRow(journal.JournalKindDecision, actor, 0, nil)
+		if err != nil {
+			return err
+		}
+		if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO journal_decisions (journal_id, decision_kind, task_id, payload) VALUES (?1, ?2, ?4, ?3)", jid, "pasture.review.vote", "{}", nil); err != nil {
+			return err
+		}
+		if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO journal_evidence (journal_id, evidence_kind, task_id, content_digest, payload) VALUES (?1, ?2, ?5, ?3, ?4)", jid, "pasture.git.commit", []byte("x"), "{}", nil); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		return 0, err
 	}
 	return journal.JournalID(jid), nil
 }
@@ -123,35 +131,33 @@ func (db *DB) AdversarialSubordinateRowCarryingActor(actor journal.ActorID, task
 	defer scope.release()
 	// Bypass the structural CHECK so the reducer-level placement guard is what
 	// catches the row (the CHECK is exercised on the production write path instead).
-	if err := sqlitex.ExecuteTransient(scope.conn, "PRAGMA ignore_check_constraints=ON", nil); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, "PRAGMA ignore_check_constraints=ON"); err != nil {
 		return 0, fmt.Errorf("AdversarialSubordinateRowCarryingActor: disable CHECK enforcement: %w", err)
 	}
-	defer func() { _ = sqlitex.ExecuteTransient(scope.conn, "PRAGMA ignore_check_constraints=OFF", nil) }()
+	defer func() { _, _ = scope.conn.ExecContext(scope.ctx, "PRAGMA ignore_check_constraints=OFF") }()
 
-	var txErr error
-	endTx := sqlitex.Transaction(scope.conn)
-	defer endTx(&txErr)
-
-	// Valid operation anchor (actor stored, PBOJID NULL) so the subordinate row's
-	// producing-operation FK resolves.
-	anchorJID, err := scope.insertJournalRow(journal.JournalKindOperation, actor, 0, nil)
-	if err != nil {
-		txErr = err
-		return 0, txErr
-	}
-	if txErr = sqlitex.Execute(scope.conn, "INSERT INTO journal_operations (journal_id, operation_id, authority_journal_id, command_digest, mutation_digest)\n\t\t VALUES (?1, ?2, ?5, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{anchorJID, fmt.Sprintf("adversarial-subord-op-%d", anchorJID), []byte("c"), []byte("m"), nil}}); txErr != nil {
-		return 0, txErr
-	}
-	// Subordinate task_event row carrying an actor it must not: PBOJID set AND
-	// actor_id set. insertJournalRow would write NULL, so insert directly.
-	if txErr = sqlitex.Execute(scope.conn, "INSERT INTO journal (kind_id, actor_id, recorded_at, produced_by_operation_journal_id) VALUES (?1, ?2, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{int(journal.JournalKindTaskEvent), actor.String(), int64(0), anchorJID}}); txErr != nil {
-		return 0, txErr
-	}
-	subordinateJID := scope.conn.LastInsertRowID()
-	if txErr = sqlitex.Execute(scope.conn,
-		insertJournalTaskEventSQL,
-		&sqlitex.ExecOptions{Args: []any{subordinateJID, task.String(), string(journal.EventKindTaskUpdated), "{}"}}); txErr != nil {
-		return 0, txErr
+	var subordinateJID int64
+	if err := runScopedTransaction(scope.ctx, scope.conn, "BEGIN", func() error {
+		// Valid operation anchor (actor stored, PBOJID NULL) so the subordinate row's
+		// producing-operation FK resolves.
+		anchorJID, err := scope.insertJournalRow(journal.JournalKindOperation, actor, 0, nil)
+		if err != nil {
+			return err
+		}
+		if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO journal_operations (journal_id, operation_id, authority_journal_id, command_digest, mutation_digest)\n\t\t VALUES (?1, ?2, ?5, ?3, ?4)", anchorJID, fmt.Sprintf("adversarial-subord-op-%d", anchorJID), []byte("c"), []byte("m"), nil); err != nil {
+			return err
+		}
+		// Subordinate task_event row carrying an actor it must not: PBOJID set AND
+		// actor_id set. insertJournalRow would write NULL, so insert directly.
+		if err := scope.conn.QueryRowContext(scope.ctx, "INSERT INTO journal (kind_id, actor_id, recorded_at, produced_by_operation_journal_id) VALUES (?1, ?2, ?3, ?4) RETURNING journal_id", int(journal.JournalKindTaskEvent), actor.String(), int64(0), anchorJID).Scan(&subordinateJID); err != nil {
+			return err
+		}
+		if _, err := scope.conn.ExecContext(scope.ctx, insertJournalTaskEventSQL, subordinateJID, task.String(), string(journal.EventKindTaskUpdated), "{}"); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		return 0, err
 	}
 	return journal.JournalID(subordinateJID), nil
 }
@@ -165,19 +171,22 @@ func (db *DB) AdversarialSubtypeMismatchingKind(actor journal.ActorID) (journal.
 		return 0, fmt.Errorf("AdversarialSubtypeMismatchingKind: lease connection: %w", err)
 	}
 	defer scope.release()
-	var txErr error
-	endTx := sqlitex.Transaction(scope.conn)
-	defer endTx(&txErr)
-	jid, err := scope.insertJournalRow(journal.JournalKindDecision, actor, 0, nil)
-	if err != nil {
-		txErr = err
-		return 0, txErr
-	}
-	if txErr = sqlitex.Execute(scope.conn, "INSERT INTO journal_decisions (journal_id, decision_kind, task_id, payload) VALUES (?1, ?2, ?4, ?3)", &sqlitex.ExecOptions{Args: []any{jid, "pasture.review.vote", "{}", nil}}); txErr != nil {
-		return 0, txErr
-	}
-	if txErr = sqlitex.Execute(scope.conn, "INSERT INTO journal_operations (journal_id, operation_id, authority_journal_id, command_digest, mutation_digest)\n\t\t VALUES (?1, ?2, ?5, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{jid, fmt.Sprintf("adversarial-op-%d", jid), []byte("c"), []byte("m"), nil}}); txErr != nil {
-		return 0, txErr
+	var jid int64
+	if err := runScopedTransaction(scope.ctx, scope.conn, "BEGIN", func() error {
+		var err error
+		jid, err = scope.insertJournalRow(journal.JournalKindDecision, actor, 0, nil)
+		if err != nil {
+			return err
+		}
+		if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO journal_decisions (journal_id, decision_kind, task_id, payload) VALUES (?1, ?2, ?4, ?3)", jid, "pasture.review.vote", "{}", nil); err != nil {
+			return err
+		}
+		if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO journal_operations (journal_id, operation_id, authority_journal_id, command_digest, mutation_digest)\n\t\t VALUES (?1, ?2, ?5, ?3, ?4)", jid, fmt.Sprintf("adversarial-op-%d", jid), []byte("c"), []byte("m"), nil); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		return 0, err
 	}
 	return journal.JournalID(jid), nil
 }
@@ -192,29 +201,30 @@ func (db *DB) AdversarialAuthorityDetailMismatch(actor journal.ActorID, task jou
 		return 0, fmt.Errorf("AdversarialAuthorityDetailMismatch: lease connection: %w", err)
 	}
 	defer scope.release()
-	var txErr error
-	endTx := sqlitex.Transaction(scope.conn)
-	defer endTx(&txErr)
-	jid, err := scope.insertJournalRow(journal.JournalKindAuthority, actor, 0, nil)
-	if err != nil {
-		txErr = err
-		return 0, txErr
-	}
-	if txErr = sqlitex.Execute(scope.conn,
-		insertJournalAuthoritySQL,
-		&sqlitex.ExecOptions{Args: []any{jid, authKindBootstrapID, fmt.Sprintf("adversarial-auth-%d", jid)}}); txErr != nil {
-		return 0, txErr
-	}
-	if txErr = sqlitex.Execute(scope.conn, "INSERT INTO journal_authority_bootstraps (journal_id, label) VALUES (?1, ?2)", &sqlitex.ExecOptions{Args: []any{jid, "adversarial"}}); txErr != nil {
-		return 0, txErr
-	}
-	assignment := fmt.Sprintf("adversarial-episode-%d", jid)
-	if txErr = sqlitex.Execute(scope.conn, "INSERT INTO journal_authority_assignment_episodes (assignment_id, task_id, slot_id, actor_id, predecessor_assignment_id)\n\t\t VALUES (?1, ?2, ?3, ?4, ?5)", &sqlitex.ExecOptions{Args: []any{assignment, task.String(), slotOwnerResponsibilityID, actor.String(), nil}}); txErr != nil {
-		return 0, txErr
-	}
-	// The transition points at the bootstrap authority above — the mismatch.
-	if txErr = sqlitex.Execute(scope.conn, "INSERT INTO journal_authority_assignment_transitions (journal_id, assignment_id, transition_id) VALUES (?1, ?2, ?3)", &sqlitex.ExecOptions{Args: []any{jid, assignment, transitionStartedID}}); txErr != nil {
-		return 0, txErr
+	var jid int64
+	if err := runScopedTransaction(scope.ctx, scope.conn, "BEGIN", func() error {
+		var err error
+		jid, err = scope.insertJournalRow(journal.JournalKindAuthority, actor, 0, nil)
+		if err != nil {
+			return err
+		}
+		if _, err := scope.conn.ExecContext(scope.ctx, insertJournalAuthoritySQL, jid, authKindBootstrapID, fmt.Sprintf("adversarial-auth-%d", jid)); err != nil {
+			return err
+		}
+		if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO journal_authority_bootstraps (journal_id, label) VALUES (?1, ?2)", jid, "adversarial"); err != nil {
+			return err
+		}
+		assignment := fmt.Sprintf("adversarial-episode-%d", jid)
+		if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO journal_authority_assignment_episodes (assignment_id, task_id, slot_id, actor_id, predecessor_assignment_id)\n\t\t VALUES (?1, ?2, ?3, ?4, ?5)", assignment, task.String(), slotOwnerResponsibilityID, actor.String(), nil); err != nil {
+			return err
+		}
+		// The transition points at the bootstrap authority above — the mismatch.
+		if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO journal_authority_assignment_transitions (journal_id, assignment_id, transition_id) VALUES (?1, ?2, ?3)", jid, assignment, transitionStartedID); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		return 0, err
 	}
 	return journal.JournalID(jid), nil
 }
@@ -300,7 +310,7 @@ func (db *DB) AdversarialAddColumn(addition AdversarialColumnAddition) error {
 	defer scope.release()
 	// DDL identifiers cannot be bound as parameters; table/column come from the
 	// closed corpus, never caller input, so identifier interpolation is safe here.
-	if err := sqlitex.ExecuteTransient(scope.conn, addition.query(), nil); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, addition.query()); err != nil {
 		return fmt.Errorf("AdversarialAddColumn: %w", err)
 	}
 	return nil
@@ -329,7 +339,7 @@ func (db *DB) AdversarialDropColumn(drop AdversarialColumnDrop) error {
 	}
 	defer scope.release()
 	// DDL identifiers cannot be bound; table/column come from the closed corpus.
-	if err := sqlitex.ExecuteTransient(scope.conn, drop.query(), nil); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, drop.query()); err != nil {
 		return fmt.Errorf("AdversarialDropColumn: %w", err)
 	}
 	return nil
@@ -359,12 +369,12 @@ func (db *DB) AdversarialDropTable(drop AdversarialTableDrop) error {
 		return fmt.Errorf("AdversarialDropTable: lease connection: %w", err)
 	}
 	defer scope.release()
-	if err := sqlitex.ExecuteTransient(scope.conn, "PRAGMA foreign_keys=OFF", nil); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, "PRAGMA foreign_keys=OFF"); err != nil {
 		return fmt.Errorf("AdversarialDropTable: disable FK: %w", err)
 	}
-	defer func() { _ = sqlitex.ExecuteTransient(scope.conn, "PRAGMA foreign_keys=ON", nil) }()
+	defer func() { _, _ = scope.conn.ExecContext(scope.ctx, "PRAGMA foreign_keys=ON") }()
 	// DDL identifier cannot be bound; table comes from the closed corpus.
-	if err := sqlitex.ExecuteTransient(scope.conn, drop.query(), nil); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, drop.query()); err != nil {
 		return fmt.Errorf("AdversarialDropTable: %w", err)
 	}
 	return nil
@@ -440,7 +450,7 @@ func (db *DB) AdversarialAddTable(addition AdversarialTableAddition) error {
 	defer scope.release()
 	// DDL identifier cannot be bound as a parameter; table comes from the closed
 	// corpus, never caller input, so identifier interpolation is safe here.
-	if err := sqlitex.ExecuteTransient(scope.conn, addition.query(), nil); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, addition.query()); err != nil {
 		return fmt.Errorf("AdversarialAddTable: %w", err)
 	}
 	return nil
@@ -476,8 +486,7 @@ func (db *DB) AdversarialCorruptTaskProjection(task journal.TaskID, field Advers
 	default:
 		return fmt.Errorf("AdversarialCorruptTaskProjection: unknown projection field %q (closed set: owner_id/status_id/last_journal_id)", field)
 	}
-	if err := sqlitex.Execute(scope.conn, field.query(),
-		&sqlitex.ExecOptions{Args: []any{value, task.String()}}); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, field.query(), value, task.String()); err != nil {
 		return fmt.Errorf("AdversarialCorruptTaskProjection %q field %d: %w", task, field, err)
 	}
 	return nil
@@ -510,7 +519,7 @@ func (db *DB) AdversarialCorruptCommentBody(commentID, body string) error {
 		return fmt.Errorf("AdversarialCorruptCommentBody: lease connection: %w", err)
 	}
 	defer scope.release()
-	if err := sqlitex.Execute(scope.conn, "UPDATE comments SET body = ?1 WHERE id = ?2", &sqlitex.ExecOptions{Args: []any{body, commentID}}); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, "UPDATE comments SET body = ?1 WHERE id = ?2", body, commentID); err != nil {
 		return fmt.Errorf("AdversarialCorruptCommentBody %q: %w", commentID, err)
 	}
 	return nil
@@ -525,7 +534,7 @@ func (db *DB) AdversarialInsertSpuriousAttribution(task journal.TaskID, actor jo
 		return fmt.Errorf("AdversarialInsertSpuriousAttribution: lease connection: %w", err)
 	}
 	defer scope.release()
-	if err := sqlitex.Execute(scope.conn, "INSERT OR REPLACE INTO task_attributions (task_id, actor_id, first_journal_id) VALUES (?1, ?2, ?3)", &sqlitex.ExecOptions{Args: []any{task.String(), actor.String(), int64(jid)}}); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, "INSERT OR REPLACE INTO task_attributions (task_id, actor_id, first_journal_id) VALUES (?1, ?2, ?3)", task.String(), actor.String(), int64(jid)); err != nil {
 		return fmt.Errorf("AdversarialInsertSpuriousAttribution %q/%q: %w", task, actor, err)
 	}
 	return nil
@@ -572,28 +581,30 @@ func (db *DB) AdversarialCyclicParentChain(actor journal.ActorID, taskX, taskY, 
 		return 0, journal.TaskID{}, 0, fmt.Errorf("AdversarialCyclicParentChain: lease connection: %w", err)
 	}
 	defer scope.release()
-	var txErr error
-	endTx := sqlitex.Transaction(scope.conn)
-	defer endTx(&txErr)
-	if _, txErr = scope.seedActiveEpisode(actor, taskX, "cyclic-parent-X", nil); txErr != nil {
-		return 0, journal.TaskID{}, 0, txErr
-	}
-	if _, txErr = scope.seedActiveEpisode(actor, taskY, "cyclic-parent-Y", "cyclic-parent-X"); txErr != nil {
-		return 0, journal.TaskID{}, 0, txErr
-	}
-	// Close the cycle: X.parent = Y. A production start effect can never write this
-	// (its cycle guard rejects it); the direct UPDATE is the corruption under test.
-	if txErr = sqlitex.Execute(scope.conn, "UPDATE journal_authority_assignment_episodes SET parent_assignment_id = ?1 WHERE assignment_id = ?2", &sqlitex.ExecOptions{Args: []any{"cyclic-parent-Y", "cyclic-parent-X"}}); txErr != nil {
-		return 0, journal.TaskID{}, 0, txErr
-	}
-	var jz int64
-	if jz, txErr = scope.seedActiveEpisode(actor, taskZ, "cyclic-parent-Z", nil); txErr != nil {
-		return 0, journal.TaskID{}, 0, txErr
-	}
-	var maxJID int64
-	if txErr = sqlitex.Execute(scope.conn, "SELECT COALESCE(MAX(journal_id), ?1) FROM journal",
-		&sqlitex.ExecOptions{Args: []any{0}, ResultFunc: func(stmt *zs.Stmt) error { maxJID = stmt.ColumnInt64(0); return nil }}); txErr != nil {
-		return 0, journal.TaskID{}, 0, txErr
+	var jz, maxJID int64
+	if err := runScopedTransaction(scope.ctx, scope.conn, "BEGIN", func() error {
+		if _, err := scope.seedActiveEpisode(actor, taskX, "cyclic-parent-X", nil); err != nil {
+			return err
+		}
+		if _, err := scope.seedActiveEpisode(actor, taskY, "cyclic-parent-Y", "cyclic-parent-X"); err != nil {
+			return err
+		}
+		// Close the cycle: X.parent = Y. A production start effect can never write this
+		// (its cycle guard rejects it); the direct UPDATE is the corruption under test.
+		if _, err := scope.conn.ExecContext(scope.ctx, "UPDATE journal_authority_assignment_episodes SET parent_assignment_id = ?1 WHERE assignment_id = ?2", "cyclic-parent-Y", "cyclic-parent-X"); err != nil {
+			return err
+		}
+		var err error
+		jz, err = scope.seedActiveEpisode(actor, taskZ, "cyclic-parent-Z", nil)
+		if err != nil {
+			return err
+		}
+		if err := scope.conn.QueryRowContext(scope.ctx, "SELECT COALESCE(MAX(journal_id), ?1) FROM journal", 0).Scan(&maxJID); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		return 0, journal.TaskID{}, 0, err
 	}
 	return journal.JournalID(jz), taskX, journal.JournalID(maxJID + 1), nil
 }
@@ -608,7 +619,7 @@ func (scope *connScope) seedActiveEpisode(actor journal.ActorID, task journal.Ta
 	if err != nil {
 		return 0, err
 	}
-	if err := sqlitex.Execute(scope.conn, "INSERT INTO journal_authority_assignment_episodes (assignment_id, task_id, slot_id, actor_id, predecessor_assignment_id, parent_assignment_id)\n\t\t VALUES (?1, ?2, ?3, ?4, ?6, ?5)", &sqlitex.ExecOptions{Args: []any{string(assignment), task.String(), slotOwnerResponsibilityID, actor.String(), parent, nil}}); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO journal_authority_assignment_episodes (assignment_id, task_id, slot_id, actor_id, predecessor_assignment_id, parent_assignment_id)\n\t\t VALUES (?1, ?2, ?3, ?4, ?6, ?5)", string(assignment), task.String(), slotOwnerResponsibilityID, actor.String(), parent, nil); err != nil {
 		return 0, fmt.Errorf("seed episode %q: %w", assignment, err)
 	}
 	if err := scope.insertAuthorityAssignmentTransition(jid, assignment, transitionStartedID); err != nil {

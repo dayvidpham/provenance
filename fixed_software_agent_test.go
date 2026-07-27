@@ -10,8 +10,6 @@ import (
 
 	"github.com/google/uuid"
 	"gopkg.in/yaml.v3"
-	"zombiezen.com/go/sqlite"
-	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 type fixedAgentFixture struct {
@@ -311,13 +309,13 @@ func TestRegisterFixedSoftwareAgentRejectsPreClaimActor(t *testing.T) {
 	defer tr.Close()
 	reg := testFixedSoftwareAgentRegistration()
 	var err error
-	withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
-		err = sqlitex.Execute(conn, `INSERT INTO agents (id, kind_id) VALUES (?1, ?2)`,
-			&sqlitex.ExecOptions{Args: []any{reg.Entry.ActorID.String(), int(AgentKindSoftware)}})
+	withRawSQLiteTestConn(t, path, func(conn *rawSQLiteConn) {
+		err = rawExecute(conn, `INSERT INTO agents (id, kind_id) VALUES (?1, ?2)`,
+			&rawExecOptions{Args: []any{reg.Entry.ActorID.String(), int(AgentKindSoftware)}})
 		if err == nil {
-			err = sqlitex.Execute(conn,
+			err = rawExecute(conn,
 				`INSERT INTO agents_software (agent_id, name, version, source) VALUES (?1, ?2, ?3, ?4)`,
-				&sqlitex.ExecOptions{Args: []any{reg.Entry.ActorID.String(), reg.AgentName, reg.Version, reg.Source}})
+				&rawExecOptions{Args: []any{reg.Entry.ActorID.String(), reg.AgentName, reg.Version, reg.Source}})
 		}
 	})
 	if err != nil {
@@ -380,14 +378,14 @@ func installFixedAgentAbortTrigger(t *testing.T, path string, boundary string) f
 	default:
 		t.Fatalf("unknown rollback boundary %q", boundary)
 	}
-	withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
-		if err := sqlitex.ExecuteTransient(conn, createStmt, nil); err != nil {
+	withRawSQLiteTestConn(t, path, func(conn *rawSQLiteConn) {
+		if err := rawExecuteTransient(conn, createStmt, nil); err != nil {
 			t.Fatalf("install %s failure trigger: %v", boundary, err)
 		}
 	})
 	return func() {
-		withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
-			if err := sqlitex.ExecuteTransient(conn, dropStmt, nil); err != nil {
+		withRawSQLiteTestConn(t, path, func(conn *rawSQLiteConn) {
+			if err := rawExecuteTransient(conn, dropStmt, nil); err != nil {
 				t.Errorf("remove %s failure trigger before tracker close: %v", boundary, err)
 			}
 		})
@@ -405,10 +403,10 @@ func assertFixedAgentRowCounts(t *testing.T, path string, want [4]int) {
 		{"agents_software", `SELECT COUNT(*) FROM agents_software`},
 		{"fixed_actor_manifest_entries", `SELECT COUNT(*) FROM fixed_actor_manifest_entries`},
 	}
-	withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
+	withRawSQLiteTestConn(t, path, func(conn *rawSQLiteConn) {
 		for i, table := range tables {
 			var got int
-			if err := sqlitex.Execute(conn, table.query, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error {
+			if err := rawExecute(conn, table.query, &rawExecOptions{ResultFunc: func(stmt *rawSQLiteStmt) error {
 				got = stmt.ColumnInt(0)
 				return nil
 			}}); err != nil {

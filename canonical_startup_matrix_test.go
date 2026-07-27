@@ -10,9 +10,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-
-	"zombiezen.com/go/sqlite"
-	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 type startupFixture struct {
@@ -30,7 +27,7 @@ type startupBaseline struct {
 }
 
 type startupCorruptionHandle struct {
-	conn *sqlite.Conn
+	conn *rawSQLiteConn
 }
 
 type startupCorruptionCase func(*testing.T, *startupCorruptionHandle, startupFixture)
@@ -96,8 +93,8 @@ func checkpointAndCloseStartupFixture(t *testing.T, tr Tracker, path string) {
 	t.Helper()
 	checkpointRows := 0
 	busy, logFrames, checkpointedFrames := 0, 0, 0
-	withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
-		if err := sqlitex.ExecuteTransient(conn, `PRAGMA wal_checkpoint(TRUNCATE)`, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error {
+	withRawSQLiteTestConn(t, path, func(conn *rawSQLiteConn) {
+		if err := rawExecuteTransient(conn, `PRAGMA wal_checkpoint(TRUNCATE)`, &rawExecOptions{ResultFunc: func(stmt *rawSQLiteStmt) error {
 			checkpointRows++
 			busy = stmt.ColumnInt(0)
 			logFrames = stmt.ColumnInt(1)
@@ -203,18 +200,18 @@ func writeStartupBaselineCopy(t *testing.T, baseline startupBaseline, path strin
 // by canonical tests whose contract includes a successful production open.
 func corruptSQL(t *testing.T, path string, statement string, args ...any) {
 	t.Helper()
-	withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
-		if err := sqlitex.Execute(conn, `PRAGMA foreign_keys=OFF`, nil); err != nil {
+	withRawSQLiteTestConn(t, path, func(conn *rawSQLiteConn) {
+		if err := rawExecute(conn, `PRAGMA foreign_keys=OFF`, nil); err != nil {
 			t.Fatal(err)
 		}
-		if err := sqlitex.Execute(conn, `PRAGMA ignore_check_constraints=ON`, nil); err != nil {
+		if err := rawExecute(conn, `PRAGMA ignore_check_constraints=ON`, nil); err != nil {
 			t.Fatal(err)
 		}
-		if err := sqlitex.Execute(conn, statement, &sqlitex.ExecOptions{Args: args}); err != nil {
+		if err := rawExecute(conn, statement, &rawExecOptions{Args: args}); err != nil {
 			t.Fatal(err)
 		}
 		changed := 0
-		if err := sqlitex.ExecuteTransient(conn, `SELECT changes()`, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error { changed = stmt.ColumnInt(0); return nil }}); err != nil {
+		if err := rawExecuteTransient(conn, `SELECT changes()`, &rawExecOptions{ResultFunc: func(stmt *rawSQLiteStmt) error { changed = stmt.ColumnInt(0); return nil }}); err != nil {
 			t.Fatal(err)
 		}
 		if changed != 1 {
@@ -225,8 +222,8 @@ func corruptSQL(t *testing.T, path string, statement string, args ...any) {
 
 func corruptDDL(t *testing.T, path string, statement string) {
 	t.Helper()
-	withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
-		if err := sqlitex.ExecuteTransient(conn, statement, nil); err != nil {
+	withRawSQLiteTestConn(t, path, func(conn *rawSQLiteConn) {
+		if err := rawExecuteTransient(conn, statement, nil); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -234,12 +231,9 @@ func corruptDDL(t *testing.T, path string, statement string) {
 
 func openStartupCorruptionHandle(t *testing.T, path string) *startupCorruptionHandle {
 	t.Helper()
-	conn, err := sqlite.OpenConn(path, sqlite.OpenReadWrite|sqlite.OpenURI)
-	if err != nil {
-		t.Fatalf("open existing private startup baseline for raw test corruption: %v", err)
-	}
+	conn := openRawSQLiteTestConn(t, path, "rw")
 	for _, pragma := range []string{`PRAGMA foreign_keys=OFF`, `PRAGMA ignore_check_constraints=ON`} {
-		if err := sqlitex.Execute(conn, pragma, nil); err != nil {
+		if err := rawExecute(conn, pragma, nil); err != nil {
 			_ = conn.Close()
 			t.Fatalf("configure raw startup corruption connection with %q: %v", pragma, err)
 		}
@@ -251,7 +245,7 @@ func closeStartupCorruptionHandle(t *testing.T, handle *startupCorruptionHandle)
 	t.Helper()
 	checkpointRows := 0
 	busy, logFrames, checkpointedFrames := 0, 0, 0
-	err := sqlitex.ExecuteTransient(handle.conn, `PRAGMA wal_checkpoint(TRUNCATE)`, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error {
+	err := rawExecuteTransient(handle.conn, `PRAGMA wal_checkpoint(TRUNCATE)`, &rawExecOptions{ResultFunc: func(stmt *rawSQLiteStmt) error {
 		checkpointRows++
 		busy = stmt.ColumnInt(0)
 		logFrames = stmt.ColumnInt(1)
@@ -273,11 +267,11 @@ func closeStartupCorruptionHandle(t *testing.T, handle *startupCorruptionHandle)
 
 func corruptStartupSQL(t *testing.T, handle *startupCorruptionHandle, statement string, args ...any) {
 	t.Helper()
-	if err := sqlitex.Execute(handle.conn, statement, &sqlitex.ExecOptions{Args: args}); err != nil {
+	if err := rawExecute(handle.conn, statement, &rawExecOptions{Args: args}); err != nil {
 		t.Fatal(err)
 	}
 	changed := 0
-	if err := sqlitex.ExecuteTransient(handle.conn, `SELECT changes()`, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error { changed = stmt.ColumnInt(0); return nil }}); err != nil {
+	if err := rawExecuteTransient(handle.conn, `SELECT changes()`, &rawExecOptions{ResultFunc: func(stmt *rawSQLiteStmt) error { changed = stmt.ColumnInt(0); return nil }}); err != nil {
 		t.Fatal(err)
 	}
 	if changed != 1 {
@@ -290,7 +284,7 @@ func corruptDropTrigger(t *testing.T, handle *startupCorruptionHandle) {
 	const trigger = "journal_operations_canonical_update"
 	triggerCount := func() int {
 		count := 0
-		if err := sqlitex.ExecuteTransient(handle.conn, `SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND name=?1`, &sqlitex.ExecOptions{Args: []any{trigger}, ResultFunc: func(stmt *sqlite.Stmt) error {
+		if err := rawExecuteTransient(handle.conn, `SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND name=?1`, &rawExecOptions{Args: []any{trigger}, ResultFunc: func(stmt *rawSQLiteStmt) error {
 			count = stmt.ColumnInt(0)
 			return nil
 		}}); err != nil {
@@ -301,7 +295,7 @@ func corruptDropTrigger(t *testing.T, handle *startupCorruptionHandle) {
 	if count := triggerCount(); count != 1 {
 		t.Fatalf("raw corruption trigger %q exists %d times before drop, want exactly one", trigger, count)
 	}
-	if err := sqlitex.ExecuteTransient(handle.conn, `DROP TRIGGER journal_operations_canonical_update`, nil); err != nil {
+	if err := rawExecuteTransient(handle.conn, `DROP TRIGGER journal_operations_canonical_update`, nil); err != nil {
 		t.Fatal(err)
 	}
 	if count := triggerCount(); count != 0 {
@@ -312,7 +306,7 @@ func corruptDropTrigger(t *testing.T, handle *startupCorruptionHandle) {
 func corruptCanonicalWire(t *testing.T, handle *startupCorruptionHandle, anchor JournalID, mutate func([]byte) []byte) {
 	t.Helper()
 	var wire []byte
-	err := sqlitex.Execute(handle.conn, `SELECT canonical_mutation FROM journal_operations WHERE journal_id=?1`, &sqlitex.ExecOptions{Args: []any{int64(anchor)}, ResultFunc: func(stmt *sqlite.Stmt) error {
+	err := rawExecute(handle.conn, `SELECT canonical_mutation FROM journal_operations WHERE journal_id=?1`, &rawExecOptions{Args: []any{int64(anchor)}, ResultFunc: func(stmt *rawSQLiteStmt) error {
 		wire = make([]byte, stmt.ColumnLen(0))
 		stmt.ColumnBytes(0, wire)
 		return nil

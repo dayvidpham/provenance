@@ -1,12 +1,12 @@
 package sqlite
 
 import (
+	"database/sql"
+	"errors"
 	"fmt"
 
 	"github.com/dayvidpham/provenance/internal/journal"
 	"github.com/dayvidpham/provenance/pkg/ptypes"
-	zs "zombiezen.com/go/sqlite"
-	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 // mutation_families.go implements the reducer half of the journaled
@@ -74,9 +74,7 @@ func (scope *connScope) foldMutationFamily(in journal.OperationInput, jid int64,
 				ptypes.ErrCycleDetected, eff.TaskID.String(), eff.EdgeTargetID)
 		}
 	}
-	if err := sqlitex.Execute(scope.conn,
-		insertJournalTaskEventSQL,
-		&sqlitex.ExecOptions{Args: []any{jid, eff.TaskID.String(), string(kind), string(payload)}}); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, insertJournalTaskEventSQL, jid, eff.TaskID.String(), string(kind), string(payload)); err != nil {
 		return fmt.Errorf("Apply: insert journal_task_events (%s): %w", kind, err)
 	}
 	contexts, err := journal.CanonicalEventContexts(eff.Contexts)
@@ -88,7 +86,7 @@ func (scope *connScope) foldMutationFamily(in journal.OperationInput, jid int64,
 		if err != nil {
 			return fmt.Errorf("Apply: encode context (%s): %w", kind, err)
 		}
-		if err := sqlitex.Execute(scope.conn, "INSERT INTO journal_task_event_contexts (event_journal_id, context_kind, context_identity, attached_by_journal_id) VALUES (?1, ?2, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{jid, string(contextKind), identity, jid}}); err != nil {
+		if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO journal_task_event_contexts (event_journal_id, context_kind, context_identity, attached_by_journal_id) VALUES (?1, ?2, ?3, ?4)", jid, string(contextKind), identity, jid); err != nil {
 			return fmt.Errorf("Apply: insert context (%s): %w", kind, err)
 		}
 	}
@@ -115,15 +113,12 @@ func encodeMutationFamilyPayload(eff journal.Effect) ([]byte, error) {
 // The bounded recursive walk reads the projection edges table (real during Apply), the
 // same table the graph store reads, so journal and graph stay consistent (§6).
 func (scope *connScope) edgeCreatesCycle(source, target string) (bool, error) {
-	found := false
-	if err := sqlitex.Execute(scope.conn, scope.projectionTarget.edgeCycleQuery(),
-		&sqlitex.ExecOptions{
-			Args:       []any{target, source, int(ptypes.EdgeBlockedBy), 1, 1},
-			ResultFunc: func(*zs.Stmt) error { found = true; return nil },
-		}); err != nil {
+	var found int
+	err := scope.conn.QueryRowContext(scope.ctx, scope.projectionTarget.edgeCycleQuery(), target, source, int(ptypes.EdgeBlockedBy), 1, 1).Scan(&found)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, fmt.Errorf("edge cycle check %s->%s: %w", source, target, err)
 	}
-	return found, nil
+	return err == nil, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -143,9 +138,7 @@ func (scope *connScope) projectMutationFamilyRow(task journal.TaskID, kind journ
 		if err != nil {
 			return err
 		}
-		if err := sqlitex.Execute(scope.conn,
-			scope.projectionTarget.projectEdgeAddQuery(),
-			&sqlitex.ExecOptions{Args: []any{task.String(), p.Target, int(p.EdgeKind), recordedAt}}); err != nil {
+		if _, err := scope.conn.ExecContext(scope.ctx, scope.projectionTarget.projectEdgeAddQuery(), task.String(), p.Target, int(p.EdgeKind), recordedAt); err != nil {
 			return fmt.Errorf("project edge-add %s->%s: %w", task, p.Target, err)
 		}
 	case journal.EventKindEdgeRemoved:
@@ -153,9 +146,7 @@ func (scope *connScope) projectMutationFamilyRow(task journal.TaskID, kind journ
 		if err != nil {
 			return err
 		}
-		if err := sqlitex.Execute(scope.conn,
-			scope.projectionTarget.projectEdgeRemoveQuery(),
-			&sqlitex.ExecOptions{Args: []any{task.String(), p.Target, int(p.EdgeKind)}}); err != nil {
+		if _, err := scope.conn.ExecContext(scope.ctx, scope.projectionTarget.projectEdgeRemoveQuery(), task.String(), p.Target, int(p.EdgeKind)); err != nil {
 			return fmt.Errorf("project edge-remove %s->%s: %w", task, p.Target, err)
 		}
 	case journal.EventKindLabelAdded:
@@ -163,9 +154,7 @@ func (scope *connScope) projectMutationFamilyRow(task journal.TaskID, kind journ
 		if err != nil {
 			return err
 		}
-		if err := sqlitex.Execute(scope.conn,
-			scope.projectionTarget.projectLabelAddQuery(),
-			&sqlitex.ExecOptions{Args: []any{task.String(), p.Label}}); err != nil {
+		if _, err := scope.conn.ExecContext(scope.ctx, scope.projectionTarget.projectLabelAddQuery(), task.String(), p.Label); err != nil {
 			return fmt.Errorf("project label-add %s %q: %w", task, p.Label, err)
 		}
 	case journal.EventKindLabelRemoved:
@@ -173,9 +162,7 @@ func (scope *connScope) projectMutationFamilyRow(task journal.TaskID, kind journ
 		if err != nil {
 			return err
 		}
-		if err := sqlitex.Execute(scope.conn,
-			scope.projectionTarget.projectLabelRemoveQuery(),
-			&sqlitex.ExecOptions{Args: []any{task.String(), p.Label}}); err != nil {
+		if _, err := scope.conn.ExecContext(scope.ctx, scope.projectionTarget.projectLabelRemoveQuery(), task.String(), p.Label); err != nil {
 			return fmt.Errorf("project label-remove %s %q: %w", task, p.Label, err)
 		}
 	case journal.EventKindCommentAdded:
@@ -186,9 +173,7 @@ func (scope *connScope) projectMutationFamilyRow(task journal.TaskID, kind journ
 		// INSERT OR IGNORE keeps a from-empty replay of the SAME journaled comment
 		// idempotent (the caller-minted id is carried in the payload, §6), so the
 		// projection reproduces exactly one row.
-		if err := sqlitex.Execute(scope.conn,
-			scope.projectionTarget.projectCommentAddQuery(),
-			&sqlitex.ExecOptions{Args: []any{p.CommentID, task.String(), p.Author, p.Body, recordedAt}}); err != nil {
+		if _, err := scope.conn.ExecContext(scope.ctx, scope.projectionTarget.projectCommentAddQuery(), p.CommentID, task.String(), p.Author, p.Body, recordedAt); err != nil {
 			return fmt.Errorf("project comment-add %s %q: %w", task, p.CommentID, err)
 		}
 	default:

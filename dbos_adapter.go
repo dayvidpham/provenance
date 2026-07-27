@@ -7,8 +7,8 @@ package provenance
 // OperationID alternate key and journal contract the reducer already enforces, and
 // post-checkpoint validation compares the journal-anchored committed operation.
 //
-// The adapter targets github.com/dbos-inc/dbos-transact-golang v0.16.0 (pinned),
-// authorized by the user at Impl-UAT C7a.
+// The adapter targets the repository-pinned DBOS library version, authorized by
+// the user at Impl-UAT C7a.
 //
 // Identity constants and retry-option types are defined in dbos_contract.go.
 
@@ -209,7 +209,7 @@ func (a *DBOSAdapter) Apply(ctx context.Context, in journal.OperationInput) (Com
 	}
 	// Always retrieve before starting. Existing SUCCESS, ERROR, or in-flight state
 	// attaches read-only; only an explicit NonExistentWorkflowError may create a row.
-	// In particular, terminal ERROR replay must not call RunWorkflow because v0.16
+	// In particular, terminal ERROR replay must not call RunWorkflow because DBOS
 	// updates workflow_status.updated_at even when it executes zero callbacks.
 	var outcome DBOSStepOutcome
 	if exists {
@@ -459,7 +459,7 @@ func checkpointDomainApplyResult(contract dbosContractSnapshot, in journal.Opera
 }
 
 // dbosStepOptions is the sole translation from resolved values to the pinned
-// opaque DBOS v0.16 functional options.
+// opaque DBOS functional options.
 func dbosStepOptions(stepName string, options resolvedDBOSStepOptions) []dbos.StepOption {
 	return []dbos.StepOption{
 		dbos.WithStepName(stepName),
@@ -654,7 +654,7 @@ func awaitWorkflowResult[T any](
 	return result, nil
 }
 
-// DBOS v0.16 persists workflow errors as text. Reconstruct its closed retry code
+// DBOS persists workflow errors as text. Reconstruct its closed retry code
 // on terminal retrieval so first delivery and later same-ID replay expose the same
 // errors.As-visible DBOSError contract instead of degrading to string matching.
 func terminalDBOSCause(err error, workflowID string) error {

@@ -9,8 +9,6 @@ import (
 
 	"github.com/dayvidpham/provenance/internal/journal"
 	"github.com/dayvidpham/provenance/pkg/ptypes"
-	zs "zombiezen.com/go/sqlite"
-	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 const benchmarkDecisionKind journal.DecisionKind = "benchmark.pool.decision"
@@ -38,12 +36,7 @@ func openBenchmarkPoolDB(b *testing.B) (*DB, ptypes.AgentID) {
 	}
 	defer scope.release()
 	journalMode := ""
-	if err := sqlitex.ExecuteTransient(scope.conn, "PRAGMA journal_mode", &sqlitex.ExecOptions{
-		ResultFunc: func(stmt *zs.Stmt) error {
-			journalMode = stmt.ColumnText(0)
-			return nil
-		},
-	}); err != nil {
+	if err := scope.conn.QueryRowContext(scope.ctx, "PRAGMA journal_mode").Scan(&journalMode); err != nil {
 		b.Fatalf("read benchmark journal mode: %v", err)
 	}
 	if journalMode != "wal" {

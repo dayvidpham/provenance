@@ -11,8 +11,6 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
-	"zombiezen.com/go/sqlite"
-	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 type allocationCounts struct {
@@ -22,7 +20,7 @@ type allocationCounts struct {
 func readAllocationCounts(t *testing.T, path string) allocationCounts {
 	t.Helper()
 	counts := allocationCounts{}
-	withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
+	withRawSQLiteTestConn(t, path, func(conn *rawSQLiteConn) {
 		for _, query := range []struct {
 			table string
 			out   *int64
@@ -33,7 +31,7 @@ func readAllocationCounts(t *testing.T, path string) allocationCounts {
 			{"journal_operation_result_slots", &counts.slots},
 			{"tasks", &counts.tasks},
 		} {
-			if err := sqlitex.Execute(conn, "SELECT count(*) FROM "+query.table, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error {
+			if err := rawExecute(conn, "SELECT count(*) FROM "+query.table, &rawExecOptions{ResultFunc: func(stmt *rawSQLiteStmt) error {
 				*query.out = stmt.ColumnInt64(0)
 				return nil
 			}}); err != nil {
@@ -263,8 +261,8 @@ func buildAllocationCorruptionFixture(t *testing.T, path string) (Tracker, alloc
 func corruptAllocationFamily(t *testing.T, path string, anchor JournalID, replacement []byte) {
 	t.Helper()
 	var wire []byte
-	withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
-		if err := sqlitex.Execute(conn, `SELECT canonical_mutation FROM journal_operations WHERE journal_id=?1`, &sqlitex.ExecOptions{Args: []any{int64(anchor)}, ResultFunc: func(stmt *sqlite.Stmt) error {
+	withRawSQLiteTestConn(t, path, func(conn *rawSQLiteConn) {
+		if err := rawExecute(conn, `SELECT canonical_mutation FROM journal_operations WHERE journal_id=?1`, &rawExecOptions{Args: []any{int64(anchor)}, ResultFunc: func(stmt *rawSQLiteStmt) error {
 			wire = make([]byte, stmt.ColumnLen(0))
 			stmt.ColumnBytes(0, wire)
 			return nil

@@ -1,11 +1,10 @@
 package sqlite
 
 import (
+	"database/sql"
 	"fmt"
 
 	"github.com/dayvidpham/provenance/internal/journal"
-	zs "zombiezen.com/go/sqlite"
-	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 // result_slots.go owns the complete committed-result reconstruction with
@@ -26,39 +25,41 @@ func (scope *connScope) reconstructAndValidateCommitted(anchor int64) (journal.C
 	res := journal.CommittedResult{Kind: journal.CommittedExact, AnchorJournalID: journal.JournalID(anchor)}
 
 	// EmittedEvents: flat task_event closure in JournalID order (§2.1, §3.2).
-	if err := sqlitex.Execute(scope.conn,
-		`SELECT journal_id FROM journal WHERE produced_by_operation_journal_id = ?1 AND kind_id = ?2 ORDER BY journal_id ASC`,
-		&sqlitex.ExecOptions{
-			Args: []any{anchor, int(journal.JournalKindTaskEvent)},
-			ResultFunc: func(stmt *zs.Stmt) error {
-				res.EmittedEvents = append(res.EmittedEvents, journal.JournalID(stmt.ColumnInt64(0)))
-				return nil
-			},
-		}); err != nil {
+	if err := scope.queryRows(`SELECT journal_id FROM journal WHERE produced_by_operation_journal_id = ?1 AND kind_id = ?2 ORDER BY journal_id ASC`, []any{anchor, int(journal.JournalKindTaskEvent)}, func(rows *sql.Rows) error {
+		var journalID int64
+		if err := rows.Scan(&journalID); err != nil {
+			return err
+		}
+		res.EmittedEvents = append(res.EmittedEvents, journal.JournalID(journalID))
+		return nil
+	}); err != nil {
 		return journal.CommittedResult{}, fmt.Errorf("reconstruct emitted events: %w", err)
 	}
 
 	// Slot-keyed result map (§3.2): resolve TaskID for task_event slots and
 	// ActivityID for activity slots. Other slot kinds carry neither.
-	if err := sqlitex.Execute(scope.conn,
-		`SELECT s.result_slot_id, s.produced_journal_id, j.kind_id, te.task_id FROM journal_operation_result_slots s JOIN journal j ON j.journal_id = s.produced_journal_id LEFT JOIN journal_task_events te ON te.journal_id = s.produced_journal_id WHERE s.journal_id = ?1 ORDER BY s.result_slot_id ASC`,
-		&sqlitex.ExecOptions{
-			Args: []any{anchor},
-			ResultFunc: func(stmt *zs.Stmt) error {
-				binding := journal.ResultSlotBinding{
-					Slot:              journal.ResultSlotID(stmt.ColumnText(0)),
-					ProducedJournalID: journal.JournalID(stmt.ColumnInt64(1)),
-					Kind:              journal.JournalKind(stmt.ColumnInt(2)),
-				}
-				if stmt.ColumnType(3) != zs.TypeNull {
-					if tid, err := journalParseTask(stmt.ColumnText(3)); err == nil {
-						binding.TaskID = &tid
-					}
-				}
-				res.ResultSlots = append(res.ResultSlots, binding)
-				return nil
-			},
-		}); err != nil {
+	if err := scope.queryRows(`SELECT s.result_slot_id, s.produced_journal_id, j.kind_id, te.task_id FROM journal_operation_result_slots s JOIN journal j ON j.journal_id = s.produced_journal_id LEFT JOIN journal_task_events te ON te.journal_id = s.produced_journal_id WHERE s.journal_id = ?1 ORDER BY s.result_slot_id ASC`, []any{anchor}, func(rows *sql.Rows) error {
+		var slot, taskID sql.NullString
+		var producedJID int64
+		var kind int
+		if err := rows.Scan(&slot, &producedJID, &kind, &taskID); err != nil {
+			return err
+		}
+		binding := journal.ResultSlotBinding{
+			Slot:              journal.ResultSlotID(slot.String),
+			ProducedJournalID: journal.JournalID(producedJID),
+			Kind:              journal.JournalKind(kind),
+		}
+		if taskID.Valid {
+			tid, err := journalParseTask(taskID.String)
+			if err != nil {
+				return err
+			}
+			binding.TaskID = &tid
+		}
+		res.ResultSlots = append(res.ResultSlots, binding)
+		return nil
+	}); err != nil {
 		return journal.CommittedResult{}, fmt.Errorf("reconstruct result slots: %w", err)
 	}
 

@@ -12,7 +12,7 @@ import (
 // observe the same snapshot as the effects they gate.
 //
 // Concurrent contenders: two goroutines racing a CurrentFact condition both
-// acquire the SQLite write lock via BEGIN IMMEDIATE (scope.beginWriteOwnership).
+// acquire the SQLite write lock via BEGIN IMMEDIATE (runImmediateTransaction).
 // The loser finds the winner's committed fact as the current row and receives
 // ConditionFailure rather than BUSY_SNAPSHOT.
 //

@@ -3,13 +3,13 @@ package sqlite
 import (
 	"bytes"
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 
 	"github.com/dayvidpham/provenance/internal/journal"
-	zs "zombiezen.com/go/sqlite"
-	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 // replay.go implements the shared-reducer projection step, Open-time full replay,
@@ -43,23 +43,16 @@ func (scope *connScope) projectJournalRow(jid int64) error {
 		actorRaw   string
 		recordedAt int64
 	)
-	found := false
 	// Read the committing actor through journal_attributed (§8.5): a subordinate row
 	// stores actor_id NULL, so effective_actor_id derives it from the row's anchor —
 	// never a bare read of the NULL column. The single shared reducer step therefore
 	// attributes the same committing actor whether Apply folds a just-produced
 	// subordinate row or Open replays it (§9.2).
-	if err := sqlitex.Execute(scope.conn, "SELECT kind_id, effective_actor_id, recorded_at FROM journal_attributed WHERE journal_id = ?1", &sqlitex.ExecOptions{Args: []any{jid}, ResultFunc: func(stmt *zs.Stmt) error {
-		found = true
-		kind = stmt.ColumnInt(0)
-		actorRaw = stmt.ColumnText(1)
-		recordedAt = stmt.ColumnInt64(2)
-		return nil
-	}}); err != nil {
+	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT kind_id, effective_actor_id, recorded_at FROM journal_attributed WHERE journal_id = ?1", jid).Scan(&kind, &actorRaw, &recordedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("project journal row %d: no such journal row", jid)
+		}
 		return fmt.Errorf("project journal row %d: load supertype: %w", jid, err)
-	}
-	if !found {
-		return fmt.Errorf("project journal row %d: no such journal row", jid)
 	}
 	committing, err := journalParseActor(actorRaw)
 	if err != nil {
@@ -96,14 +89,10 @@ func (scope *connScope) projectTaskEventRow(jid int64, committing journal.ActorI
 		kindStr string
 		payload []byte
 	)
-	if err := sqlitex.Execute(scope.conn, "SELECT task_id, event_kind, payload FROM journal_task_events WHERE journal_id = ?1", &sqlitex.ExecOptions{Args: []any{jid}, ResultFunc: func(stmt *zs.Stmt) error {
-		taskRaw = stmt.ColumnText(0)
-		kindStr = stmt.ColumnText(1)
-		payload = readBlob(stmt, 2)
-		return nil
-	}}); err != nil {
+	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT task_id, event_kind, payload FROM journal_task_events WHERE journal_id = ?1", jid).Scan(&taskRaw, &kindStr, &payload); err != nil {
 		return fmt.Errorf("project task_event %d: %w", jid, err)
 	}
+	payload = append([]byte(nil), payload...)
 	task, err := journalParseTask(taskRaw)
 	if err != nil {
 		return err
@@ -189,17 +178,11 @@ func (scope *connScope) projectTaskEventRow(jid int64, committing journal.ActorI
 // from history strictly before the row being folded (§8.1, §15).
 func (scope *connScope) readProjTaskStatus(task journal.TaskID) (journal.TaskStatus, error) {
 	var status journal.TaskStatus
-	found := false
-	if err := sqlitex.Execute(scope.conn,
-		scope.projectionTarget.readTaskStatusQuery(),
-		&sqlitex.ExecOptions{Args: []any{task.String()}, ResultFunc: func(stmt *zs.Stmt) error {
-			found = true
-			status = journal.TaskStatus(stmt.ColumnInt(0))
-			return nil
-		}}); err != nil {
+	err := scope.conn.QueryRowContext(scope.ctx, scope.projectionTarget.readTaskStatusQuery(), task.String()).Scan(&status)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return 0, fmt.Errorf("read current status for %q: %w", task, err)
 	}
-	if !found {
+	if errors.Is(err, sql.ErrNoRows) {
 		return 0, fmt.Errorf(
 			"provenance: status FSM cannot read current status of task %q — where: shared-reducer "+
 				"status projection (§8.1); when: folding a transition lifecycle event; impact: nothing "+
@@ -220,12 +203,11 @@ func (scope *connScope) projectAuthorityRow(jid int64) error {
 		transition = -1
 		hasTrans   bool
 	)
-	if err := sqlitex.Execute(scope.conn, "SELECT assignment_id, transition_id FROM journal_authority_assignment_transitions WHERE journal_id = ?1", &sqlitex.ExecOptions{Args: []any{jid}, ResultFunc: func(stmt *zs.Stmt) error {
+	err := scope.conn.QueryRowContext(scope.ctx, "SELECT assignment_id, transition_id FROM journal_authority_assignment_transitions WHERE journal_id = ?1", jid).Scan(&assignment, &transition)
+	if err == nil {
 		hasTrans = true
-		assignment = stmt.ColumnText(0)
-		transition = stmt.ColumnInt(1)
-		return nil
-	}}); err != nil {
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("project authority %d: load transition: %w", jid, err)
 	}
 	if !hasTrans {
@@ -236,12 +218,7 @@ func (scope *connScope) projectAuthorityRow(jid int64) error {
 		occupantRaw string
 		slot        = -1
 	)
-	if err := sqlitex.Execute(scope.conn, "SELECT task_id, actor_id, slot_id FROM journal_authority_assignment_episodes WHERE assignment_id = ?1", &sqlitex.ExecOptions{Args: []any{assignment}, ResultFunc: func(stmt *zs.Stmt) error {
-		taskRaw = stmt.ColumnText(0)
-		occupantRaw = stmt.ColumnText(1)
-		slot = stmt.ColumnInt(2)
-		return nil
-	}}); err != nil {
+	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT task_id, actor_id, slot_id FROM journal_authority_assignment_episodes WHERE assignment_id = ?1", assignment).Scan(&taskRaw, &occupantRaw, &slot); err != nil {
 		return fmt.Errorf("project authority %d: load episode %q: %w", jid, assignment, err)
 	}
 	task, err := journalParseTask(taskRaw)
@@ -287,16 +264,13 @@ func (table taskScopedTable) label() string {
 func (scope *connScope) projectTaskScopedRow(jid int64, committing journal.ActorID, table taskScopedTable) error {
 	var taskRaw string
 	hasTask := false
-	if err := sqlitex.Execute(scope.conn,
-		table.query(),
-		&sqlitex.ExecOptions{Args: []any{jid}, ResultFunc: func(stmt *zs.Stmt) error {
-			if stmt.ColumnType(0) != zs.TypeNull {
-				taskRaw = stmt.ColumnText(0)
-				hasTask = true
-			}
-			return nil
-		}}); err != nil {
+	var taskValue sql.NullString
+	if err := scope.conn.QueryRowContext(scope.ctx, table.query(), jid).Scan(&taskValue); err != nil {
 		return fmt.Errorf("project %s %d: %w", table.label(), jid, err)
+	}
+	if taskValue.Valid {
+		taskRaw = taskValue.String
+		hasTask = true
 	}
 	if !hasTask {
 		return nil
@@ -322,9 +296,7 @@ func (scope *connScope) projectTaskStatus(task journal.TaskID, status journal.Ta
 	}
 	// Targets the real tasks table during a live Apply and the shadow tasks table
 	// during a from-empty replay derivation (§8.1, §15).
-	if err := sqlitex.Execute(scope.conn,
-		scope.projectionTarget.projectTaskStatusQuery(),
-		&sqlitex.ExecOptions{Args: []any{int(status), closedAt, jid, task.String()}}); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, scope.projectionTarget.projectTaskStatusQuery(), int(status), closedAt, jid, task.String()); err != nil {
 		return fmt.Errorf("project task status for %q: %w", task, err)
 	}
 	return nil
@@ -373,7 +345,9 @@ func (target projectionTarget) projectTaskStatusQuery() string {
 // watermark, no foreign keys) — and diffs them against the real tables. The real
 // tasks / task_attributions rows are never mutated during the check, so the check is
 // constraint-independent (the NOT NULL tasks.last_journal_id tightening cannot break
-// a from-empty refold) and needs no scratch savepoint/rollback.
+// a from-empty refold). The complete stored-and-derived comparison runs in a scoped
+// savepoint, which holds one stable WAL snapshot while retaining this connection's
+// TEMP-table affinity and composing with activation's outer transaction.
 const (
 	shadowTasksTable    = "shadow_tasks"
 	shadowAttribTable   = "shadow_task_attributions"
@@ -396,9 +370,10 @@ const (
 // is read-only and idempotent: the from-empty refold derives into throwaway shadow
 // tables (which carry the projection columns but none of the real tables' constraints)
 // while the real tasks / task_attributions rows stay read-only, so a converged
-// database is left untouched, the check is constraint-independent (the NOT NULL
-// tasks.last_journal_id tightening cannot be tripped by the refold), and no scratch
-// savepoint/rollback is needed. On genuine divergence it returns a typed
+// database is left untouched and the check is constraint-independent (the NOT NULL
+// tasks.last_journal_id tightening cannot be tripped by the refold). Its scoped
+// savepoint keeps every stored read and every derived read in one WAL snapshot. On
+// genuine divergence it returns a typed
 // ProjectionDivergenceError naming the task, field, and stored-vs-derived values, and
 // writes nothing (§13.1 six-field actionable shape).
 //
@@ -437,76 +412,89 @@ func (scope *connScope) replayProjectionsReadOnlyLegacyCompatible() (result jour
 }
 
 func (scope *connScope) replayProjectionsMode(allowLegacyFactContexts bool) (result journal.ReplayResult, err error) {
-	endTx := sqlitex.Save(scope.conn)
-	defer endTx(&err)
-	if err := scope.preflightSchema(); err != nil {
-		return journal.ReplayResult{}, err
-	}
-	var factContextErr error
-	if allowLegacyFactContexts {
-		factContextErr = scope.verifyFactContextIntegrityReadOnlyLegacyCompatible()
-	} else {
-		factContextErr = scope.verifyFactContextIntegrity()
-	}
-	if factContextErr != nil {
-		return journal.ReplayResult{}, factContextErr
-	}
-	if err := scope.validateCanonicalOperations(); err != nil {
-		return journal.ReplayResult{}, err
-	}
+	return scope.replayProjectionsModeWithStoredSnapshotBarrier(allowLegacyFactContexts, nil)
+}
 
-	// Snapshot the STORED projection before any change, keyed by task id.
-	storedTasks, err := scope.snapshotTaskProjections(projectionTargetLive)
-	if err != nil {
-		return journal.ReplayResult{}, err
-	}
-	storedTaskState, err := scope.snapshotCompleteTaskState(projectionTargetLive)
-	if err != nil {
-		return journal.ReplayResult{}, err
-	}
-	storedAttribs, err := scope.snapshotAttributions(projectionTargetLive)
-	if err != nil {
-		return journal.ReplayResult{}, err
-	}
-	anchored, err := scope.journalAnchoredTasks()
-	if err != nil {
-		return journal.ReplayResult{}, err
-	}
-	// The relationship/annotation domain projections are journaled in full (§6 amendment),
-	// so every edge/label/comment is journal-reproducible; the stored sets are snapshotted
-	// whole (not scoped to anchored tasks) and diffed against the from-empty re-derivation.
-	storedDomain, err := scope.snapshotDomainProjections(projectionTargetLive)
-	if err != nil {
-		return journal.ReplayResult{}, err
-	}
-
-	// Re-derive every projection from empty into connection-scoped shadow tables;
-	// the real tables stay read-only (SHADOW DERIVATION, §15).
-	derivedTasks, derivedTaskState, derivedAttribs, derivedDomain, folded, err := scope.rederiveProjectionsShadow()
-	if err != nil {
-		return journal.ReplayResult{}, err
-	}
-
-	// Convergence over the FULL projection set, scoped to journal-anchored tasks.
-	if err := diffTaskProjections(storedTasks, derivedTasks, anchored); err != nil {
-		return journal.ReplayResult{}, err
-	}
-	if err := diffCompleteTaskState(storedTaskState, derivedTaskState, anchored); err != nil {
-		return journal.ReplayResult{}, err
-	}
-	if err := diffAttributions(storedAttribs, derivedAttribs, anchored); err != nil {
-		return journal.ReplayResult{}, err
-	}
-	// Convergence over the journaled edge/label/comment domain projections (§6, §15).
-	if err := diffDomainProjections(storedDomain, derivedDomain); err != nil {
-		return journal.ReplayResult{}, err
-	}
-
-	result = journal.ReplayResult{RowsFolded: folded}
-	for id := range anchored {
-		if p, ok := derivedTasks[id]; ok {
-			result.Tasks = append(result.Tasks, p)
+// replayProjectionsModeWithStoredSnapshotBarrier keeps the production replay path
+// deterministic under concurrent writers. Production passes nil; the package test
+// supplies a barrier after all stored snapshots to prove a real Modernc Apply cannot
+// mix a newer derivation with older stored values.
+func (scope *connScope) replayProjectionsModeWithStoredSnapshotBarrier(allowLegacyFactContexts bool, afterStoredSnapshot func()) (result journal.ReplayResult, err error) {
+	err = scope.runScopedSavepoint(func() error {
+		if err := scope.preflightSchema(); err != nil {
+			return err
 		}
+		if allowLegacyFactContexts {
+			if err := scope.verifyFactContextIntegrityReadOnlyLegacyCompatible(); err != nil {
+				return err
+			}
+		} else if err := scope.verifyFactContextIntegrity(); err != nil {
+			return err
+		}
+		if err := scope.validateCanonicalOperations(); err != nil {
+			return err
+		}
+
+		// Snapshot the STORED projection before any change, keyed by task id.
+		storedTasks, err := scope.snapshotTaskProjections(projectionTargetLive)
+		if err != nil {
+			return err
+		}
+		storedTaskState, err := scope.snapshotCompleteTaskState(projectionTargetLive)
+		if err != nil {
+			return err
+		}
+		storedAttribs, err := scope.snapshotAttributions(projectionTargetLive)
+		if err != nil {
+			return err
+		}
+		anchored, err := scope.journalAnchoredTasks()
+		if err != nil {
+			return err
+		}
+		// The relationship/annotation domain projections are journaled in full (§6 amendment),
+		// so every edge/label/comment is journal-reproducible; the stored sets are snapshotted
+		// whole (not scoped to anchored tasks) and diffed against the from-empty re-derivation.
+		storedDomain, err := scope.snapshotDomainProjections(projectionTargetLive)
+		if err != nil {
+			return err
+		}
+		if afterStoredSnapshot != nil {
+			afterStoredSnapshot()
+		}
+
+		// Re-derive every projection from empty into connection-scoped shadow tables;
+		// the real tables stay read-only (SHADOW DERIVATION, §15).
+		derivedTasks, derivedTaskState, derivedAttribs, derivedDomain, folded, err := scope.rederiveProjectionsShadow()
+		if err != nil {
+			return err
+		}
+
+		// Convergence over the FULL projection set, scoped to journal-anchored tasks.
+		if err := diffTaskProjections(storedTasks, derivedTasks, anchored); err != nil {
+			return err
+		}
+		if err := diffCompleteTaskState(storedTaskState, derivedTaskState, anchored); err != nil {
+			return err
+		}
+		if err := diffAttributions(storedAttribs, derivedAttribs, anchored); err != nil {
+			return err
+		}
+		// Convergence over the journaled edge/label/comment domain projections (§6, §15).
+		if err := diffDomainProjections(storedDomain, derivedDomain); err != nil {
+			return err
+		}
+
+		result = journal.ReplayResult{RowsFolded: folded}
+		for id := range anchored {
+			if p, ok := derivedTasks[id]; ok {
+				result.Tasks = append(result.Tasks, p)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return journal.ReplayResult{}, err
 	}
 	return result, nil
 }
@@ -580,30 +568,36 @@ func (scope *connScope) validateCanonicalOperations() error {
 	if shape == canonicalColumnsLegacy {
 		args = []any{nil, nil}
 	}
-	if err := sqlitex.Execute(scope.conn,
-		shape.operationsQuery(),
-		&sqlitex.ExecOptions{Args: args, ResultFunc: func(stmt *zs.Stmt) error {
-			op := canonicalStoredOperation{anchor: stmt.ColumnInt64(0), digest: readBlob(stmt, 4), recordedAt: stmt.ColumnInt64(6)}
-			if stmt.ColumnType(1) != zs.TypeNull {
-				authority := journal.JournalID(stmt.ColumnInt64(1))
-				op.authority = &authority
-			}
-			if stmt.ColumnType(2) != zs.TypeNull {
-				op.versionSet = true
-				op.version = stmt.ColumnText(2)
-			}
-			if stmt.ColumnType(3) != zs.TypeNull {
-				op.wireSet = true
-				op.wire = readBlob(stmt, 3)
-			}
-			actor, err := journalParseActor(stmt.ColumnText(5))
-			if err != nil {
-				return err
-			}
-			op.actor = actor
-			operations = append(operations, op)
-			return nil
-		}}); err != nil {
+	if err := scope.queryRows(shape.operationsQuery(), args, func(rows *sql.Rows) error {
+		var op canonicalStoredOperation
+		var authority sql.NullInt64
+		var version sql.NullString
+		var wire []byte
+		var actorRaw string
+		if err := rows.Scan(&op.anchor, &authority, &version, &wire, &op.digest, &actorRaw, &op.recordedAt); err != nil {
+			return err
+		}
+		op.digest = append([]byte(nil), op.digest...)
+		if authority.Valid {
+			value := journal.JournalID(authority.Int64)
+			op.authority = &value
+		}
+		if version.Valid {
+			op.versionSet = true
+			op.version = version.String
+		}
+		if wire != nil {
+			op.wireSet = true
+			op.wire = append([]byte(nil), wire...)
+		}
+		actor, err := journalParseActor(actorRaw)
+		if err != nil {
+			return err
+		}
+		op.actor = actor
+		operations = append(operations, op)
+		return nil
+	}); err != nil {
 		return fmt.Errorf("startup canonical validation: enumerate operations: %w", err)
 	}
 	for _, op := range operations {
@@ -628,7 +622,14 @@ func (scope *connScope) validateCanonicalOperations() error {
 		}
 		effects := prepared.NormalizedEffects()
 		var rows []int64
-		if err := sqlitex.Execute(scope.conn, "SELECT journal_id FROM journal WHERE produced_by_operation_journal_id=?1 ORDER BY journal_id", &sqlitex.ExecOptions{Args: []any{op.anchor}, ResultFunc: func(stmt *zs.Stmt) error { rows = append(rows, stmt.ColumnInt64(0)); return nil }}); err != nil {
+		if err := scope.queryRows("SELECT journal_id FROM journal WHERE produced_by_operation_journal_id=?1 ORDER BY journal_id", []any{op.anchor}, func(sqlRows *sql.Rows) error {
+			var journalID int64
+			if err := sqlRows.Scan(&journalID); err != nil {
+				return err
+			}
+			rows = append(rows, journalID)
+			return nil
+		}); err != nil {
 			return err
 		}
 		if len(rows) != len(effects) {
@@ -685,7 +686,15 @@ func (scope *connScope) validateCanonicalResultSlots(anchor int64, rows []int64,
 		}
 	}
 	actual := map[string]int64{}
-	if err := sqlitex.Execute(scope.conn, "SELECT result_slot_id,produced_journal_id FROM journal_operation_result_slots WHERE journal_id=?1", &sqlitex.ExecOptions{Args: []any{anchor}, ResultFunc: func(stmt *zs.Stmt) error { slot := stmt.ColumnText(0); actual[slot] = stmt.ColumnInt64(1); return nil }}); err != nil {
+	if err := scope.queryRows("SELECT result_slot_id,produced_journal_id FROM journal_operation_result_slots WHERE journal_id=?1", []any{anchor}, func(rows *sql.Rows) error {
+		var slot string
+		var journalID int64
+		if err := rows.Scan(&slot, &journalID); err != nil {
+			return err
+		}
+		actual[slot] = journalID
+		return nil
+	}); err != nil {
 		return err
 	}
 	for slot, want := range expected {
@@ -716,7 +725,7 @@ func (scope *connScope) validateCanonicalEffectRow(op canonicalStoredOperation, 
 	}
 	var kind int
 	var recordedAt int64
-	if err := sqlitex.Execute(scope.conn, "SELECT kind_id, recorded_at FROM journal WHERE journal_id=?1", &sqlitex.ExecOptions{Args: []any{jid}, ResultFunc: func(stmt *zs.Stmt) error { kind = stmt.ColumnInt(0); recordedAt = stmt.ColumnInt64(1); return nil }}); err != nil {
+	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT kind_id, recorded_at FROM journal WHERE journal_id=?1", jid).Scan(&kind, &recordedAt); err != nil {
 		return err
 	}
 	if kind != int(expectedKind) {
@@ -828,7 +837,14 @@ func (scope *connScope) validateCanonicalTaskEvent(anchor, jid int64, effect jou
 		}
 	}
 	attached := []int64{}
-	if err := sqlitex.Execute(scope.conn, "SELECT attached_by_journal_id FROM journal_task_event_contexts WHERE event_journal_id=?1 ORDER BY context_kind,context_identity", &sqlitex.ExecOptions{Args: []any{jid}, ResultFunc: func(stmt *zs.Stmt) error { attached = append(attached, stmt.ColumnInt64(0)); return nil }}); err != nil {
+	if err := scope.queryRows("SELECT attached_by_journal_id FROM journal_task_event_contexts WHERE event_journal_id=?1 ORDER BY context_kind,context_identity", []any{jid}, func(rows *sql.Rows) error {
+		var attachedBy int64
+		if err := rows.Scan(&attachedBy); err != nil {
+			return err
+		}
+		attached = append(attached, attachedBy)
+		return nil
+	}); err != nil {
 		return err
 	}
 	for i, got := range attached {
@@ -872,13 +888,28 @@ func (query canonicalSubtypeQuery) sql() string {
 func (scope *connScope) compareSingleRow(anchor, jid int64, query canonicalSubtypeQuery, expected []string) error {
 	found := false
 	var actual []string
-	if err := sqlitex.Execute(scope.conn, query.sql(), &sqlitex.ExecOptions{Args: []any{jid}, ResultFunc: func(stmt *zs.Stmt) error {
+	if err := scope.queryRows(query.sql(), []any{jid}, func(rows *sql.Rows) error {
+		values := make([]any, len(expected))
+		pointers := make([]any, len(expected))
+		for i := range values {
+			pointers[i] = &values[i]
+		}
+		if err := rows.Scan(pointers...); err != nil {
+			return err
+		}
 		found = true
-		for i := range expected {
-			actual = append(actual, stmt.ColumnText(i))
+		for _, value := range values {
+			switch value := value.(type) {
+			case nil:
+				actual = append(actual, "")
+			case []byte:
+				actual = append(actual, string(value))
+			default:
+				actual = append(actual, fmt.Sprint(value))
+			}
 		}
 		return nil
-	}}); err != nil {
+	}); err != nil {
 		return err
 	}
 	if !found {
@@ -929,10 +960,14 @@ func (scope *connScope) rederiveProjectionsShadow() (
 	}()
 
 	var order []int64
-	if err = sqlitex.Execute(scope.conn, "SELECT journal_id FROM journal ORDER BY journal_id ASC", &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
-		order = append(order, stmt.ColumnInt64(0))
+	if err = scope.queryRows("SELECT journal_id FROM journal ORDER BY journal_id ASC", nil, func(rows *sql.Rows) error {
+		var journalID int64
+		if err := rows.Scan(&journalID); err != nil {
+			return err
+		}
+		order = append(order, journalID)
 		return nil
-	}}); err != nil {
+	}); err != nil {
 		return nil, nil, nil, domainProjection{}, 0, fmt.Errorf("ReplayProjections: enumerate journal: %w", err)
 	}
 	for _, jid := range order {
@@ -982,7 +1017,7 @@ func (scope *connScope) createProjectionShadow() error {
 		"CREATE TEMP TABLE shadow_comments (id TEXT PRIMARY KEY, task_id TEXT NOT NULL, author_id TEXT NOT NULL, body TEXT NOT NULL, created_at INTEGER NOT NULL)",
 	}
 	for _, stmt := range ddl {
-		if err := sqlitex.ExecuteTransient(scope.conn, stmt, nil); err != nil {
+		if _, err := scope.conn.ExecContext(scope.ctx, stmt); err != nil {
 			return fmt.Errorf("create shadow projection table: %w", err)
 		}
 	}
@@ -1001,8 +1036,7 @@ func (scope *connScope) createProjectionShadow() error {
 	if shape == canonicalColumnsPresent {
 		args = append(args, nil)
 	}
-	if err := sqlitex.Execute(scope.conn, shape.seedLegacyTasksQuery(),
-		&sqlitex.ExecOptions{Args: args}); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, shape.seedLegacyTasksQuery(), args...); err != nil {
 		return fmt.Errorf("seed shadow_tasks legacy slate: %w", err)
 	}
 	return nil
@@ -1012,7 +1046,6 @@ func (scope *connScope) canonicalEffectForJournalRow(jid int64) (journal.Effect,
 	var version string
 	var wire []byte
 	var anchor int64
-	found := false
 	columns, err := scope.tableColumns("journal_operations")
 	if err != nil {
 		return journal.Effect{}, false, err
@@ -1025,22 +1058,20 @@ func (scope *connScope) canonicalEffectForJournalRow(jid int64) (journal.Effect,
 	if shape == canonicalColumnsLegacy {
 		args = append(args, nil, nil)
 	}
-	if err := sqlitex.Execute(scope.conn, shape.effectForRowQuery(),
-		&sqlitex.ExecOptions{Args: args, ResultFunc: func(stmt *zs.Stmt) error {
-			found = true
-			anchor = stmt.ColumnInt64(0)
-			if stmt.ColumnType(1) != zs.TypeNull {
-				version = stmt.ColumnText(1)
-			}
-			if stmt.ColumnType(2) != zs.TypeNull {
-				wire = readBlob(stmt, 2)
-			}
-			return nil
-		}}); err != nil {
+	var storedVersion sql.NullString
+	var storedWire []byte
+	err = scope.conn.QueryRowContext(scope.ctx, shape.effectForRowQuery(), args...).Scan(&anchor, &storedVersion, &storedWire)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return journal.Effect{}, false, nil
+		}
 		return journal.Effect{}, false, fmt.Errorf("load canonical mutation for row %d: %w", jid, err)
 	}
-	if !found {
-		return journal.Effect{}, false, nil
+	if storedVersion.Valid {
+		version = storedVersion.String
+	}
+	if storedWire != nil {
+		wire = append([]byte(nil), storedWire...)
 	}
 	if (version == "") != (len(wire) == 0) {
 		return journal.Effect{}, false, fmt.Errorf("provenance: operation %d has mixed canonical encoding facts (version=%q bytes=%d) — where: startup canonical validation; impact: database open fails without mutation; fix: restore both canonical columns together, or NULL both only for a genuine legacy operation", anchor, version, len(wire))
@@ -1056,9 +1087,10 @@ func (scope *connScope) canonicalEffectForJournalRow(jid int64) (journal.Effect,
 		return journal.Effect{}, false, fmt.Errorf("operation %d canonical column version %q differs from registered wire version %q", anchor, version, prepared.EncodingVersion())
 	}
 	ordinal := 0
-	if err := sqlitex.Execute(scope.conn, "SELECT COUNT(*) FROM journal WHERE produced_by_operation_journal_id=?1 AND journal_id<=?2", &sqlitex.ExecOptions{Args: []any{anchor, jid}, ResultFunc: func(stmt *zs.Stmt) error { ordinal = stmt.ColumnInt(0) - 1; return nil }}); err != nil {
+	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT COUNT(*) FROM journal WHERE produced_by_operation_journal_id=?1 AND journal_id<=?2", anchor, jid).Scan(&ordinal); err != nil {
 		return journal.Effect{}, false, fmt.Errorf("resolve canonical effect ordinal for row %d: %w", jid, err)
 	}
+	ordinal--
 	effects := prepared.NormalizedEffects()
 	if ordinal < 0 || ordinal >= len(effects) {
 		return journal.Effect{}, false, fmt.Errorf("provenance: operation %d row %d has effect ordinal %d outside canonical effect count %d", anchor, jid, ordinal, len(effects))
@@ -1067,8 +1099,8 @@ func (scope *connScope) canonicalEffectForJournalRow(jid int64) (journal.Effect,
 }
 
 func (scope *connScope) insertCanonicalShadowTask(e journal.Effect, recordedAt, jid int64) error {
-	if err := sqlitex.Execute(scope.conn, "INSERT INTO shadow_tasks\n\t\t (id, namespace, title, description, owner_id, status_id, priority_id, type_id,\n\t\t  phase_id, notes, created_at, updated_at, closed_at, close_reason, last_journal_id)\n\t\t VALUES (?1, ?2, ?3, ?4, ?12, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?13, ?9, ?11)", &sqlitex.ExecOptions{Args: []any{e.TaskID.String(), e.TaskID.Namespace, e.Title, e.Description,
-		statusOpenID, int(e.Priority), int(e.Type), int(e.Phase), "", recordedAt, jid, nil, nil}}); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO shadow_tasks\n\t\t (id, namespace, title, description, owner_id, status_id, priority_id, type_id,\n\t\t  phase_id, notes, created_at, updated_at, closed_at, close_reason, last_journal_id)\n\t\t VALUES (?1, ?2, ?3, ?4, ?12, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?13, ?9, ?11)", e.TaskID.String(), e.TaskID.Namespace, e.Title, e.Description,
+		statusOpenID, int(e.Priority), int(e.Type), int(e.Phase), "", recordedAt, jid, nil, nil); err != nil {
 		return fmt.Errorf("replay canonical task create %q: %w", e.TaskID, err)
 	}
 	return nil
@@ -1098,7 +1130,7 @@ func (scope *connScope) materializeCanonicalShadowTaskEvent(e journal.Effect, re
 	if e.UpdatePhase != nil {
 		phase = int(*e.UpdatePhase)
 	}
-	if err := sqlitex.Execute(scope.conn, "UPDATE shadow_tasks SET\n\t\tupdated_at=?1,\n\t\ttitle=CASE WHEN ?2 THEN ?3 ELSE title END,\n\t\tdescription=CASE WHEN ?4 THEN ?5 ELSE description END,\n\t\tpriority_id=CASE WHEN ?6 THEN ?7 ELSE priority_id END,\n\t\tphase_id=CASE WHEN ?8 THEN ?9 ELSE phase_id END,\n\t\tnotes=CASE WHEN ?10 THEN ?11 ELSE notes END,\n\t\tclose_reason=CASE WHEN ?12 THEN ?13 ELSE close_reason END\n\t\tWHERE id=?14", &sqlitex.ExecOptions{Args: []any{
+	if _, err := scope.conn.ExecContext(scope.ctx, "UPDATE shadow_tasks SET\n\t\tupdated_at=?1,\n\t\ttitle=CASE WHEN ?2 THEN ?3 ELSE title END,\n\t\tdescription=CASE WHEN ?4 THEN ?5 ELSE description END,\n\t\tpriority_id=CASE WHEN ?6 THEN ?7 ELSE priority_id END,\n\t\tphase_id=CASE WHEN ?8 THEN ?9 ELSE phase_id END,\n\t\tnotes=CASE WHEN ?10 THEN ?11 ELSE notes END,\n\t\tclose_reason=CASE WHEN ?12 THEN ?13 ELSE close_reason END\n\t\tWHERE id=?14",
 		recordedAt,
 		flag(e.UpdateTitle != nil), value(e.UpdateTitle),
 		flag(e.UpdateDescription != nil), value(e.UpdateDescription),
@@ -1107,7 +1139,7 @@ func (scope *connScope) materializeCanonicalShadowTaskEvent(e journal.Effect, re
 		flag(e.UpdateNotes != nil), value(e.UpdateNotes),
 		flag(closeReasonSet), e.CloseReason,
 		e.TaskID.String(),
-	}}); err != nil {
+	); err != nil {
 		return fmt.Errorf("replay canonical task event %q: %w", e.TaskID, err)
 	}
 	return nil
@@ -1116,7 +1148,7 @@ func (scope *connScope) materializeCanonicalShadowTaskEvent(e journal.Effect, re
 // dropProjectionShadow removes the connection-scoped shadow projection tables.
 func (scope *connScope) dropProjectionShadow() error {
 	for _, stmt := range []string{"DROP TABLE IF EXISTS shadow_tasks", "DROP TABLE IF EXISTS shadow_task_attributions", "DROP TABLE IF EXISTS shadow_edges", "DROP TABLE IF EXISTS shadow_labels", "DROP TABLE IF EXISTS shadow_comments"} {
-		if err := sqlitex.ExecuteTransient(scope.conn, stmt, nil); err != nil {
+		if _, err := scope.conn.ExecContext(scope.ctx, stmt); err != nil {
 			return fmt.Errorf("drop shadow projection table: %w", err)
 		}
 	}
@@ -1129,12 +1161,16 @@ func (scope *connScope) dropProjectionShadow() error {
 // therefore in scope for the §15 convergence assertion.
 func (scope *connScope) journalAnchoredTasks() (map[string]struct{}, error) {
 	out := map[string]struct{}{}
-	if err := sqlitex.Execute(scope.conn, "SELECT task_id FROM journal_task_events\n\t\t UNION SELECT task_id FROM journal_authority_assignment_episodes\n\t\t UNION SELECT task_id FROM journal_decisions WHERE task_id IS NOT ?1\n\t\t UNION SELECT task_id FROM journal_evidence WHERE task_id IS NOT ?2", &sqlitex.ExecOptions{Args: []any{nil, nil}, ResultFunc: func(stmt *zs.Stmt) error {
-		if stmt.ColumnType(0) != zs.TypeNull {
-			out[stmt.ColumnText(0)] = struct{}{}
+	if err := scope.queryRows("SELECT task_id FROM journal_task_events\n\t\t UNION SELECT task_id FROM journal_authority_assignment_episodes\n\t\t UNION SELECT task_id FROM journal_decisions WHERE task_id IS NOT ?1\n\t\t UNION SELECT task_id FROM journal_evidence WHERE task_id IS NOT ?2", []any{nil, nil}, func(rows *sql.Rows) error {
+		var task sql.NullString
+		if err := rows.Scan(&task); err != nil {
+			return err
+		}
+		if task.Valid {
+			out[task.String] = struct{}{}
 		}
 		return nil
-	}}); err != nil {
+	}); err != nil {
 		return nil, fmt.Errorf("enumerate journal-anchored tasks: %w", err)
 	}
 	return out, nil
@@ -1146,28 +1182,32 @@ func (scope *connScope) journalAnchoredTasks() (map[string]struct{}, error) {
 // ("shadow_tasks") (§15).
 func (scope *connScope) snapshotTaskProjections(target projectionTarget) (map[string]journal.TaskProjection, error) {
 	out := map[string]journal.TaskProjection{}
-	if err := sqlitex.Execute(scope.conn,
-		target.snapshotTaskProjectionsQuery(),
-		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
-			taskRaw := stmt.ColumnText(0)
-			task, err := journalParseTask(taskRaw)
+	if err := scope.queryRows(target.snapshotTaskProjectionsQuery(), nil, func(rows *sql.Rows) error {
+		var taskRaw string
+		var owner sql.NullString
+		var status int
+		var lastJournalID sql.NullInt64
+		if err := rows.Scan(&taskRaw, &owner, &status, &lastJournalID); err != nil {
+			return err
+		}
+		task, err := journalParseTask(taskRaw)
+		if err != nil {
+			return err
+		}
+		p := journal.TaskProjection{TaskID: task, Status: journal.TaskStatus(status)}
+		if owner.Valid {
+			ownerID, err := journalParseActor(owner.String)
 			if err != nil {
 				return err
 			}
-			p := journal.TaskProjection{TaskID: task, Status: journal.TaskStatus(stmt.ColumnInt(2))}
-			if stmt.ColumnType(1) != zs.TypeNull {
-				owner, err := journalParseActor(stmt.ColumnText(1))
-				if err != nil {
-					return err
-				}
-				p.Owner = &owner
-			}
-			if stmt.ColumnType(3) != zs.TypeNull {
-				p.LastJournalID = journal.JournalID(stmt.ColumnInt64(3))
-			}
-			out[taskRaw] = p
-			return nil
-		}}); err != nil {
+			p.Owner = &ownerID
+		}
+		if lastJournalID.Valid {
+			p.LastJournalID = journal.JournalID(lastJournalID.Int64)
+		}
+		out[taskRaw] = p
+		return nil
+	}); err != nil {
 		return nil, fmt.Errorf("snapshot task projections: %w", err)
 	}
 	return out, nil
@@ -1245,16 +1285,18 @@ func (target projectionTarget) snapshotCommentsQuery() string {
 // ("shadow_task_attributions") (§8.2, §15).
 func (scope *connScope) snapshotAttributions(target projectionTarget) (map[string]map[string]int64, error) {
 	out := map[string]map[string]int64{}
-	if err := sqlitex.Execute(scope.conn,
-		target.snapshotAttributionsQuery(),
-		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
-			task := stmt.ColumnText(0)
-			if out[task] == nil {
-				out[task] = map[string]int64{}
-			}
-			out[task][stmt.ColumnText(1)] = stmt.ColumnInt64(2)
-			return nil
-		}}); err != nil {
+	if err := scope.queryRows(target.snapshotAttributionsQuery(), nil, func(rows *sql.Rows) error {
+		var task, actor string
+		var journalID int64
+		if err := rows.Scan(&task, &actor, &journalID); err != nil {
+			return err
+		}
+		if out[task] == nil {
+			out[task] = map[string]int64{}
+		}
+		out[task][actor] = journalID
+		return nil
+	}); err != nil {
 		return nil, fmt.Errorf("snapshot task_attributions: %w", err)
 	}
 	return out, nil
@@ -1347,32 +1389,40 @@ type completeTaskState struct {
 
 func (scope *connScope) snapshotCompleteTaskState(target projectionTarget) (map[string]completeTaskState, error) {
 	out := map[string]completeTaskState{}
-	if err := sqlitex.Execute(scope.conn, target.snapshotCompleteTaskStateQuery(), &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
-		id, err := journalParseTask(stmt.ColumnText(0))
+	if err := scope.queryRows(target.snapshotCompleteTaskStateQuery(), nil, func(rows *sql.Rows) error {
+		var idRaw string
+		var namespace, title, description, notes, closeReason sql.NullString
+		var status, priority, taskType, phase, createdAt, updatedAt sql.NullInt64
+		var owner sql.NullString
+		var closedAt, watermark sql.NullInt64
+		if err := rows.Scan(&idRaw, &namespace, &title, &description, &status, &priority, &taskType, &phase, &owner, &notes, &createdAt, &updatedAt, &closedAt, &closeReason, &watermark); err != nil {
+			return err
+		}
+		id, err := journalParseTask(idRaw)
 		if err != nil {
 			return err
 		}
-		text := func(column int) string {
-			if stmt.ColumnType(column) == zs.TypeNull {
+		text := func(value sql.NullString) string {
+			if !value.Valid {
 				return "<null>"
 			}
-			return stmt.ColumnText(column)
+			return value.String
 		}
-		integer := func(column int) string {
-			if stmt.ColumnType(column) == zs.TypeNull {
+		integer := func(value sql.NullInt64) string {
+			if !value.Valid {
 				return "<null>"
 			}
-			return strconv.FormatInt(stmt.ColumnInt64(column), 10)
+			return strconv.FormatInt(value.Int64, 10)
 		}
 		out[id.String()] = completeTaskState{task: id, fields: map[string]string{
-			"namespace": text(1), "title": text(2), "description": text(3),
-			"status": integer(4), "priority": integer(5), "type": integer(6),
-			"phase": integer(7), "owner": text(8), "notes": text(9),
-			"created_at": integer(10), "updated_at": integer(11), "closed_at": integer(12),
-			"close_reason": text(13), "watermark": integer(14),
+			"namespace": text(namespace), "title": text(title), "description": text(description),
+			"status": integer(status), "priority": integer(priority), "type": integer(taskType),
+			"phase": integer(phase), "owner": text(owner), "notes": text(notes),
+			"created_at": integer(createdAt), "updated_at": integer(updatedAt), "closed_at": integer(closedAt),
+			"close_reason": text(closeReason), "watermark": integer(watermark),
 		}}
 		return nil
-	}}); err != nil {
+	}); err != nil {
 		return nil, fmt.Errorf("snapshot complete task state from %s: %w", target.label(), err)
 	}
 	return out, nil
@@ -1469,48 +1519,54 @@ func (scope *connScope) snapshotDomainProjections(target projectionTarget) (doma
 		labels:   map[string]domainLabel{},
 		comments: map[string]domainComment{},
 	}
-	if err := sqlitex.Execute(scope.conn,
-		target.snapshotEdgesQuery(),
-		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
-			src, tgt, kind := stmt.ColumnText(0), stmt.ColumnText(1), stmt.ColumnInt(2)
-			task, err := journalParseTask(src)
-			if err != nil {
-				return err
-			}
-			dp.edges[fmt.Sprintf("%s\x00%s\x00%d", src, tgt, kind)] = domainEdge{task: task, createdAt: stmt.ColumnInt64(3)}
-			return nil
-		}}); err != nil {
+	if err := scope.queryRows(target.snapshotEdgesQuery(), nil, func(rows *sql.Rows) error {
+		var src, tgt string
+		var kind int
+		var createdAt int64
+		if err := rows.Scan(&src, &tgt, &kind, &createdAt); err != nil {
+			return err
+		}
+		task, err := journalParseTask(src)
+		if err != nil {
+			return err
+		}
+		dp.edges[fmt.Sprintf("%s\x00%s\x00%d", src, tgt, kind)] = domainEdge{task: task, createdAt: createdAt}
+		return nil
+	}); err != nil {
 		return domainProjection{}, fmt.Errorf("snapshot %s edges: %w", target.label(), err)
 	}
-	if err := sqlitex.Execute(scope.conn,
-		target.snapshotLabelsQuery(),
-		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
-			taskRaw, name := stmt.ColumnText(0), stmt.ColumnText(1)
-			task, err := journalParseTask(taskRaw)
-			if err != nil {
-				return err
-			}
-			dp.labels[fmt.Sprintf("%s\x00%s", taskRaw, name)] = domainLabel{task: task}
-			return nil
-		}}); err != nil {
+	if err := scope.queryRows(target.snapshotLabelsQuery(), nil, func(rows *sql.Rows) error {
+		var taskRaw, name string
+		if err := rows.Scan(&taskRaw, &name); err != nil {
+			return err
+		}
+		task, err := journalParseTask(taskRaw)
+		if err != nil {
+			return err
+		}
+		dp.labels[fmt.Sprintf("%s\x00%s", taskRaw, name)] = domainLabel{task: task}
+		return nil
+	}); err != nil {
 		return domainProjection{}, fmt.Errorf("snapshot %s labels: %w", target.label(), err)
 	}
-	if err := sqlitex.Execute(scope.conn,
-		target.snapshotCommentsQuery(),
-		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
-			id, taskRaw := stmt.ColumnText(0), stmt.ColumnText(1)
-			task, err := journalParseTask(taskRaw)
-			if err != nil {
-				return err
-			}
-			dp.comments[id] = domainComment{
-				task:      task,
-				author:    stmt.ColumnText(2),
-				body:      stmt.ColumnText(3),
-				createdAt: stmt.ColumnInt64(4),
-			}
-			return nil
-		}}); err != nil {
+	if err := scope.queryRows(target.snapshotCommentsQuery(), nil, func(rows *sql.Rows) error {
+		var id, taskRaw, author, body string
+		var createdAt int64
+		if err := rows.Scan(&id, &taskRaw, &author, &body, &createdAt); err != nil {
+			return err
+		}
+		task, err := journalParseTask(taskRaw)
+		if err != nil {
+			return err
+		}
+		dp.comments[id] = domainComment{
+			task:      task,
+			author:    author,
+			body:      body,
+			createdAt: createdAt,
+		}
+		return nil
+	}); err != nil {
 		return domainProjection{}, fmt.Errorf("snapshot %s comments: %w", target.label(), err)
 	}
 	return dp, nil

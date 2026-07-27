@@ -2,13 +2,13 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/dayvidpham/provenance/pkg/ptypes"
 	"github.com/google/uuid"
-	zs "zombiezen.com/go/sqlite"
-	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 // AddComment adds a comment to a task authored by authorID.
@@ -28,15 +28,9 @@ func (db *DB) AddComment(id ptypes.TaskID, authorID ptypes.AgentID, body string)
 		return ptypes.Comment{}, fmt.Errorf("sqlite.AddComment on task %q: %w", id.String(), err)
 	}
 	defer scope.release()
-	if err := sqlitex.Execute(scope.conn, "INSERT INTO comments (id, task_id, author_id, body, created_at) VALUES (?1, ?2, ?3, ?4, ?5)", &sqlitex.ExecOptions{Args: []any{
-		comment.ID.String(), comment.TaskID.String(),
-		comment.AuthorID.String(), comment.Body, comment.CreatedAt.UnixNano(),
-	}}); err != nil {
-		return ptypes.Comment{}, fmt.Errorf(
-			"sqlite.AddComment: failed to insert comment on task %q: %w — "+
-				"check that the task and author agent both exist",
-			id.String(), err,
-		)
+	if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO comments (id, task_id, author_id, body, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+		comment.ID.String(), comment.TaskID.String(), comment.AuthorID.String(), comment.Body, comment.CreatedAt.UnixNano()); err != nil {
+		return ptypes.Comment{}, fmt.Errorf("sqlite.AddComment: failed to insert comment on task %q: %w — check that the task and author agent both exist", id.String(), err)
 	}
 	return comment, nil
 }
@@ -49,25 +43,14 @@ func (db *DB) GetComment(id ptypes.CommentID) (ptypes.Comment, bool, error) {
 		return ptypes.Comment{}, false, fmt.Errorf("sqlite.GetComment %q: %w", id.String(), err)
 	}
 	defer scope.release()
-	var (
-		comment ptypes.Comment
-		found   bool
-	)
-	if err := sqlitex.Execute(scope.conn, "SELECT id, task_id, author_id, body, created_at FROM comments WHERE id = ?1", &sqlitex.ExecOptions{
-		Args: []any{id.String()},
-		ResultFunc: func(stmt *zs.Stmt) error {
-			c, err := ScanComment(stmt)
-			if err != nil {
-				return err
-			}
-			comment = c
-			found = true
-			return nil
-		},
-	}); err != nil {
+	comment, err := ScanComment(scope.conn.QueryRowContext(scope.ctx, "SELECT id, task_id, author_id, body, created_at FROM comments WHERE id = ?1", id.String()))
+	if errors.Is(err, sql.ErrNoRows) {
+		return ptypes.Comment{}, false, nil
+	}
+	if err != nil {
 		return ptypes.Comment{}, false, fmt.Errorf("sqlite.GetComment %q: %w", id.String(), err)
 	}
-	return comment, found, nil
+	return comment, true, nil
 }
 
 // GetComments returns all comments on a task in chronological order.
@@ -77,20 +60,21 @@ func (db *DB) GetComments(id ptypes.TaskID) ([]ptypes.Comment, error) {
 		return nil, fmt.Errorf("sqlite.GetComments %q: %w", id.String(), err)
 	}
 	defer scope.release()
-	var comments []ptypes.Comment
-	err = sqlitex.Execute(scope.conn, "SELECT id, task_id, author_id, body, created_at\n\t\t FROM comments WHERE task_id = ?1 ORDER BY created_at ASC", &sqlitex.ExecOptions{
-		Args: []any{id.String()},
-		ResultFunc: func(stmt *zs.Stmt) error {
-			c, err := ScanComment(stmt)
-			if err != nil {
-				return err
-			}
-			comments = append(comments, c)
-			return nil
-		},
-	})
+	rows, err := scope.conn.QueryContext(scope.ctx, "SELECT id, task_id, author_id, body, created_at FROM comments WHERE task_id = ?1 ORDER BY created_at ASC", id.String())
 	if err != nil {
 		return nil, fmt.Errorf("sqlite.GetComments: %w", err)
+	}
+	defer rows.Close()
+	comments := make([]ptypes.Comment, 0)
+	for rows.Next() {
+		comment, err := ScanComment(rows)
+		if err != nil {
+			return nil, fmt.Errorf("sqlite.GetComments: scan comment row: %w", err)
+		}
+		comments = append(comments, comment)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sqlite.GetComments: iterate comment rows: %w", err)
 	}
 	return comments, nil
 }

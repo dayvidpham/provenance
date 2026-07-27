@@ -12,7 +12,6 @@ import (
 	"github.com/dayvidpham/provenance/internal/journal"
 	"github.com/dayvidpham/provenance/internal/testcorpus"
 	"github.com/dayvidpham/provenance/pkg/ptypes"
-	zs "zombiezen.com/go/sqlite"
 )
 
 //go:embed testdata/contract/dbos_outcome_failure.yaml
@@ -414,8 +413,8 @@ func TestDBOSOnlyKnownDomainFailuresAreCheckpointable(t *testing.T) {
 			t.Fatalf("known domain failure %q classified as %#v err=%v", descriptor.kind, matched, err)
 		}
 	}
-	for _, code := range []zs.ResultCode{zs.ResultIOErr, zs.ResultFull, zs.ResultReadOnly, zs.ResultCantOpen, zs.ResultBusy, zs.ResultLocked} {
-		err := code.ToError()
+	for _, name := range []string{"ioerr", "full", "readonly", "cantopen", "busy", "locked"} {
+		err := fmt.Errorf("injected SQLite operational failure: %s", name)
 		if descriptor, classifyErr := classifyDomainFailure(err); classifyErr != err {
 			t.Fatalf("operational SQLite error %v classified as durable domain descriptor %#v err=%v", err, descriptor, classifyErr)
 		}

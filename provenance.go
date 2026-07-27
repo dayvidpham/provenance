@@ -1,5 +1,7 @@
 package provenance
 
+import "context"
+
 // Tracker is the central API for Provenance task management.
 // All methods are safe for concurrent use.
 // Use OpenSQLite or OpenMemory to obtain an implementation.
@@ -21,6 +23,10 @@ type Tracker interface {
 	// relationship, and annotation verbs all commit typed effects through Apply
 	// (docs/journal-relational-contract.md §6 and §9). See Session.
 	As(actor ActorID, authority JournalID) *Session
+
+	// InitializeGovernedRoot creates exactly one root task and root assignment.
+	// A nil authority is accepted only by this explicit genesis entrypoint.
+	InitializeGovernedRoot(context.Context, RootGenesisRequest) (OperationClosure, error)
 
 	// ---------------------------------------------------------------------------
 	// Task reads

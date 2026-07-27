@@ -1,12 +1,12 @@
 package sqlite
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/dayvidpham/provenance/internal/journal"
-	zs "zombiezen.com/go/sqlite"
-	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 // fact_match.go implements the shared FactFilter/FactSelector matcher used by
@@ -239,17 +239,12 @@ func evaluateExactFactSelector(scope *connScope, sel journal.FactSelector, asser
 		return 0, false, err
 	}
 	exactArgs := append(binding.args, int64(asserted)) // ?13 (args already has ?11 and ?12)
-	found := false
-	if err := sqlitex.Execute(scope.conn, binding.kind.exactMatchSQL(), &sqlitex.ExecOptions{
-		Args: exactArgs,
-		ResultFunc: func(*zs.Stmt) error {
-			found = true
-			return nil
-		},
-	}); err != nil {
+	var matchedID int64
+	err = scope.conn.QueryRowContext(scope.ctx, binding.kind.exactMatchSQL(), exactArgs...).Scan(&matchedID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return 0, false, fmt.Errorf("evaluateExactFactSelector (%v): %w", sel.Kind, err)
 	}
-	if found {
+	if err == nil {
 		if _, err := scope.verifySelectedFactContext(binding.contexts, int64(asserted)); err != nil {
 			return 0, false, err
 		}
@@ -293,21 +288,14 @@ func latestFactSelector(scope *connScope, kind factSelectorKind, args []any) (jo
 }
 
 func latestFactMatch(scope *connScope, binding factMatchBinding) (journal.JournalID, bool, error) {
-	var latest journal.JournalID
-	found := false
-	if err := sqlitex.Execute(scope.conn, binding.kind.latestMatchSQL(), &sqlitex.ExecOptions{
-		Args: binding.args,
-		ResultFunc: func(stmt *zs.Stmt) error {
-			if stmt.ColumnType(0) != zs.TypeNull {
-				latest = journal.JournalID(stmt.ColumnInt64(0))
-				found = true
-			}
-			return nil
-		},
-	}); err != nil {
+	var latest sql.NullInt64
+	if err := scope.conn.QueryRowContext(scope.ctx, binding.kind.latestMatchSQL(), binding.args...).Scan(&latest); err != nil {
 		return 0, false, fmt.Errorf("latestFactSelector: %w", err)
 	}
-	return latest, found, nil
+	if !latest.Valid {
+		return 0, false, nil
+	}
+	return journal.JournalID(latest.Int64), true, nil
 }
 
 func (k factSelectorKind) contextRelation() factContextRelation {

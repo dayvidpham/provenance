@@ -16,8 +16,6 @@ import (
 	"github.com/dayvidpham/provenance/internal/journal"
 	"github.com/dayvidpham/provenance/pkg/ptypes"
 	"github.com/google/uuid"
-	zs "zombiezen.com/go/sqlite"
-	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 func TestFactQueryReturnsExactDecisionAndEvidenceRows(t *testing.T) {
@@ -895,7 +893,7 @@ func TestFactQueryCorruptionFailsClosedWithoutChangingSQLiteArtifacts(t *testing
 	if err != nil {
 		t.Fatalf("bind corruption scope: %v", err)
 	}
-	if err := sqlitex.Execute(scope.conn, "UPDATE journal_operations SET operation_id=char(1) WHERE operation_id=?1", &sqlitex.ExecOptions{Args: []any{"facts-corrupt-query"}}); err != nil {
+	if err := execFactTestSQL(scope, "UPDATE journal_operations SET operation_id=char(1) WHERE operation_id=?1", "facts-corrupt-query"); err != nil {
 		scope.release()
 		t.Fatalf("corrupt operation identity: %v", err)
 	}
@@ -932,54 +930,54 @@ func TestFactQueriesCorruptionMatrixFailsClosedForBothSubtypes(t *testing.T) {
 		mutate func(*connScope, journal.JournalID, journal.JournalID, journal.ActorID, factContextRelation) error
 	}{
 		{name: "dangling-producer", mutate: func(scope *connScope, factID, _ journal.JournalID, actor journal.ActorID, _ factContextRelation) error {
-			return sqlitex.Execute(scope.conn, "UPDATE journal SET actor_id=NULL, produced_by_operation_journal_id=?1 WHERE journal_id=?2", &sqlitex.ExecOptions{Args: []any{int64(1 << 60), int64(factID)}})
+			return execFactTestSQL(scope, "UPDATE journal SET actor_id=NULL, produced_by_operation_journal_id=?1 WHERE journal_id=?2", int64(1<<60), int64(factID))
 		}},
 		{name: "missing-attribution-producer", mutate: func(scope *connScope, factID, _ journal.JournalID, actor journal.ActorID, _ factContextRelation) error {
-			return sqlitex.Execute(scope.conn, "UPDATE journal SET actor_id=?1, produced_by_operation_journal_id=NULL WHERE journal_id=?2", &sqlitex.ExecOptions{Args: []any{actor.String(), int64(factID)}})
+			return execFactTestSQL(scope, "UPDATE journal SET actor_id=?1, produced_by_operation_journal_id=NULL WHERE journal_id=?2", actor.String(), int64(factID))
 		}},
 		{name: "malformed-attribution-actor", mutate: func(scope *connScope, factID, operationAnchor journal.JournalID, _ journal.ActorID, _ factContextRelation) error {
-			if err := sqlitex.Execute(scope.conn, "UPDATE journal SET actor_id=NULL WHERE journal_id=?1", &sqlitex.ExecOptions{Args: []any{int64(factID)}}); err != nil {
+			if err := execFactTestSQL(scope, "UPDATE journal SET actor_id=NULL WHERE journal_id=?1", int64(factID)); err != nil {
 				return err
 			}
-			return sqlitex.Execute(scope.conn, "UPDATE journal SET actor_id=?1 WHERE journal_id=?2", &sqlitex.ExecOptions{Args: []any{"\x01", int64(operationAnchor)}})
+			return execFactTestSQL(scope, "UPDATE journal SET actor_id=?1 WHERE journal_id=?2", "\x01", int64(operationAnchor))
 		}},
 		{name: "wrong-subtype", mutate: func(scope *connScope, factID, _ journal.JournalID, _ journal.ActorID, _ factContextRelation) error {
-			return sqlitex.Execute(scope.conn, "UPDATE journal SET kind_id=?1 WHERE journal_id=?2", &sqlitex.ExecOptions{Args: []any{int(journal.JournalKindOperation), int64(factID)}})
+			return execFactTestSQL(scope, "UPDATE journal SET kind_id=?1 WHERE journal_id=?2", int(journal.JournalKindOperation), int64(factID))
 		}},
 		{name: "malformed-producer-operation-id", mutate: func(scope *connScope, _ journal.JournalID, operationAnchor journal.JournalID, _ journal.ActorID, _ factContextRelation) error {
-			return sqlitex.Execute(scope.conn, "UPDATE journal_operations SET operation_id=char(1) WHERE journal_id=?1", &sqlitex.ExecOptions{Args: []any{int64(operationAnchor)}})
+			return execFactTestSQL(scope, "UPDATE journal_operations SET operation_id=char(1) WHERE journal_id=?1", int64(operationAnchor))
 		}},
 		{name: "invalid-payload", mutate: func(scope *connScope, factID, _ journal.JournalID, _ journal.ActorID, relation factContextRelation) error {
-			if err := sqlitex.ExecuteTransient(scope.conn, "PRAGMA ignore_check_constraints=ON", nil); err != nil {
+			if err := execFactTestSQL(scope, "PRAGMA ignore_check_constraints=ON"); err != nil {
 				return err
 			}
 			table := "journal_decisions"
 			if relation == factContextEvidence {
 				table = "journal_evidence"
 			}
-			return sqlitex.Execute(scope.conn, "UPDATE "+table+" SET payload=?1 WHERE journal_id=?2", &sqlitex.ExecOptions{Args: []any{"not-json", int64(factID)}})
+			return execFactTestSQL(scope, "UPDATE "+table+" SET payload=?1 WHERE journal_id=?2", "not-json", int64(factID))
 		}},
 		{name: "wrong-evidence-digest", mutate: func(scope *connScope, factID, _ journal.JournalID, _ journal.ActorID, relation factContextRelation) error {
 			if relation != factContextEvidence {
 				return nil
 			}
-			return sqlitex.Execute(scope.conn, "UPDATE journal_evidence SET content_digest=?1 WHERE journal_id=?2", &sqlitex.ExecOptions{Args: []any{[]byte("wrong-digest"), int64(factID)}})
+			return execFactTestSQL(scope, "UPDATE journal_evidence SET content_digest=?1 WHERE journal_id=?2", []byte("wrong-digest"), int64(factID))
 		}},
 		{name: "missing-context", mutate: func(scope *connScope, factID, _ journal.JournalID, _ journal.ActorID, relation factContextRelation) error {
-			return sqlitex.Execute(scope.conn, "DELETE FROM "+relation.tableName()+" WHERE "+relation.parentColumn()+"=?1", &sqlitex.ExecOptions{Args: []any{int64(factID)}})
+			return execFactTestSQL(scope, "DELETE FROM "+relation.tableName()+" WHERE "+relation.parentColumn()+"=?1", int64(factID))
 		}},
 		{name: "extra-context", mutate: func(scope *connScope, factID, _ journal.JournalID, _ journal.ActorID, relation factContextRelation) error {
-			return sqlitex.Execute(scope.conn, relation.insertSQL(), &sqlitex.ExecOptions{Args: []any{int64(factID), "git", "0123456789abcdef0123456789abcdef01234567"}})
+			return execFactTestSQL(scope, relation.insertSQL(), int64(factID), "git", "0123456789abcdef0123456789abcdef01234567")
 		}},
 		{name: "malformed-context", mutate: func(scope *connScope, factID, _ journal.JournalID, _ journal.ActorID, relation factContextRelation) error {
-			return sqlitex.Execute(scope.conn, "UPDATE "+relation.tableName()+" SET context_kind=?1, context_identity=?2 WHERE "+relation.parentColumn()+"=?3", &sqlitex.ExecOptions{Args: []any{"git", "not-a-git-object", int64(factID)}})
+			return execFactTestSQL(scope, "UPDATE "+relation.tableName()+" SET context_kind=?1, context_identity=?2 WHERE "+relation.parentColumn()+"=?3", "git", "not-a-git-object", int64(factID))
 		}},
 		{name: "cross-subtype-context", mutate: func(scope *connScope, factID, _ journal.JournalID, actor journal.ActorID, relation factContextRelation) error {
 			opposite := factContextEvidence
 			if relation == factContextEvidence {
 				opposite = factContextDecision
 			}
-			return sqlitex.Execute(scope.conn, opposite.insertSQL(), &sqlitex.ExecOptions{Args: []any{int64(factID), "actor", actor.String()}})
+			return execFactTestSQL(scope, opposite.insertSQL(), int64(factID), "actor", actor.String())
 		}},
 	}
 	for _, subtype := range []factContextRelation{factContextDecision, factContextEvidence} {
@@ -1010,7 +1008,7 @@ func TestFactQueriesCorruptionMatrixFailsClosedForBothSubtypes(t *testing.T) {
 				if err != nil {
 					t.Fatalf("bind corruption scope: %v", err)
 				}
-				if err := sqlitex.ExecuteTransient(scope.conn, "PRAGMA foreign_keys=OFF", nil); err != nil {
+				if err := execFactTestSQL(scope, "PRAGMA foreign_keys=OFF"); err != nil {
 					scope.release()
 					t.Fatalf("disable FK checks for corruption fixture: %v", err)
 				}
@@ -1049,7 +1047,8 @@ func stabilizeReadArtifacts(t *testing.T, db *DB) {
 		if err != nil {
 			t.Fatalf("bind artifact stabilization scope: %v", err)
 		}
-		if err := sqlitex.Execute(scope.conn, "SELECT COUNT(*) FROM journal", &sqlitex.ExecOptions{ResultFunc: func(*zs.Stmt) error { return nil }}); err != nil {
+		var count int
+		if err := scope.conn.QueryRowContext(scope.ctx, "SELECT COUNT(*) FROM journal").Scan(&count); err != nil {
 			scope.release()
 			t.Fatalf("stabilize artifact read: %v", err)
 		}
@@ -1151,9 +1150,9 @@ func seedFactActor(t *testing.T, db *DB) journal.ActorID {
 	if err != nil {
 		t.Fatalf("bind actor seed scope: %v", err)
 	}
-	err = sqlitex.Execute(scope.conn, "INSERT INTO agents (id, kind_id) VALUES (?1, ?2)", &sqlitex.ExecOptions{Args: []any{actor.String(), int(ptypes.AgentKindSoftware)}})
+	_, err = scope.conn.ExecContext(scope.ctx, "INSERT INTO agents (id, kind_id) VALUES (?1, ?2)", actor.String(), int(ptypes.AgentKindSoftware))
 	if err == nil {
-		err = sqlitex.Execute(scope.conn, "INSERT INTO agents_software (agent_id, name, version, source) VALUES (?1, ?2, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{actor.String(), "facts-test", "0", "test"}})
+		_, err = scope.conn.ExecContext(scope.ctx, "INSERT INTO agents_software (agent_id, name, version, source) VALUES (?1, ?2, ?3, ?4)", actor.String(), "facts-test", "0", "test")
 	}
 	scope.release()
 	if err != nil {
@@ -1227,15 +1226,18 @@ func operationAnchor(t *testing.T, db *DB, operation journal.OperationID) journa
 		t.Fatalf("bind operation anchor scope: %v", err)
 	}
 	defer scope.release()
-	var anchor journal.JournalID
-	if err := sqlitex.Execute(scope.conn, "SELECT journal_id FROM journal_operations WHERE operation_id=?1", &sqlitex.ExecOptions{Args: []any{string(operation)}, ResultFunc: func(stmt *zs.Stmt) error {
-		anchor = journal.JournalID(stmt.ColumnInt64(0))
-		return nil
-	}}); err != nil {
+	var rawAnchor int64
+	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT journal_id FROM journal_operations WHERE operation_id=?1", string(operation)).Scan(&rawAnchor); err != nil {
 		t.Fatalf("operation anchor %q: %v", operation, err)
 	}
+	anchor := journal.JournalID(rawAnchor)
 	if anchor <= 0 {
 		t.Fatalf("operation anchor %q = %d, want positive", operation, anchor)
 	}
 	return anchor
+}
+
+func execFactTestSQL(scope *connScope, query string, args ...any) error {
+	_, err := scope.conn.ExecContext(scope.ctx, query, args...)
+	return err
 }

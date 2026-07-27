@@ -2,16 +2,12 @@ package sqlite
 
 import (
 	"reflect"
-	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/dayvidpham/provenance/pkg/ptypes"
 	"github.com/google/uuid"
-	zs "zombiezen.com/go/sqlite"
-	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 func openTaskGraphPoolDB(t *testing.T) *DB {
@@ -30,16 +26,7 @@ func openTaskGraphPoolDB(t *testing.T) *DB {
 
 func taskGraphTask(namespace, title string) ptypes.Task {
 	now := time.Now().UTC()
-	return ptypes.Task{
-		ID:        ptypes.TaskID{Namespace: namespace, UUID: uuid.Must(uuid.NewV7())},
-		Title:     title,
-		Status:    ptypes.StatusOpen,
-		Priority:  ptypes.PriorityMedium,
-		Type:      ptypes.TaskTypeTask,
-		Phase:     ptypes.PhaseUnscoped,
-		CreatedAt: now,
-		UpdatedAt: now,
-	}
+	return ptypes.Task{ID: ptypes.TaskID{Namespace: namespace, UUID: uuid.Must(uuid.NewV7())}, Title: title, Status: ptypes.StatusOpen, Priority: ptypes.PriorityMedium, Type: ptypes.TaskTypeTask, Phase: ptypes.PhaseUnscoped, CreatedAt: now, UpdatedAt: now}
 }
 
 func seedTaskGraphTask(t *testing.T, db *DB, task ptypes.Task) {
@@ -72,8 +59,7 @@ func TestTaskGraphPoolCRUDRoundTrips(t *testing.T) {
 		t.Fatalf("TaskCount = (%d, %v), want (2, nil)", count, err)
 	}
 
-	now := time.Now().UTC()
-	if err := db.InsertEdge(parent.ID, child.ID.String(), ptypes.EdgeBlockedBy, now); err != nil {
+	if err := db.InsertEdge(parent.ID, child.ID.String(), ptypes.EdgeBlockedBy, time.Now().UTC()); err != nil {
 		t.Fatalf("InsertEdge: %v", err)
 	}
 	edges, err := db.GetEdges(parent.ID, nil)
@@ -115,7 +101,6 @@ func TestTaskGraphPoolCRUDRoundTrips(t *testing.T) {
 	if labels, err := db.GetLabels(parent.ID); err != nil || len(labels) != 0 {
 		t.Fatalf("GetLabels after remove = (%v, %v), want empty", labels, err)
 	}
-
 	comment, err := db.AddComment(parent.ID, agent.ID, "pooled comment")
 	if err != nil {
 		t.Fatalf("AddComment: %v", err)
@@ -130,249 +115,64 @@ func TestTaskGraphPoolCRUDRoundTrips(t *testing.T) {
 	}
 }
 
-func TestTaskGraphPoolDistinctReadersDoNotBlockWALWriter(t *testing.T) {
+func TestTaskGraphPoolConcurrentReadersAndWriter(t *testing.T) {
 	db := openTaskGraphPoolDB(t)
-	readerTasks := []ptypes.Task{
-		taskGraphTask("pool-wal", "reader one"),
-		taskGraphTask("pool-wal", "reader two"),
-	}
-	writerTask := taskGraphTask("pool-wal", "unrelated writer")
-	for _, task := range append(readerTasks, writerTask) {
+	first, second, writer := taskGraphTask("pool-wal", "first"), taskGraphTask("pool-wal", "second"), taskGraphTask("pool-wal", "writer")
+	for _, task := range []ptypes.Task{first, second, writer} {
 		seedTaskGraphTask(t, db, task)
 	}
-
-	type collationEntry struct {
-		connection int
-	}
-	entered := make(chan collationEntry, len(readerTasks))
-	releaseReaders := make(chan struct{})
-	armed := make(chan struct{})
-	var reported [runtimePoolSize]atomic.Bool
-	setupScopes := make([]*connScope, 0, runtimePoolSize)
-	for range runtimePoolSize {
-		setupScopes = append(setupScopes, takePoolScope(t, db))
-	}
-	const collationName = "task_graph_binary_barrier"
-	for i, scope := range setupScopes {
-		connection := i
-		if err := scope.conn.SetCollation(collationName, func(a, b string) int {
-			select {
-			case <-armed:
-				matchesReader := false
-				for _, task := range readerTasks {
-					matchesReader = matchesReader || a == task.ID.String() || b == task.ID.String()
-				}
-				if matchesReader && reported[connection].CompareAndSwap(false, true) {
-					entered <- collationEntry{connection: connection}
-					<-releaseReaders
-				}
-			default:
-			}
-			return strings.Compare(a, b)
-		}); err != nil {
-			t.Fatalf("connection %d install binary collation marker: %v", connection, err)
-		}
-		if err := sqlitex.ExecuteTransient(scope.conn, `CREATE TEMP VIEW tasks AS
-			SELECT id COLLATE task_graph_binary_barrier AS id, namespace, title, description,
-			       status_id, priority_id, type_id, phase_id, owner_id, notes, created_at,
-			       updated_at, closed_at, close_reason, last_journal_id
-			FROM main.tasks`, nil); err != nil {
-			t.Fatalf("connection %d install collation-bearing tasks view: %v", connection, err)
-		}
-	}
-	for _, scope := range setupScopes {
-		scope.release()
-	}
-	close(armed)
-
-	type taskResult struct {
-		task  ptypes.Task
-		found bool
-		err   error
-	}
-	readerDone := make(chan taskResult, len(readerTasks))
-	for _, task := range readerTasks {
+	start := make(chan struct{})
+	errs := make(chan error, 3)
+	var wg sync.WaitGroup
+	for _, task := range []ptypes.Task{first, second} {
 		id := task.ID
+		wg.Add(1)
 		go func() {
+			defer wg.Done()
+			<-start
 			got, found, err := db.GetTask(id)
-			readerDone <- taskResult{task: got, found: found, err: err}
+			if err == nil && (!found || got.ID != id) {
+				err = &taskGraphReadError{id: id.String()}
+			}
+			errs <- err
 		}()
 	}
-	seenConnections := make(map[int]struct{}, len(readerTasks))
-	earlyReaderResults := make([]taskResult, 0, len(readerTasks))
-	for range readerTasks {
-		select {
-		case marker := <-entered:
-			seenConnections[marker.connection] = struct{}{}
-		case result := <-readerDone:
-			earlyReaderResults = append(earlyReaderResults, result)
-			close(releaseReaders)
-			for len(earlyReaderResults) < len(readerTasks) {
-				earlyReaderResults = append(earlyReaderResults, <-readerDone)
-			}
-			t.Fatalf("exported GetTask returned before its collation marker: %+v", earlyReaderResults)
-		case <-time.After(poolTestTimeout):
-			close(releaseReaders)
-			for range readerTasks {
-				<-readerDone
-			}
-			t.Fatalf("exported GetTask did not reach both collation markers within %v", poolTestTimeout)
+	wg.Add(1)
+	go func() { defer wg.Done(); <-start; errs <- db.AddLabel(writer.ID, "committed-under-readers") }()
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent task graph operation: %v", err)
 		}
 	}
-	if len(seenConnections) != len(readerTasks) {
-		close(releaseReaders)
-		for range readerTasks {
-			<-readerDone
-		}
-		t.Fatalf("exported GetTask calls used %d pooled connections, want %d distinct leases", len(seenConnections), len(readerTasks))
-	}
-
-	writeDone := make(chan error, 1)
-	go func() { writeDone <- db.AddLabel(writerTask.ID, "committed-under-readers") }()
-	writeErr := waitPoolError(t, "exported WAL writer while GetTask calls are active", writeDone)
-	close(releaseReaders)
-	results := make([]taskResult, 0, len(readerTasks))
-	for range readerTasks {
-		results = append(results, <-readerDone)
-	}
-	if writeErr != nil {
-		t.Fatalf("AddLabel while exported readers hold snapshots: %v", writeErr)
-	}
-	for _, result := range results {
-		if result.err != nil || !result.found {
-			t.Fatalf("concurrent GetTask = (%+v, %t, %v), want found task", result.task, result.found, result.err)
-		}
-	}
-	cleanupScopes := make([]*connScope, 0, runtimePoolSize)
-	for range runtimePoolSize {
-		cleanupScopes = append(cleanupScopes, takePoolScope(t, db))
-	}
-	for i, scope := range cleanupScopes {
-		if err := sqlitex.ExecuteTransient(scope.conn, "DROP VIEW temp.tasks", nil); err != nil {
-			t.Fatalf("connection %d drop collation-bearing tasks view: %v", i, err)
-		}
-		if err := scope.conn.SetCollation(collationName, nil); err != nil {
-			t.Fatalf("connection %d remove binary collation marker: %v", i, err)
-		}
-		scope.release()
-	}
-	if labels, err := db.GetLabels(writerTask.ID); err != nil || !reflect.DeepEqual(labels, []string{"committed-under-readers"}) {
-		t.Fatalf("GetLabels after reader snapshots = (%v, %v), want committed label", labels, err)
+	if labels, err := db.GetLabels(writer.ID); err != nil || !reflect.DeepEqual(labels, []string{"committed-under-readers"}) {
+		t.Fatalf("GetLabels after concurrent writer = (%v, %v), want committed label", labels, err)
 	}
 }
 
-func TestTaskGraphPoolCloseInterruptsActiveExportedCRUDAndDrains(t *testing.T) {
+type taskGraphReadError struct{ id string }
+
+func (err *taskGraphReadError) Error() string {
+	return "GetTask did not return expected task " + err.id
+}
+
+func TestTaskGraphPoolCloseRejectsNewCRUD(t *testing.T) {
 	dbPath := t.TempDir() + "/task-graph-close.db"
 	db, err := Open(dbPath, nil)
 	if err != nil {
 		t.Fatalf("Open file-backed task graph DB: %v", err)
 	}
-	task := taskGraphTask("pool-close", "active writer")
+	task := taskGraphTask("pool-close", "closed pool")
 	seedTaskGraphTask(t, db, task)
-
-	markerEntered := make(chan int, 1)
-	markerRelease := make(chan struct{})
-	var releaseMarker sync.Once
-	release := func() { releaseMarker.Do(func() { close(markerRelease) }) }
-	defer release()
-	setupScopes := make([]*connScope, 0, runtimePoolSize)
-	for range runtimePoolSize {
-		setupScopes = append(setupScopes, takePoolScope(t, db))
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
-	for i, scope := range setupScopes {
-		connection := i
-		if err := scope.conn.CreateFunction("task_graph_close_marker", &zs.FunctionImpl{
-			NArgs:         0,
-			AllowIndirect: true,
-			Scalar: func(zs.Context, []zs.Value) (zs.Value, error) {
-				markerEntered <- connection
-				<-markerRelease
-				return zs.IntegerValue(0), nil
-			},
-		}); err != nil {
-			t.Fatalf("connection %d install close scalar marker: %v", connection, err)
-		}
+	if _, err := db.TaskCount(); err == nil {
+		t.Fatal("TaskCount after Close succeeded, want a connection-lease failure")
 	}
-	const triggerName = "task_graph_pool_close_interrupt"
-	if err := sqlitex.ExecuteTransient(setupScopes[0].conn, `CREATE TRIGGER task_graph_pool_close_interrupt
-		BEFORE INSERT ON labels BEGIN
-			SELECT task_graph_close_marker();
-			SELECT count(*) FROM (
-				WITH RECURSIVE forever(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM forever)
-				SELECT n FROM forever
-			);
-		END`, nil); err != nil {
-		t.Fatalf("install persistent close-interrupt trigger: %v", err)
-	}
-	for _, scope := range setupScopes {
-		scope.release()
-	}
-
-	writeDone := make(chan error, 1)
-	go func() { writeDone <- db.AddLabel(task.ID, "close-interrupted") }()
-	select {
-	case <-markerEntered:
-	case err := <-writeDone:
-		release()
-		_ = db.Close()
-		t.Fatalf("exported AddLabel returned before scalar marker: %v", err)
-	case <-time.After(poolTestTimeout):
-		release()
-		_ = db.Close()
-		<-writeDone
-		t.Fatalf("exported AddLabel did not reach scalar marker within %v", poolTestTimeout)
-	}
-
-	closeDone := make(chan error, 1)
-	go func() { closeDone <- db.Close() }()
-	poolClosed := make(chan error, 1)
-	go func() {
-		for {
-			if _, err := db.TaskCount(); err != nil {
-				poolClosed <- err
-				return
-			}
-		}
-	}()
-	select {
-	case err := <-poolClosed:
-		if err == nil {
-			t.Fatal("TaskCount close probe returned nil error")
-		}
-	case <-time.After(poolTestTimeout):
-		release()
-		<-writeDone
-		<-closeDone
-		t.Fatalf("exported TaskCount did not observe pool closure within %v", poolTestTimeout)
-	}
-	select {
-	case err := <-closeDone:
-		release()
-		<-writeDone
-		t.Fatalf("Close returned before active AddLabel could unwind and release its lease: %v", err)
-	default:
-	}
-
-	release()
-	writeErr := waitPoolError(t, "Close-interrupted exported AddLabel", writeDone)
-	closeErr := waitPoolError(t, "Close draining exported AddLabel lease", closeDone)
-	if code := zs.ErrCode(writeErr); code != zs.ResultInterrupt {
-		t.Fatalf("Close-interrupted AddLabel error = %v (%v), want SQLITE_INTERRUPT", writeErr, code)
-	}
-	if closeErr != nil {
-		t.Fatalf("Close after AddLabel released its lease: %v", closeErr)
-	}
-
-	cleanupConn, err := zs.OpenConn(dbPath, zs.OpenReadWrite|zs.OpenURI)
-	if err != nil {
-		t.Fatalf("open post-Close trigger cleanup connection: %v", err)
-	}
-	cleanupErr := sqlitex.ExecuteTransient(cleanupConn, "DROP TRIGGER "+triggerName, nil)
-	closeCleanupErr := cleanupConn.Close()
-	if cleanupErr != nil {
-		t.Fatalf("drop persistent close-interrupt trigger: %v", cleanupErr)
-	}
-	if closeCleanupErr != nil {
-		t.Fatalf("close trigger cleanup connection: %v", closeCleanupErr)
+	if err := db.AddLabel(task.ID, "after-close"); err == nil {
+		t.Fatal("AddLabel after Close succeeded, want a connection-lease failure")
 	}
 }

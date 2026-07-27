@@ -89,7 +89,7 @@ func newDBOSStackUnlaunched(t *testing.T, wrap func(provenance.Tracker) provenan
 	}
 
 	// Establish the committing actor and genesis authority BEFORE Launch: these are
-	// pure domain (zombiezen) writes, and doing them before DBOS starts its recovery/
+	// pure domain writes, and doing them before DBOS starts its recovery/
 	// queue writers avoids WAL write contention on the shared file at startup.
 	sys, err := borrowed.RegisterSoftwareAgent("provenance-test", "pasture-system", "0", "test")
 	if err != nil {
@@ -105,6 +105,41 @@ func newDBOSStackUnlaunched(t *testing.T, wrap func(provenance.Tracker) provenan
 	return &dbosStack{
 		root: root, db: db, tracker: tracker, adapter: adapter,
 		path: path, actor: sys.ID, boot: boot,
+	}
+}
+
+func TestBorrowedTrackerCloseInvalidatesOnlyLocalTracker(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "borrowed-close.db")
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.Ping(); err != nil {
+		t.Fatalf("ping borrowed pool: %v", err)
+	}
+
+	first, err := provenance.OpenBorrowedSQLite(db)
+	if err != nil {
+		t.Fatalf("first OpenBorrowedSQLite: %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("first borrowed Close: %v", err)
+	}
+	if _, err := first.RegisterSoftwareAgent("borrowed-close", "old", "1", "test"); err == nil {
+		t.Fatal("closed borrowed tracker accepted a new operation")
+	}
+	if err := db.Ping(); err != nil {
+		t.Fatalf("first borrowed Close closed the caller pool: %v", err)
+	}
+
+	second, err := provenance.OpenBorrowedSQLite(db)
+	if err != nil {
+		t.Fatalf("second OpenBorrowedSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = second.Close() })
+	if _, err := second.RegisterSoftwareAgent("borrowed-close", "new", "1", "test"); err != nil {
+		t.Fatalf("new borrowed tracker did not work after old tracker Close: %v", err)
 	}
 }
 

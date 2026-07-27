@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,8 +13,6 @@ import (
 	"github.com/dayvidpham/provenance/internal/journal"
 	"github.com/dayvidpham/provenance/pkg/ptypes"
 	"github.com/google/uuid"
-	zs "zombiezen.com/go/sqlite"
-	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 func newJournalDB(t *testing.T) *DB {
@@ -35,13 +34,9 @@ func seedActorAndTask(t *testing.T, db *DB) (journal.ActorID, journal.TaskID) {
 	if err != nil {
 		t.Fatalf("bind agent seed scope: %v", err)
 	}
-	err = sqlitex.Execute(scope.conn,
-		`INSERT INTO agents (id, kind_id) VALUES (?1, ?2)`,
-		&sqlitex.ExecOptions{Args: []any{actor.String(), int(ptypes.AgentKindSoftware)}})
+	_, err = scope.conn.ExecContext(scope.ctx, `INSERT INTO agents (id, kind_id) VALUES (?1, ?2)`, actor.String(), int(ptypes.AgentKindSoftware))
 	if err == nil {
-		err = sqlitex.Execute(scope.conn,
-			`INSERT INTO agents_software (agent_id, name, version, source) VALUES (?1,?2,?3,?4)`,
-			&sqlitex.ExecOptions{Args: []any{actor.String(), "harness", "0", "test"}})
+		_, err = scope.conn.ExecContext(scope.ctx, `INSERT INTO agents_software (agent_id, name, version, source) VALUES (?1, ?2, ?3, ?4)`, actor.String(), "harness", "0", "test")
 	}
 	scope.release()
 	if err != nil {
@@ -218,12 +213,15 @@ func TestJournalKindsSeededMatchGoEnum(t *testing.T) {
 		t.Fatalf("bind journal-kind inspection scope: %v", err)
 	}
 	defer scope.release()
-	err = sqlitex.Execute(scope.conn,
-		`SELECT id, name FROM journal_kinds ORDER BY id`,
-		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
-			got[stmt.ColumnInt(0)] = stmt.ColumnText(1)
-			return nil
-		}})
+	err = scope.queryRows(`SELECT id, name FROM journal_kinds ORDER BY id`, nil, func(rows *sql.Rows) error {
+		var id int
+		var name string
+		if err := rows.Scan(&id, &name); err != nil {
+			return err
+		}
+		got[id] = name
+		return nil
+	})
 	if err != nil {
 		t.Fatalf("read journal_kinds: %v", err)
 	}
@@ -261,10 +259,7 @@ func TestAppendTaskEventAdvancesProjections(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bind watermark inspection scope: %v", err)
 	}
-	if err := sqlitex.Execute(scope.conn,
-		`SELECT last_journal_id FROM tasks WHERE id = ?1`,
-		&sqlitex.ExecOptions{Args: []any{task.String()},
-			ResultFunc: func(stmt *zs.Stmt) error { watermark = stmt.ColumnInt64(0); return nil }}); err != nil {
+	if err := scope.conn.QueryRowContext(scope.ctx, `SELECT last_journal_id FROM tasks WHERE id = ?1`, task.String()).Scan(&watermark); err != nil {
 		scope.release()
 		t.Fatalf("read task watermark: %v", err)
 	}
@@ -645,9 +640,8 @@ func TestTasksWatermarkSchemaIsNotNull(t *testing.T) {
 		t.Fatalf("bind watermark constraint scope: %v", err)
 	}
 	defer scope.release()
-	err = sqlitex.Execute(scope.conn,
-		`INSERT INTO tasks (id, namespace, title, phase_id, created_at, updated_at)
-		 VALUES ('provenance-test--x','provenance-test','x',12,1,1)`, nil)
+	_, err = scope.conn.ExecContext(scope.ctx, `INSERT INTO tasks (id, namespace, title, phase_id, created_at, updated_at)
+		 VALUES ('provenance-test--x','provenance-test','x',12,1,1)`)
 	if err == nil {
 		t.Fatal("expected the NOT NULL last_journal_id constraint to reject a watermark-less tasks insert")
 	}
@@ -663,13 +657,9 @@ func registerSoftwareActor(t *testing.T, db *DB, name string) journal.ActorID {
 		t.Fatalf("bind software actor registration scope: %v", err)
 	}
 	defer scope.release()
-	err = sqlitex.Execute(scope.conn,
-		`INSERT INTO agents (id, kind_id) VALUES (?1, ?2)`,
-		&sqlitex.ExecOptions{Args: []any{actor.String(), int(ptypes.AgentKindSoftware)}})
+	_, err = scope.conn.ExecContext(scope.ctx, `INSERT INTO agents (id, kind_id) VALUES (?1, ?2)`, actor.String(), int(ptypes.AgentKindSoftware))
 	if err == nil {
-		err = sqlitex.Execute(scope.conn,
-			`INSERT INTO agents_software (agent_id, name, version, source) VALUES (?1,?2,?3,?4)`,
-			&sqlitex.ExecOptions{Args: []any{actor.String(), name, "0", "test"}})
+		_, err = scope.conn.ExecContext(scope.ctx, `INSERT INTO agents_software (agent_id, name, version, source) VALUES (?1, ?2, ?3, ?4)`, actor.String(), name, "0", "test")
 	}
 	if err != nil {
 		t.Fatalf("registerSoftwareActor %q: %v", name, err)
@@ -745,12 +735,7 @@ func TestMigrationReTightensWatermarkToNotNull(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bind migrated watermark scope: %v", err)
 	}
-	err = sqlitex.Execute(scope.conn,
-		`SELECT last_journal_id FROM tasks WHERE id = ?1`,
-		&sqlitex.ExecOptions{Args: []any{migrated.String()}, ResultFunc: func(stmt *zs.Stmt) error {
-			watermark = stmt.ColumnInt64(0)
-			return nil
-		}})
+	err = scope.conn.QueryRowContext(scope.ctx, `SELECT last_journal_id FROM tasks WHERE id = ?1`, migrated.String()).Scan(&watermark)
 	scope.release()
 	if err != nil {
 		t.Fatalf("read migrated watermark: %v", err)
@@ -765,9 +750,8 @@ func TestMigrationReTightensWatermarkToNotNull(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bind post-migration constraint scope: %v", err)
 	}
-	insErr := sqlitex.Execute(scope.conn,
-		`INSERT INTO tasks (id, namespace, title, phase_id, created_at, updated_at)
-		 VALUES ('provenance-test--bare','provenance-test','x',12,1,1)`, nil)
+	_, insErr := scope.conn.ExecContext(scope.ctx, `INSERT INTO tasks (id, namespace, title, phase_id, created_at, updated_at)
+		 VALUES ('provenance-test--bare','provenance-test','x',12,1,1)`)
 	scope.release()
 	if insErr == nil {
 		t.Fatal("post-migration schema accepted a watermark-less tasks insert; NOT NULL was not restored")

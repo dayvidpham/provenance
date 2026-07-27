@@ -2,14 +2,14 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/dayvidpham/provenance/internal/journal"
 	"github.com/dayvidpham/provenance/pkg/ptypes"
-	zs "zombiezen.com/go/sqlite"
-	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 // journalParseActor / journalParseTask resolve stored wire-format IDs into the
@@ -88,7 +88,7 @@ func (scope *connScope) ensureJournalSchema() error {
 		journalAttributedViewDDL,
 	}
 	for _, stmt := range ddl {
-		if err := sqlitex.ExecuteTransient(scope.conn, stmt, nil); err != nil {
+		if _, err := scope.conn.ExecContext(scope.ctx, stmt); err != nil {
 			return fmt.Errorf("ensureJournalSchema: statement %q: %w", stmt, err)
 		}
 	}
@@ -96,7 +96,7 @@ func (scope *connScope) ensureJournalSchema() error {
 	// Seed journal_kinds from the single source of truth in the journal package,
 	// so the SQL lookup and the Go enum can never drift.
 	for _, k := range journal.JournalKinds() {
-		if err := sqlitex.Execute(scope.conn, "INSERT OR IGNORE INTO journal_kinds (id, name) VALUES (?1, ?2)", &sqlitex.ExecOptions{Args: []any{int(k), k.String()}}); err != nil {
+		if _, err := scope.conn.ExecContext(scope.ctx, "INSERT OR IGNORE INTO journal_kinds (id, name) VALUES (?1, ?2)", int(k), k.String()); err != nil {
 			return fmt.Errorf("ensureJournalSchema: seed journal_kinds %s: %w", k, err)
 		}
 	}
@@ -138,51 +138,44 @@ func (db *DB) AppendTaskEvent(in journal.AppendTaskEventInput) (journal.TaskEven
 	}
 	defer scope.release()
 
-	var txErr error
-	endTx := sqlitex.Transaction(scope.conn)
-	defer endTx(&txErr)
-
 	var journalID int64
-	if txErr = sqlitex.Execute(scope.conn, "INSERT INTO journal (kind_id, actor_id, recorded_at, produced_by_operation_journal_id)\n\t\t VALUES (?1, ?2, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{
-		int(journal.JournalKindTaskEvent), in.ActorID.String(), recordedAt.UnixNano(), nil,
-	}}); txErr != nil {
-		return journal.TaskEventRow{}, fmt.Errorf("AppendTaskEvent: insert journal row: %w", txErr)
-	}
-	journalID = scope.conn.LastInsertRowID()
-
-	if txErr = sqlitex.Execute(scope.conn,
-		insertJournalTaskEventSQL,
-		&sqlitex.ExecOptions{Args: []any{
-			journalID, in.TaskID.String(), string(in.EventKind), string(in.Payload),
-		}},
-	); txErr != nil {
-		return journal.TaskEventRow{}, fmt.Errorf("AppendTaskEvent: insert journal_task_events row: %w", txErr)
-	}
-
-	for _, ctx := range contexts {
-		kind, identity, encErr := journal.EncodeStoredEventContext(ctx)
-		if encErr != nil {
-			txErr = encErr
-			return journal.TaskEventRow{}, fmt.Errorf("AppendTaskEvent: encode context: %w", txErr)
+	if err := runImmediateTransaction(scope.ctx, scope.conn, func() error {
+		var err error
+		journalID, err = scope.insertJournalRow(journal.JournalKindTaskEvent, in.ActorID, recordedAt.UnixNano(), nil)
+		if err != nil {
+			return fmt.Errorf("AppendTaskEvent: insert journal row: %w", err)
 		}
-		if txErr = sqlitex.Execute(scope.conn, "INSERT OR IGNORE INTO journal_task_event_contexts\n\t\t\t\t(event_journal_id, context_kind, context_identity, attached_by_journal_id)\n\t\t\t VALUES (?1, ?2, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{journalID, string(kind), identity, journalID}}); txErr != nil {
-			return journal.TaskEventRow{}, fmt.Errorf("AppendTaskEvent: insert context edge: %w", txErr)
+		if _, err = scope.conn.ExecContext(scope.ctx, insertJournalTaskEventSQL, journalID, in.TaskID.String(), string(in.EventKind), string(in.Payload)); err != nil {
+			return fmt.Errorf("AppendTaskEvent: insert journal_task_events row: %w", err)
 		}
-	}
 
-	// Reducer subtype-integrity gate (§10 rule 8) before the projections.
-	if txErr = scope.verifySubtypeIntegrity(); txErr != nil {
-		return journal.TaskEventRow{}, txErr
-	}
+		for _, ctx := range contexts {
+			kind, identity, encErr := journal.EncodeStoredEventContext(ctx)
+			if encErr != nil {
+				return fmt.Errorf("AppendTaskEvent: encode context: %w", encErr)
+			}
+			if _, err := scope.conn.ExecContext(scope.ctx, "INSERT OR IGNORE INTO journal_task_event_contexts\n\t\t\t\t(event_journal_id, context_kind, context_identity, attached_by_journal_id)\n\t\t\t VALUES (?1, ?2, ?3, ?4)", journalID, string(kind), identity, journalID); err != nil {
+				return fmt.Errorf("AppendTaskEvent: insert context edge: %w", err)
+			}
+		}
 
-	// Projection: first-wins attribution edge for the authoring actor (§8.2).
-	if txErr = sqlitex.Execute(scope.conn, "INSERT OR IGNORE INTO task_attributions (task_id, actor_id, first_journal_id)\n\t\t VALUES (?1, ?2, ?3)", &sqlitex.ExecOptions{Args: []any{in.TaskID.String(), in.ActorID.String(), journalID}}); txErr != nil {
-		return journal.TaskEventRow{}, fmt.Errorf("AppendTaskEvent: update task_attributions: %w", txErr)
-	}
+		// Reducer subtype-integrity gate (§10 rule 8) before the projections.
+		if err := scope.verifySubtypeIntegrity(); err != nil {
+			return err
+		}
 
-	// Projection: advance the current-task-state watermark if the task exists.
-	if txErr = sqlitex.Execute(scope.conn, "UPDATE tasks SET last_journal_id = ?1 WHERE id = ?2", &sqlitex.ExecOptions{Args: []any{journalID, in.TaskID.String()}}); txErr != nil {
-		return journal.TaskEventRow{}, fmt.Errorf("AppendTaskEvent: advance tasks.last_journal_id: %w", txErr)
+		// Projection: first-wins attribution edge for the authoring actor (§8.2).
+		if _, err := scope.conn.ExecContext(scope.ctx, "INSERT OR IGNORE INTO task_attributions (task_id, actor_id, first_journal_id)\n\t\t VALUES (?1, ?2, ?3)", in.TaskID.String(), in.ActorID.String(), journalID); err != nil {
+			return fmt.Errorf("AppendTaskEvent: update task_attributions: %w", err)
+		}
+
+		// Projection: advance the current-task-state watermark if the task exists.
+		if _, err := scope.conn.ExecContext(scope.ctx, "UPDATE tasks SET last_journal_id = ?1 WHERE id = ?2", journalID, in.TaskID.String()); err != nil {
+			return fmt.Errorf("AppendTaskEvent: advance tasks.last_journal_id: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return journal.TaskEventRow{}, err
 	}
 
 	row := journal.TaskEventRow{
@@ -213,13 +206,11 @@ func (db *DB) AppendBareJournalRow(kind journal.JournalKind, actorID journal.Act
 		return 0, fmt.Errorf("AppendBareJournalRow: lease connection: %w", err)
 	}
 	defer scope.release()
-	var txErr error
-	endTx := sqlitex.Save(scope.conn)
-	defer endTx(&txErr)
-	if txErr = sqlitex.Execute(scope.conn, "INSERT INTO journal (kind_id, actor_id, recorded_at, produced_by_operation_journal_id)\n\t\t VALUES (?1, ?2, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{int(kind), actorID.String(), recordedAt.UTC().UnixNano(), nil}}); txErr != nil {
-		return 0, fmt.Errorf("AppendBareJournalRow: %w", txErr)
+	journalID, err := scope.insertJournalRow(kind, actorID, recordedAt.UTC().UnixNano(), nil)
+	if err != nil {
+		return 0, fmt.Errorf("AppendBareJournalRow: %w", err)
 	}
-	return journal.JournalID(scope.conn.LastInsertRowID()), nil
+	return journal.JournalID(journalID), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -257,8 +248,6 @@ func (scope *connScope) verifyIntegrityReadOnlyLegacyCompatible() (err error) {
 }
 
 func (scope *connScope) verifyIntegrityMode(allowLegacyFactContexts bool) (err error) {
-	endTx := sqlitex.Save(scope.conn)
-	defer endTx(&err)
 	var factContextErr error
 	if allowLegacyFactContexts {
 		factContextErr = scope.verifyFactContextIntegrityReadOnlyLegacyCompatible()
@@ -288,27 +277,37 @@ func (scope *connScope) verifyIntegrityMode(allowLegacyFactContexts bool) (err e
 
 func (scope *connScope) verifyForeignKeyTopology() error {
 	var table, parent string
-	var rowID int64
-	if err := sqlitex.Execute(scope.conn, "PRAGMA foreign_key_check", &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
-		if table == "" {
-			table, rowID, parent = stmt.ColumnText(0), stmt.ColumnInt64(1), stmt.ColumnText(2)
+	var rowID sql.NullInt64
+	if err := scope.queryRows("PRAGMA foreign_key_check", nil, func(rows *sql.Rows) error {
+		if table != "" {
+			return nil
+		}
+		var fk int
+		if err := rows.Scan(&table, &rowID, &parent, &fk); err != nil {
+			return err
 		}
 		return nil
-	}}); err != nil {
+	}); err != nil {
 		return fmt.Errorf("verify foreign-key topology: %w", err)
 	}
 	if table != "" {
-		return fmt.Errorf("%w: table %s row %d references missing parent %s — where: read-only startup topology preflight; impact: activation stopped before persistent pragmas or writes; fix: restore the missing canonical support/supertype row", journal.ErrSubtypeIntegrity, table, rowID, parent)
+		row := "WITHOUT ROWID"
+		if rowID.Valid {
+			row = fmt.Sprintf("%d", rowID.Int64)
+		}
+		return fmt.Errorf("%w: table %s row %s references missing parent %s — where: read-only startup topology preflight; impact: activation stopped before persistent pragmas or writes; fix: restore the missing canonical support/supertype row", journal.ErrSubtypeIntegrity, table, row, parent)
 	}
 	var produced int64
-	if err := sqlitex.Execute(scope.conn, "SELECT j.journal_id FROM journal j LEFT JOIN journal_operations o ON o.journal_id=j.produced_by_operation_journal_id WHERE j.produced_by_operation_journal_id IS NOT ?1 AND o.journal_id IS ?2 LIMIT ?3", &sqlitex.ExecOptions{Args: []any{nil, nil, 1}, ResultFunc: func(stmt *zs.Stmt) error { produced = stmt.ColumnInt64(0); return nil }}); err != nil {
+	err := scope.conn.QueryRowContext(scope.ctx, "SELECT j.journal_id FROM journal j LEFT JOIN journal_operations o ON o.journal_id=j.produced_by_operation_journal_id WHERE j.produced_by_operation_journal_id IS NOT ?1 AND o.journal_id IS ?2 LIMIT ?3", nil, nil, 1).Scan(&produced)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("verify operation producer topology: %w", err)
 	}
 	if produced != 0 {
 		return fmt.Errorf("%w: journal row %d references a missing producing operation — where: read-only startup topology preflight; impact: activation stopped before writes; fix: restore its journal_operations anchor", journal.ErrSubtypeIntegrity, produced)
 	}
 	var orphanEpisode string
-	if err := sqlitex.Execute(scope.conn, "SELECT e.assignment_id FROM journal_authority_assignment_episodes e LEFT JOIN journal_authority_assignment_transitions t ON t.assignment_id=e.assignment_id WHERE t.journal_id IS ?1 LIMIT ?2", &sqlitex.ExecOptions{Args: []any{nil, 1}, ResultFunc: func(stmt *zs.Stmt) error { orphanEpisode = stmt.ColumnText(0); return nil }}); err != nil {
+	err = scope.conn.QueryRowContext(scope.ctx, "SELECT e.assignment_id FROM journal_authority_assignment_episodes e LEFT JOIN journal_authority_assignment_transitions t ON t.assignment_id=e.assignment_id WHERE t.journal_id IS ?1 LIMIT ?2", nil, 1).Scan(&orphanEpisode)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("verify assignment episode topology: %w", err)
 	}
 	if orphanEpisode != "" {
@@ -331,7 +330,8 @@ func (scope *connScope) verifyWatermarkPresence() error {
 		return nil
 	}
 	var badID string
-	if err := sqlitex.Execute(scope.conn, "SELECT id FROM tasks WHERE last_journal_id IS ?1 LIMIT ?2", &sqlitex.ExecOptions{Args: []any{nil, 1}, ResultFunc: func(stmt *zs.Stmt) error { badID = stmt.ColumnText(0); return nil }}); err != nil {
+	err = scope.conn.QueryRowContext(scope.ctx, "SELECT id FROM tasks WHERE last_journal_id IS ?1 LIMIT ?2", nil, 1).Scan(&badID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("verifyWatermarkPresence: %w", err)
 	}
 	if badID != "" {
@@ -359,12 +359,11 @@ func (scope *connScope) verifyActorPlacement() error {
 		subord   bool
 		violated bool
 	)
-	if err := sqlitex.Execute(scope.conn, "SELECT journal_id, produced_by_operation_journal_id IS NOT ?1\n\t\t FROM journal\n\t\t WHERE (produced_by_operation_journal_id IS NOT ?2 AND actor_id IS NOT ?3)\n\t\t    OR (produced_by_operation_journal_id IS ?4     AND actor_id IS ?5)\n\t\t LIMIT ?6", &sqlitex.ExecOptions{Args: []any{nil, nil, nil, nil, nil, 1}, ResultFunc: func(stmt *zs.Stmt) error {
+	err := scope.conn.QueryRowContext(scope.ctx, "SELECT journal_id, produced_by_operation_journal_id IS NOT ?1\n\t\t FROM journal\n\t\t WHERE (produced_by_operation_journal_id IS NOT ?2 AND actor_id IS NOT ?3)\n\t\t    OR (produced_by_operation_journal_id IS ?4     AND actor_id IS ?5)\n\t\t LIMIT ?6", nil, nil, nil, nil, nil, 1).Scan(&badJID, &subord)
+	if err == nil {
 		violated = true
-		badJID = stmt.ColumnInt64(0)
-		subord = stmt.ColumnInt64(1) == 1
-		return nil
-	}}); err != nil {
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("verifyActorPlacement: %w", err)
 	}
 	if !violated {
@@ -556,17 +555,12 @@ var subtypeExclusivityPairs = []subtypeExclusivityPair{
 func (scope *connScope) subtypeTablesPresent() (map[journal.JournalKind]subtypeTable, error) {
 	present := make(map[journal.JournalKind]subtypeTable, len(subtypeAllTables))
 	for kind, table := range subtypeAllTables {
-		var exists bool
-		if err := sqlitex.Execute(scope.conn,
-			"SELECT ?3 FROM sqlite_master WHERE type=?1 AND name=?2",
-			&sqlitex.ExecOptions{
-				Args:       []any{"table", table.label(), 1},
-				ResultFunc: func(*zs.Stmt) error { exists = true; return nil },
-			},
-		); err != nil {
+		var exists int
+		err := scope.conn.QueryRowContext(scope.ctx, "SELECT ?3 FROM sqlite_master WHERE type=?1 AND name=?2", "table", table.label(), 1).Scan(&exists)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return nil, fmt.Errorf("subtypeTablesPresent: probe %q: %w", table.label(), err)
 		}
-		if exists {
+		if err == nil {
 			present[kind] = table
 		}
 	}
@@ -581,12 +575,8 @@ func (scope *connScope) verifySubtypeIntegrity() error {
 	for kind, table := range tables {
 		// Totality: a journal row of this kind with no subtype row.
 		var missing int64
-		if err := sqlitex.Execute(scope.conn, table.totalityQuery(),
-			&sqlitex.ExecOptions{
-				Args:       []any{int(kind), nil, 1},
-				ResultFunc: func(stmt *zs.Stmt) error { missing = stmt.ColumnInt64(0); return nil },
-			},
-		); err != nil {
+		err := scope.conn.QueryRowContext(scope.ctx, table.totalityQuery(), int(kind), nil, 1).Scan(&missing)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("verifySubtypeIntegrity totality %s: %w", table.label(), err)
 		}
 		if missing != 0 {
@@ -602,12 +592,8 @@ func (scope *connScope) verifySubtypeIntegrity() error {
 		// carries a different kind_id (or a JournalID present in a foreign
 		// subtype table).
 		var mismatch int64
-		if err := sqlitex.Execute(scope.conn, table.discriminatorQuery(),
-			&sqlitex.ExecOptions{
-				Args:       []any{int(kind), 1},
-				ResultFunc: func(stmt *zs.Stmt) error { mismatch = stmt.ColumnInt64(0); return nil },
-			},
-		); err != nil {
+		err = scope.conn.QueryRowContext(scope.ctx, table.discriminatorQuery(), int(kind), 1).Scan(&mismatch)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("verifySubtypeIntegrity agreement %s: %w", table.label(), err)
 		}
 		if mismatch != 0 {
@@ -645,9 +631,8 @@ func (scope *connScope) verifySubtypeExclusivity(tables map[journal.JournalKind]
 			continue
 		}
 		var dup int64
-		if err := sqlitex.Execute(scope.conn, p.query.query(),
-			&sqlitex.ExecOptions{Args: []any{1}, ResultFunc: func(stmt *zs.Stmt) error { dup = stmt.ColumnInt64(0); return nil }},
-		); err != nil {
+		err := scope.conn.QueryRowContext(scope.ctx, p.query.query(), 1).Scan(&dup)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("verifySubtypeExclusivity %s/%s: %w", ta.label(), tb.label(), err)
 		}
 		if dup != 0 {
@@ -666,13 +651,12 @@ func (scope *connScope) verifySubtypeExclusivity(tables map[journal.JournalKind]
 // and no assignment transition; an assignment authority carries a transition and
 // no bootstrap detail.
 func (scope *connScope) verifyAuthorityDetailIntegrity() error {
-	var present bool
-	if err := sqlitex.Execute(scope.conn,
-		"SELECT ?3 FROM sqlite_master WHERE type=?1 AND name=?2",
-		&sqlitex.ExecOptions{Args: []any{"table", "journal_authorities", 1}, ResultFunc: func(*zs.Stmt) error { present = true; return nil }}); err != nil {
+	var present int
+	err := scope.conn.QueryRowContext(scope.ctx, "SELECT ?3 FROM sqlite_master WHERE type=?1 AND name=?2", "table", "journal_authorities", 1).Scan(&present)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("verifyAuthorityDetailIntegrity: probe journal_authorities: %w", err)
 	}
-	if !present {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
 	checks := []struct {
@@ -691,9 +675,8 @@ func (scope *connScope) verifyAuthorityDetailIntegrity() error {
 		if c.query == authorityBootstrapMissing || c.query == authorityAssignmentMissing {
 			args = []any{c.want, nil, 1}
 		}
-		if err := sqlitex.Execute(scope.conn, c.query.query(),
-			&sqlitex.ExecOptions{Args: args, ResultFunc: func(stmt *zs.Stmt) error { bad = stmt.ColumnInt64(0); return nil }},
-		); err != nil {
+		err := scope.conn.QueryRowContext(scope.ctx, c.query.query(), args...).Scan(&bad)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("verifyAuthorityDetailIntegrity %s: %w", c.label, err)
 		}
 		if bad != 0 {
@@ -731,18 +714,10 @@ func (db *DB) QueryTaskEvents(q journal.JournalQueryV1) (page journal.JournalTas
 		return journal.JournalTaskEventPageV1{}, fmt.Errorf("QueryTaskEvents: lease connection: %w", err)
 	}
 	defer scope.release()
-	endTx := sqlitex.Save(scope.conn)
-	defer endTx(&err)
 
 	snapshot := int64(q.SnapshotMaxJournalID)
 	if snapshot == 0 {
-		if err := sqlitex.Execute(scope.conn,
-			"SELECT COALESCE(MAX(journal_id), ?1) FROM journal",
-			&sqlitex.ExecOptions{Args: []any{0}, ResultFunc: func(stmt *zs.Stmt) error {
-				snapshot = stmt.ColumnInt64(0)
-				return nil
-			}},
-		); err != nil {
+		if err := scope.conn.QueryRowContext(scope.ctx, "SELECT COALESCE(MAX(journal_id), ?1) FROM journal", 0).Scan(&snapshot); err != nil {
 			return journal.JournalTaskEventPageV1{}, fmt.Errorf("QueryTaskEvents: snapshot watermark: %w", err)
 		}
 	}
@@ -793,18 +768,15 @@ func (db *DB) QueryTaskEvents(q journal.JournalQueryV1) (page journal.JournalTas
 	}
 
 	var rows []journal.TaskEventRow
-	if err := sqlitex.Execute(scope.conn, queryOrder.query(), &sqlitex.ExecOptions{
-		Args: []any{snapshot, afterRecordedAt, int64(q.AfterJournalID),
-			flag(len(taskIDs) > 0), string(taskJSON), flag(len(eventKinds) > 0), string(eventJSON),
-			flag(len(contextFilters) > 0), string(contextJSON), "$[0]", "$[1]", boundLimit, 1},
-		ResultFunc: func(stmt *zs.Stmt) error {
-			row, scanErr := scanTaskEventRow(stmt)
-			if scanErr != nil {
-				return scanErr
-			}
-			rows = append(rows, row)
-			return nil
-		},
+	if err := scope.queryRows(queryOrder.query(), []any{snapshot, afterRecordedAt, int64(q.AfterJournalID),
+		flag(len(taskIDs) > 0), string(taskJSON), flag(len(eventKinds) > 0), string(eventJSON),
+		flag(len(contextFilters) > 0), string(contextJSON), "$[0]", "$[1]", boundLimit, 1}, func(sqlRows *sql.Rows) error {
+		row, scanErr := scanTaskEventRow(sqlRows)
+		if scanErr != nil {
+			return scanErr
+		}
+		rows = append(rows, row)
+		return nil
 	}); err != nil {
 		return journal.JournalTaskEventPageV1{}, fmt.Errorf("QueryTaskEvents: %w", err)
 	}
@@ -836,41 +808,48 @@ func (db *DB) QueryTaskEvents(q journal.JournalQueryV1) (page journal.JournalTas
 	return page, nil
 }
 
-func scanTaskEventRow(stmt *zs.Stmt) (journal.TaskEventRow, error) {
-	actorID, err := journalParseActor(stmt.ColumnText(1))
+func scanTaskEventRow(rows *sql.Rows) (journal.TaskEventRow, error) {
+	var journalID, recordedAt int64
+	var actorRaw, taskRaw, eventKind string
+	var payload []byte
+	if err := rows.Scan(&journalID, &actorRaw, &recordedAt, &taskRaw, &eventKind, &payload); err != nil {
+		return journal.TaskEventRow{}, err
+	}
+	actorID, err := journalParseActor(actorRaw)
 	if err != nil {
 		return journal.TaskEventRow{}, err
 	}
-	taskID, err := journalParseTask(stmt.ColumnText(3))
+	taskID, err := journalParseTask(taskRaw)
 	if err != nil {
 		return journal.TaskEventRow{}, err
 	}
 	return journal.TaskEventRow{
 		Row: journal.Row{
-			JournalID:  journal.JournalID(stmt.ColumnInt64(0)),
+			JournalID:  journal.JournalID(journalID),
 			Kind:       journal.JournalKindTaskEvent,
 			ActorID:    actorID,
-			RecordedAt: time.Unix(0, stmt.ColumnInt64(2)).UTC(),
+			RecordedAt: time.Unix(0, recordedAt).UTC(),
 		},
 		TaskID:    taskID,
-		EventKind: journal.EventKind(stmt.ColumnText(4)),
-		Payload:   json.RawMessage(stmt.ColumnText(5)),
+		EventKind: journal.EventKind(eventKind),
+		Payload:   append(json.RawMessage(nil), payload...),
 	}, nil
 }
 
 func (scope *connScope) loadContexts(journalID int64) ([]journal.EventContext, error) {
 	var ctxs []journal.EventContext
-	if err := sqlitex.Execute(scope.conn, "SELECT context_kind, context_identity FROM journal_task_event_contexts\n\t\t WHERE event_journal_id = ?1 ORDER BY context_kind, context_identity", &sqlitex.ExecOptions{
-		Args: []any{journalID},
-		ResultFunc: func(stmt *zs.Stmt) error {
-			ctx, decErr := journal.DecodeStoredEventContext(
-				journal.EventContextKind(stmt.ColumnText(0)), stmt.ColumnText(1))
-			if decErr != nil {
-				return decErr
-			}
-			ctxs = append(ctxs, ctx)
-			return nil
-		},
+	if err := scope.queryRows("SELECT context_kind, context_identity FROM journal_task_event_contexts\n\t\t WHERE event_journal_id = ?1 ORDER BY context_kind, context_identity", []any{journalID}, func(rows *sql.Rows) error {
+		var kind, identity string
+		if err := rows.Scan(&kind, &identity); err != nil {
+			return err
+		}
+		ctx, decErr := journal.DecodeStoredEventContext(
+			journal.EventContextKind(kind), identity)
+		if decErr != nil {
+			return decErr
+		}
+		ctxs = append(ctxs, ctx)
+		return nil
 	}); err != nil {
 		return nil, fmt.Errorf("loadContexts %d: %w", journalID, err)
 	}
@@ -889,26 +868,26 @@ func (db *DB) TaskAttributions(taskID journal.TaskID) (out []journal.TaskAttribu
 		return nil, fmt.Errorf("TaskAttributions: lease connection: %w", err)
 	}
 	defer scope.release()
-	endTx := sqlitex.Save(scope.conn)
-	defer endTx(&err)
-	if err := sqlitex.Execute(scope.conn, "SELECT task_id, actor_id, first_journal_id FROM task_attributions\n\t\t WHERE task_id = ?1 ORDER BY first_journal_id ASC", &sqlitex.ExecOptions{
-		Args: []any{taskID.String()},
-		ResultFunc: func(stmt *zs.Stmt) error {
-			actorID, err := journalParseActor(stmt.ColumnText(1))
-			if err != nil {
-				return err
-			}
-			tid, err := journalParseTask(stmt.ColumnText(0))
-			if err != nil {
-				return err
-			}
-			out = append(out, journal.TaskAttribution{
-				TaskID:         tid,
-				ActorID:        actorID,
-				FirstJournalID: journal.JournalID(stmt.ColumnInt64(2)),
-			})
-			return nil
-		},
+	if err := scope.queryRows("SELECT task_id, actor_id, first_journal_id FROM task_attributions\n\t\t WHERE task_id = ?1 ORDER BY first_journal_id ASC", []any{taskID.String()}, func(rows *sql.Rows) error {
+		var taskRaw, actorRaw string
+		var firstJournalID int64
+		if err := rows.Scan(&taskRaw, &actorRaw, &firstJournalID); err != nil {
+			return err
+		}
+		actorID, err := journalParseActor(actorRaw)
+		if err != nil {
+			return err
+		}
+		tid, err := journalParseTask(taskRaw)
+		if err != nil {
+			return err
+		}
+		out = append(out, journal.TaskAttribution{
+			TaskID:         tid,
+			ActorID:        actorID,
+			FirstJournalID: journal.JournalID(firstJournalID),
+		})
+		return nil
 	}); err != nil {
 		return nil, fmt.Errorf("TaskAttributions %q: %w", taskID.String(), err)
 	}

@@ -39,12 +39,14 @@ package provenance
 // provisional UUIDs from the committed result and return the original task.
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
+	"github.com/dayvidpham/provenance/internal/allocation"
 	"github.com/google/uuid"
 )
 
@@ -77,6 +79,28 @@ func (s *Session) checkGate(op string) error {
 		return nil
 	}
 	return s.gate("Session." + op)
+}
+
+// AllocateGoverned creates a governed child batch under this Session's exact
+// bound assignment authority. The request repeats ActorID deliberately so its
+// canonical operation identity is self-contained; it must match the Session
+// actor before the transaction begins.
+func (s *Session) AllocateGoverned(ctx context.Context, request GovernedAllocationRequest) (OperationClosure, error) {
+	if err := s.checkGate("AllocateGoverned"); err != nil {
+		return OperationClosure{}, err
+	}
+	if request.ActorID != s.actor {
+		return OperationClosure{}, allocation.NewError(
+			allocation.ErrorAuthority, request.OperationID, "Session.AllocateGoverned",
+			"the request ActorID differs from the actor bound to this Session",
+			"nothing was written; actor attribution cannot be silently substituted",
+			"construct the request with the Session actor or bind a Session for the request actor", nil)
+	}
+	closure, err := s.tr.db.AllocateGovernedForAuthority(ctx, request, s.authority)
+	if err != nil {
+		return OperationClosure{}, fmt.Errorf("provenance.Session.AllocateGoverned: %w", err)
+	}
+	return closure, nil
 }
 
 // ErrGenesisRequired is returned by a journaled Session verb invoked against a journal

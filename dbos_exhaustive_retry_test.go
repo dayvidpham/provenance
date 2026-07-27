@@ -278,6 +278,7 @@ var auditedDurableTables = []string{
 	"activities", "actor_namespace_claims", "agent_kinds", "agents", "agents_human", "agents_ml", "agents_software",
 	"application_versions", "assignment_slots", "assignment_transitions", "authority_kinds", "comments", "dbos_migrations",
 	"edge_kinds", "edges", "event_dispatch_kv", "fixed_actor_manifest_entries", "journal", "journal_authorities",
+	"governed_allocation_genesis", "governed_allocation_operations", "governed_operation_effect_rows",
 	"journal_authority_assignment_episodes", "journal_authority_assignment_transitions", "journal_authority_bootstraps",
 	"journal_activity_creations", "journal_decision_contexts", "journal_decisions", "journal_evidence", "journal_evidence_contexts", "journal_kinds", "journal_operation_result_slots", "journal_operations",
 	"journal_task_event_contexts", "journal_task_events", "labels", "ml_models", "notifications", "operation_outputs", "phases",

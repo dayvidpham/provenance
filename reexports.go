@@ -9,6 +9,7 @@ package provenance
 // and parse functions are re-exported as package-level vars/funcs.
 
 import (
+	"github.com/dayvidpham/provenance/internal/allocation"
 	"github.com/dayvidpham/provenance/pkg/namespace"
 	"github.com/dayvidpham/provenance/pkg/ptypes"
 )
@@ -65,6 +66,18 @@ type (
 type (
 	UpdateFields = ptypes.UpdateFields
 	ListFilter   = ptypes.ListFilter
+
+	// Governed allocation is the closed first-class primitive for creating a
+	// caller-identified child task and assignment under one exact parent.
+	GovernedAllocationRequest   = allocation.GovernedAllocationRequest
+	RootGenesisRequest          = allocation.RootGenesisRequest
+	GovernedChildSpec           = allocation.ChildSpec
+	OperationClosure            = allocation.OperationClosure
+	GovernedChildBinding        = allocation.ChildBinding
+	GovernedProducedRow         = allocation.ProducedRow
+	GovernedAllocationError     = allocation.Error
+	GovernedAllocationErrorKind = allocation.ErrorKind
+	GovernedRequestKind         = allocation.RequestKind
 )
 
 // ---------------------------------------------------------------------------
@@ -153,6 +166,24 @@ const (
 	StageInProgress = ptypes.StageInProgress
 	StageBlocked    = ptypes.StageBlocked
 	StageComplete   = ptypes.StageComplete
+)
+
+// Governed allocation bounds and closed enum values.
+const (
+	MaxGovernedAllocationChildren = allocation.MaxChildren
+	MaxGovernedAuthorityDepth     = allocation.MaxAuthorityDepth
+
+	GovernedRequestGenesis    = allocation.RequestKindGenesis
+	GovernedRequestAllocation = allocation.RequestKindAllocation
+
+	GovernedAllocationValidation = allocation.ErrorValidation
+	GovernedAllocationConflict   = allocation.ErrorConflict
+	GovernedAllocationAuthority  = allocation.ErrorAuthority
+	GovernedAllocationRevoked    = allocation.ErrorRevoked
+	GovernedAllocationDepth      = allocation.ErrorDepth
+	GovernedAllocationCollision  = allocation.ErrorCollision
+	GovernedAllocationGenesis    = allocation.ErrorGenesis
+	GovernedAllocationCorruption = allocation.ErrorCorruption
 )
 
 // ---------------------------------------------------------------------------

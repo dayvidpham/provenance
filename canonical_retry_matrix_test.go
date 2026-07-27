@@ -6,9 +6,6 @@ import (
 	"reflect"
 	"sync"
 	"testing"
-
-	"zombiezen.com/go/sqlite"
-	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 type retryMatrixFixture struct {
@@ -160,12 +157,12 @@ type operationCounts struct{ journal, operations, slots int64 }
 func readOperationCounts(t *testing.T, path string) operationCounts {
 	t.Helper()
 	c := operationCounts{}
-	withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
+	withRawSQLiteTestConn(t, path, func(conn *rawSQLiteConn) {
 		for _, q := range []struct {
 			sql string
 			dst *int64
 		}{{`SELECT count(*) FROM journal`, &c.journal}, {`SELECT count(*) FROM journal_operations`, &c.operations}, {`SELECT count(*) FROM journal_operation_result_slots`, &c.slots}} {
-			if err := sqlitex.Execute(conn, q.sql, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error { *q.dst = stmt.ColumnInt64(0); return nil }}); err != nil {
+			if err := rawExecute(conn, q.sql, &rawExecOptions{ResultFunc: func(stmt *rawSQLiteStmt) error { *q.dst = stmt.ColumnInt64(0); return nil }}); err != nil {
 				t.Fatal(err)
 			}
 		}

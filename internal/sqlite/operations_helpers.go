@@ -2,12 +2,12 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 
 	"github.com/dayvidpham/provenance/internal/journal"
-	zs "zombiezen.com/go/sqlite"
-	"zombiezen.com/go/sqlite/sqlitex"
+	moderncsqlite "modernc.org/sqlite"
 )
 
 // operations_helpers.go holds the low-level reducer steps and read-path
@@ -21,6 +21,73 @@ import (
 // Row inserts
 // ---------------------------------------------------------------------------
 
+// queryRows executes a query on this scope's pinned connection and consumes its
+// rows before returning the connection to any caller. It is deliberately narrow:
+// callers still use database/sql's standard SQL contract, while this helper keeps
+// every multi-row reducer read context-aware and guarantees both Rows.Close and
+// Rows.Err are checked.
+func (scope *connScope) queryRows(query string, args []any, consume func(*sql.Rows) error) (err error) {
+	rows, err := scope.conn.QueryContext(scope.ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			if err == nil {
+				err = fmt.Errorf("close SQL rows: %w", closeErr)
+			} else {
+				err = errors.Join(err, fmt.Errorf("close SQL rows: %w", closeErr))
+			}
+		}
+	}()
+	for rows.Next() {
+		if err := consume(rows); err != nil {
+			return err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// runScopedSavepoint keeps a connection-affine operation atomic while allowing it
+// to compose with activation and migration transactions that already own the same
+// pinned connection. Names are static package constants, never caller input.
+func (scope *connScope) runScopedSavepoint(operation func() error) (err error) {
+	if _, err = scope.conn.ExecContext(scope.ctx, "SAVEPOINT provenance_scope"); err != nil {
+		return fmt.Errorf("start scoped savepoint: %w", err)
+	}
+	released := false
+	defer func() {
+		if released {
+			return
+		}
+		if _, rollbackErr := scope.conn.ExecContext(scope.ctx, "ROLLBACK TO SAVEPOINT provenance_scope"); rollbackErr != nil {
+			if err == nil {
+				err = fmt.Errorf("rollback scoped savepoint: %w", rollbackErr)
+			} else {
+				err = errors.Join(err, fmt.Errorf("rollback scoped savepoint: %w", rollbackErr))
+			}
+		}
+		if _, releaseErr := scope.conn.ExecContext(scope.ctx, "RELEASE SAVEPOINT provenance_scope"); releaseErr != nil {
+			if err == nil {
+				err = fmt.Errorf("release rolled-back scoped savepoint: %w", releaseErr)
+			} else {
+				err = errors.Join(err, fmt.Errorf("release rolled-back scoped savepoint: %w", releaseErr))
+			}
+		}
+	}()
+	if err = operation(); err != nil {
+		return err
+	}
+	if _, err = scope.conn.ExecContext(scope.ctx, "RELEASE SAVEPOINT provenance_scope"); err != nil {
+		return fmt.Errorf("release scoped savepoint: %w", err)
+	}
+	released = true
+	return nil
+}
+
 func (scope *connScope) insertJournalRow(kind journal.JournalKind, actor journal.ActorID, recordedAt int64, pboj *int64) (int64, error) {
 	// Anchor-only actor placement (§2.1, §10 rule 5): a subordinate row (pboj set —
 	// produced by an operation) stores actor_id NULL and derives its committing actor
@@ -32,10 +99,11 @@ func (scope *connScope) insertJournalRow(kind journal.JournalKind, actor journal
 	} else {
 		actorArg = actor.String()
 	}
-	if err := sqlitex.Execute(scope.conn, "INSERT INTO journal (kind_id, actor_id, recorded_at, produced_by_operation_journal_id) VALUES (?1, ?2, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{int(kind), actorArg, recordedAt, pbojArg}}); err != nil {
+	var journalID int64
+	if err := scope.conn.QueryRowContext(scope.ctx, "INSERT INTO journal (kind_id, actor_id, recorded_at, produced_by_operation_journal_id) VALUES (?1, ?2, ?3, ?4) RETURNING journal_id", int(kind), actorArg, recordedAt, pbojArg).Scan(&journalID); err != nil {
 		return 0, fmt.Errorf("insert journal row (kind %s): %w", kind, err)
 	}
-	return scope.conn.LastInsertRowID(), nil
+	return journalID, nil
 }
 
 func (scope *connScope) insertOperationRow(anchor int64, in journal.OperationInput, prepared journal.CanonicalMutation) error {
@@ -43,7 +111,7 @@ func (scope *connScope) insertOperationRow(anchor int64, in journal.OperationInp
 	if in.AuthorityJournalID != nil {
 		authArg = int64(*in.AuthorityJournalID)
 	}
-	if err := sqlitex.Execute(scope.conn, "INSERT INTO journal_operations\n\t\t (journal_id, operation_id, authority_journal_id, command_digest, mutation_digest, mutation_encoding_version, canonical_mutation)\n\t\t VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", &sqlitex.ExecOptions{Args: []any{anchor, string(in.OperationID), authArg, in.CommandDigest, prepared.DerivedDigest(), prepared.EncodingVersion().String(), prepared.CanonicalBytes()}}); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO journal_operations\n\t\t (journal_id, operation_id, authority_journal_id, command_digest, mutation_digest, mutation_encoding_version, canonical_mutation)\n\t\t VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", anchor, string(in.OperationID), authArg, in.CommandDigest, prepared.DerivedDigest(), prepared.EncodingVersion().String(), prepared.CanonicalBytes()); err != nil {
 		return fmt.Errorf("insert journal_operations for %q: %w", in.OperationID, err)
 	}
 	return nil
@@ -51,12 +119,10 @@ func (scope *connScope) insertOperationRow(anchor int64, in journal.OperationInp
 
 func (scope *connScope) insertAuthorityAssignmentTransition(jid int64, assignment journal.AssignmentID, transitionID int) error {
 	opAuthID := fmt.Sprintf("authority--assignment--%d", jid)
-	if err := sqlitex.Execute(scope.conn,
-		insertJournalAuthoritySQL,
-		&sqlitex.ExecOptions{Args: []any{jid, authKindAssignmentID, opAuthID}}); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, insertJournalAuthoritySQL, jid, authKindAssignmentID, opAuthID); err != nil {
 		return fmt.Errorf("insert journal_authorities (assignment): %w", err)
 	}
-	if err := sqlitex.Execute(scope.conn, "INSERT INTO journal_authority_assignment_transitions (journal_id, assignment_id, transition_id) VALUES (?1, ?2, ?3)", &sqlitex.ExecOptions{Args: []any{jid, string(assignment), transitionID}}); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO journal_authority_assignment_transitions (journal_id, assignment_id, transition_id) VALUES (?1, ?2, ?3)", jid, string(assignment), transitionID); err != nil {
 		return fmt.Errorf("insert assignment transition (%s): %w", journal.AssignmentTransition(transitionID), err)
 	}
 	return nil
@@ -69,30 +135,23 @@ func (scope *connScope) insertResultSlot(anchor int64, slot journal.ResultSlotID
 	if err := scope.requireResultSlotOwnOperation(anchor, producedJID); err != nil {
 		return err
 	}
-	if err := sqlitex.Execute(scope.conn, "INSERT INTO journal_operation_result_slots (journal_id, result_slot_id, produced_journal_id) VALUES (?1, ?2, ?3)", &sqlitex.ExecOptions{Args: []any{anchor, string(slot), producedJID}}); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO journal_operation_result_slots (journal_id, result_slot_id, produced_journal_id) VALUES (?1, ?2, ?3)", anchor, string(slot), producedJID); err != nil {
 		return fmt.Errorf("insert result slot %q: %w", slot, err)
 	}
 	return nil
 }
 
 func (scope *connScope) requireResultSlotOwnOperation(anchor, producedJID int64) error {
-	var producer int64
-	var isNull = true
-	if err := sqlitex.Execute(scope.conn, "SELECT produced_by_operation_journal_id FROM journal WHERE journal_id = ?1", &sqlitex.ExecOptions{Args: []any{producedJID}, ResultFunc: func(stmt *zs.Stmt) error {
-		if stmt.ColumnType(0) != zs.TypeNull {
-			producer = stmt.ColumnInt64(0)
-			isNull = false
-		}
-		return nil
-	}}); err != nil {
+	var producer sql.NullInt64
+	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT produced_by_operation_journal_id FROM journal WHERE journal_id = ?1", producedJID).Scan(&producer); err != nil {
 		return fmt.Errorf("rule-9 check: load produced row %d: %w", producedJID, err)
 	}
-	if isNull || producer != anchor {
+	if !producer.Valid || producer.Int64 != anchor {
 		return fmt.Errorf(
 			"%w: result slot on operation anchor %d references produced row %d whose own producing "+
 				"operation is %d — where: result-slot fold (§3.2, §10 rule 9); when: before commit; "+
 				"impact: nothing committed; fix: a result slot may only map to a row its own operation produced",
-			journal.ErrResultSlotIntegrity, anchor, producedJID, producer)
+			journal.ErrResultSlotIntegrity, anchor, producedJID, producer.Int64)
 	}
 	return nil
 }
@@ -100,9 +159,7 @@ func (scope *connScope) requireResultSlotOwnOperation(anchor, producedJID int64)
 func (scope *connScope) insertAttribution(task journal.TaskID, actor journal.ActorID, jid int64) error {
 	// Targets the real task_attributions during a live Apply and the shadow
 	// attribution table during a from-empty replay derivation (§8.2, §15).
-	if err := sqlitex.Execute(scope.conn,
-		scope.projectionTarget.insertAttributionQuery(),
-		&sqlitex.ExecOptions{Args: []any{task.String(), actor.String(), jid}}); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, scope.projectionTarget.insertAttributionQuery(), task.String(), actor.String(), jid); err != nil {
 		return fmt.Errorf("update %s attribution: %w", scope.projectionTarget.label(), err)
 	}
 	return nil
@@ -111,9 +168,7 @@ func (scope *connScope) insertAttribution(task journal.TaskID, actor journal.Act
 func (scope *connScope) advanceWatermark(task journal.TaskID, jid int64) error {
 	// Targets the real tasks table during a live Apply and the shadow tasks table
 	// during a from-empty replay derivation (§8.1, §15).
-	if err := sqlitex.Execute(scope.conn,
-		scope.projectionTarget.advanceWatermarkQuery(),
-		&sqlitex.ExecOptions{Args: []any{jid, task.String()}}); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, scope.projectionTarget.advanceWatermarkQuery(), jid, task.String()); err != nil {
 		return fmt.Errorf("advance %s task watermark: %w", scope.projectionTarget.label(), err)
 	}
 	return nil
@@ -125,16 +180,15 @@ func (scope *connScope) advanceWatermark(task journal.TaskID, jid int64) error {
 // journal spine (the source of truth, untouched by replay); the UPDATE targets the
 // projection table — real during Apply, shadow during replay (§15).
 func (scope *connScope) recomputeTaskOwner(task journal.TaskID, jid int64) error {
-	var owner any
-	if err := sqlitex.Execute(scope.conn, "SELECT e.actor_id FROM journal_authority_assignment_episodes e\n\t\t JOIN journal_authority_assignment_transitions started\n\t\t   ON started.assignment_id = e.assignment_id AND started.transition_id = ?2\n\t\t WHERE e.task_id = ?1 AND e.slot_id = ?3\n\t\t   AND NOT EXISTS (SELECT ?5 FROM journal_authority_assignment_transitions ended\n\t\t                   WHERE ended.assignment_id = e.assignment_id AND ended.transition_id = ?4)\n\t\t ORDER BY started.journal_id DESC LIMIT ?6", &sqlitex.ExecOptions{
-		Args:       []any{task.String(), transitionStartedID, slotOwnerResponsibilityID, transitionEndedID, 1, 1},
-		ResultFunc: func(stmt *zs.Stmt) error { owner = stmt.ColumnText(0); return nil },
-	}); err != nil {
+	var owner sql.NullString
+	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT e.actor_id FROM journal_authority_assignment_episodes e\n\t\t JOIN journal_authority_assignment_transitions started\n\t\t   ON started.assignment_id = e.assignment_id AND started.transition_id = ?2\n\t\t WHERE e.task_id = ?1 AND e.slot_id = ?3\n\t\t   AND NOT EXISTS (SELECT ?5 FROM journal_authority_assignment_transitions ended\n\t\t                   WHERE ended.assignment_id = e.assignment_id AND ended.transition_id = ?4)\n\t\t ORDER BY started.journal_id DESC LIMIT ?6", task.String(), transitionStartedID, slotOwnerResponsibilityID, transitionEndedID, 1, 1).Scan(&owner); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("recompute task owner: %w", err)
 	}
-	if err := sqlitex.Execute(scope.conn,
-		scope.projectionTarget.updateOwnerQuery(),
-		&sqlitex.ExecOptions{Args: []any{owner, jid, task.String()}}); err != nil {
+	var ownerArg any
+	if owner.Valid {
+		ownerArg = owner.String
+	}
+	if _, err := scope.conn.ExecContext(scope.ctx, scope.projectionTarget.updateOwnerQuery(), ownerArg, jid, task.String()); err != nil {
 		return fmt.Errorf("update %s owner: %w", scope.projectionTarget.label(), err)
 	}
 	return nil
@@ -194,24 +248,26 @@ func (scope *connScope) episodeEnded(assignment journal.AssignmentID) (ended boo
 }
 
 func (scope *connScope) episodeExists(assignment journal.AssignmentID) (bool, error) {
-	found := false
-	if err := sqlitex.Execute(scope.conn, "SELECT ?2 FROM journal_authority_assignment_episodes WHERE assignment_id = ?1", &sqlitex.ExecOptions{Args: []any{string(assignment), 1}, ResultFunc: func(*zs.Stmt) error { found = true; return nil }}); err != nil {
+	var found int
+	err := scope.conn.QueryRowContext(scope.ctx, "SELECT ?2 FROM journal_authority_assignment_episodes WHERE assignment_id = ?1", string(assignment), 1).Scan(&found)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, fmt.Errorf("episode exists %q: %w", assignment, err)
 	}
-	return found, nil
+	return err == nil, nil
 }
 
 func (scope *connScope) transitionExists(assignment journal.AssignmentID, transitionID int) (bool, error) {
-	found := false
-	if err := sqlitex.Execute(scope.conn, "SELECT ?3 FROM journal_authority_assignment_transitions WHERE assignment_id = ?1 AND transition_id = ?2", &sqlitex.ExecOptions{Args: []any{string(assignment), transitionID, 1}, ResultFunc: func(*zs.Stmt) error { found = true; return nil }}); err != nil {
+	var found int
+	err := scope.conn.QueryRowContext(scope.ctx, "SELECT ?3 FROM journal_authority_assignment_transitions WHERE assignment_id = ?1 AND transition_id = ?2", string(assignment), transitionID, 1).Scan(&found)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, fmt.Errorf("transition exists %q/%d: %w", assignment, transitionID, err)
 	}
-	return found, nil
+	return err == nil, nil
 }
 
 func (scope *connScope) episodeTask(assignment journal.AssignmentID) (journal.TaskID, error) {
 	var raw string
-	if err := sqlitex.Execute(scope.conn, "SELECT task_id FROM journal_authority_assignment_episodes WHERE assignment_id = ?1", &sqlitex.ExecOptions{Args: []any{string(assignment)}, ResultFunc: func(stmt *zs.Stmt) error { raw = stmt.ColumnText(0); return nil }}); err != nil {
+	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT task_id FROM journal_authority_assignment_episodes WHERE assignment_id = ?1", string(assignment)).Scan(&raw); err != nil {
 		return journal.TaskID{}, fmt.Errorf("episode task %q: %w", assignment, err)
 	}
 	if raw == "" {
@@ -224,14 +280,16 @@ func (scope *connScope) episodeTask(assignment journal.AssignmentID) (journal.Ta
 // (§4.4, §14.5). hasParent is false when the episode cites no parent (NULL
 // parent_assignment_id) or does not exist.
 func (scope *connScope) episodeParent(assignment journal.AssignmentID) (parent journal.AssignmentID, hasParent bool, err error) {
-	if execErr := sqlitex.Execute(scope.conn, "SELECT parent_assignment_id FROM journal_authority_assignment_episodes WHERE assignment_id = ?1", &sqlitex.ExecOptions{Args: []any{string(assignment)}, ResultFunc: func(stmt *zs.Stmt) error {
-		if stmt.ColumnType(0) != zs.TypeNull {
-			parent = journal.AssignmentID(stmt.ColumnText(0))
-			hasParent = parent != ""
+	var raw sql.NullString
+	if execErr := scope.conn.QueryRowContext(scope.ctx, "SELECT parent_assignment_id FROM journal_authority_assignment_episodes WHERE assignment_id = ?1", string(assignment)).Scan(&raw); execErr != nil {
+		if errors.Is(execErr, sql.ErrNoRows) {
+			return "", false, nil
 		}
-		return nil
-	}}); execErr != nil {
 		return "", false, fmt.Errorf("episode parent %q: %w", assignment, execErr)
+	}
+	if raw.Valid {
+		parent = journal.AssignmentID(raw.String)
+		hasParent = parent != ""
 	}
 	return parent, hasParent, nil
 }
@@ -241,11 +299,12 @@ func (scope *connScope) episodeParent(assignment journal.AssignmentID) (parent j
 // position-aware liveness). It is the position-scoped variant of
 // transitionExists, which considers transitions at any position.
 func (scope *connScope) transitionExistsBefore(assignment journal.AssignmentID, transitionID int, beforeJID int64) (bool, error) {
-	found := false
-	if err := sqlitex.Execute(scope.conn, "SELECT ?4 FROM journal_authority_assignment_transitions\n\t\t WHERE assignment_id = ?1 AND transition_id = ?2 AND journal_id < ?3 LIMIT ?5", &sqlitex.ExecOptions{Args: []any{string(assignment), transitionID, beforeJID, 1, 1}, ResultFunc: func(*zs.Stmt) error { found = true; return nil }}); err != nil {
+	var found int
+	err := scope.conn.QueryRowContext(scope.ctx, "SELECT ?4 FROM journal_authority_assignment_transitions\n\t\t WHERE assignment_id = ?1 AND transition_id = ?2 AND journal_id < ?3 LIMIT ?5", string(assignment), transitionID, beforeJID, 1, 1).Scan(&found)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, fmt.Errorf("transition-before %q/%d < %d: %w", assignment, transitionID, beforeJID, err)
 	}
-	return found, nil
+	return err == nil, nil
 }
 
 // episodeActiveAt reports whether episode `assignment` is active at journal
@@ -270,14 +329,12 @@ func (scope *connScope) episodeActiveAt(assignment journal.AssignmentID, beforeJ
 }
 
 func (scope *connScope) taskHasActiveOwnerEpisode(task journal.TaskID) (bool, error) {
-	found := false
-	if err := sqlitex.Execute(scope.conn, "SELECT ?5 FROM journal_authority_assignment_episodes e\n\t\t WHERE e.task_id = ?1 AND e.slot_id = ?2\n\t\t   AND EXISTS (SELECT ?6 FROM journal_authority_assignment_transitions s WHERE s.assignment_id = e.assignment_id AND s.transition_id = ?3)\n\t\t   AND NOT EXISTS (SELECT ?7 FROM journal_authority_assignment_transitions x WHERE x.assignment_id = e.assignment_id AND x.transition_id = ?4)\n\t\t LIMIT ?8", &sqlitex.ExecOptions{
-		Args:       []any{task.String(), slotOwnerResponsibilityID, transitionStartedID, transitionEndedID, 1, 1, 1, 1},
-		ResultFunc: func(*zs.Stmt) error { found = true; return nil },
-	}); err != nil {
+	var found int
+	err := scope.conn.QueryRowContext(scope.ctx, "SELECT ?5 FROM journal_authority_assignment_episodes e\n\t\t WHERE e.task_id = ?1 AND e.slot_id = ?2\n\t\t   AND EXISTS (SELECT ?6 FROM journal_authority_assignment_transitions s WHERE s.assignment_id = e.assignment_id AND s.transition_id = ?3)\n\t\t   AND NOT EXISTS (SELECT ?7 FROM journal_authority_assignment_transitions x WHERE x.assignment_id = e.assignment_id AND x.transition_id = ?4)\n\t\t LIMIT ?8", task.String(), slotOwnerResponsibilityID, transitionStartedID, transitionEndedID, 1, 1, 1, 1).Scan(&found)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, fmt.Errorf("active owner episode %q: %w", task, err)
 	}
-	return found, nil
+	return err == nil, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -286,7 +343,7 @@ func (scope *connScope) taskHasActiveOwnerEpisode(task journal.TaskID) (bool, er
 
 func (scope *connScope) operationCount() (int, error) {
 	var n int
-	if err := sqlitex.Execute(scope.conn, "SELECT COUNT(*) FROM journal_operations", &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
+	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT COUNT(*) FROM journal_operations").Scan(&n); err != nil {
 		return 0, fmt.Errorf("count operations: %w", err)
 	}
 	return n, nil
@@ -316,11 +373,12 @@ func (scope *connScope) validateGenesis(in journal.OperationInput) error {
 }
 
 func (scope *connScope) requireAuthorityExists(authJID journal.JournalID) error {
-	found := false
-	if err := sqlitex.Execute(scope.conn, "SELECT ?2 FROM journal_authorities WHERE journal_id = ?1", &sqlitex.ExecOptions{Args: []any{int64(authJID), 1}, ResultFunc: func(*zs.Stmt) error { found = true; return nil }}); err != nil {
+	var found int
+	err := scope.conn.QueryRowContext(scope.ctx, "SELECT ?2 FROM journal_authorities WHERE journal_id = ?1", int64(authJID), 1).Scan(&found)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("require authority %d: %w", authJID, err)
 	}
-	if !found {
+	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf(
 			"%w: operation cites authority %d which is not a committed journal_authorities row — "+
 				"where: authority resolution (§4.2); when: before commit; impact: nothing committed; "+
@@ -369,7 +427,8 @@ func (scope *connScope) authorityGovernsTaskAt(authJID journal.JournalID, target
 		return false, nil // authority does not precede the effect (§9.3)
 	}
 	var kind = -1
-	if err := sqlitex.Execute(scope.conn, "SELECT authority_kind_id FROM journal_authorities WHERE journal_id = ?1", &sqlitex.ExecOptions{Args: []any{int64(authJID)}, ResultFunc: func(stmt *zs.Stmt) error { kind = stmt.ColumnInt(0); return nil }}); err != nil {
+	err := scope.conn.QueryRowContext(scope.ctx, "SELECT authority_kind_id FROM journal_authorities WHERE journal_id = ?1", int64(authJID)).Scan(&kind)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, fmt.Errorf("authority kind %d: %w", authJID, err)
 	}
 	switch kind {
@@ -393,7 +452,8 @@ func (scope *connScope) authorityGovernsTaskAt(authJID journal.JournalID, target
 func (scope *connScope) assignmentAuthorityGoverns(authJID journal.JournalID, targetTask journal.TaskID, beforeJID int64) (bool, error) {
 	// Resolve the assignment episode this authority (a transition row) belongs to.
 	var authEpisode string
-	if err := sqlitex.Execute(scope.conn, "SELECT assignment_id FROM journal_authority_assignment_transitions WHERE journal_id = ?1", &sqlitex.ExecOptions{Args: []any{int64(authJID)}, ResultFunc: func(stmt *zs.Stmt) error { authEpisode = stmt.ColumnText(0); return nil }}); err != nil {
+	err := scope.conn.QueryRowContext(scope.ctx, "SELECT assignment_id FROM journal_authority_assignment_transitions WHERE journal_id = ?1", int64(authJID)).Scan(&authEpisode)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, fmt.Errorf("authority assignment %d: %w", authJID, err)
 	}
 	if authEpisode == "" {
@@ -446,10 +506,14 @@ func (scope *connScope) assignmentAuthorityGoverns(authJID journal.JournalID, ta
 // entry points). A task typically has few episodes.
 func (scope *connScope) episodesOnTask(task journal.TaskID) ([]journal.AssignmentID, error) {
 	var out []journal.AssignmentID
-	if err := sqlitex.Execute(scope.conn, "SELECT assignment_id FROM journal_authority_assignment_episodes WHERE task_id = ?1", &sqlitex.ExecOptions{Args: []any{task.String()}, ResultFunc: func(stmt *zs.Stmt) error {
-		out = append(out, journal.AssignmentID(stmt.ColumnText(0)))
+	if err := scope.queryRows("SELECT assignment_id FROM journal_authority_assignment_episodes WHERE task_id = ?1", []any{task.String()}, func(rows *sql.Rows) error {
+		var assignment string
+		if err := rows.Scan(&assignment); err != nil {
+			return err
+		}
+		out = append(out, journal.AssignmentID(assignment))
 		return nil
-	}}); err != nil {
+	}); err != nil {
 		return nil, fmt.Errorf("episodes on task %q: %w", task, err)
 	}
 	return out, nil
@@ -505,7 +569,7 @@ func (scope *connScope) parentChainReaches(start, target journal.AssignmentID, b
 
 func (scope *connScope) countEpisodes() (int, error) {
 	var n int
-	if err := sqlitex.Execute(scope.conn, "SELECT COUNT(*) FROM journal_authority_assignment_episodes", &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
+	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT COUNT(*) FROM journal_authority_assignment_episodes").Scan(&n); err != nil {
 		return 0, fmt.Errorf("count episodes: %w", err)
 	}
 	return n, nil
@@ -625,40 +689,33 @@ func (scope *connScope) lookupOperation(op journal.OperationID) (storedOperation
 	var authority *journal.JournalID
 	var commandDigest, mutationDigest, canonicalMutation []byte
 	var encodingVersion string
-	found := false
-	if err := sqlitex.Execute(scope.conn, "SELECT journal_id, authority_journal_id, command_digest, mutation_digest,\n\t\t        mutation_encoding_version, canonical_mutation\n\t\t FROM journal_operations WHERE operation_id = ?1", &sqlitex.ExecOptions{Args: []any{string(op)}, ResultFunc: func(stmt *zs.Stmt) error {
-		found = true
-		out.anchor = stmt.ColumnInt64(0)
-		if stmt.ColumnType(1) != zs.TypeNull {
-			a := journal.JournalID(stmt.ColumnInt64(1))
-			authority = &a
+	var authorityRaw sql.NullInt64
+	var encodingRaw sql.NullString
+	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT journal_id, authority_journal_id, command_digest, mutation_digest,\n\t\t        mutation_encoding_version, canonical_mutation\n\t\t FROM journal_operations WHERE operation_id = ?1", string(op)).Scan(&out.anchor, &authorityRaw, &commandDigest, &mutationDigest, &encodingRaw, &canonicalMutation); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return storedOperation{}, false, nil
 		}
-		commandDigest = readBlob(stmt, 2)
-		mutationDigest = readBlob(stmt, 3)
-		if stmt.ColumnType(4) != zs.TypeNull {
-			encodingVersion = stmt.ColumnText(4)
-		}
-		if stmt.ColumnType(5) != zs.TypeNull {
-			canonicalMutation = readBlob(stmt, 5)
-		}
-		return nil
-	}}); err != nil {
 		return storedOperation{}, false, fmt.Errorf("lookup operation %q: %w", op, err)
 	}
-	if !found {
-		return storedOperation{}, false, nil
+	commandDigest = append([]byte(nil), commandDigest...)
+	mutationDigest = append([]byte(nil), mutationDigest...)
+	canonicalMutation = append([]byte(nil), canonicalMutation...)
+	if authorityRaw.Valid {
+		a := journal.JournalID(authorityRaw.Int64)
+		authority = &a
+	}
+	if encodingRaw.Valid {
+		encodingVersion = encodingRaw.String
 	}
 	// The committing actor lives on the anchor journal row.
 	var actor journal.ActorID
-	if err := sqlitex.Execute(scope.conn, "SELECT actor_id FROM journal WHERE journal_id = ?1", &sqlitex.ExecOptions{Args: []any{out.anchor}, ResultFunc: func(stmt *zs.Stmt) error {
-		parsed, err := journalParseActor(stmt.ColumnText(0))
-		if err != nil {
-			return err
-		}
-		actor = parsed
-		return nil
-	}}); err != nil {
+	var actorRaw string
+	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT actor_id FROM journal WHERE journal_id = ?1", out.anchor).Scan(&actorRaw); err != nil {
 		return storedOperation{}, false, fmt.Errorf("lookup operation actor %q: %w", op, err)
+	}
+	actor, err := journalParseActor(actorRaw)
+	if err != nil {
+		return storedOperation{}, false, err
 	}
 	out.identity = newStoredOperationReplayIdentity(op, actor, authority, commandDigest, mutationDigest, encodingVersion, canonicalMutation)
 	return out, true, nil
@@ -696,10 +753,14 @@ func (scope *connScope) reconcileAllocatedTaskCreates(in journal.OperationInput,
 		slots[binding.Slot] = binding
 	}
 	var produced []journal.JournalID
-	if err := sqlitex.Execute(scope.conn, "SELECT journal_id FROM journal WHERE produced_by_operation_journal_id=?1 ORDER BY journal_id", &sqlitex.ExecOptions{Args: []any{existing.anchor}, ResultFunc: func(stmt *zs.Stmt) error {
-		produced = append(produced, journal.JournalID(stmt.ColumnInt64(0)))
+	if err := scope.queryRows("SELECT journal_id FROM journal WHERE produced_by_operation_journal_id=?1 ORDER BY journal_id", []any{existing.anchor}, func(rows *sql.Rows) error {
+		var producedJID int64
+		if err := rows.Scan(&producedJID); err != nil {
+			return err
+		}
+		produced = append(produced, journal.JournalID(producedJID))
 		return nil
-	}}); err != nil {
+	}); err != nil {
 		return journal.OperationInput{}, err
 	}
 	if len(produced) != len(committedEffects) {
@@ -826,7 +887,7 @@ func (db *DB) CountAuthoritiesOfKind(kind int) (int, error) {
 	}
 	defer scope.release()
 	var n int
-	if err := sqlitex.Execute(scope.conn, "SELECT COUNT(*) FROM journal_authorities WHERE authority_kind_id = ?1", &sqlitex.ExecOptions{Args: []any{kind}, ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
+	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT COUNT(*) FROM journal_authorities WHERE authority_kind_id = ?1", kind).Scan(&n); err != nil {
 		return 0, fmt.Errorf("CountAuthoritiesOfKind %d: %w", kind, err)
 	}
 	return n, nil
@@ -842,7 +903,7 @@ func (db *DB) CountSuccessorEpisodes(task journal.TaskID) (int, error) {
 	}
 	defer scope.release()
 	var n int
-	if err := sqlitex.Execute(scope.conn, "SELECT COUNT(*) FROM journal_authority_assignment_episodes WHERE task_id = ?1 AND predecessor_assignment_id IS NOT ?2", &sqlitex.ExecOptions{Args: []any{task.String(), nil}, ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
+	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT COUNT(*) FROM journal_authority_assignment_episodes WHERE task_id = ?1 AND predecessor_assignment_id IS NOT ?2", task.String(), nil).Scan(&n); err != nil {
 		return 0, fmt.Errorf("CountSuccessorEpisodes %q: %w", task, err)
 	}
 	return n, nil
@@ -852,18 +913,20 @@ func (db *DB) CountSuccessorEpisodes(task journal.TaskID) (int, error) {
 // Small utilities
 // ---------------------------------------------------------------------------
 
-func readBlob(stmt *zs.Stmt, col int) []byte {
-	n := stmt.ColumnLen(col)
-	buf := make([]byte, n)
-	stmt.ColumnBytes(col, buf)
-	return buf
-}
-
 func isUniqueViolation(err error) bool {
-	return err != nil && (zs.ErrCode(err) == zs.ResultConstraintUnique || zs.ErrCode(err) == zs.ResultConstraintPrimaryKey ||
-		errors.Is(err, errUniqueSentinel))
+	if err == nil {
+		return false
+	}
+	var sqliteErr *moderncsqlite.Error
+	if errors.As(err, &sqliteErr) {
+		switch sqliteErr.Code() {
+		case 1555, 2067: // SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE
+			return true
+		}
+	}
+	return errors.Is(err, errUniqueSentinel)
 }
 
-// errUniqueSentinel is unused at runtime; it keeps isUniqueViolation total even
-// if a future zombiezen version changes its extended-code surface.
+// errUniqueSentinel keeps the predicate total for an explicitly wrapped test or
+// domain error without depending on driver error text.
 var errUniqueSentinel = errors.New("unique constraint")

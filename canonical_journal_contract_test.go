@@ -12,8 +12,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
-	"zombiezen.com/go/sqlite"
-	"zombiezen.com/go/sqlite/sqlitex"
+	moderncsqlite "modernc.org/sqlite"
 )
 
 func pinnedCreateOperationID(sequence int) OperationID {
@@ -21,8 +20,8 @@ func pinnedCreateOperationID(sequence int) OperationID {
 }
 
 func isSQLiteContentionError(err error) bool {
-	primary := sqlite.ErrCode(err) & 0xff
-	return primary == sqlite.ResultBusy || primary == sqlite.ResultLocked
+	var sqliteErr *moderncsqlite.Error
+	return errors.As(err, &sqliteErr) && (sqliteErr.Code()&0xff == 5 || sqliteErr.Code()&0xff == 6)
 }
 
 func newCanonicalOpsEnv(t *testing.T) (*opsEnv, string) {
@@ -112,8 +111,8 @@ func TestCanonicalRetryIgnoresCallerMutationDigestButRejectsEffectChange(t *test
 func journalRowCount(t *testing.T, path string) int64 {
 	t.Helper()
 	var count int64
-	withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
-		if err := sqlitex.Execute(conn, `SELECT count(*) FROM journal`, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error {
+	withRawSQLiteTestConn(t, path, func(conn *rawSQLiteConn) {
+		if err := rawExecute(conn, `SELECT count(*) FROM journal`, &rawExecOptions{ResultFunc: func(stmt *rawSQLiteStmt) error {
 			count = stmt.ColumnInt64(0)
 			return nil
 		}}); err != nil {
@@ -703,8 +702,8 @@ func TestCanonicalSchemaMigrationAndMixedLegacyRowsAreIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	legacyOK, canonicalOK := false, false
-	withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
-		if err := sqlitex.Execute(conn, `SELECT operation_id,mutation_encoding_version IS NULL,canonical_mutation IS NULL,hex(mutation_digest),length(canonical_mutation) FROM journal_operations ORDER BY journal_id`, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error {
+	withRawSQLiteTestConn(t, path, func(conn *rawSQLiteConn) {
+		if err := rawExecute(conn, `SELECT operation_id,mutation_encoding_version IS NULL,canonical_mutation IS NULL,hex(mutation_digest),length(canonical_mutation) FROM journal_operations ORDER BY journal_id`, &rawExecOptions{ResultFunc: func(stmt *rawSQLiteStmt) error {
 			switch stmt.ColumnText(0) {
 			case "mixed-genesis":
 				legacyOK = stmt.ColumnInt(1) == 1 && stmt.ColumnInt(2) == 1 && stmt.ColumnText(3) == "6C65676163792D646967657374"
@@ -746,7 +745,7 @@ func TestCanonicalSchemaMigrationAndMixedLegacyRowsAreIdempotent(t *testing.T) {
 
 func makeOperationsSchemaLegacy(t *testing.T, path string) {
 	t.Helper()
-	withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
+	withRawSQLiteTestConn(t, path, func(conn *rawSQLiteConn) {
 		for _, statement := range []string{
 			`DROP TRIGGER journal_operations_canonical_insert`, `DROP TRIGGER journal_operations_canonical_update`,
 			`PRAGMA foreign_keys=OFF`, `PRAGMA legacy_alter_table=ON`,
@@ -755,7 +754,7 @@ func makeOperationsSchemaLegacy(t *testing.T, path string) {
 			`INSERT INTO journal_operations SELECT journal_id,operation_id,authority_journal_id,command_digest,X'6c65676163792d646967657374' FROM journal_operations_canonical`,
 			`DROP TABLE journal_operations_canonical`, `PRAGMA foreign_keys=ON`,
 		} {
-			if err := sqlitex.ExecuteTransient(conn, statement, nil); err != nil {
+			if err := rawExecuteTransient(conn, statement, nil); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -899,18 +898,15 @@ func TestDeleteModeCorruptionPreflightIsByteAndModeReadOnly(t *testing.T) {
 			if err := tr.Close(); err != nil {
 				t.Fatal(err)
 			}
-			conn, err := sqlite.OpenConn(path, sqlite.OpenReadWrite|sqlite.OpenURI)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := sqlitex.ExecuteTransient(conn, `PRAGMA journal_mode=DELETE`, nil); err != nil {
+			conn := openRawSQLiteTestConn(t, path, "rw")
+			if err := rawExecuteTransient(conn, `PRAGMA journal_mode=DELETE`, nil); err != nil {
 				t.Fatal(err)
 			}
 			if legacy {
-				if err := sqlitex.Execute(conn, `DELETE FROM journal_authority_bootstraps WHERE journal_id=?1`, &sqlitex.ExecOptions{Args: []any{int64(boot)}}); err != nil {
+				if err := rawExecute(conn, `DELETE FROM journal_authority_bootstraps WHERE journal_id=?1`, &rawExecOptions{Args: []any{int64(boot)}}); err != nil {
 					t.Fatal(err)
 				}
-			} else if err := sqlitex.Execute(conn, `UPDATE tasks SET title='corrupt' WHERE id=?1`, &sqlitex.ExecOptions{Args: []any{task.ID.String()}}); err != nil {
+			} else if err := rawExecute(conn, `UPDATE tasks SET title='corrupt' WHERE id=?1`, &rawExecOptions{Args: []any{task.ID.String()}}); err != nil {
 				t.Fatal(err)
 			}
 			if err := conn.Close(); err != nil {
@@ -950,15 +946,12 @@ func TestDeleteModeActivationSchemaFailureDoesNotPersistWAL(t *testing.T) {
 			if err := tr.Close(); err != nil {
 				t.Fatal(err)
 			}
-			conn, err := sqlite.OpenConn(path, sqlite.OpenReadWrite|sqlite.OpenURI)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := sqlitex.ExecuteTransient(conn, `PRAGMA journal_mode=DELETE`, nil); err != nil {
+			conn := openRawSQLiteTestConn(t, path, "rw")
+			if err := rawExecuteTransient(conn, `PRAGMA journal_mode=DELETE`, nil); err != nil {
 				t.Fatal(err)
 			}
 			for _, statement := range statements {
-				if err := sqlitex.ExecuteTransient(conn, statement, nil); err != nil {
+				if err := rawExecuteTransient(conn, statement, nil); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -1004,13 +997,10 @@ func snapshotSQLiteFiles(t *testing.T, path string) map[string][]byte {
 
 func sqliteJournalMode(t *testing.T, path string) string {
 	t.Helper()
-	conn, err := sqlite.OpenConn(path, sqlite.OpenReadOnly|sqlite.OpenURI)
-	if err != nil {
-		t.Fatal(err)
-	}
+	conn := openRawSQLiteTestConn(t, path, "ro")
 	defer conn.Close()
 	mode := ""
-	if err := sqlitex.ExecuteTransient(conn, `PRAGMA journal_mode`, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error { mode = stmt.ColumnText(0); return nil }}); err != nil {
+	if err := rawExecuteTransient(conn, `PRAGMA journal_mode`, &rawExecOptions{ResultFunc: func(stmt *rawSQLiteStmt) error { mode = stmt.ColumnText(0); return nil }}); err != nil {
 		t.Fatal(err)
 	}
 	return mode
@@ -1092,8 +1082,8 @@ func TestCanonicalSQLConstraintsAreVersionAgnostic(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tr.Close()
-	withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
-		if err := sqlitex.Execute(conn, `SELECT sql FROM sqlite_master WHERE name IN ('journal_operations','journal_operations_canonical_insert','journal_operations_canonical_update')`, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error {
+	withRawSQLiteTestConn(t, path, func(conn *rawSQLiteConn) {
+		if err := rawExecute(conn, `SELECT sql FROM sqlite_master WHERE name IN ('journal_operations','journal_operations_canonical_insert','journal_operations_canonical_update')`, &rawExecOptions{ResultFunc: func(stmt *rawSQLiteStmt) error {
 			sql := stmt.ColumnText(0)
 			if strings.Contains(sql, MutationEncodingV1.String()) {
 				t.Fatalf("SQLite schema embeds codec version: %s", sql)
@@ -1143,8 +1133,8 @@ func TestV1SpecificSQLAuthorityMigratesOnce(t *testing.T) {
 
 func assertNoCodecVersionInSQLiteSchema(t *testing.T, path string) {
 	t.Helper()
-	withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
-		if err := sqlitex.Execute(conn, `SELECT sql FROM sqlite_master WHERE name IN ('journal_operations','journal_operations_canonical_insert','journal_operations_canonical_update')`, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error {
+	withRawSQLiteTestConn(t, path, func(conn *rawSQLiteConn) {
+		if err := rawExecute(conn, `SELECT sql FROM sqlite_master WHERE name IN ('journal_operations','journal_operations_canonical_insert','journal_operations_canonical_update')`, &rawExecOptions{ResultFunc: func(stmt *rawSQLiteStmt) error {
 			if sql := stmt.ColumnText(0); strings.Contains(sql, MutationEncodingV1.String()) {
 				t.Fatalf("SQLite schema embeds codec version: %s", sql)
 			}
@@ -1158,8 +1148,8 @@ func assertNoCodecVersionInSQLiteSchema(t *testing.T, path string) {
 func journalOperationFKPresent(t *testing.T, path string) bool {
 	t.Helper()
 	present := false
-	withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
-		if err := sqlitex.ExecuteTransient(conn, `PRAGMA foreign_key_list(journal)`, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error {
+	withRawSQLiteTestConn(t, path, func(conn *rawSQLiteConn) {
+		if err := rawExecuteTransient(conn, `PRAGMA foreign_key_list(journal)`, &rawExecOptions{ResultFunc: func(stmt *rawSQLiteStmt) error {
 			if stmt.ColumnText(3) == "produced_by_operation_journal_id" && stmt.ColumnText(2) == "journal_operations" {
 				present = true
 			}

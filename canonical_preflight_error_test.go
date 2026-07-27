@@ -7,9 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"zombiezen.com/go/sqlite"
-	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 const canonicalPreflightOperationID = "canonical-preflight-operation"
@@ -51,8 +48,8 @@ func buildCanonicalPreflightErrorFixture(t *testing.T, path string) Tracker {
 func readCanonicalPreflightWire(t *testing.T, path string) []byte {
 	t.Helper()
 	var wire []byte
-	withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
-		if err := sqlitex.Execute(conn, `SELECT canonical_mutation FROM journal_operations WHERE operation_id=?1`, &sqlitex.ExecOptions{Args: []any{canonicalPreflightOperationID}, ResultFunc: func(stmt *sqlite.Stmt) error {
+	withRawSQLiteTestConn(t, path, func(conn *rawSQLiteConn) {
+		if err := rawExecute(conn, `SELECT canonical_mutation FROM journal_operations WHERE operation_id=?1`, &rawExecOptions{Args: []any{canonicalPreflightOperationID}, ResultFunc: func(stmt *rawSQLiteStmt) error {
 			wire = make([]byte, stmt.ColumnLen(0))
 			stmt.ColumnBytes(0, wire)
 			return nil

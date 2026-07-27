@@ -11,8 +11,6 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
-	"zombiezen.com/go/sqlite"
-	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 // newActivityID mints a fresh namespaced ActivityID for a create effect.
@@ -41,9 +39,9 @@ func activityCounts(t *testing.T, path string) activityStorageCounts {
 		{`SELECT count(*) FROM main.activities`, &counts.activities},
 		{`SELECT count(*) FROM main.journal_activity_creations`, &counts.births},
 	}
-	withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
+	withRawSQLiteTestConn(t, path, func(conn *rawSQLiteConn) {
 		for _, query := range queries {
-			if err := sqlitex.Execute(conn, query.sql, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error {
+			if err := rawExecute(conn, query.sql, &rawExecOptions{ResultFunc: func(stmt *rawSQLiteStmt) error {
 				*query.count = stmt.ColumnInt64(0)
 				return nil
 			}}); err != nil {
@@ -356,19 +354,19 @@ func TestActivityCreate_BirthMappingFailureRollsBackActivity(t *testing.T) {
 	t.Parallel()
 	env, path := newFileActivityOpsEnv(t)
 	boot := env.genesis(t, "op-genesis-birth-mapping-rollback")
-	withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
-		if err := sqlitex.ExecuteTransient(conn, `CREATE TRIGGER main.reject_activity_birth BEFORE INSERT ON journal_activity_creations BEGIN SELECT RAISE(ABORT, 'forced birth mapping failure'); END`, nil); err != nil {
+	withRawSQLiteTestConn(t, path, func(conn *rawSQLiteConn) {
+		if err := rawExecuteTransient(conn, `CREATE TRIGGER main.reject_activity_birth BEFORE INSERT ON journal_activity_creations BEGIN SELECT RAISE(ABORT, 'forced birth mapping failure'); END`, nil); err != nil {
 			t.Fatalf("create birth-mapping failure trigger: %v", err)
 		}
 	})
 	t.Cleanup(func() {
-		withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
-			if err := sqlitex.ExecuteTransient(conn, `DROP TRIGGER main.reject_activity_birth`, nil); err != nil {
+		withRawSQLiteTestConn(t, path, func(conn *rawSQLiteConn) {
+			if err := rawExecuteTransient(conn, `DROP TRIGGER main.reject_activity_birth`, nil); err != nil {
 				t.Errorf("drop birth-mapping failure trigger before tracker Close: %v", err)
 				return
 			}
 			var remaining int64
-			if err := sqlitex.Execute(conn, `SELECT count(*) FROM main.sqlite_schema WHERE type = 'trigger' AND name = 'reject_activity_birth'`, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error {
+			if err := rawExecute(conn, `SELECT count(*) FROM main.sqlite_schema WHERE type = 'trigger' AND name = 'reject_activity_birth'`, &rawExecOptions{ResultFunc: func(stmt *rawSQLiteStmt) error {
 				remaining = stmt.ColumnInt64(0)
 				return nil
 			}}); err != nil {
@@ -405,18 +403,18 @@ func TestActivityCreate_CollisionAttributionLookupErrorPropagates(t *testing.T) 
 	if _, err := env.tr.StartActivityWithID(actID, env.actor, PhaseWorkerSlices, StageInProgress, "non-journaled"); err != nil {
 		t.Fatalf("seed non-journaled activity: %v", err)
 	}
-	withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
-		if err := sqlitex.ExecuteTransient(conn, `ALTER TABLE main.journal_activity_creations RENAME COLUMN journal_id TO invalid_test_journal_id`, nil); err != nil {
+	withRawSQLiteTestConn(t, path, func(conn *rawSQLiteConn) {
+		if err := rawExecuteTransient(conn, `ALTER TABLE main.journal_activity_creations RENAME COLUMN journal_id TO invalid_test_journal_id`, nil); err != nil {
 			t.Fatalf("rename attribution column for lookup failure: %v", err)
 		}
 	})
 	t.Cleanup(func() {
-		withRawSQLiteTestConn(t, path, func(conn *sqlite.Conn) {
-			if err := sqlitex.ExecuteTransient(conn, `ALTER TABLE main.journal_activity_creations RENAME COLUMN invalid_test_journal_id TO journal_id`, nil); err != nil {
+		withRawSQLiteTestConn(t, path, func(conn *rawSQLiteConn) {
+			if err := rawExecuteTransient(conn, `ALTER TABLE main.journal_activity_creations RENAME COLUMN invalid_test_journal_id TO journal_id`, nil); err != nil {
 				t.Errorf("restore attribution column before tracker Close: %v", err)
 				return
 			}
-			if err := sqlitex.ExecuteTransient(conn, `SELECT journal_id FROM main.journal_activity_creations LIMIT 0`, nil); err != nil {
+			if err := rawExecuteTransient(conn, `SELECT journal_id FROM main.journal_activity_creations LIMIT 0`, nil); err != nil {
 				t.Errorf("verify attribution column restoration before tracker Close: %v", err)
 			}
 		})

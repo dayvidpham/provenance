@@ -1,12 +1,12 @@
 package sqlite
 
 import (
+	"database/sql"
+	"errors"
 	"fmt"
 
 	"github.com/dayvidpham/provenance/internal/journal"
 	"github.com/dayvidpham/provenance/pkg/ptypes"
-	zs "zombiezen.com/go/sqlite"
-	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 // activity_replay.go implements the EffectActivityCreate fold inside Apply's
@@ -41,7 +41,7 @@ func (scope *connScope) ensureActivityCreationsSchema() error {
 		"CREATE INDEX IF NOT EXISTS idx_journal_activity_creations_activity ON journal_activity_creations (activity_id)",
 	}
 	for _, stmt := range ddl {
-		if err := sqlitex.ExecuteTransient(scope.conn, stmt, nil); err != nil {
+		if _, err := scope.conn.ExecContext(scope.ctx, stmt); err != nil {
 			return fmt.Errorf("ensureActivityCreationsSchema: %w", err)
 		}
 	}
@@ -76,24 +76,10 @@ func (scope *connScope) foldActivityCreate(in journal.OperationInput, jid int64,
 	if eff.RecordedAtOverride != nil {
 		recordedAt = *eff.RecordedAtOverride
 	}
-	if err := sqlitex.Execute(scope.conn,
-		`INSERT INTO activities (id, agent_id, phase_id, stage_id, started_at, ended_at, notes) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
-		&sqlitex.ExecOptions{Args: []any{
-			activityID.String(), agentID.String(),
-			int(eff.ActivityPhase), int(eff.ActivityStage),
-			recordedAt, nil, eff.ActivityNotes,
-		}}); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, `INSERT INTO activities (id, agent_id, phase_id, stage_id, started_at, ended_at, notes) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`, activityID.String(), agentID.String(), int(eff.ActivityPhase), int(eff.ActivityStage), recordedAt, nil, eff.ActivityNotes); err != nil {
 		if isUniqueViolation(err) {
 			var claimingJournalID int64
-			if lookupErr := sqlitex.Execute(scope.conn,
-				`SELECT journal_id FROM journal_activity_creations WHERE activity_id = ?1`,
-				&sqlitex.ExecOptions{
-					Args: []any{activityID.String()},
-					ResultFunc: func(stmt *zs.Stmt) error {
-						claimingJournalID = stmt.ColumnInt64(0)
-						return nil
-					},
-				}); lookupErr != nil {
+			if lookupErr := scope.conn.QueryRowContext(scope.ctx, `SELECT journal_id FROM journal_activity_creations WHERE activity_id = ?1`, activityID.String()).Scan(&claimingJournalID); lookupErr != nil && !errors.Is(lookupErr, sql.ErrNoRows) {
 				return fmt.Errorf(
 					"Apply: operation %q EffectActivityCreate: attribute ActivityID collision for %q: %w — "+
 						"where: EffectActivityCreate fold, journal_activity_creations lookup after activities uniqueness failure; "+
@@ -116,9 +102,7 @@ func (scope *connScope) foldActivityCreate(in journal.OperationInput, jid int64,
 
 	// Step 2: Insert journal_activity_creations (birth record). Any failure rolls
 	// the fresh activities row back with the enclosing Apply savepoint.
-	if err := sqlitex.Execute(scope.conn,
-		`INSERT INTO journal_activity_creations (journal_id, activity_id) VALUES (?1, ?2)`,
-		&sqlitex.ExecOptions{Args: []any{jid, activityID.String()}}); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, `INSERT INTO journal_activity_creations (journal_id, activity_id) VALUES (?1, ?2)`, jid, activityID.String()); err != nil {
 		return fmt.Errorf(
 			"Apply: operation %q EffectActivityCreate: insert journal_activity_creations for %q: %w — "+
 				"where: EffectActivityCreate fold, journal_activity_creations INSERT; when: after activities INSERT; "+
@@ -133,23 +117,16 @@ func (scope *connScope) foldActivityCreate(in journal.OperationInput, jid int64,
 // journal_activity_creations row by journal_id. Used by result-slot reconstruction.
 // The caller owns scope.conn and its transaction.
 func (scope *connScope) lookupActivityIDForJournalRow(jid int64) (ptypes.ActivityID, bool, error) {
-	var actID ptypes.ActivityID
-	found := false
-	if err := sqlitex.Execute(scope.conn,
-		`SELECT activity_id FROM journal_activity_creations WHERE journal_id = ?1`,
-		&sqlitex.ExecOptions{
-			Args: []any{jid},
-			ResultFunc: func(stmt *zs.Stmt) error {
-				var err error
-				actID, err = ptypes.ParseActivityID(stmt.ColumnText(0))
-				if err != nil {
-					return fmt.Errorf("decode stored activity_id for journal row %d: %w", jid, err)
-				}
-				found = true
-				return nil
-			},
-		}); err != nil {
+	var raw string
+	if err := scope.conn.QueryRowContext(scope.ctx, `SELECT activity_id FROM journal_activity_creations WHERE journal_id = ?1`, jid).Scan(&raw); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ptypes.ActivityID{}, false, nil
+		}
 		return ptypes.ActivityID{}, false, fmt.Errorf("lookupActivityIDForJournalRow(%d): %w", jid, err)
 	}
-	return actID, found, nil
+	actID, err := ptypes.ParseActivityID(raw)
+	if err != nil {
+		return ptypes.ActivityID{}, false, fmt.Errorf("decode stored activity_id for journal row %d: %w", jid, err)
+	}
+	return actID, true, nil
 }

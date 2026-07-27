@@ -2,14 +2,14 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 
+	"github.com/dayvidpham/provenance/internal/allocation"
 	"github.com/dayvidpham/provenance/internal/journal"
-	zs "zombiezen.com/go/sqlite"
-	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 // operations.go implements the mutation-time reducer for the operations,
@@ -79,20 +79,20 @@ func (scope *connScope) ensureOperationsSchema() error {
 		"CREATE INDEX IF NOT EXISTS idx_episodes_parent ON journal_authority_assignment_episodes (parent_assignment_id)",
 	}
 	for _, stmt := range ddl {
-		if err := sqlitex.ExecuteTransient(scope.conn, stmt, nil); err != nil {
+		if _, err := scope.conn.ExecContext(scope.ctx, stmt); err != nil {
 			return fmt.Errorf("ensureOperationsSchema: statement %q: %w", stmt, err)
 		}
 	}
 	for id, name := range map[int]string{authKindBootstrapID: "bootstrap", authKindAssignmentID: "assignment"} {
-		if err := sqlitex.Execute(scope.conn, "INSERT OR IGNORE INTO authority_kinds (id, name) VALUES (?1, ?2)", &sqlitex.ExecOptions{Args: []any{id, name}}); err != nil {
+		if _, err := scope.conn.ExecContext(scope.ctx, "INSERT OR IGNORE INTO authority_kinds (id, name) VALUES (?1, ?2)", id, name); err != nil {
 			return fmt.Errorf("ensureOperationsSchema: seed authority_kinds: %w", err)
 		}
 	}
-	if err := sqlitex.Execute(scope.conn, "INSERT OR IGNORE INTO assignment_slots (id, name) VALUES (?1, ?2)", &sqlitex.ExecOptions{Args: []any{slotOwnerResponsibilityID, string(journal.SlotOwnerResponsibility)}}); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, "INSERT OR IGNORE INTO assignment_slots (id, name) VALUES (?1, ?2)", slotOwnerResponsibilityID, string(journal.SlotOwnerResponsibility)); err != nil {
 		return fmt.Errorf("ensureOperationsSchema: seed assignment_slots: %w", err)
 	}
 	for id, name := range map[int]string{transitionStartedID: "started", transitionEndedID: "ended"} {
-		if err := sqlitex.Execute(scope.conn, "INSERT OR IGNORE INTO assignment_transitions (id, name) VALUES (?1, ?2)", &sqlitex.ExecOptions{Args: []any{id, name}}); err != nil {
+		if _, err := scope.conn.ExecContext(scope.ctx, "INSERT OR IGNORE INTO assignment_transitions (id, name) VALUES (?1, ?2)", id, name); err != nil {
 			return fmt.Errorf("ensureOperationsSchema: seed assignment_transitions: %w", err)
 		}
 	}
@@ -108,7 +108,13 @@ func (scope *connScope) ensureOperationsSchema() error {
 	if err := scope.ensureActivityCreationsSchema(); err != nil {
 		return err
 	}
-	return scope.completeJournalOperationFK()
+	if err := scope.completeJournalOperationFK(); err != nil {
+		return err
+	}
+	if err := allocation.EnsureSchema(scope.ctx, allocationSQLTx{conn: scope.conn}); err != nil {
+		return fmt.Errorf("ensure governed allocation schema: %w", err)
+	}
+	return nil
 }
 
 // ensureCanonicalMutationColumns upgrades operation rows without rewriting them.
@@ -119,14 +125,21 @@ func (scope *connScope) ensureCanonicalMutationColumns() error {
 		canonicalOperationVersionColumn, canonicalOperationBytesColumn,
 	} {
 		present := false
-		if err := sqlitex.ExecuteTransient(scope.conn, "PRAGMA table_info(journal_operations)", &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
-			present = present || stmt.ColumnText(1) == column.name()
+		if err := scope.queryRows("PRAGMA table_info(journal_operations)", nil, func(rows *sql.Rows) error {
+			var cid int
+			var name, columnType string
+			var notNull, pk int
+			var defaultValue any
+			if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+				return err
+			}
+			present = present || name == column.name()
 			return nil
-		}}); err != nil {
+		}); err != nil {
 			return fmt.Errorf("ensure canonical mutation schema: inspect %s: %w", column.name(), err)
 		}
 		if !present {
-			if err := sqlitex.ExecuteTransient(scope.conn, column.addQuery(), nil); err != nil {
+			if _, err := scope.conn.ExecContext(scope.ctx, column.addQuery()); err != nil {
 				return fmt.Errorf("ensure canonical mutation schema: add %s: %w", column.name(), err)
 			}
 		}
@@ -164,38 +177,39 @@ func (column canonicalOperationColumn) addQuery() string {
 
 func (scope *connScope) ensureGenericCanonicalConstraints() error {
 	var tableSQL string
-	if err := sqlitex.Execute(scope.conn, "SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2", &sqlitex.ExecOptions{Args: []any{"table", "journal_operations"}, ResultFunc: func(stmt *zs.Stmt) error { tableSQL = stmt.ColumnText(0); return nil }}); err != nil {
+	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2", "table", "journal_operations").Scan(&tableSQL); err != nil {
 		return fmt.Errorf("inspect journal_operations constraint: %w", err)
 	}
 	needsTriggers := false
 	if strings.Contains(tableSQL, journal.MutationEncodingV1.String()) {
 		needsTriggers = true
-		if err := sqlitex.ExecuteTransient(scope.conn, "DROP TRIGGER IF EXISTS journal_operations_canonical_insert", nil); err != nil {
+		if _, err := scope.conn.ExecContext(scope.ctx, "DROP TRIGGER IF EXISTS journal_operations_canonical_insert"); err != nil {
 			return fmt.Errorf("replace V1-specific journal_operations constraint: drop insert trigger: %w", err)
 		}
-		if err := sqlitex.ExecuteTransient(scope.conn, "DROP TRIGGER IF EXISTS journal_operations_canonical_update", nil); err != nil {
+		if _, err := scope.conn.ExecContext(scope.ctx, "DROP TRIGGER IF EXISTS journal_operations_canonical_update"); err != nil {
 			return fmt.Errorf("replace V1-specific journal_operations constraint: drop update trigger: %w", err)
 		}
-		if err := sqlitex.ExecuteTransient(scope.conn, "CREATE TABLE journal_operations_generic (journal_id INTEGER PRIMARY KEY REFERENCES journal(journal_id),operation_id TEXT NOT NULL UNIQUE,authority_journal_id INTEGER REFERENCES journal_authorities(journal_id),command_digest BLOB NOT NULL,mutation_digest BLOB NOT NULL,mutation_encoding_version TEXT,canonical_mutation BLOB,CHECK ((mutation_encoding_version IS NULL AND canonical_mutation IS NULL) OR (length(mutation_encoding_version)>0 AND length(canonical_mutation)>0))) STRICT", nil); err != nil {
+		if _, err := scope.conn.ExecContext(scope.ctx, "CREATE TABLE journal_operations_generic (journal_id INTEGER PRIMARY KEY REFERENCES journal(journal_id),operation_id TEXT NOT NULL UNIQUE,authority_journal_id INTEGER REFERENCES journal_authorities(journal_id),command_digest BLOB NOT NULL,mutation_digest BLOB NOT NULL,mutation_encoding_version TEXT,canonical_mutation BLOB,CHECK ((mutation_encoding_version IS NULL AND canonical_mutation IS NULL) OR (length(mutation_encoding_version)>0 AND length(canonical_mutation)>0))) STRICT"); err != nil {
 			return fmt.Errorf("replace V1-specific journal_operations constraint: create generic table: %w", err)
 		}
-		if err := sqlitex.Execute(scope.conn, "INSERT INTO journal_operations_generic SELECT * FROM journal_operations", nil); err != nil {
+		if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO journal_operations_generic SELECT * FROM journal_operations"); err != nil {
 			return fmt.Errorf("replace V1-specific journal_operations constraint: copy rows: %w", err)
 		}
-		if err := sqlitex.ExecuteTransient(scope.conn, "DROP TABLE journal_operations", nil); err != nil {
+		if _, err := scope.conn.ExecContext(scope.ctx, "DROP TABLE journal_operations"); err != nil {
 			return fmt.Errorf("replace V1-specific journal_operations constraint: drop old table: %w", err)
 		}
-		if err := sqlitex.ExecuteTransient(scope.conn, "ALTER TABLE journal_operations_generic RENAME TO journal_operations", nil); err != nil {
+		if _, err := scope.conn.ExecContext(scope.ctx, "ALTER TABLE journal_operations_generic RENAME TO journal_operations"); err != nil {
 			return fmt.Errorf("replace V1-specific journal_operations constraint: rename table: %w", err)
 		}
 	}
 	if !needsTriggers {
 		for _, name := range []string{"journal_operations_canonical_insert", "journal_operations_canonical_update"} {
-			sql := ""
-			if err := sqlitex.Execute(scope.conn, "SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2", &sqlitex.ExecOptions{Args: []any{"trigger", name}, ResultFunc: func(stmt *zs.Stmt) error { sql = stmt.ColumnText(0); return nil }}); err != nil {
+			triggerSQL := ""
+			err := scope.conn.QueryRowContext(scope.ctx, "SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2", "trigger", name).Scan(&triggerSQL)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return err
 			}
-			if sql == "" || strings.Contains(sql, journal.MutationEncodingV1.String()) {
+			if triggerSQL == "" || strings.Contains(triggerSQL, journal.MutationEncodingV1.String()) {
 				needsTriggers = true
 				break
 			}
@@ -205,7 +219,7 @@ func (scope *connScope) ensureGenericCanonicalConstraints() error {
 		return nil
 	}
 	for _, trigger := range []string{"DROP TRIGGER IF EXISTS journal_operations_canonical_insert", "DROP TRIGGER IF EXISTS journal_operations_canonical_update", "CREATE TRIGGER journal_operations_canonical_insert BEFORE INSERT ON journal_operations WHEN NOT ((NEW.mutation_encoding_version IS NULL AND NEW.canonical_mutation IS NULL) OR (length(NEW.mutation_encoding_version)>0 AND length(NEW.canonical_mutation)>0)) BEGIN SELECT RAISE(ABORT,'invalid canonical mutation version/bytes pair'); END", "CREATE TRIGGER journal_operations_canonical_update BEFORE UPDATE OF mutation_encoding_version,canonical_mutation ON journal_operations WHEN NOT ((NEW.mutation_encoding_version IS NULL AND NEW.canonical_mutation IS NULL) OR (length(NEW.mutation_encoding_version)>0 AND length(NEW.canonical_mutation)>0)) BEGIN SELECT RAISE(ABORT,'invalid canonical mutation version/bytes pair'); END"} {
-		if err := sqlitex.ExecuteTransient(scope.conn, trigger, nil); err != nil {
+		if _, err := scope.conn.ExecContext(scope.ctx, trigger); err != nil {
 			return fmt.Errorf("install generic canonical constraint trigger: %w", err)
 		}
 	}
@@ -230,49 +244,53 @@ func (scope *connScope) preflightCanonicalColumnsReadOnly() error {
 		return nil
 	}
 	malformed, versionState, bytesState := "", "", ""
-	if err := sqlitex.Execute(scope.conn, "SELECT operation_id,mutation_encoding_version,canonical_mutation FROM journal_operations WHERE (mutation_encoding_version IS ?1) != (canonical_mutation IS ?2) OR (mutation_encoding_version IS NOT ?3 AND (NOT length(mutation_encoding_version) OR NOT length(canonical_mutation))) LIMIT ?4", &sqlitex.ExecOptions{Args: []any{nil, nil, nil, 1}, ResultFunc: func(stmt *zs.Stmt) error {
-		malformed = stmt.ColumnText(0)
-		versionState = canonicalColumnState(stmt, 1)
-		bytesState = canonicalColumnState(stmt, 2)
-		return nil
-	}}); err != nil {
+	var version sql.NullString
+	var wire []byte
+	var wireIsNull bool
+	err = scope.conn.QueryRowContext(scope.ctx, "SELECT operation_id,mutation_encoding_version,canonical_mutation,canonical_mutation IS NULL FROM journal_operations WHERE (mutation_encoding_version IS ?1) != (canonical_mutation IS ?2) OR (mutation_encoding_version IS NOT ?3 AND (NOT length(mutation_encoding_version) OR NOT length(canonical_mutation))) LIMIT ?4", nil, nil, nil, 1).Scan(&malformed, &version, &wire, &wireIsNull)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return canonicalStartupPreflightError(fmt.Errorf("%w: %v", journal.ErrProjectionDivergence, err), "canonical version/bytes pairing could not be inspected", "SQLite rejected the read-only canonical-pair query: "+err.Error(), "repair the journal_operations canonical columns from a known-good backup, then retry Open")
+	}
+	if err == nil {
+		versionState = canonicalColumnState(version.Valid, len(version.String))
+		bytesState = canonicalColumnState(!wireIsNull, len(wire))
 	}
 	if malformed != "" {
 		return canonicalStartupPreflightError(journal.ErrProjectionDivergence, fmt.Sprintf("operation %q has malformed canonical pairing (version=%s, bytes=%s)", malformed, versionState, bytesState), "version and bytes must either both be NULL for a legacy row or both be nonempty for a canonical row", "restore both canonical columns from the same committed operation, or set both NULL only if the row is genuinely legacy")
 	}
 	oversized := ""
-	if err := sqlitex.Execute(scope.conn, "SELECT operation_id FROM journal_operations WHERE canonical_mutation IS NOT ?2 AND length(canonical_mutation)>?1 LIMIT ?3", &sqlitex.ExecOptions{Args: []any{journal.MaxCanonicalMutationBytes, nil, 1}, ResultFunc: func(stmt *zs.Stmt) error {
-		oversized = stmt.ColumnText(0)
-		return nil
-	}}); err != nil {
+	err = scope.conn.QueryRowContext(scope.ctx, "SELECT operation_id FROM journal_operations WHERE canonical_mutation IS NOT ?2 AND length(canonical_mutation)>?1 LIMIT ?3", journal.MaxCanonicalMutationBytes, nil, 1).Scan(&oversized)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return canonicalStartupPreflightError(fmt.Errorf("%w: %v", journal.ErrCanonicalMutation, err), "canonical mutation size could not be inspected", "SQLite rejected the read-only canonical-size query: "+err.Error(), "repair journal_operations from a known-good backup, then retry Open")
 	}
 	if oversized != "" {
 		cause := &journal.CanonicalMutationError{Field: "mutation", Reason: fmt.Sprintf("operation %q exceeds maximum %d bytes", oversized, journal.MaxCanonicalMutationBytes), Fix: "restore bounded canonical bytes"}
 		return canonicalStartupPreflightError(cause, fmt.Sprintf("operation %q has an oversized canonical mutation", oversized), "the stored wire exceeds the allocation-safe canonical mutation limit", "restore canonical bytes and their digest from a bounded known-good committed backup")
 	}
-	if err := sqlitex.Execute(scope.conn, "SELECT operation_id,mutation_encoding_version,canonical_mutation FROM journal_operations WHERE canonical_mutation IS NOT ?1", &sqlitex.ExecOptions{Args: []any{nil}, ResultFunc: func(stmt *zs.Stmt) error {
-		opID := stmt.ColumnText(0)
-		version := stmt.ColumnText(1)
-		wire := readBlob(stmt, 2)
+	if err := scope.queryRows("SELECT operation_id,mutation_encoding_version,canonical_mutation FROM journal_operations WHERE canonical_mutation IS NOT ?1", []any{nil}, func(rows *sql.Rows) error {
+		var opID, storedVersion string
+		var storedWire []byte
+		if err := rows.Scan(&opID, &storedVersion, &storedWire); err != nil {
+			return err
+		}
+		wire := append([]byte(nil), storedWire...)
 		wireVersion, err := journal.InspectCanonicalMutationEncodingVersion(wire)
 		if err != nil {
 			return canonicalStartupPreflightError(err, fmt.Sprintf("operation %q has a malformed canonical wire-version frame", opID), "the canonical bytes do not begin with one valid framed version field", "restore canonical bytes and mutation digest from the same committed backup")
 		}
-		if !wireVersion.MatchesStoredText(version) {
-			return canonicalStartupPreflightError(journal.ErrProjectionDivergence, fmt.Sprintf("operation %q column version %q differs from wire version (opaque inspected tag)", opID, version), "the redundant column and framed wire version identify different codecs", "restore mutation_encoding_version, canonical_mutation, and mutation_digest from the same committed operation")
+		if !wireVersion.MatchesStoredText(storedVersion) {
+			return canonicalStartupPreflightError(journal.ErrProjectionDivergence, fmt.Sprintf("operation %q column version %q differs from wire version (opaque inspected tag)", opID, storedVersion), "the redundant column and framed wire version identify different codecs", "restore mutation_encoding_version, canonical_mutation, and mutation_digest from the same committed operation")
 		}
 		registeredVersion, supported := wireVersion.RegisteredVersion()
 		if !supported || !journal.IsSupportedMutationEncoding(registeredVersion) {
-			cause := &journal.CanonicalMutationError{Field: "version", Reason: fmt.Sprintf("unsupported canonical codec version %q for operation %q", version, opID), Fix: "open with a build that supports this codec or restore bytes written by a supported codec"}
-			return canonicalStartupPreflightError(cause, fmt.Sprintf("operation %q uses unsupported canonical codec version %q", opID, version), "the column and wire agree, but this build has no registered decoder for that version", "upgrade to a codec-capable build, or restore the operation's version, bytes, and digest from a supported backup")
+			cause := &journal.CanonicalMutationError{Field: "version", Reason: fmt.Sprintf("unsupported canonical codec version %q for operation %q", storedVersion, opID), Fix: "open with a build that supports this codec or restore bytes written by a supported codec"}
+			return canonicalStartupPreflightError(cause, fmt.Sprintf("operation %q uses unsupported canonical codec version %q", opID, storedVersion), "the column and wire agree, but this build has no registered decoder for that version", "upgrade to a codec-capable build, or restore the operation's version, bytes, and digest from a supported backup")
 		}
 		if _, err := journal.DecodeCanonicalMutation(wire); err != nil {
-			return canonicalStartupPreflightError(err, fmt.Sprintf("operation %q has malformed canonical wire for supported version %q", opID, version), "the full canonical frame is invalid, incomplete, duplicated, or has trailing data", "restore canonical bytes and mutation digest from the same committed operation")
+			return canonicalStartupPreflightError(err, fmt.Sprintf("operation %q has malformed canonical wire for supported version %q", opID, storedVersion), "the full canonical frame is invalid, incomplete, duplicated, or has trailing data", "restore canonical bytes and mutation digest from the same committed operation")
 		}
 		return nil
-	}}); err != nil {
+	}); err != nil {
 		if errors.Is(err, journal.ErrCanonicalMutation) || errors.Is(err, journal.ErrProjectionDivergence) {
 			return err
 		}
@@ -281,14 +299,14 @@ func (scope *connScope) preflightCanonicalColumnsReadOnly() error {
 	return nil
 }
 
-func canonicalColumnState(stmt *zs.Stmt, column int) string {
-	if stmt.ColumnType(column) == zs.TypeNull {
+func canonicalColumnState(valid bool, n int) string {
+	if !valid {
 		return "NULL"
 	}
-	if stmt.ColumnLen(column) == 0 {
+	if n == 0 {
 		return "empty"
 	}
-	return fmt.Sprintf("nonempty(%d bytes)", stmt.ColumnLen(column))
+	return fmt.Sprintf("nonempty(%d bytes)", n)
 }
 
 func canonicalStartupPreflightError(cause error, what, why, fix string) error {
@@ -312,17 +330,17 @@ func (scope *connScope) completeJournalOperationFK() error {
 	// Open disables FK enforcement before beginning its one activation transaction
 	// and restores it after commit/rollback. This function must remain composable:
 	// it neither starts a nested transaction nor changes connection pragmas.
-	if err := sqlitex.ExecuteTransient(scope.conn, "DROP VIEW IF EXISTS journal_attributed", nil); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, "DROP VIEW IF EXISTS journal_attributed"); err != nil {
 		return fmt.Errorf("completeJournalOperationFK: drop view: %w", err)
 	}
-	if err := sqlitex.ExecuteTransient(scope.conn, "CREATE TABLE journal_new (journal_id INTEGER PRIMARY KEY AUTOINCREMENT,kind_id INTEGER NOT NULL REFERENCES journal_kinds(id),actor_id TEXT REFERENCES agents(id),recorded_at INTEGER NOT NULL,produced_by_operation_journal_id INTEGER REFERENCES journal_operations(journal_id),CHECK ((actor_id IS NULL) = (produced_by_operation_journal_id IS NOT NULL)),CHECK (kind_id <> 1 OR produced_by_operation_journal_id IS NOT NULL)) STRICT", nil); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, "CREATE TABLE journal_new (journal_id INTEGER PRIMARY KEY AUTOINCREMENT,kind_id INTEGER NOT NULL REFERENCES journal_kinds(id),actor_id TEXT REFERENCES agents(id),recorded_at INTEGER NOT NULL,produced_by_operation_journal_id INTEGER REFERENCES journal_operations(journal_id),CHECK ((actor_id IS NULL) = (produced_by_operation_journal_id IS NOT NULL)),CHECK (kind_id <> 1 OR produced_by_operation_journal_id IS NOT NULL)) STRICT"); err != nil {
 		return fmt.Errorf("completeJournalOperationFK: create table: %w", err)
 	}
-	if err := sqlitex.Execute(scope.conn, "INSERT INTO journal_new (journal_id, kind_id, actor_id, recorded_at, produced_by_operation_journal_id) SELECT journal_id, kind_id, actor_id, recorded_at, produced_by_operation_journal_id FROM journal", nil); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO journal_new (journal_id, kind_id, actor_id, recorded_at, produced_by_operation_journal_id) SELECT journal_id, kind_id, actor_id, recorded_at, produced_by_operation_journal_id FROM journal"); err != nil {
 		return fmt.Errorf("completeJournalOperationFK: copy rows: %w", err)
 	}
 	for _, stmt := range []string{"DROP TABLE journal", "ALTER TABLE journal_new RENAME TO journal", "CREATE INDEX IF NOT EXISTS idx_journal_kind ON journal (kind_id)", "CREATE INDEX IF NOT EXISTS idx_journal_actor ON journal (actor_id)", "CREATE INDEX IF NOT EXISTS idx_journal_pboj ON journal (produced_by_operation_journal_id)", "CREATE INDEX IF NOT EXISTS idx_journal_recorded_at ON journal (recorded_at, journal_id)", journalAttributedViewDDL} {
-		if err := sqlitex.ExecuteTransient(scope.conn, stmt, nil); err != nil {
+		if _, err := scope.conn.ExecContext(scope.ctx, stmt); err != nil {
 			return fmt.Errorf("completeJournalOperationFK: rebuild DDL: %w", err)
 		}
 	}
@@ -332,8 +350,10 @@ func (scope *connScope) completeJournalOperationFK() error {
 	// (foreign_key_check IS permitted inside a transaction; only the
 	// foreign_keys=ON/OFF toggle is the no-op-inside-a-tx pragma handled above.)
 	var violations int
-	if err := sqlitex.ExecuteTransient(scope.conn, "PRAGMA foreign_key_check",
-		&sqlitex.ExecOptions{ResultFunc: func(*zs.Stmt) error { violations++; return nil }}); err != nil {
+	if err := scope.queryRows("PRAGMA foreign_key_check", nil, func(rows *sql.Rows) error {
+		violations++
+		return nil
+	}); err != nil {
 		return fmt.Errorf("completeJournalOperationFK: foreign_key_check: %w", err)
 	}
 	if violations > 0 {
@@ -346,14 +366,18 @@ func (scope *connScope) completeJournalOperationFK() error {
 
 func (scope *connScope) journalProducedByFKPresent() (bool, error) {
 	present := false
-	if err := sqlitex.ExecuteTransient(scope.conn, "PRAGMA foreign_key_list(journal)",
-		&sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
-			// columns: id, seq, table, from, to, on_update, on_delete, match
-			if stmt.ColumnText(3) == "produced_by_operation_journal_id" {
-				present = true
-			}
-			return nil
-		}}); err != nil {
+	if err := scope.queryRows("PRAGMA foreign_key_list(journal)", nil, func(rows *sql.Rows) error {
+		var id, sequence int
+		var table, from, to, onUpdate, onDelete, match string
+		if err := rows.Scan(&id, &sequence, &table, &from, &to, &onUpdate, &onDelete, &match); err != nil {
+			return err
+		}
+		// columns: id, seq, table, from, to, on_update, on_delete, match
+		if from == "produced_by_operation_journal_id" {
+			present = true
+		}
+		return nil
+	}); err != nil {
 		return false, fmt.Errorf("journalProducedByFKPresent: %w", err)
 	}
 	return present, nil
@@ -370,11 +394,12 @@ func (db *DB) JournalIsEmpty() (bool, error) {
 		return false, fmt.Errorf("JournalIsEmpty: lease pooled connection: %w", err)
 	}
 	defer scope.release()
-	empty := true
-	if err := sqlitex.Execute(scope.conn, "SELECT ?1 FROM journal LIMIT ?2", &sqlitex.ExecOptions{Args: []any{1, 1}, ResultFunc: func(*zs.Stmt) error { empty = false; return nil }}); err != nil {
+	var present int
+	err = scope.conn.QueryRowContext(scope.ctx, "SELECT ?1 FROM journal LIMIT ?2", 1, 1).Scan(&present)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, fmt.Errorf("JournalIsEmpty: %w", err)
 	}
-	return empty, nil
+	return errors.Is(err, sql.ErrNoRows), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -414,39 +439,17 @@ func (db *DB) Apply(in journal.OperationInput) (res journal.CommittedResult, err
 	// the loser observes the winner's committed fact and receives ConditionFailure
 	// (not BUSY_SNAPSHOT). Initial BUSY/LOCKED while acquiring this lock is
 	// transient infrastructure — the 5 s busy_timeout (set in Open) retries it.
-	if err := scope.beginWriteOwnership(); err != nil {
-		return journal.CommittedResult{}, err
+	if transactionErr := runImmediateTransaction(scope.ctx, scope.conn, func() error {
+		var foldErr error
+		res, foldErr = scope.foldPreparedOperation(in, prepared, callerMutationDigest, nil)
+		return foldErr
+	}); transactionErr != nil {
+		// A replay conflict intentionally returns both its closed result variant and
+		// its typed error. The transaction rolls back because no new durable state
+		// may accompany the conflict, but callers still need its classified axis.
+		return res, fmt.Errorf("Apply: acquire, fold, and commit pinned SQLite write transaction: %w", transactionErr)
 	}
-	defer func() {
-		if err != nil {
-			_ = sqlitex.ExecuteTransient(scope.conn, "ROLLBACK", nil)
-		} else {
-			commitErr := sqlitex.ExecuteTransient(scope.conn, "COMMIT", nil)
-			if commitErr != nil {
-				_ = sqlitex.ExecuteTransient(scope.conn, "ROLLBACK", nil)
-				res = journal.CommittedResult{}
-				err = fmt.Errorf("Apply: commit pooled write transaction before returning lease: %w", commitErr)
-			}
-		}
-	}()
-	res, err = scope.foldPreparedOperation(in, prepared, callerMutationDigest, nil)
-	return res, err
-}
-
-// beginWriteOwnership executes BEGIN IMMEDIATE on the held connection,
-// acquiring SQLite write ownership before any read or write in the Apply
-// transaction. The caller must own scope.conn for the full transaction.
-func (scope *connScope) beginWriteOwnership() error {
-	if err := sqlitex.ExecuteTransient(scope.conn, "BEGIN IMMEDIATE", nil); err != nil {
-		return fmt.Errorf(
-			"Apply: acquire SQLite write ownership (BEGIN IMMEDIATE): %w — "+
-				"where: Apply write transaction setup; when: before OperationID lookup or condition reads; "+
-				"impact: nothing was written; the caller's operation was not committed; "+
-				"fix: if BUSY/LOCKED, the 5 s busy_timeout will retry automatically; "+
-				"persistent failure indicates another connection holds a long write transaction",
-			err)
-	}
-	return nil
+	return res, nil
 }
 
 // validateApplyInput runs the pre-transaction input checks shared by the public
@@ -498,8 +501,17 @@ func (scope *connScope) foldPreparedOperation(in journal.OperationInput, prepare
 	// §13 whole-batch atomicity); standalone it behaves as an ordinary atomic
 	// transaction.
 	var txErr error
-	endTx := sqlitex.Save(scope.conn)
-	defer endTx(&txErr)
+	if _, txErr = scope.conn.ExecContext(scope.ctx, "SAVEPOINT provenance_fold"); txErr != nil {
+		return journal.CommittedResult{}, fmt.Errorf("Apply: start reducer savepoint: %w", txErr)
+	}
+	defer func() {
+		if txErr != nil {
+			_, _ = scope.conn.ExecContext(scope.ctx, "ROLLBACK TO SAVEPOINT provenance_fold")
+			_, _ = scope.conn.ExecContext(scope.ctx, "RELEASE SAVEPOINT provenance_fold")
+			return
+		}
+		_, _ = scope.conn.ExecContext(scope.ctx, "RELEASE SAVEPOINT provenance_fold")
+	}()
 
 	// §9.4: OperationID-presence short-circuit, evaluated before any
 	// operation-kind-specific validity check (genesis rule 6 included, §4.6).
@@ -710,11 +722,12 @@ func (scope *connScope) foldTaskCreate(in journal.OperationInput, jid int64, eff
 	}
 	// Existence guard: creating a task id that already has a row is a typed conflict,
 	// not a silent duplicate (the UNIQUE PK would otherwise surface a raw driver error).
-	exists := false
-	if err := sqlitex.Execute(scope.conn, "SELECT ?2 FROM tasks WHERE id = ?1", &sqlitex.ExecOptions{Args: []any{eff.TaskID.String(), 1}, ResultFunc: func(*zs.Stmt) error { exists = true; return nil }}); err != nil {
+	var exists int
+	err := scope.conn.QueryRowContext(scope.ctx, "SELECT ?2 FROM tasks WHERE id = ?1", eff.TaskID.String(), 1).Scan(&exists)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("Apply: task-create existence check for %q: %w", eff.TaskID, err)
 	}
-	if exists {
+	if err == nil {
 		return fmt.Errorf(
 			"provenance: operation %q task-create effect targets task %q which already exists — where: "+
 				"task-create fold (§8.1); when: before commit; impact: nothing committed; fix: create a task "+
@@ -725,11 +738,11 @@ func (scope *connScope) foldTaskCreate(in journal.OperationInput, jid int64, eff
 	if eff.RecordedAtOverride != nil {
 		recordedAt = *eff.RecordedAtOverride
 	}
-	if err := sqlitex.Execute(scope.conn, "INSERT INTO tasks\n\t\t\t(id, namespace, title, description, status_id, priority_id, type_id,\n\t\t\t phase_id, owner_id, notes, created_at, updated_at, closed_at, close_reason, last_journal_id)\n\t\t VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?13, ?9, ?10, ?11, ?14, ?9, ?12)", &sqlitex.ExecOptions{Args: []any{
+	if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO tasks\n\t\t\t(id, namespace, title, description, status_id, priority_id, type_id,\n\t\t\t phase_id, owner_id, notes, created_at, updated_at, closed_at, close_reason, last_journal_id)\n\t\t VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?13, ?9, ?10, ?11, ?14, ?9, ?12)",
 		eff.TaskID.String(), eff.TaskID.Namespace, eff.Title, eff.Description,
 		statusOpenID, int(eff.Priority), int(eff.Type), int(eff.Phase),
 		"", recordedAt, recordedAt, jid, nil, nil,
-	}}); err != nil {
+	); err != nil {
 		return fmt.Errorf("Apply: insert task row for %q: %w", eff.TaskID, err)
 	}
 	// The created event itself (provenance.task.created), forced to the canonical kind
@@ -741,9 +754,7 @@ func (scope *connScope) foldTaskCreate(in journal.OperationInput, jid int64, eff
 	if !json.Valid(payload) {
 		return fmt.Errorf("Apply: task-create payload for %q is not valid JSON", eff.TaskID)
 	}
-	if err := sqlitex.Execute(scope.conn,
-		insertJournalTaskEventSQL,
-		&sqlitex.ExecOptions{Args: []any{jid, eff.TaskID.String(), string(journal.EventKindTaskCreated), string(payload)}}); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, insertJournalTaskEventSQL, jid, eff.TaskID.String(), string(journal.EventKindTaskCreated), string(payload)); err != nil {
 		return fmt.Errorf("Apply: insert journal_task_events (task-create): %w", err)
 	}
 	contexts, err := journal.CanonicalEventContexts(eff.Contexts)
@@ -755,7 +766,7 @@ func (scope *connScope) foldTaskCreate(in journal.OperationInput, jid int64, eff
 		if encErr != nil {
 			return fmt.Errorf("Apply: encode context (task-create): %w", encErr)
 		}
-		if err := sqlitex.Execute(scope.conn, "INSERT OR IGNORE INTO journal_task_event_contexts (event_journal_id, context_kind, context_identity, attached_by_journal_id)\n\t\t\t VALUES (?1, ?2, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{jid, string(ck), identity, jid}}); err != nil {
+		if _, err := scope.conn.ExecContext(scope.ctx, "INSERT OR IGNORE INTO journal_task_event_contexts (event_journal_id, context_kind, context_identity, attached_by_journal_id)\n\t\t\t VALUES (?1, ?2, ?3, ?4)", jid, string(ck), identity, jid); err != nil {
 			return fmt.Errorf("Apply: insert context edge (task-create): %w", err)
 		}
 	}
@@ -783,9 +794,7 @@ func (scope *connScope) foldTaskEvent(in journal.OperationInput, jid int64, eff 
 	if !json.Valid(payload) {
 		return fmt.Errorf("Apply: task_event payload for %q is not valid JSON", eff.EventKind)
 	}
-	if err := sqlitex.Execute(scope.conn,
-		insertJournalTaskEventSQL,
-		&sqlitex.ExecOptions{Args: []any{jid, eff.TaskID.String(), string(eff.EventKind), string(payload)}}); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, insertJournalTaskEventSQL, jid, eff.TaskID.String(), string(eff.EventKind), string(payload)); err != nil {
 		return fmt.Errorf("Apply: insert journal_task_events: %w", err)
 	}
 	contexts, err := journal.CanonicalEventContexts(eff.Contexts)
@@ -797,7 +806,7 @@ func (scope *connScope) foldTaskEvent(in journal.OperationInput, jid int64, eff 
 		if encErr != nil {
 			return fmt.Errorf("Apply: encode context: %w", encErr)
 		}
-		if err := sqlitex.Execute(scope.conn, "INSERT OR IGNORE INTO journal_task_event_contexts (event_journal_id, context_kind, context_identity, attached_by_journal_id)\n\t\t\t VALUES (?1, ?2, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{jid, string(ck), identity, jid}}); err != nil {
+		if _, err := scope.conn.ExecContext(scope.ctx, "INSERT OR IGNORE INTO journal_task_event_contexts (event_journal_id, context_kind, context_identity, attached_by_journal_id)\n\t\t\t VALUES (?1, ?2, ?3, ?4)", jid, string(ck), identity, jid); err != nil {
 			return fmt.Errorf("Apply: insert context edge: %w", err)
 		}
 	}
@@ -849,7 +858,7 @@ func (scope *connScope) materializeTaskEventColumns(in journal.OperationInput, j
 	if eff.UpdatePhase != nil {
 		phase = int(*eff.UpdatePhase)
 	}
-	if err := sqlitex.Execute(scope.conn, "UPDATE tasks SET\n\t\tupdated_at=?1,\n\t\ttitle=CASE WHEN ?2 THEN ?3 ELSE title END,\n\t\tdescription=CASE WHEN ?4 THEN ?5 ELSE description END,\n\t\tpriority_id=CASE WHEN ?6 THEN ?7 ELSE priority_id END,\n\t\tphase_id=CASE WHEN ?8 THEN ?9 ELSE phase_id END,\n\t\tnotes=CASE WHEN ?10 THEN ?11 ELSE notes END,\n\t\tclose_reason=CASE WHEN ?12 THEN ?13 ELSE close_reason END\n\t\tWHERE id=?14", &sqlitex.ExecOptions{Args: []any{
+	if _, err := scope.conn.ExecContext(scope.ctx, "UPDATE tasks SET\n\t\tupdated_at=?1,\n\t\ttitle=CASE WHEN ?2 THEN ?3 ELSE title END,\n\t\tdescription=CASE WHEN ?4 THEN ?5 ELSE description END,\n\t\tpriority_id=CASE WHEN ?6 THEN ?7 ELSE priority_id END,\n\t\tphase_id=CASE WHEN ?8 THEN ?9 ELSE phase_id END,\n\t\tnotes=CASE WHEN ?10 THEN ?11 ELSE notes END,\n\t\tclose_reason=CASE WHEN ?12 THEN ?13 ELSE close_reason END\n\t\tWHERE id=?14",
 		recordedAt,
 		flag(eff.UpdateTitle != nil), value(eff.UpdateTitle),
 		flag(eff.UpdateDescription != nil), value(eff.UpdateDescription),
@@ -858,7 +867,7 @@ func (scope *connScope) materializeTaskEventColumns(in journal.OperationInput, j
 		flag(eff.UpdateNotes != nil), value(eff.UpdateNotes),
 		flag(closeReasonSet), eff.CloseReason,
 		eff.TaskID.String(),
-	}}); err != nil {
+	); err != nil {
 		return fmt.Errorf(
 			"Apply: operation %q materialize task-event columns for %q: %w",
 			in.OperationID, eff.TaskID, err)
@@ -871,16 +880,14 @@ func (scope *connScope) foldBootstrapAuthority(jid int64, eff journal.Effect) er
 	if authorityID == "" {
 		authorityID = fmt.Sprintf("authority--bootstrap--%d", jid)
 	}
-	if err := sqlitex.Execute(scope.conn,
-		insertJournalAuthoritySQL,
-		&sqlitex.ExecOptions{Args: []any{jid, authKindBootstrapID, authorityID}}); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, insertJournalAuthoritySQL, jid, authKindBootstrapID, authorityID); err != nil {
 		return fmt.Errorf("Apply: insert journal_authorities (bootstrap): %w", err)
 	}
 	label := eff.BootstrapLabel
 	if label == "" {
 		label = "bootstrap"
 	}
-	if err := sqlitex.Execute(scope.conn, "INSERT INTO journal_authority_bootstraps (journal_id, label) VALUES (?1, ?2)", &sqlitex.ExecOptions{Args: []any{jid, label}}); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO journal_authority_bootstraps (journal_id, label) VALUES (?1, ?2)", jid, label); err != nil {
 		return fmt.Errorf("Apply: insert journal_authority_bootstraps: %w", err)
 	}
 	return nil
@@ -931,7 +938,7 @@ func (scope *connScope) foldAssignmentStart(in journal.OperationInput, jid int64
 	// Episode identity row (append-only; created once per AssignmentID). The
 	// UNIQUE(predecessor_assignment_id) constraint is the single-consumption
 	// backstop (§14.2); a second successor of the same predecessor fails here.
-	if err := sqlitex.Execute(scope.conn, "INSERT INTO journal_authority_assignment_episodes (assignment_id, task_id, slot_id, actor_id, predecessor_assignment_id, parent_assignment_id)\n\t\t VALUES (?1, ?2, ?3, ?4, ?5, ?6)", &sqlitex.ExecOptions{Args: []any{string(eff.AssignmentID), eff.TaskID.String(), slot, occupant.String(), predecessor, parent}}); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO journal_authority_assignment_episodes (assignment_id, task_id, slot_id, actor_id, predecessor_assignment_id, parent_assignment_id)\n\t\t VALUES (?1, ?2, ?3, ?4, ?5, ?6)", string(eff.AssignmentID), eff.TaskID.String(), slot, occupant.String(), predecessor, parent); err != nil {
 		if eff.Predecessor != "" && isUniqueViolation(err) {
 			return fmt.Errorf("%w: predecessor episode %q is already consumed by another successor (§14.2)",
 				journal.ErrOrphanedEvidence, eff.Predecessor)
@@ -1006,7 +1013,7 @@ func (scope *connScope) foldDecision(in journal.OperationInput, jid int64, eff j
 	if len(payload) == 0 {
 		payload = json.RawMessage(`{}`)
 	}
-	if err := sqlitex.Execute(scope.conn, "INSERT INTO journal_decisions (journal_id, decision_kind, task_id, payload) VALUES (?1, ?2, ?3, ?4)", &sqlitex.ExecOptions{Args: []any{jid, string(eff.DecisionKind), taskID, string(payload)}}); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO journal_decisions (journal_id, decision_kind, task_id, payload) VALUES (?1, ?2, ?3, ?4)", jid, string(eff.DecisionKind), taskID, string(payload)); err != nil {
 		return fmt.Errorf("Apply: insert journal_decisions: %w", err)
 	}
 	if err := scope.persistFactContexts(factContextDecision, jid, eff.Contexts); err != nil {
@@ -1030,7 +1037,7 @@ func (scope *connScope) foldEvidence(in journal.OperationInput, jid int64, eff j
 	if len(payload) == 0 {
 		payload = json.RawMessage(`{}`)
 	}
-	if err := sqlitex.Execute(scope.conn, "INSERT INTO journal_evidence (journal_id, evidence_kind, task_id, content_digest, payload) VALUES (?1, ?2, ?3, ?4, ?5)", &sqlitex.ExecOptions{Args: []any{jid, string(eff.EvidenceKind), taskID, eff.ContentDigest, string(payload)}}); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO journal_evidence (journal_id, evidence_kind, task_id, content_digest, payload) VALUES (?1, ?2, ?3, ?4, ?5)", jid, string(eff.EvidenceKind), taskID, eff.ContentDigest, string(payload)); err != nil {
 		return fmt.Errorf("Apply: insert journal_evidence: %w", err)
 	}
 	if err := scope.persistFactContexts(factContextEvidence, jid, eff.Contexts); err != nil {

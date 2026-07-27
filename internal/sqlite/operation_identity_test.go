@@ -10,8 +10,6 @@ import (
 
 	"github.com/dayvidpham/provenance/internal/journal"
 	"github.com/dayvidpham/provenance/pkg/ptypes"
-	zs "zombiezen.com/go/sqlite"
-	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 func TestStoredOperationIdentityUsesStructuralCanonicalComparison(t *testing.T) {
@@ -152,11 +150,11 @@ func TestApplyReplayAxisAndIndexMatrixHasZeroDurableDelta(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bind alternate actor seed scope: %v", err)
 	}
-	if err := sqlitex.Execute(scope.conn, `INSERT INTO agents (id, kind_id) VALUES (?1, ?2)`, &sqlitex.ExecOptions{Args: []any{other.String(), int(ptypes.AgentKindSoftware)}}); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, `INSERT INTO agents (id, kind_id) VALUES (?1, ?2)`, other.String(), int(ptypes.AgentKindSoftware)); err != nil {
 		scope.release()
 		t.Fatalf("seed alternate actor: %v", err)
 	}
-	if err := sqlitex.Execute(scope.conn, `INSERT INTO agents_software (agent_id, name, version, source) VALUES (?1,?2,?3,?4)`, &sqlitex.ExecOptions{Args: []any{other.String(), "alternate", "0", "test"}}); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, `INSERT INTO agents_software (agent_id, name, version, source) VALUES (?1, ?2, ?3, ?4)`, other.String(), "alternate", "0", "test"); err != nil {
 		scope.release()
 		t.Fatalf("seed alternate software actor: %v", err)
 	}
@@ -349,7 +347,7 @@ func journalRowCount(t *testing.T, db *DB) int {
 	}
 	defer scope.release()
 	count := -1
-	if err := sqlitex.Execute(scope.conn, "SELECT COUNT(*) FROM journal", &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { count = stmt.ColumnInt(0); return nil }}); err != nil {
+	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT COUNT(*) FROM journal").Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 	return count
@@ -369,43 +367,33 @@ func persistAndLoadStoredIdentity(t *testing.T, db *DB, input storedOperationRep
 		t.Fatalf("bind operation identity fixture scope: %v", err)
 	}
 	defer scope.release()
-	if err := sqlitex.Execute(scope.conn, `CREATE TEMP TABLE operation_identity_fixture (
+	if _, err := scope.conn.ExecContext(scope.ctx, `CREATE TEMP TABLE operation_identity_fixture (
 		operation_id TEXT PRIMARY KEY, actor_id TEXT NOT NULL, authority_journal_id INTEGER,
 		command_digest BLOB NOT NULL, mutation_digest BLOB NOT NULL,
 		encoding_version TEXT NOT NULL, canonical_mutation BLOB NOT NULL
-	)`, nil); err != nil {
+	)`); err != nil {
 		t.Fatal(err)
 	}
-	if err := sqlitex.Execute(scope.conn, `INSERT INTO operation_identity_fixture VALUES (?1,?2,?3,?4,?5,?6,?7)`, &sqlitex.ExecOptions{Args: []any{
-		string(input.operationID), input.actorID.String(), int64(*input.authorityJournalID), input.commandDigest, input.mutationDigest, input.encodingVersion, input.canonicalMutation,
-	}}); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, `INSERT INTO operation_identity_fixture VALUES (?1,?2,?3,?4,?5,?6,?7)`, string(input.operationID), input.actorID.String(), int64(*input.authorityJournalID), input.commandDigest, input.mutationDigest, input.encodingVersion, input.canonicalMutation); err != nil {
 		t.Fatal(err)
 	}
 	var output storedOperationReplayIdentity
-	if err := sqlitex.Execute(scope.conn, `SELECT operation_id,actor_id,authority_journal_id,command_digest,mutation_digest,encoding_version,canonical_mutation FROM operation_identity_fixture`, &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
-		output.operationID = journal.OperationID(stmt.ColumnText(0))
-		actor, err := ptypes.ParseActorID(stmt.ColumnText(1))
-		if err != nil {
-			return err
-		}
-		output.actorID = actor
-		authority := journal.JournalID(stmt.ColumnInt64(2))
-		output.authorityJournalID = &authority
-		output.commandDigest = readIdentityBlob(stmt, 3)
-		output.mutationDigest = readIdentityBlob(stmt, 4)
-		output.encodingVersion = stmt.ColumnText(5)
-		output.canonicalMutation = readIdentityBlob(stmt, 6)
-		return nil
-	}}); err != nil {
+	var actorRaw string
+	var authority int64
+	if err := scope.conn.QueryRowContext(scope.ctx, `SELECT operation_id,actor_id,authority_journal_id,command_digest,mutation_digest,encoding_version,canonical_mutation FROM operation_identity_fixture`).Scan(&output.operationID, &actorRaw, &authority, &output.commandDigest, &output.mutationDigest, &output.encodingVersion, &output.canonicalMutation); err != nil {
 		t.Fatal(err)
 	}
+	actor, err := ptypes.ParseActorID(actorRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output.actorID = actor
+	authorityJournalID := journal.JournalID(authority)
+	output.authorityJournalID = &authorityJournalID
+	output.commandDigest = append([]byte(nil), output.commandDigest...)
+	output.mutationDigest = append([]byte(nil), output.mutationDigest...)
+	output.canonicalMutation = append([]byte(nil), output.canonicalMutation...)
 	return output
-}
-
-func readIdentityBlob(stmt *zs.Stmt, column int) []byte {
-	value := make([]byte, stmt.ColumnLen(column))
-	stmt.ColumnBytes(column, value)
-	return value
 }
 
 func cloneIdentityInput(input journal.OperationInput) journal.OperationInput {

@@ -10,8 +10,6 @@ import (
 	"github.com/dayvidpham/provenance/internal/journal"
 	"github.com/dayvidpham/provenance/pkg/ptypes"
 	"github.com/google/uuid"
-	zs "zombiezen.com/go/sqlite"
-	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 // fact_conditions_test.go tests transaction-local ExactFact and CurrentFact
@@ -72,15 +70,16 @@ func latestFactInLeasedTransaction(t *testing.T, db *DB, sel journal.FactSelecto
 		t.Fatalf("bind fact matcher connection: %v", err)
 	}
 	defer scope.release()
-	var txErr error
-	endTx := sqlitex.Save(scope.conn)
-	defer endTx(&txErr)
-	kind, args, err := buildSelectorArgs(sel, 0)
-	if err != nil {
-		t.Fatalf("build fact selector: %v", err)
-	}
-	latest, found, err := latestFactSelector(scope, kind, args)
-	if err != nil {
+	var latest journal.JournalID
+	var found bool
+	if err := runScopedTransaction(scope.ctx, scope.conn, "BEGIN", func() error {
+		kind, args, err := buildSelectorArgs(sel, 0)
+		if err != nil {
+			return err
+		}
+		latest, found, err = latestFactSelector(scope, kind, args)
+		return err
+	}); err != nil {
 		t.Fatalf("evaluate latest fact on leased transaction: %v", err)
 	}
 	return latest, found
@@ -465,10 +464,10 @@ func TestFactMatcherOnLeasedTransaction(t *testing.T) {
 		t.Fatalf("bind matcher connection: %v", err)
 	}
 	defer scope.release()
-	if err := sqlitex.ExecuteTransient(scope.conn, "BEGIN IMMEDIATE", nil); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, "BEGIN IMMEDIATE"); err != nil {
 		t.Fatalf("begin matcher transaction: %v", err)
 	}
-	defer func() { _ = sqlitex.ExecuteTransient(scope.conn, "ROLLBACK", nil) }()
+	defer func() { _, _ = scope.conn.ExecContext(scope.ctx, "ROLLBACK") }()
 
 	latest, found, err := evaluateCurrentFactSelector(scope, sel)
 	if err != nil || !found || latest <= 0 {
@@ -532,14 +531,8 @@ func TestSharedFactPageBindingUsesBoundedKindsSnapshotCursorAndContexts(t *testi
 	if binding.form != factMatchPage || binding.contexts != factContextDecision || binding.snapshotMax != second || binding.afterJournal != 0 || len(binding.pageKinds) != 2 {
 		t.Fatalf("page binding = %+v, want decision context relation, snapshot=%d, zero cursor, two kinds", binding, second)
 	}
-	var ids []journal.JournalID
-	if err := sqlitex.Execute(scope.conn, binding.kind.pageMatchSQL(), &sqlitex.ExecOptions{
-		Args: binding.args,
-		ResultFunc: func(stmt *zs.Stmt) error {
-			ids = append(ids, journal.JournalID(stmt.ColumnInt64(0)))
-			return nil
-		},
-	}); err != nil {
+	ids, err := factPageBindingIDs(scope, binding)
+	if err != nil {
 		t.Fatalf("execute shared page binding: %v", err)
 	}
 	if len(ids) != 2 || ids[0] != first || ids[1] != second {
@@ -551,14 +544,8 @@ func TestSharedFactPageBindingUsesBoundedKindsSnapshotCursorAndContexts(t *testi
 	if err != nil {
 		t.Fatalf("build cursor page binding: %v", err)
 	}
-	ids = nil
-	if err := sqlitex.Execute(scope.conn, binding.kind.pageMatchSQL(), &sqlitex.ExecOptions{
-		Args: binding.args,
-		ResultFunc: func(stmt *zs.Stmt) error {
-			ids = append(ids, journal.JournalID(stmt.ColumnInt64(0)))
-			return nil
-		},
-	}); err != nil {
+	ids, err = factPageBindingIDs(scope, binding)
+	if err != nil {
 		t.Fatalf("execute cursor page binding: %v", err)
 	}
 	if len(ids) != 1 || ids[0] != second {
@@ -584,10 +571,10 @@ func TestFactConditionsObserveSuppliedTransactionAndRollback(t *testing.T) {
 		t.Fatalf("bind condition connection: %v", err)
 	}
 	defer scope.release()
-	if err := sqlitex.ExecuteTransient(scope.conn, "BEGIN IMMEDIATE", nil); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, "BEGIN IMMEDIATE"); err != nil {
 		t.Fatalf("begin condition transaction: %v", err)
 	}
-	if err := sqlitex.Execute(scope.conn, "UPDATE journal_decisions SET decision_kind=?1 WHERE journal_id=?2", &sqlitex.ExecOptions{Args: []any{"fixture.transaction.v1", int64(jid)}}); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, "UPDATE journal_decisions SET decision_kind=?1 WHERE journal_id=?2", "fixture.transaction.v1", int64(jid)); err != nil {
 		t.Fatalf("update transaction-local decision: %v", err)
 	}
 	txSel := journal.FactSelector{Kind: journal.FactDecision, DecisionKind: "fixture.transaction.v1",
@@ -599,14 +586,14 @@ func TestFactConditionsObserveSuppliedTransactionAndRollback(t *testing.T) {
 	if err := checkConditions(scope, conditions); !errors.Is(err, journal.ErrFactContextIntegrity) {
 		t.Fatalf("transaction-local parent rewrite error = %v, want ErrFactContextIntegrity", err)
 	}
-	if err := sqlitex.ExecuteTransient(scope.conn, "ROLLBACK", nil); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, "ROLLBACK"); err != nil {
 		t.Fatalf("rollback condition transaction: %v", err)
 	}
 
-	if err := sqlitex.ExecuteTransient(scope.conn, "BEGIN", nil); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, "BEGIN"); err != nil {
 		t.Fatalf("begin post-rollback read transaction: %v", err)
 	}
-	defer func() { _ = sqlitex.ExecuteTransient(scope.conn, "ROLLBACK", nil) }()
+	defer func() { _, _ = scope.conn.ExecContext(scope.ctx, "ROLLBACK") }()
 	if actual, found, err := evaluateCurrentFactSelector(scope, committedSel); err != nil || !found || actual != jid {
 		t.Fatalf("committed selector after rollback: actual=%d found=%v err=%v, want %d", actual, found, err, jid)
 	}
@@ -626,24 +613,24 @@ func TestFactMatcherLookupFailureRollsBackCleanly(t *testing.T) {
 		t.Fatalf("bind matcher connection: %v", err)
 	}
 	defer scope.release()
-	if err := sqlitex.ExecuteTransient(scope.conn, "BEGIN IMMEDIATE", nil); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, "BEGIN IMMEDIATE"); err != nil {
 		t.Fatalf("begin lookup-failure transaction: %v", err)
 	}
-	if err := sqlitex.ExecuteTransient(scope.conn, "DROP VIEW journal_attributed", nil); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, "DROP VIEW journal_attributed"); err != nil {
 		t.Fatalf("drop matcher dependency in transaction: %v", err)
 	}
 	_, _, lookupErr := evaluateExactFactSelector(scope, sel, 1)
 	if lookupErr == nil || !strings.Contains(lookupErr.Error(), "evaluateExactFactSelector") {
 		t.Fatalf("lookup failure = %v, want contextual matcher error", lookupErr)
 	}
-	if err := sqlitex.ExecuteTransient(scope.conn, "ROLLBACK", nil); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, "ROLLBACK"); err != nil {
 		t.Fatalf("rollback lookup-failure transaction: %v", err)
 	}
 
-	if err := sqlitex.ExecuteTransient(scope.conn, "BEGIN", nil); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, "BEGIN"); err != nil {
 		t.Fatalf("begin recovered lookup transaction: %v", err)
 	}
-	defer func() { _ = sqlitex.ExecuteTransient(scope.conn, "ROLLBACK", nil) }()
+	defer func() { _, _ = scope.conn.ExecContext(scope.ctx, "ROLLBACK") }()
 	if _, found, err := evaluateCurrentFactSelector(scope, sel); err != nil || !found {
 		t.Fatalf("matcher after rollback: found=%v err=%v", found, err)
 	}
@@ -792,4 +779,24 @@ func TestFactConditionsRequireSubtypeOwnedContexts(t *testing.T) {
 			t.Fatalf("scope condition %+v: result=%+v err=%v", condition, result, err)
 		}
 	}
+}
+
+func factPageBindingIDs(scope *connScope, binding factMatchBinding) ([]journal.JournalID, error) {
+	rows, err := scope.conn.QueryContext(scope.ctx, binding.kind.pageMatchSQL(), binding.args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := make([]journal.JournalID, 0)
+	for rows.Next() {
+		row, err := scanFactPageRow(rows, binding.kind)
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, row.journalID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return ids, nil
 }
