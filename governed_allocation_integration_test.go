@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -501,6 +502,246 @@ func TestFusedWorkflowIDReplayMatchesCanonicalRequestAndAuthority(t *testing.T) 
 	assertNoGovernedWrites(t, beforeChangedAuthority, db)
 }
 
+func TestFusedGovernedAllocationParticipantCommitsDomainAuditAndCheckpoint(t *testing.T) {
+	ctx := context.Background()
+	var calls int
+	participant := provenance.GovernedAllocationParticipant(func(ctx context.Context, tx provenance.GovernedAllocationTransaction, request provenance.GovernedAllocationRequest, closure provenance.OperationClosure) error {
+		calls++
+		children := closure.Children()
+		if len(children) != 1 || closure.OperationID() != request.OperationID {
+			return fmt.Errorf("participant received inconsistent governed closure for operation %q", request.OperationID)
+		}
+
+		var domainRows int
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM tasks WHERE id = ?1`, children[0].TaskID.String()).Scan(&domainRows); err != nil {
+			return fmt.Errorf("participant query committed child task: %w", err)
+		}
+		if domainRows != 1 {
+			return fmt.Errorf("participant found %d committed child task rows, want one", domainRows)
+		}
+		rows, err := tx.Query(ctx, `SELECT title FROM tasks WHERE id = ?1`, children[0].TaskID.String())
+		if err != nil {
+			return fmt.Errorf("participant query child title: %w", err)
+		}
+		if !rows.Next() {
+			_ = rows.Close()
+			return fmt.Errorf("participant found no title row for committed child task")
+		}
+		var title string
+		if err := rows.Scan(&title); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("participant scan child title: %w", err)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("participant iterate child title: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return fmt.Errorf("participant close child title rows: %w", err)
+		}
+		if title != request.Children[0].Title {
+			return fmt.Errorf("participant saw child title %q, want %q", title, request.Children[0].Title)
+		}
+
+		result, err := tx.Exec(ctx, `INSERT INTO fused_governed_participant_audit (operation_id, anchor_journal_id, child_task_id) VALUES (?1, ?2, ?3)`, request.OperationID, closure.AnchorJournalID(), children[0].TaskID.String())
+		if err != nil {
+			return fmt.Errorf("participant insert audit sentinel: %w", err)
+		}
+		if affected, err := result.RowsAffected(); err != nil || affected != 1 {
+			return fmt.Errorf("participant audit sentinel affected rows=%d err=%v, want 1 and nil", affected, err)
+		}
+		return nil
+	})
+	fused, db := openFusedAllocatorWithParticipantAndDatabase(t, "participant-commit", participant)
+	createFusedGovernedParticipantAuditTable(t, db)
+	tr := fused.Tracker()
+	actor := registerGovernedActor(t, tr, "participant-commit")
+	if err := fused.Launch(); err != nil {
+		t.Fatalf("launch fused capability: %v", err)
+	}
+	root := initializeFusedRoot(t, fused, actor, "participant-commit-root")
+	request := governedRequest("participant-commit", actor, root.AssignmentID, 1)
+	closure, err := fused.RunAllocate(ctx, "participant-commit-workflow", root.AssignmentRow.JournalID, request)
+	if err != nil {
+		t.Fatalf("run fused allocation with participant: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("participant calls = %d, want 1", calls)
+	}
+	child := closure.Children()[0]
+	if got := countFusedGovernedRows(t, db, `SELECT COUNT(*) FROM tasks WHERE id = ?1`, child.TaskID.String()); got != 1 {
+		t.Fatalf("committed child task rows = %d, want 1", got)
+	}
+	if got := countFusedGovernedRows(t, db, `SELECT COUNT(*) FROM governed_allocation_operations WHERE operation_id = ?1`, request.OperationID); got != 1 {
+		t.Fatalf("committed governed operation rows = %d, want 1", got)
+	}
+	if got := countFusedGovernedRows(t, db, `SELECT COUNT(*) FROM fused_governed_participant_audit WHERE operation_id = ?1`, request.OperationID); got != 1 {
+		t.Fatalf("committed participant audit rows = %d, want 1", got)
+	}
+	if got := countFusedGovernedRows(t, db, `SELECT COUNT(*) FROM operation_outputs WHERE workflow_uuid = ?1 AND error IS NULL`, "participant-commit-workflow"); got != 1 {
+		t.Fatalf("successful DBOS checkpoints = %d, want 1", got)
+	}
+}
+
+func TestFusedGovernedAllocationParticipantErrorRollsBackDomainAuditAndSuccessfulCheckpoint(t *testing.T) {
+	ctx := context.Background()
+	const participantFailure = "participant audit dependency unavailable"
+	participant := provenance.GovernedAllocationParticipant(func(ctx context.Context, tx provenance.GovernedAllocationTransaction, request provenance.GovernedAllocationRequest, closure provenance.OperationClosure) error {
+		if _, err := tx.Exec(ctx, `INSERT INTO fused_governed_participant_audit (operation_id, anchor_journal_id, child_task_id) VALUES (?1, ?2, ?3)`, request.OperationID, closure.AnchorJournalID(), closure.Children()[0].TaskID.String()); err != nil {
+			return fmt.Errorf("participant insert audit sentinel: %w", err)
+		}
+		return errors.New(participantFailure)
+	})
+	fused, db := openFusedAllocatorWithParticipantAndDatabase(t, "participant-rollback", participant)
+	createFusedGovernedParticipantAuditTable(t, db)
+	tr := fused.Tracker()
+	actor := registerGovernedActor(t, tr, "participant-rollback")
+	if err := fused.Launch(); err != nil {
+		t.Fatalf("launch fused capability: %v", err)
+	}
+	root := initializeFusedRoot(t, fused, actor, "participant-rollback-root")
+	request := governedRequest("participant-rollback", actor, root.AssignmentID, 1)
+	_, err := fused.RunAllocate(ctx, "participant-rollback-workflow", root.AssignmentRow.JournalID, request)
+	if err == nil || !strings.Contains(err.Error(), participantFailure) {
+		t.Fatalf("participant failure error = %v, want infrastructure error containing %q", err, participantFailure)
+	}
+	var domainError *provenance.GovernedAllocationError
+	if errors.As(err, &domainError) {
+		t.Fatalf("participant failure was returned as typed domain rejection: %+v", domainError)
+	}
+	if got := countFusedGovernedRows(t, db, `SELECT COUNT(*) FROM tasks WHERE id = ?1`, request.Children[0].TaskID.String()); got != 0 {
+		t.Fatalf("rolled-back child task rows = %d, want 0", got)
+	}
+	if got := countFusedGovernedRows(t, db, `SELECT COUNT(*) FROM governed_allocation_operations WHERE operation_id = ?1`, request.OperationID); got != 0 {
+		t.Fatalf("rolled-back governed operation rows = %d, want 0", got)
+	}
+	if got := countFusedGovernedRows(t, db, `SELECT COUNT(*) FROM fused_governed_participant_audit WHERE operation_id = ?1`, request.OperationID); got != 0 {
+		t.Fatalf("rolled-back participant audit rows = %d, want 0", got)
+	}
+	if got := countFusedGovernedRows(t, db, `SELECT COUNT(*) FROM operation_outputs WHERE workflow_uuid = ?1 AND error IS NULL`, "participant-rollback-workflow"); got != 0 {
+		t.Fatalf("successful DBOS checkpoints after participant failure = %d, want 0", got)
+	}
+	if got := countFusedGovernedRows(t, db, `SELECT COUNT(*) FROM operation_outputs WHERE workflow_uuid = ?1 AND error IS NOT NULL`, "participant-rollback-workflow"); got != 1 {
+		t.Fatalf("failed DBOS checkpoints after participant failure = %d, want 1", got)
+	}
+	assertGovernedOperationAbsent(t, tr, request.OperationID)
+}
+
+func TestFusedGovernedAllocationParticipantExactReplaySkipsCallbackAndDistinctWorkflowIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	var calls int
+	participant := provenance.GovernedAllocationParticipant(func(ctx context.Context, tx provenance.GovernedAllocationTransaction, request provenance.GovernedAllocationRequest, closure provenance.OperationClosure) error {
+		calls++
+		child := closure.Children()[0]
+		if _, err := tx.Exec(ctx, `INSERT INTO fused_governed_participant_audit (operation_id, anchor_journal_id, child_task_id)
+			VALUES (?1, ?2, ?3) ON CONFLICT(operation_id) DO NOTHING`, request.OperationID, closure.AnchorJournalID(), child.TaskID.String()); err != nil {
+			return fmt.Errorf("participant idempotent audit insert: %w", err)
+		}
+		var storedAnchor int64
+		var storedTaskID string
+		if err := tx.QueryRow(ctx, `SELECT anchor_journal_id, child_task_id FROM fused_governed_participant_audit WHERE operation_id = ?1`, request.OperationID).Scan(&storedAnchor, &storedTaskID); err != nil {
+			return fmt.Errorf("participant load idempotent audit binding: %w", err)
+		}
+		if storedAnchor != int64(closure.AnchorJournalID()) || storedTaskID != child.TaskID.String() {
+			return fmt.Errorf("participant immutable audit binding differs for operation %q", request.OperationID)
+		}
+		return nil
+	})
+	fused, db := openFusedAllocatorWithParticipantAndDatabase(t, "participant-replay", participant)
+	createFusedGovernedParticipantAuditTable(t, db)
+	tr := fused.Tracker()
+	actor := registerGovernedActor(t, tr, "participant-replay")
+	if err := fused.Launch(); err != nil {
+		t.Fatalf("launch fused capability: %v", err)
+	}
+	root := initializeFusedRoot(t, fused, actor, "participant-replay-root")
+	request := governedRequest("participant-replay", actor, root.AssignmentID, 1)
+	first, err := fused.RunAllocate(ctx, "participant-replay-workflow", root.AssignmentRow.JournalID, request)
+	if err != nil {
+		t.Fatalf("first fused allocation: %v", err)
+	}
+	exactReplay, err := fused.RunAllocate(ctx, "participant-replay-workflow", root.AssignmentRow.JournalID, request)
+	if err != nil {
+		t.Fatalf("exact DBOS workflow replay: %v", err)
+	}
+	assertSameClosure(t, first, exactReplay)
+	if calls != 1 {
+		t.Fatalf("participant calls after exact workflow replay = %d, want 1", calls)
+	}
+	if got := countFusedGovernedRows(t, db, `SELECT COUNT(*) FROM operation_outputs WHERE workflow_uuid = ?1 AND error IS NULL`, "participant-replay-workflow"); got != 1 {
+		t.Fatalf("successful checkpoints for exact workflow replay = %d, want 1", got)
+	}
+
+	distinctWorkflowReplay, err := fused.RunAllocate(ctx, "participant-replay-distinct-workflow", root.AssignmentRow.JournalID, request)
+	if err != nil {
+		t.Fatalf("distinct workflow operation replay: %v", err)
+	}
+	assertSameClosure(t, first, distinctWorkflowReplay)
+	if calls != 2 {
+		t.Fatalf("participant calls after distinct workflow replay = %d, want 2", calls)
+	}
+	if got := countFusedGovernedRows(t, db, `SELECT COUNT(*) FROM fused_governed_participant_audit WHERE operation_id = ?1`, request.OperationID); got != 1 {
+		t.Fatalf("idempotent participant audit rows = %d, want 1", got)
+	}
+	if got := countFusedGovernedRows(t, db, `SELECT COUNT(*) FROM operation_outputs WHERE workflow_uuid = ?1 AND error IS NULL`, "participant-replay-distinct-workflow"); got != 1 {
+		t.Fatalf("successful checkpoints for distinct workflow replay = %d, want 1", got)
+	}
+
+	rejected := request
+	rejected.Children = append([]provenance.GovernedChildSpec(nil), request.Children...)
+	rejected.Children[0].Title = "changed participant replay child"
+	if _, err := fused.RunAllocate(ctx, "participant-replay-domain-rejection", root.AssignmentRow.JournalID, rejected); err == nil {
+		t.Fatal("changed allocation request did not return a typed domain rejection")
+	} else {
+		mustGovernedError(t, err, provenance.GovernedAllocationConflict)
+	}
+	if calls != 2 {
+		t.Fatalf("participant calls after typed domain rejection = %d, want 2", calls)
+	}
+}
+
+func TestFusedGovernedAllocationParticipantReceivesDefensiveRequestAndClosureCopies(t *testing.T) {
+	ctx := context.Background()
+	participant := provenance.GovernedAllocationParticipant(func(_ context.Context, _ provenance.GovernedAllocationTransaction, request provenance.GovernedAllocationRequest, closure provenance.OperationClosure) error {
+		request.Children[0].Title = "participant-mutated-title"
+		request.Children = nil
+		children := closure.Children()
+		children[0].AssignmentID = "participant-mutated-assignment"
+		if closure.Children()[0].AssignmentID == "participant-mutated-assignment" {
+			return errors.New("participant mutated closure through returned children")
+		}
+		return nil
+	})
+	fused, db := openFusedAllocatorWithParticipantAndDatabase(t, "participant-copies", participant)
+	tr := fused.Tracker()
+	actor := registerGovernedActor(t, tr, "participant-copies")
+	if err := fused.Launch(); err != nil {
+		t.Fatalf("launch fused capability: %v", err)
+	}
+	root := initializeFusedRoot(t, fused, actor, "participant-copies-root")
+	request := governedRequest("participant-copies", actor, root.AssignmentID, 1)
+	wantTitle := request.Children[0].Title
+	wantAssignmentID := request.Children[0].AssignmentID
+	closure, err := fused.RunAllocate(ctx, "participant-copies-workflow", root.AssignmentRow.JournalID, request)
+	if err != nil {
+		t.Fatalf("fused allocation with copying participant: %v", err)
+	}
+	if len(request.Children) != 1 || request.Children[0].Title != wantTitle || request.Children[0].AssignmentID != wantAssignmentID {
+		t.Fatalf("participant mutated caller request: %+v", request)
+	}
+	child := closure.Children()[0]
+	if child.AssignmentID != wantAssignmentID {
+		t.Fatalf("participant mutated returned closure assignment = %q, want %q", child.AssignmentID, wantAssignmentID)
+	}
+	var persistedTitle string
+	if err := db.QueryRow(`SELECT title FROM tasks WHERE id = ?1`, child.TaskID.String()).Scan(&persistedTitle); err != nil {
+		t.Fatalf("load child title after participant mutation: %v", err)
+	}
+	if persistedTitle != wantTitle {
+		t.Fatalf("participant mutated persisted child title = %q, want %q", persistedTitle, wantTitle)
+	}
+}
+
 func openGovernedTracker(t *testing.T) (provenance.Tracker, provenance.ActorID) {
 	t.Helper()
 	tr, err := provenance.OpenMemory()
@@ -535,6 +776,10 @@ func openFusedAllocator(t *testing.T, name string) *provenance.FusedGovernedAllo
 }
 
 func openFusedAllocatorWithDatabase(t *testing.T, name string) (*provenance.FusedGovernedAllocator, *sql.DB) {
+	return openFusedAllocatorWithParticipantAndDatabase(t, name, nil)
+}
+
+func openFusedAllocatorWithParticipantAndDatabase(t *testing.T, name string, participant provenance.GovernedAllocationParticipant) (*provenance.FusedGovernedAllocator, *sql.DB) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), name+".db")
 	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
@@ -543,6 +788,7 @@ func openFusedAllocatorWithDatabase(t *testing.T, name string) (*provenance.Fuse
 		AppName:            "provenance-governed-" + name,
 		ApplicationVersion: "test-v1",
 		Logger:             slog.Default(),
+		Participant:        participant,
 	})
 	if err != nil {
 		t.Fatalf("open fused allocator: %v", err)
@@ -559,6 +805,44 @@ func openFusedAllocatorWithDatabase(t *testing.T, name string) (*provenance.Fuse
 		}
 	})
 	return allocator, db
+}
+
+func initializeFusedRoot(t *testing.T, fused *provenance.FusedGovernedAllocator, actor provenance.ActorID, name string) provenance.GovernedChildBinding {
+	t.Helper()
+	closure, err := fused.RunInitializeRoot(context.Background(), name+"-genesis-workflow", provenance.RootGenesisRequest{
+		OperationID: provenance.OperationID(name + "-genesis"),
+		ActorID:     actor,
+		Command:     "test.genesis",
+		Root:        governedChild(name+"-root", actor),
+	})
+	if err != nil {
+		t.Fatalf("initialize fused root: %v", err)
+	}
+	root, ok := closure.Root()
+	if !ok {
+		t.Fatal("fused root closure has no root binding")
+	}
+	return root
+}
+
+func createFusedGovernedParticipantAuditTable(t *testing.T, db *sql.DB) {
+	t.Helper()
+	if _, err := db.Exec(`CREATE TABLE fused_governed_participant_audit (
+		operation_id TEXT PRIMARY KEY,
+		anchor_journal_id INTEGER NOT NULL,
+		child_task_id TEXT NOT NULL
+	) STRICT`); err != nil {
+		t.Fatalf("create fused governed participant audit table: %v", err)
+	}
+}
+
+func countFusedGovernedRows(t *testing.T, db *sql.DB, query string, args ...any) int {
+	t.Helper()
+	var count int
+	if err := db.QueryRow(query, args...).Scan(&count); err != nil {
+		t.Fatalf("count fused governed rows with %q: %v", query, err)
+	}
+	return count
 }
 
 func registerGovernedActor(t *testing.T, tr provenance.Tracker, namespace string) provenance.ActorID {

@@ -24,6 +24,10 @@ type FusedGovernedAllocatorConfig struct {
 	AppName            string
 	ApplicationVersion string
 	Logger             *slog.Logger
+	// Participant optionally writes an integration-owned audit or projection
+	// record in the exact transaction that commits a fused allocation. It is
+	// intentionally unavailable to the standalone Session path.
+	Participant GovernedAllocationParticipant
 }
 
 // FusedGovernedAllocator owns the DBOS root, exact SQLite system handle, and
@@ -31,8 +35,9 @@ type FusedGovernedAllocatorConfig struct {
 // root; it never closes caller-owned resources because callers supply neither a
 // root nor a database handle.
 type FusedGovernedAllocator struct {
-	system  *fusedtx.System
-	tracker Tracker
+	system      *fusedtx.System
+	tracker     Tracker
+	participant GovernedAllocationParticipant
 
 	closeOnce sync.Once
 	closeErr  error
@@ -56,7 +61,7 @@ func OpenFusedGovernedAllocator(ctx context.Context, config FusedGovernedAllocat
 		system.Close(30 * time.Second)
 		return nil, fmt.Errorf("provenance.OpenFusedGovernedAllocator: activate Provenance schema on the owned DBOS system handle: %w", err)
 	}
-	allocator := &FusedGovernedAllocator{system: system, tracker: tracker}
+	allocator := &FusedGovernedAllocator{system: system, tracker: tracker, participant: config.Participant}
 	// Registration occurs before Launch and uses the allocator instance as the
 	// DBOS configured instance. No raw root/handle pair crosses the public API.
 	dbos.RegisterWorkflow(system.Root(), allocator.initializeRootWorkflow, dbos.WithInstance(allocator))
@@ -371,7 +376,19 @@ func (a *FusedGovernedAllocator) allocateWorkflow(ctx dbos.DBOSContext, input fu
 		return resultFrom(OperationClosure{}, err)
 	}
 	closure, err := fusedtx.Run(ctx, a.system, func(txCtx context.Context, tx fusedtx.SQLTx) (OperationClosure, error) {
-		return allocation.ReduceAllocation(txCtx, tx, request, input.Authority)
+		closure, err := allocation.ReduceAllocation(txCtx, tx, request, input.Authority)
+		if err != nil {
+			// Typed reducer rejections remain durable DBOS outcomes and must not
+			// trigger an integration side effect.
+			return OperationClosure{}, err
+		}
+		if a.participant == nil {
+			return closure, nil
+		}
+		if err := a.participant(txCtx, governedAllocationTransaction{tx: tx}, copyGovernedAllocationRequest(request), copyOperationClosure(closure)); err != nil {
+			return OperationClosure{}, newGovernedAllocationParticipantFailure(request.OperationID, err)
+		}
+		return closure, nil
 	})
 	return resultFrom(closure, err)
 }
