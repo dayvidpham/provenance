@@ -37,6 +37,13 @@ import (
 // subtype row with the fixed per-family kind and the operand payload. The domain write is
 // deferred to the shared projection step so it is reproducible from history.
 func (scope *connScope) foldMutationFamily(in journal.OperationInput, jid int64, eff journal.Effect) error {
+	if eff.Sort == journal.EffectEdgeAdd {
+		recordedAt := in.RecordedAt
+		if eff.RecordedAtOverride != nil {
+			recordedAt = *eff.RecordedAtOverride
+		}
+		return foldV1EdgeAdd(scope.ctx, allocationSQLTx{conn: scope.conn}, in, jid, recordedAt, eff)
+	}
 	if eff.TaskID.Namespace == "" {
 		return fmt.Errorf(
 			"provenance: operation %q %s effect has an empty subject task id — where: mutation-family fold "+
@@ -138,7 +145,11 @@ func (scope *connScope) projectMutationFamilyRow(task journal.TaskID, kind journ
 		if err != nil {
 			return err
 		}
-		if _, err := scope.conn.ExecContext(scope.ctx, scope.projectionTarget.projectEdgeAddQuery(), task.String(), p.Target, int(p.EdgeKind), recordedAt); err != nil {
+		if scope.projectionTarget == projectionTargetLive {
+			if err := v1ProjectEdgeAdd(scope.ctx, allocationSQLTx{conn: scope.conn}, task, p.Target, p.EdgeKind, recordedAt); err != nil {
+				return err
+			}
+		} else if _, err := scope.conn.ExecContext(scope.ctx, scope.projectionTarget.projectEdgeAddQuery(), task.String(), p.Target, int(p.EdgeKind), recordedAt); err != nil {
 			return fmt.Errorf("project edge-add %s->%s: %w", task, p.Target, err)
 		}
 	case journal.EventKindEdgeRemoved:

@@ -299,7 +299,10 @@ type CommittedResult struct {
 // ---------------------------------------------------------------------------
 
 var (
-	// ErrOperationConflict wraps a typed OperationID-reuse conflict (§11, §9.6).
+	// ErrOperationConflict classifies operation-identity admission conflicts. A
+	// committed OperationID-reuse conflict also carries *OperationConflict details
+	// (§11, §9.6); rejection of a reserved reducer-owned identity wraps this
+	// sentinel only because no conflicting committed identity is being compared.
 	ErrOperationConflict = errors.New("provenance: operation identity conflict")
 	// ErrConditionFailed wraps a typed pre-condition failure (§9.5).
 	ErrConditionFailed = errors.New("provenance: journal condition failed")

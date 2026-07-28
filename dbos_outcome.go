@@ -710,14 +710,24 @@ func diagnostic(class DBOSDiagnosticClass, field DBOSDiagnosticField, stage DBOS
 // ID. Every canonical input variant for one OperationID must address one DBOS
 // workflow; fingerprint remains the stricter input/step collision guard below.
 func workflowIdentity(contract dbosContractSnapshot, applicationVersion string, operation OperationID) string {
+	return workflowIdentityForKind(contract, applicationVersion, operation, dbosOperationKindApply)
+}
+
+func workflowIdentityForKind(contract dbosContractSnapshot, applicationVersion string, operation OperationID, kind dbosOperationKind) string {
 	h := sha256.New()
-	for _, value := range [][]byte{
+	values := [][]byte{
 		[]byte(contract.applyInputSchema), []byte(contract.contextSchema),
 		[]byte(contract.outcomeSchema), []byte(contract.workflowSchema),
 		[]byte(contract.workflowPrefix), []byte(contract.stepPrefix),
 		[]byte(contract.pinnedLibrary),
 		[]byte(applicationVersion), []byte(operation),
-	} {
+	}
+	// Preserve generic workflow identities exactly; only typed extensions add a
+	// kind discriminator to avoid attaching to a generic workflow by OperationID.
+	if kind != dbosOperationKindApply {
+		values = append(values, []byte(kind))
+	}
+	for _, value := range values {
 		writeFingerprintValue(h, value)
 	}
 	return fmt.Sprintf("%x", h.Sum(nil))
@@ -734,6 +744,9 @@ func workflowIdentity(contract dbosContractSnapshot, applicationVersion string, 
 // via the adapter field, NOT from the package-level const aliases — the snapshot is
 // the sole identity authority per Proposal 54.
 func fingerprint(contract dbosContractSnapshot, applicationVersion string, input DBOSApplyInput) (string, error) {
+	if !input.Kind.known() {
+		return "", fmt.Errorf("unsupported DBOS operation kind %q", input.Kind)
+	}
 	identity, err := decodeDBOSContext(contract, input.Context)
 	if err != nil {
 		return "", err
@@ -750,6 +763,9 @@ func fingerprint(contract dbosContractSnapshot, applicationVersion string, input
 		var authority [8]byte
 		binary.BigEndian.PutUint64(authority[:], uint64(*identity.AuthorityJournalID))
 		values = append(values, authority[:])
+	}
+	if input.Kind != dbosOperationKindApply {
+		values = append(values, []byte(input.Kind))
 	}
 	values = append(values, identity.CommandDigest, input.Mutation)
 	for _, value := range values {

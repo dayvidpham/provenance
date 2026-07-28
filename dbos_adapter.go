@@ -67,9 +67,8 @@ func defaultApplyTestHooks() applyTestHooks {
 }
 
 // DBOSAdapter runs Provenance operations as durable DBOS workflows over a shared
-// journal contract. It owns one workflow for the single supported DBOS contract.
-// The adapter captures its contract snapshot once at construction; no paths
-// rebuild or mutate the identity after registration.
+// journal contract. The adapter captures its contract snapshot once at
+// construction; no paths rebuild or mutate the identity after registration.
 type DBOSAdapter struct {
 	root                  dbos.DBOSContext
 	tracker               Tracker
@@ -135,6 +134,7 @@ func NewDBOSAdapter(root dbos.DBOSContext, tracker Tracker, config DBOSAdapterCo
 		testHooks:             defaultApplyTestHooks(),
 	}
 	dbos.RegisterWorkflow(root, a.applyWorkflow)
+	dbos.RegisterWorkflow(root, a.transferWorkflow)
 	return a, nil
 }
 
@@ -160,6 +160,15 @@ func (a *DBOSAdapter) Apply(ctx context.Context, in journal.OperationInput) (Com
 	input, normalized, err := encodeApplyInput(a.contract, in)
 	if err != nil {
 		return CommittedResult{}, fmt.Errorf("provenance.DBOSAdapter.Apply: canonicalize operation %q: %w", in.OperationID, err)
+	}
+	// Reserved syntax was valid before composed allocation existed, so durable
+	// workflow decoding remains syntactic. Classify it against durable ownership
+	// before any DBOS lookup/start: only an exact unmarked historical replay may
+	// continue; fresh or composition-owned identities fail without a checkpoint.
+	if journal.IsReservedInternalOperationID(normalized.OperationID) {
+		if _, err := a.tracker.Journal().Apply(normalized); err != nil {
+			return CommittedResult{}, fmt.Errorf("provenance.DBOSAdapter.Apply: classify reserved operation %q before workflow work: %w", normalized.OperationID, err)
+		}
 	}
 
 	// Workflow identity is operation-scoped and available immediately after
@@ -408,20 +417,30 @@ func reconcileDBOSAllocatedCreates(in journal.OperationInput, result journal.Com
 // failures use the Go-error channel. The step name is derived from the adapter-
 // captured contract prefix plus the fingerprint.
 func (a *DBOSAdapter) applyWorkflow(wfCtx dbos.DBOSContext, input DBOSApplyInput) (DBOSStepOutcome, error) {
+	return a.runDomainWorkflow(wfCtx, input, "applyWorkflow", decodeApplyInput, a.foldDomainMutation)
+}
+
+func (a *DBOSAdapter) runDomainWorkflow(
+	wfCtx dbos.DBOSContext,
+	input DBOSApplyInput,
+	workflowName string,
+	decode func(dbosContractSnapshot, DBOSApplyInput) (journal.OperationInput, error),
+	fold func(journal.OperationInput) (CommittedResult, error),
+) (DBOSStepOutcome, error) {
 	a.testHooks.onWorkflowEntry()
-	in, err := decodeApplyInput(a.contract, input)
+	in, err := decode(a.contract, input)
 	if err != nil {
-		return DBOSStepOutcome{}, fmt.Errorf("provenance.applyWorkflow: %w", err)
+		return DBOSStepOutcome{}, fmt.Errorf("provenance.%s: %w", workflowName, err)
 	}
 	fp, err := fingerprint(a.contract, a.applicationVersion, input)
 	if err != nil {
-		return DBOSStepOutcome{}, fmt.Errorf("provenance.applyWorkflow: derive step identity: %w", err)
+		return DBOSStepOutcome{}, fmt.Errorf("provenance.%s: derive step identity: %w", workflowName, err)
 	}
 	// Step name is derived from the adapter-captured contract prefix.
 	stepName := a.contract.stepPrefix + fp
 	outcome, err := dbos.RunAsStep(wfCtx, func(stepCtx context.Context) (DBOSStepOutcome, error) {
 		a.testHooks.beforeDomainCommit()
-		result, applyErr := a.foldDomainMutation(in)
+		result, applyErr := fold(in)
 		outcome, checkpointErr := checkpointDomainApplyResult(a.contract, in, result, applyErr)
 		if checkpointErr != nil || applyErr != nil {
 			return outcome, checkpointErr

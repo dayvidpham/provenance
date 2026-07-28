@@ -2,7 +2,13 @@
 // fused transactions.
 package fusedtx
 
-import "context"
+import (
+	"context"
+	"database/sql"
+	"errors"
+
+	dbos "github.com/dbos-inc/dbos-transact-golang/dbos"
+)
 
 // Result reports the effect of a SQL write without exposing a driver-specific
 // result type to application reducers.
@@ -40,3 +46,11 @@ type SQLTx interface {
 // Callback is application work executed in DBOS's transaction. R is the
 // callback result that DBOS checkpoints with the application writes.
 type Callback[R any] func(context.Context, SQLTx) (R, error)
+
+// IsNoRows normalizes the two narrow SQL adapters used by the allocation
+// reducers. Standalone Modernc returns database/sql.ErrNoRows; the DBOS v0.20
+// adapter maps it to dbos.ErrNoRows. Keeping this distinction here prevents
+// reducer code from depending on DBOS driver types.
+func IsNoRows(err error) bool {
+	return errors.Is(err, sql.ErrNoRows) || errors.Is(err, dbos.ErrNoRows)
+}

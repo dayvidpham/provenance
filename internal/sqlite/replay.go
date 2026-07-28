@@ -120,6 +120,9 @@ func (scope *connScope) projectTaskEventRow(jid int64, committing journal.ActorI
 				}
 			}
 		}
+		if scope.projectionTarget == projectionTargetLive && canonicalEffect.Sort == journal.EffectTaskEvent && !journal.IsMutationFamilyKind(canonicalEffect.EventKind) && canonicalEffect.EventKind != journal.EventKindTaskMigrated {
+			return projectV1TaskEvent(scope.ctx, allocationSQLTx{conn: scope.conn}, committing, jid, recordedAt, canonicalEffect)
+		}
 	}
 	// Journaled relationship/annotation mutation families (§6 amendment) fold into the
 	// edges/labels/comments domain projection through the same shared reducer step Apply
@@ -653,8 +656,37 @@ func (scope *connScope) validateCanonicalOperations() error {
 			if err := scope.requireAuthorityExists(*op.authority); err != nil {
 				return fmt.Errorf("startup canonical operation %d authority: %w", op.anchor, err)
 			}
+			// A semantic self-transfer is the sole canonical history whose second
+			// effect may outlive its operation authority. Reconstruct the same exact
+			// shape and prove the predecessor was active immediately before effect 0;
+			// ordinary bootstrap-authorized transfers continue through the generic
+			// per-effect checks below.
+			transferStartAuthorized := false
+			if lease, transferErr := newAssignmentTransferLease(journal.OperationInput{
+				AuthorityJournalID: op.authority,
+				Conditions:         prepared.NormalizedConditions(),
+				Effects:            effects,
+			}); transferErr == nil {
+				matches, err := scope.assignmentTransferAuthorityMatches(*op.authority, lease)
+				if err != nil {
+					return fmt.Errorf("startup canonical operation %d transfer authority: %w", op.anchor, err)
+				}
+				if matches {
+					active, err := scope.episodeActiveAt(lease.previous, rows[0])
+					if err != nil {
+						return fmt.Errorf("startup canonical operation %d transfer predecessor liveness: %w", op.anchor, err)
+					}
+					if !active {
+						return canonicalCorruption(op.anchor, "assignment transfer predecessor liveness", "inactive before predecessor end", "active immediately before effect 0")
+					}
+					transferStartAuthorized = true
+				}
+			}
 			in := journal.OperationInput{ActorID: op.actor, AuthorityJournalID: op.authority}
 			for i, effect := range effects {
+				if transferStartAuthorized && i == 1 {
+					continue
+				}
 				if effect.TaskID.Namespace != "" {
 					if err := scope.requireAuthorityGoverns(in, rows[i], effect.TaskID); err != nil {
 						return fmt.Errorf("startup canonical operation %d authority for effect %d: %w", op.anchor, i, err)

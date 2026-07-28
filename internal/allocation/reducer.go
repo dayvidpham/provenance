@@ -54,6 +54,10 @@ func EnsureSchema(ctx context.Context, tx fusedtx.SQLTx) error {
 			singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
 			operation_id TEXT NOT NULL UNIQUE REFERENCES governed_allocation_operations(operation_id)
 		) STRICT, WITHOUT ROWID`,
+		`CREATE TABLE IF NOT EXISTS governed_composed_supplement_owners (
+			supplement_operation_id TEXT PRIMARY KEY,
+			governed_operation_id TEXT NOT NULL UNIQUE REFERENCES governed_allocation_operations(operation_id)
+		) STRICT, WITHOUT ROWID`,
 	} {
 		if _, err := tx.Exec(ctx, statement); err != nil {
 			return fmt.Errorf("ensure governed-allocation schema: %w", err)
@@ -107,62 +111,286 @@ func ReduceGenesis(ctx context.Context, tx fusedtx.SQLTx, request RootGenesisReq
 	return reconstruct(ctx, tx, request.OperationID)
 }
 
-// ReduceAllocation applies or reconstructs a governed batch. expectedAuthority
-// is mandatory: it must be the start authority JournalID for the exact parent
-// assignment. This keeps every allocation authority-bound, including the fused
-// DBOS path, rather than retaining a zero-authority escape hatch.
+// ComposedOutcome distinguishes a newly inserted allocation from an exact
+// external retry. The SQLite composition coordinator uses Replayed to reconstruct
+// supplemental result bindings without re-entering the canonical journal reducer.
+type ComposedOutcome struct {
+	Closure  OperationClosure
+	Replayed bool
+}
+
+// ReduceAllocation applies or reconstructs the baseline governed-allocation
+// receipt. Its canonical bytes intentionally remain distinct from CompositionV1
+// so existing simple allocations replay through the exact same identity and
+// fused workflow input shape they used before composition was introduced.
 func ReduceAllocation(ctx context.Context, tx fusedtx.SQLTx, request GovernedAllocationRequest, expectedAuthority journal.JournalID) (OperationClosure, error) {
-	// Authority is part of replay identity, not merely a write-time permission.
-	// Reject its zero value before looking up an existing operation so a forged
-	// zero-authority Session cannot attach to a prior closure.
-	if expectedAuthority == 0 {
-		return OperationClosure{}, NewError(ErrorAuthority, request.OperationID, "governed allocation authority validation", "the allocation has no bound parent start authority", "nothing was written; governed allocation cannot proceed without an exact parent authority", "allocate through Session.AllocateGoverned or pass the parent assignment start JournalID through the fused capability", nil)
-	}
 	canonical, digest, err := CanonicalizeAllocation(request)
 	if err != nil {
 		return OperationClosure{}, err
 	}
-	if existing, found, err := lookupOperation(ctx, tx, request.OperationID); err != nil {
+	outcome, err := reduceAllocationCanonical(ctx, tx, request, expectedAuthority, canonical, digest, allocationReceiptSimple)
+	return outcome.Closure, err
+}
+
+// ReduceComposedAllocation applies or reconstructs the governed allocation
+// receipt whose identity contains the full ordered supplemental effect list.
+// It deliberately stops after inserting/reconstructing allocation rows; the
+// caller owns reducing the supplemental canonical journal operation through the
+// same enclosing transaction, then invokes any fused participant last.
+func ReduceComposedAllocation(ctx context.Context, tx fusedtx.SQLTx, request ComposedRequest, expectedAuthority journal.JournalID) (ComposedOutcome, error) {
+	canonical, digest, err := CanonicalizeComposed(request)
+	if err != nil {
+		return ComposedOutcome{}, err
+	}
+	return reduceAllocationCanonical(ctx, tx, request.Allocation, expectedAuthority, canonical, digest, allocationReceiptComposed)
+}
+
+// VerifyGenesisReceipt reconstructs a genesis result from an existing receipt
+// without admitting or writing a missing operation. It is used after DBOS
+// success decoding so the durable workflow output is never authoritative over
+// SQLite.
+func VerifyGenesisReceipt(ctx context.Context, tx fusedtx.SQLTx, request RootGenesisRequest) (OperationClosure, error) {
+	canonical, digest, err := CanonicalizeGenesis(request)
+	if err != nil {
 		return OperationClosure{}, err
+	}
+	stored, found, err := lookupOperation(ctx, tx, request.OperationID)
+	if err != nil {
+		return OperationClosure{}, err
+	}
+	if !found {
+		return OperationClosure{}, corruption(request.OperationID, "the authoritative genesis receipt is absent")
+	}
+	if err := validateExistingInput(stored, RequestKindGenesis, canonical, digest, request.OperationID); err != nil {
+		return OperationClosure{}, err
+	}
+	return reconstruct(ctx, tx, request.OperationID)
+}
+
+// VerifyAllocationReceipt is the read-only counterpart of allocation replay.
+func VerifyAllocationReceipt(ctx context.Context, tx fusedtx.SQLTx, request GovernedAllocationRequest, expectedAuthority journal.JournalID, composed bool) (OperationClosure, error) {
+	var canonical []byte
+	var digest [sha256.Size]byte
+	var err error
+	if composed {
+		return OperationClosure{}, NewError(ErrorCorruption, request.OperationID, "authoritative allocation reconstruction", "a composed request must be verified with VerifyComposedAllocationReceipt", "no result was returned", "use the composed receipt verifier", nil)
+	}
+	canonical, digest, err = CanonicalizeAllocation(request)
+	if err != nil {
+		return OperationClosure{}, err
+	}
+	stored, found, err := lookupOperation(ctx, tx, request.OperationID)
+	if err != nil {
+		return OperationClosure{}, err
+	}
+	if !found {
+		return OperationClosure{}, corruption(request.OperationID, "the authoritative allocation receipt is absent")
+	}
+	if err := validateExistingInput(stored, RequestKindAllocation, canonical, digest, request.OperationID); err != nil {
+		return OperationClosure{}, err
+	}
+	if err := validateReplayAuthority(ctx, tx, stored, request.OperationID, request.ParentAssignmentID, expectedAuthority); err != nil {
+		return OperationClosure{}, err
+	}
+	return reconstruct(ctx, tx, request.OperationID)
+}
+
+// VerifyComposedAllocationReceipt validates the composed owner marker and
+// immutable request/authority before reconstructing the allocation closure.
+func VerifyComposedAllocationReceipt(ctx context.Context, tx fusedtx.SQLTx, request ComposedRequest, expectedAuthority journal.JournalID) (OperationClosure, error) {
+	canonical, digest, err := CanonicalizeComposed(request)
+	if err != nil {
+		return OperationClosure{}, err
+	}
+	stored, found, err := lookupOperation(ctx, tx, request.Allocation.OperationID)
+	if err != nil {
+		return OperationClosure{}, err
+	}
+	if !found {
+		return OperationClosure{}, corruption(request.Allocation.OperationID, "the authoritative composed allocation receipt is absent")
+	}
+	if err := validateExistingInput(stored, RequestKindAllocation, canonical, digest, request.Allocation.OperationID); err != nil {
+		return OperationClosure{}, err
+	}
+	if err := validateComposedSupplementOwner(ctx, tx, request.Allocation.OperationID); err != nil {
+		return OperationClosure{}, err
+	}
+	if err := validateReplayAuthority(ctx, tx, stored, request.Allocation.OperationID, request.Allocation.ParentAssignmentID, expectedAuthority); err != nil {
+		return OperationClosure{}, err
+	}
+	return reconstruct(ctx, tx, request.Allocation.OperationID)
+}
+
+// ProveCanonicalConflict authenticates a conflict solely from the governed
+// SQLite receipt. submitted must already be the canonical request bytes for the
+// statically selected workflow path. A malformed, generic, or exact receipt is
+// corruption rather than evidence of conflict.
+func ProveCanonicalConflict(ctx context.Context, tx fusedtx.SQLTx, operationID journal.OperationID, submitted []byte, verifyComposed func(ComposedRequest, journal.JournalID) error) error {
+	stored, found, err := lookupOperation(ctx, tx, operationID)
+	if err != nil {
+		return corruption(operationID, "the authoritative governed receipt could not be loaded: "+err.Error())
+	}
+	if !found {
+		return corruption(operationID, "no authoritative governed receipt exists for the reported conflict")
+	}
+	calculated := sha256.Sum256(stored.canonical)
+	if !bytes.Equal(calculated[:], stored.digest) {
+		return corruption(operationID, "canonical request digest does not match its persisted bytes")
+	}
+	var roundTrip []byte
+	var composedReceipt *ComposedRequest
+	var allocationParent journal.AssignmentID
+	switch stored.kind {
+	case RequestKindGenesis:
+		request, decodeErr := DecodeGenesisRequest(stored.canonical)
+		if decodeErr != nil || request.OperationID != operationID {
+			return corruption(operationID, "the stored genesis receipt is malformed or embeds a different operation identity")
+		}
+		roundTrip, _, err = CanonicalizeGenesis(request)
+	case RequestKindAllocation:
+		request, decodeErr := DecodeAllocationRequest(stored.canonical)
+		if decodeErr == nil {
+			if request.OperationID != operationID {
+				return corruption(operationID, "the stored allocation receipt embeds a different operation identity")
+			}
+			roundTrip, _, err = CanonicalizeAllocation(request)
+			allocationParent = request.ParentAssignmentID
+		} else {
+			composed, composedErr := DecodeComposedRequest(stored.canonical)
+			if composedErr != nil || composed.Allocation.OperationID != operationID {
+				return corruption(operationID, "the stored allocation receipt is neither a valid simple nor composed canonical request")
+			}
+			roundTrip, _, err = CanonicalizeComposed(composed)
+			composedReceipt = &composed
+			allocationParent = composed.Allocation.ParentAssignmentID
+		}
+	default:
+		return corruption(operationID, "the stored governed receipt has an unknown request kind")
+	}
+	if err != nil || !bytes.Equal(roundTrip, stored.canonical) {
+		return corruption(operationID, "the stored governed receipt does not survive canonical round-trip validation")
+	}
+	if _, err := reconstruct(ctx, tx, operationID); err != nil {
+		return corruption(operationID, "the stored governed receipt cannot be authoritatively reconstructed: "+err.Error())
+	}
+	if stored.kind == RequestKindAllocation {
+		if !stored.hasAuthority {
+			return corruption(operationID, "the allocation operation has no exact authority anchor")
+		}
+		if err := validateReplayAuthority(ctx, tx, stored, operationID, allocationParent, stored.authority); err != nil {
+			return corruption(operationID, "the allocation authority receipt is not owned by its canonical parent: "+err.Error())
+		}
+	}
+	if composedReceipt != nil {
+		if err := validateComposedSupplementOwner(ctx, tx, operationID); err != nil {
+			return err
+		}
+		if verifyComposed == nil {
+			return corruption(operationID, "the composed supplemental receipt verifier is unavailable")
+		}
+		if err := verifyComposed(*composedReceipt, stored.authority); err != nil {
+			return corruption(operationID, "the composed supplemental receipt is incomplete or corrupt: "+err.Error())
+		}
+	}
+	submittedDigest := sha256.Sum256(submitted)
+	if bytes.Equal(submitted, stored.canonical) || bytes.Equal(submittedDigest[:], stored.digest) {
+		return corruption(operationID, "the submitted request exactly matches the committed governed receipt")
+	}
+	return conflictError(operationID, "the OperationID is committed to a different authoritative canonical governed request")
+}
+
+type allocationReceiptMode uint8
+
+const (
+	allocationReceiptSimple allocationReceiptMode = iota
+	allocationReceiptComposed
+)
+
+// reduceAllocationCanonical is the single admission, replay, and write pipeline
+// for both receipt encodings. Callers own only their encoding-specific
+// canonicalization; mode controls the composed receipt's durable owner marker.
+func reduceAllocationCanonical(ctx context.Context, tx fusedtx.SQLTx, request GovernedAllocationRequest, expectedAuthority journal.JournalID, canonical []byte, digest [sha256.Size]byte, mode allocationReceiptMode) (ComposedOutcome, error) {
+	// Authority is part of replay identity, not merely a write-time permission.
+	// Reject its zero value before looking up an existing operation so a forged
+	// zero-authority Session cannot attach to a prior closure.
+	if expectedAuthority == 0 {
+		return ComposedOutcome{}, NewError(ErrorAuthority, request.OperationID, "governed allocation authority validation", "the allocation has no bound parent start authority", "nothing was written; governed allocation cannot proceed without an exact parent authority", "allocate through Session.AllocateGoverned or pass the parent assignment start JournalID through the fused capability", nil)
+	}
+	if existing, found, err := lookupOperation(ctx, tx, request.OperationID); err != nil {
+		return ComposedOutcome{}, err
 	} else if found {
 		if err := validateExistingInput(existing, RequestKindAllocation, canonical, digest, request.OperationID); err != nil {
-			return OperationClosure{}, err
+			return ComposedOutcome{}, err
+		}
+		// Only an exact composed canonical receipt is required to have the owner
+		// marker. A simple allocation or genesis reusing this operation identity
+		// is an ordinary immutable-input conflict, not evidence of corruption.
+		if mode == allocationReceiptComposed {
+			if err := validateComposedSupplementOwner(ctx, tx, request.OperationID); err != nil {
+				return ComposedOutcome{}, err
+			}
 		}
 		// An exact replay is allowed after revocation, but only after its persisted
 		// request bytes and exact parent-start authority have been proved. Do not
 		// run the current active-chain check here: it would make an immutable
 		// previously committed closure depend on later revocation state.
 		if err := validateReplayAuthority(ctx, tx, existing, request.OperationID, request.ParentAssignmentID, expectedAuthority); err != nil {
-			return OperationClosure{}, err
+			return ComposedOutcome{}, err
 		}
-		return reconstruct(ctx, tx, request.OperationID)
+		closure, err := reconstruct(ctx, tx, request.OperationID)
+		if err != nil {
+			return ComposedOutcome{}, err
+		}
+		return ComposedOutcome{Closure: closure, Replayed: true}, nil
 	}
 	if exists, err := operationIDAlreadyUsed(ctx, tx, request.OperationID); err != nil {
-		return OperationClosure{}, err
+		return ComposedOutcome{}, err
 	} else if exists {
-		return OperationClosure{}, conflictError(request.OperationID, "operation identity is already used by a non-governed operation")
+		return ComposedOutcome{}, conflictError(request.OperationID, "operation identity is already used by a non-governed operation")
 	}
-	parent, depth, err := validateActiveParentChain(ctx, tx, request.OperationID, request.ParentAssignmentID, expectedAuthority)
-	if err != nil {
-		return OperationClosure{}, err
-	}
-	if depth+1 > MaxAuthorityDepth {
-		return OperationClosure{}, NewError(ErrorDepth, request.OperationID, "governed parent-chain validation", fmt.Sprintf("child depth %d exceeds the root-inclusive maximum %d", depth+1, MaxAuthorityDepth), "nothing was written", "allocate beneath a parent at depth 63 or less", nil)
+	if err := validateActiveParentChain(ctx, tx, request.OperationID, request.ParentAssignmentID, expectedAuthority); err != nil {
+		return ComposedOutcome{}, err
 	}
 	if err := validateActorsAndCollisions(ctx, tx, request.OperationID, request.ActorID, request.Children); err != nil {
-		return OperationClosure{}, err
+		return ComposedOutcome{}, err
 	}
 
-	anchor, err := insertOperation(ctx, tx, RequestKindAllocation, request.OperationID, request.ActorID, request.Command, parent.authorityJournalID, canonical, digest, len(request.Children))
+	anchor, err := insertOperation(ctx, tx, RequestKindAllocation, request.OperationID, request.ActorID, request.Command, expectedAuthority, canonical, digest, len(request.Children))
 	if err != nil {
-		return OperationClosure{}, err
+		return ComposedOutcome{}, err
+	}
+	if mode == allocationReceiptComposed {
+		internalOperation := journal.NewGovernedAllocationSupplementOperationID(request.OperationID).OperationID()
+		if _, err := tx.Exec(ctx, `INSERT INTO governed_composed_supplement_owners (supplement_operation_id,governed_operation_id) VALUES (?1,?2)`, string(internalOperation), string(request.OperationID)); err != nil {
+			return ComposedOutcome{}, fmt.Errorf("persist composed supplemental operation ownership for %q: %w", request.OperationID, err)
+		}
 	}
 	for ordinal, child := range request.Children {
 		if err := insertChild(ctx, tx, anchor, ordinal, request.ActorID, child, request.ParentAssignmentID); err != nil {
-			return OperationClosure{}, err
+			return ComposedOutcome{}, err
 		}
 	}
-	return reconstruct(ctx, tx, request.OperationID)
+	closure, err := reconstruct(ctx, tx, request.OperationID)
+	if err != nil {
+		return ComposedOutcome{}, err
+	}
+	return ComposedOutcome{Closure: closure}, nil
+}
+
+func validateComposedSupplementOwner(ctx context.Context, tx fusedtx.SQLTx, operationID journal.OperationID) error {
+	wantSupplement := journal.NewGovernedAllocationSupplementOperationID(operationID).OperationID()
+	var storedOwner string
+	err := tx.QueryRow(ctx, `SELECT governed_operation_id FROM governed_composed_supplement_owners WHERE supplement_operation_id=?1`, string(wantSupplement)).Scan(&storedOwner)
+	if errors.Is(err, sql.ErrNoRows) {
+		return NewError(ErrorCorruption, operationID, "composed supplemental ownership replay", "the composed allocation receipt has no durable supplemental-operation owner linkage", "the composed result cannot be trusted", "restore the governed allocation, owner linkage, and supplemental operation from one consistent backup; do not backfill the marker", nil)
+	}
+	if err != nil {
+		return fmt.Errorf("load composed supplemental operation ownership for %q: %w", operationID, err)
+	}
+	if storedOwner != string(operationID) {
+		return NewError(ErrorCorruption, operationID, "composed supplemental ownership replay", fmt.Sprintf("the supplemental operation is linked to governed operation %q", storedOwner), "the composed result cannot be trusted", "restore the governed allocation, owner linkage, and supplemental operation from one consistent backup; do not infer ownership from the reserved prefix", nil)
+	}
+	return nil
 }
 
 type storedOperation struct {
@@ -302,26 +530,20 @@ func requireActor(ctx context.Context, tx fusedtx.SQLTx, operationID journal.Ope
 	return nil
 }
 
-type parentState struct {
-	authorityJournalID journal.JournalID
-}
-
 // validateActiveParentChain authorizes the requested parent and every ancestor
 // in the allocation's write transaction. A valid direct parent is insufficient:
 // a revoked middle ancestor also revokes all of its descendants. The chain walk
-// is bounded, detects cycles, and requires each assignment start to be backed by
-// a journal authority row before any governed row is inserted.
-func validateActiveParentChain(ctx context.Context, tx fusedtx.SQLTx, operationID journal.OperationID, start journal.AssignmentID, expectedAuthority journal.JournalID) (parentState, int, error) {
+// detects cycles and requires each assignment start to be backed by a journal
+// authority row before any governed row is inserted.
+func validateActiveParentChain(ctx context.Context, tx fusedtx.SQLTx, operationID journal.OperationID, start journal.AssignmentID, expectedAuthority journal.JournalID) error {
 	visited := map[journal.AssignmentID]struct{}{}
 	current := start
-	for depth := 1; ; depth++ {
+	direct := true
+	for {
 		if _, found := visited[current]; found {
-			return parentState{}, 0, NewError(ErrorCorruption, operationID, "governed parent-chain validation", fmt.Sprintf("assignment parent chain revisits %q", current), "authorization fails closed and nothing was written", "repair the cyclic parent_assignment_id rows from a consistent backup", nil)
+			return NewError(ErrorCorruption, operationID, "governed parent-chain validation", fmt.Sprintf("assignment parent chain revisits %q", current), "authorization fails closed and nothing was written", "repair the cyclic parent_assignment_id rows from a consistent backup", nil)
 		}
 		visited[current] = struct{}{}
-		if depth > MaxAuthorityDepth {
-			return parentState{}, 0, NewError(ErrorDepth, operationID, "governed parent-chain validation", fmt.Sprintf("stored parent chain exceeds the root-inclusive maximum %d", MaxAuthorityDepth), "nothing was written", "repair the stored parent chain to at most 64 assignments", nil)
-		}
 
 		var (
 			parent         sql.NullString
@@ -338,24 +560,25 @@ func validateActiveParentChain(ctx context.Context, tx fusedtx.SQLTx, operationI
 			JOIN journal start_journal ON start_journal.journal_id = started.journal_id AND start_journal.kind_id = 2
 			WHERE episode.assignment_id = ?1 AND episode.slot_id = 0`, string(current)).Scan(&parent, &startJournalID, &ended)
 		if errors.Is(err, sql.ErrNoRows) {
-			if depth == 1 {
-				return parentState{}, 0, NewError(ErrorAuthority, operationID, "Session.AllocateGoverned", fmt.Sprintf("parent assignment %q does not exist or has no linked start authority", current), "nothing was written", "bind the Session to the exact active parent assignment authority", nil)
+			if direct {
+				return NewError(ErrorAuthority, operationID, "Session.AllocateGoverned", fmt.Sprintf("parent assignment %q does not exist or has no linked start authority", current), "nothing was written", "bind the Session to the exact active parent assignment authority", nil)
 			}
-			return parentState{}, 0, NewError(ErrorCorruption, operationID, "governed parent-chain validation", fmt.Sprintf("ancestor assignment %q is absent or lacks a linked start authority", current), "authorization fails closed and nothing was written", "restore the assignment lineage from a consistent backup", err)
+			return NewError(ErrorCorruption, operationID, "governed parent-chain validation", fmt.Sprintf("ancestor assignment %q is absent or lacks a linked start authority", current), "authorization fails closed and nothing was written", "restore the assignment lineage from a consistent backup", err)
 		}
 		if err != nil {
-			return parentState{}, 0, fmt.Errorf("read parent chain at assignment %q: %w", current, err)
+			return fmt.Errorf("read parent chain at assignment %q: %w", current, err)
 		}
 		if ended {
-			return parentState{}, 0, NewError(ErrorRevoked, operationID, "governed parent-chain validation", fmt.Sprintf("assignment %q is ended or revoked", current), "nothing was written", "choose a descendant of an active root-to-parent chain", nil)
+			return NewError(ErrorRevoked, operationID, "governed parent-chain validation", fmt.Sprintf("assignment %q is ended or revoked", current), "nothing was written", "choose a descendant of an active root-to-parent chain", nil)
 		}
-		if depth == 1 && journal.JournalID(startJournalID) != expectedAuthority {
-			return parentState{}, 0, NewError(ErrorAuthority, operationID, "Session.AllocateGoverned", "the Session authority does not identify the request's exact parent assignment", "nothing was written; a Session cannot use one assignment to allocate under another", "bind the Session to the active parent assignment authority", nil)
+		if direct && journal.JournalID(startJournalID) != expectedAuthority {
+			return NewError(ErrorAuthority, operationID, "Session.AllocateGoverned", "the Session authority does not identify the request's exact parent assignment", "nothing was written; a Session cannot use one assignment to allocate under another", "bind the Session to the active parent assignment authority", nil)
 		}
 		if !parent.Valid {
-			return parentState{authorityJournalID: journal.JournalID(startJournalID)}, depth, nil
+			return nil
 		}
 		current = journal.AssignmentID(parent.String)
+		direct = false
 	}
 }
 
@@ -451,18 +674,54 @@ func reconstruct(ctx context.Context, tx fusedtx.SQLTx, operationID journal.Oper
 	if !bytes.Equal(calculated[:], stored.digest) {
 		return OperationClosure{}, corruption(operationID, "canonical request digest does not match its persisted bytes")
 	}
-	kind, decodedOperation, _, parent, children, err := DecodeCanonical(stored.canonical)
-	if err != nil {
-		return OperationClosure{}, corruption(operationID, "canonical request cannot be decoded: "+err.Error())
-	}
-	if decodedOperation != operationID || kind != stored.kind {
-		return OperationClosure{}, corruption(operationID, "canonical request identity or kind disagrees with its receipt")
+	var (
+		kind       RequestKind
+		actor      ptypes.ActorID
+		parent     journal.AssignmentID
+		children   []ChildSpec
+		isComposed bool
+	)
+	if stored.kind == RequestKindAllocation {
+		// The baseline allocation receipt predates composition and remains the
+		// simple API's identity. Try it first so a persisted simple allocation is
+		// never reinterpreted as a composed request during reopen/replay.
+		decodedKind, decodedOperation, decodedActor, decodedParent, decodedChildren, decodeErr := DecodeCanonical(stored.canonical)
+		if decodeErr == nil {
+			if decodedOperation != operationID || decodedKind != stored.kind {
+				return OperationClosure{}, corruption(operationID, "canonical request identity or kind disagrees with its receipt")
+			}
+			kind, actor, parent, children = decodedKind, decodedActor, decodedParent, decodedChildren
+		} else {
+			composed, composedErr := DecodeComposedRequest(stored.canonical)
+			if composedErr != nil {
+				return OperationClosure{}, corruption(operationID, "allocation canonical request cannot be decoded as a simple or composed receipt: "+decodeErr.Error()+"; "+composedErr.Error())
+			}
+			if composed.Allocation.OperationID != operationID {
+				return OperationClosure{}, corruption(operationID, "composed canonical request operation identity disagrees with its receipt")
+			}
+			kind = RequestKindAllocation
+			actor = composed.Allocation.ActorID
+			parent = composed.Allocation.ParentAssignmentID
+			children = composed.Allocation.Children
+			isComposed = true
+		}
+	} else {
+		decodedKind, decodedOperation, decodedActor, decodedParent, decodedChildren, decodeErr := DecodeCanonical(stored.canonical)
+		if decodeErr != nil {
+			return OperationClosure{}, corruption(operationID, "canonical request cannot be decoded: "+decodeErr.Error())
+		}
+		if decodedOperation != operationID || decodedKind != stored.kind {
+			return OperationClosure{}, corruption(operationID, "canonical request identity or kind disagrees with its receipt")
+		}
+		kind, actor, parent, children = decodedKind, decodedActor, decodedParent, decodedChildren
 	}
 	if len(children) == 0 || stored.childCount != len(children) {
 		return OperationClosure{}, corruption(operationID, "canonical request child count disagrees with its receipt")
 	}
-	var anchorOperation string
-	if err := tx.QueryRow(ctx, `SELECT operation_id FROM journal_operations WHERE journal_id = ?1`, int64(stored.anchor)).Scan(&anchorOperation); err != nil || anchorOperation != string(operationID) {
+	var anchorOperation, receiptActor, anchorActor string
+	var anchorKind int
+	var anchorProducer sql.NullInt64
+	if err := tx.QueryRow(ctx, `SELECT operation.operation_id,governed.actor_id,journal.kind_id,COALESCE(journal.actor_id,''),journal.produced_by_operation_journal_id FROM journal_operations operation JOIN governed_allocation_operations governed ON governed.anchor_journal_id=operation.journal_id JOIN journal ON journal.journal_id=operation.journal_id WHERE operation.journal_id=?1`, int64(stored.anchor)).Scan(&anchorOperation, &receiptActor, &anchorKind, &anchorActor, &anchorProducer); err != nil || anchorOperation != string(operationID) || receiptActor != actor.String() || anchorKind != int(journal.JournalKindOperation) || anchorActor != actor.String() || anchorProducer.Valid {
 		return OperationClosure{}, corruption(operationID, "operation receipt anchor does not identify the governed operation")
 	}
 
@@ -474,7 +733,7 @@ func reconstruct(ctx context.Context, tx fusedtx.SQLTx, operationID journal.Oper
 	for ordinal, child := range children {
 		taskRow := positions[[2]int{ordinal, 0}]
 		assignmentRow := positions[[2]int{ordinal, 1}]
-		if err := validateProducedRows(ctx, tx, operationID, stored.anchor, ordinal, child, parent, taskRow, assignmentRow); err != nil {
+		if err := validateProducedRows(ctx, tx, operationID, stored.anchor, ordinal, child, parent, taskRow, assignmentRow, isComposed); err != nil {
 			return OperationClosure{}, err
 		}
 		bindings[ordinal] = ChildBinding{
@@ -539,25 +798,72 @@ func loadProducedRows(ctx context.Context, tx fusedtx.SQLTx, operationID journal
 // the position rows name the canonical child and that both journal rows were
 // produced by this operation anchor rather than merely looking structurally
 // similar in another operation.
-func validateProducedRows(ctx context.Context, tx fusedtx.SQLTx, operationID journal.OperationID, anchor journal.JournalID, ordinal int, child ChildSpec, parent journal.AssignmentID, taskRow, assignmentRow journal.JournalID) error {
+func validateProducedRows(ctx context.Context, tx fusedtx.SQLTx, operationID journal.OperationID, anchor journal.JournalID, ordinal int, child ChildSpec, parent journal.AssignmentID, taskRow, assignmentRow journal.JournalID, composed bool) error {
 	var kind int
-	var taskID string
-	err := tx.QueryRow(ctx, `SELECT j.kind_id, event.task_id
+	var taskID, eventKind, payload string
+	var taskActor sql.NullString
+	var taskProducer int64
+	var taskRecorded int64
+	err := tx.QueryRow(ctx, `SELECT j.kind_id, j.actor_id, j.produced_by_operation_journal_id, j.recorded_at, event.task_id, event.event_kind, event.payload
 		FROM journal j JOIN journal_task_events event ON event.journal_id = j.journal_id
-		WHERE j.journal_id = ?1 AND j.produced_by_operation_journal_id = ?2`, int64(taskRow), int64(anchor)).Scan(&kind, &taskID)
-	if err != nil || kind != int(journal.JournalKindTaskEvent) || taskID != child.TaskID.String() {
+		WHERE j.journal_id = ?1`, int64(taskRow)).Scan(&kind, &taskActor, &taskProducer, &taskRecorded, &taskID, &eventKind, &payload)
+	if err != nil || kind != int(journal.JournalKindTaskEvent) || taskActor.Valid || taskProducer != int64(anchor) || taskID != child.TaskID.String() || eventKind != "provenance.task.created" || payload != "{}" {
 		return corruption(operationID, fmt.Sprintf("task produced row at child %d does not name the expected operation-owned task event", ordinal))
+	}
+	var namespace, title, description, owner, notes, closeReason string
+	var status, priority, taskType, phase int
+	var createdAt, updatedAt, watermark int64
+	var closedAt sql.NullInt64
+	if err := tx.QueryRow(ctx, `SELECT namespace,title,description,status_id,priority_id,type_id,phase_id,COALESCE(owner_id,''),notes,created_at,updated_at,closed_at,close_reason,last_journal_id FROM tasks WHERE id=?1`, child.TaskID.String()).Scan(&namespace, &title, &description, &status, &priority, &taskType, &phase, &owner, &notes, &createdAt, &updatedAt, &closedAt, &closeReason, &watermark); err != nil || namespace != child.TaskID.Namespace || title != child.Title || description != child.Description || priority != int(child.Priority) || taskType != int(child.Type) || phase != int(child.Phase) || notes != "" || createdAt != taskRecorded || (!composed && (status != 0 || owner != child.Occupant.String() || updatedAt != taskRecorded || closedAt.Valid || closeReason != "" || watermark != int64(assignmentRow))) {
+		return corruption(operationID, fmt.Sprintf("task metadata or projection at child %d disagrees with the canonical allocation receipt", ordinal))
 	}
 	var assignment, episodeTask, occupant string
 	var storedParent sql.NullString
-	err = tx.QueryRow(ctx, `SELECT episode.assignment_id, episode.task_id, episode.actor_id, episode.parent_assignment_id
+	var assignmentActor sql.NullString
+	var assignmentProducer int64
+	var authorityKind int
+	var authorityOwner string
+	var slot, transition int
+	var predecessor sql.NullString
+	err = tx.QueryRow(ctx, `SELECT episode.assignment_id, episode.task_id, episode.actor_id, episode.parent_assignment_id,
+		j.actor_id,j.produced_by_operation_journal_id,authority.authority_kind_id,authority.operation_authority_id,
+		episode.slot_id,episode.predecessor_assignment_id,transition.transition_id
 		FROM journal j
 		JOIN journal_authorities authority ON authority.journal_id = j.journal_id
 		JOIN journal_authority_assignment_transitions transition ON transition.journal_id = j.journal_id AND transition.transition_id = 0
 		JOIN journal_authority_assignment_episodes episode ON episode.assignment_id = transition.assignment_id
-		WHERE j.journal_id = ?1 AND j.kind_id = 2 AND j.produced_by_operation_journal_id = ?2`, int64(assignmentRow), int64(anchor)).Scan(&assignment, &episodeTask, &occupant, &storedParent)
-	if err != nil || assignment != string(child.AssignmentID) || episodeTask != child.TaskID.String() || occupant != child.Occupant.String() || (parent == "") != !storedParent.Valid || (parent != "" && storedParent.String != string(parent)) {
+		WHERE j.journal_id = ?1 AND j.kind_id = 2`, int64(assignmentRow)).Scan(&assignment, &episodeTask, &occupant, &storedParent, &assignmentActor, &assignmentProducer, &authorityKind, &authorityOwner, &slot, &predecessor, &transition)
+	if err != nil || assignmentActor.Valid || assignmentProducer != int64(anchor) || authorityKind != 1 || authorityOwner != "governed-assignment/"+string(child.AssignmentID) || slot != 0 || predecessor.Valid || transition != 0 || assignment != string(child.AssignmentID) || episodeTask != child.TaskID.String() || occupant != child.Occupant.String() || (parent == "") != !storedParent.Valid || (parent != "" && storedParent.String != string(parent)) {
 		return corruption(operationID, fmt.Sprintf("assignment produced row at child %d does not name the expected operation-owned child episode", ordinal))
+	}
+	rows, err := tx.Query(ctx, `SELECT actor_id,first_journal_id FROM task_attributions WHERE task_id=?1 ORDER BY actor_id`, child.TaskID.String())
+	if err != nil {
+		return corruption(operationID, fmt.Sprintf("task attribution receipt at child %d cannot be loaded", ordinal))
+	}
+	want := map[string]int64{child.Occupant.String(): int64(assignmentRow)}
+	var requestActor string
+	if err := tx.QueryRow(ctx, `SELECT actor_id FROM governed_allocation_operations WHERE anchor_journal_id=?1`, int64(anchor)).Scan(&requestActor); err != nil {
+		_ = rows.Close()
+		return corruption(operationID, "the allocation request actor is absent")
+	}
+	want[requestActor] = int64(taskRow)
+	seen := 0
+	for rows.Next() {
+		var actor string
+		var first int64
+		if rows.Scan(&actor, &first) != nil || want[actor] != first {
+			_ = rows.Close()
+			return corruption(operationID, fmt.Sprintf("task attribution receipt at child %d is foreign or has a forged watermark", ordinal))
+		}
+		seen++
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return corruption(operationID, fmt.Sprintf("task attribution receipt at child %d cannot be read", ordinal))
+	}
+	_ = rows.Close()
+	if !composed && seen != len(want) {
+		return corruption(operationID, fmt.Sprintf("task attribution receipt at child %d is incomplete", ordinal))
 	}
 	return nil
 }

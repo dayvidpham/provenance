@@ -69,15 +69,26 @@ type (
 
 	// Governed allocation is the closed first-class primitive for creating a
 	// caller-identified child task and assignment under one exact parent.
-	GovernedAllocationRequest   = allocation.GovernedAllocationRequest
-	RootGenesisRequest          = allocation.RootGenesisRequest
-	GovernedChildSpec           = allocation.ChildSpec
-	OperationClosure            = allocation.OperationClosure
-	GovernedChildBinding        = allocation.ChildBinding
-	GovernedProducedRow         = allocation.ProducedRow
-	GovernedAllocationError     = allocation.Error
-	GovernedAllocationErrorKind = allocation.ErrorKind
-	GovernedRequestKind         = allocation.RequestKind
+	GovernedAllocationRequest         = allocation.GovernedAllocationRequest
+	GovernedAllocationComposedRequest = allocation.ComposedRequest
+	GovernedAllocationComposedResult  = allocation.ComposedResult
+	// GovernedAllocationComposedBatchRequest is the additive multi-child
+	// composition contract. SupplementalEffects apply to the complete ordered
+	// allocation closure, rather than to one child independently.
+	GovernedAllocationComposedBatchRequest = allocation.ComposedRequest
+	GovernedAllocationComposedBatchResult  = allocation.ComposedResult
+	GovernedAllocationCompositionVersion   = allocation.CompositionVersion
+	GovernedAllocationSupplementPolicy     = allocation.SupplementPolicy
+	GovernedAllocationReferenceScope       = allocation.ReferenceScope
+	GovernedAllocationReferenceScopeKind   = allocation.ReferenceScopeKind
+	RootGenesisRequest                     = allocation.RootGenesisRequest
+	GovernedChildSpec                      = allocation.ChildSpec
+	OperationClosure                       = allocation.OperationClosure
+	GovernedChildBinding                   = allocation.ChildBinding
+	GovernedProducedRow                    = allocation.ProducedRow
+	GovernedAllocationError                = allocation.Error
+	GovernedAllocationErrorKind            = allocation.ErrorKind
+	GovernedRequestKind                    = allocation.RequestKind
 )
 
 // ---------------------------------------------------------------------------
@@ -170,8 +181,10 @@ const (
 
 // Governed allocation bounds and closed enum values.
 const (
-	MaxGovernedAllocationChildren = allocation.MaxChildren
-	MaxGovernedAuthorityDepth     = allocation.MaxAuthorityDepth
+	MaxGovernedAllocationChildren          = allocation.MaxChildren
+	GovernedAllocationCompositionV1        = allocation.CompositionV1
+	GovernedAllocationSupplementPolicyV1   = allocation.SupplementPolicyV1
+	GovernedAllocationReferenceDescendants = allocation.ReferenceScopeDescendants
 
 	GovernedRequestGenesis    = allocation.RequestKindGenesis
 	GovernedRequestAllocation = allocation.RequestKindAllocation

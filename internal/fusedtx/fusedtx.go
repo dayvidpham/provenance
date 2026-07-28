@@ -34,6 +34,25 @@ type System struct {
 	closeOnce  sync.Once
 }
 
+// BindSystem borrows a host-created DBOS root and its exact SQLite system
+// handle. It creates only the matching DBOS data source: it never opens a
+// database, creates or launches a DBOS root, or assumes shutdown ownership.
+// Hosts must call it before launching root so workflows can be registered on
+// the same application boundary.
+func BindSystem(root dbos.DBOSContext, systemDB *sql.DB) (*System, error) {
+	if root == nil {
+		return nil, fmt.Errorf("fusedtx.BindSystem: DBOS root is nil -- where: host-bound fused system construction; impact: no composed workflow can be registered; fix: pass the exact context returned by dbos.NewDBOSContext before launch")
+	}
+	if systemDB == nil {
+		return nil, fmt.Errorf("fusedtx.BindSystem: system database is nil -- where: host-bound fused system construction; impact: DBOS and Provenance cannot share one transaction source; fix: pass the exact *sql.DB used as DBOS Config.SqliteSystemDB")
+	}
+	dataSource, err := dbos.NewDataSource(root, systemDB)
+	if err != nil {
+		return nil, fmt.Errorf("fusedtx.BindSystem: bind DBOS data source to the host system database -- where: host-bound fused system construction; impact: the composed workflow was not registered; fix: pass the exact pre-launch DBOS root and its SqliteSystemDB handle: %w", err)
+	}
+	return &System{root: root, systemDB: systemDB, dataSource: dataSource}, nil
+}
+
 // OpenSystem creates the DBOS root and exact system handle as one ownership
 // unit. Close shuts down that root; because the handle is factory-owned, callers
 // never need to close or retain a second SQLite pool.

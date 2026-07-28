@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/dayvidpham/provenance/internal/fusedtx"
 	"github.com/dayvidpham/provenance/internal/journal"
+	"github.com/dayvidpham/provenance/pkg/ptypes"
 	moderncsqlite "modernc.org/sqlite"
 )
 
@@ -142,8 +144,12 @@ func (scope *connScope) insertResultSlot(anchor int64, slot journal.ResultSlotID
 }
 
 func (scope *connScope) requireResultSlotOwnOperation(anchor, producedJID int64) error {
+	return requireResultSlotOwnOperation(scope.ctx, allocationSQLTx{conn: scope.conn}, anchor, producedJID)
+}
+
+func requireResultSlotOwnOperation(ctx context.Context, tx fusedtx.SQLTx, anchor, producedJID int64) error {
 	var producer sql.NullInt64
-	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT produced_by_operation_journal_id FROM journal WHERE journal_id = ?1", producedJID).Scan(&producer); err != nil {
+	if err := tx.QueryRow(ctx, "SELECT produced_by_operation_journal_id FROM journal WHERE journal_id = ?1", producedJID).Scan(&producer); err != nil {
 		return fmt.Errorf("rule-9 check: load produced row %d: %w", producedJID, err)
 	}
 	if !producer.Valid || producer.Int64 != anchor {
@@ -159,6 +165,9 @@ func (scope *connScope) requireResultSlotOwnOperation(anchor, producedJID int64)
 func (scope *connScope) insertAttribution(task journal.TaskID, actor journal.ActorID, jid int64) error {
 	// Targets the real task_attributions during a live Apply and the shadow
 	// attribution table during a from-empty replay derivation (§8.2, §15).
+	if scope.projectionTarget == projectionTargetLive {
+		return v1InsertAttribution(scope.ctx, allocationSQLTx{conn: scope.conn}, task, actor, jid)
+	}
 	if _, err := scope.conn.ExecContext(scope.ctx, scope.projectionTarget.insertAttributionQuery(), task.String(), actor.String(), jid); err != nil {
 		return fmt.Errorf("update %s attribution: %w", scope.projectionTarget.label(), err)
 	}
@@ -168,6 +177,9 @@ func (scope *connScope) insertAttribution(task journal.TaskID, actor journal.Act
 func (scope *connScope) advanceWatermark(task journal.TaskID, jid int64) error {
 	// Targets the real tasks table during a live Apply and the shadow tasks table
 	// during a from-empty replay derivation (§8.1, §15).
+	if scope.projectionTarget == projectionTargetLive {
+		return v1AdvanceWatermark(scope.ctx, allocationSQLTx{conn: scope.conn}, task, jid)
+	}
 	if _, err := scope.conn.ExecContext(scope.ctx, scope.projectionTarget.advanceWatermarkQuery(), jid, task.String()); err != nil {
 		return fmt.Errorf("advance %s task watermark: %w", scope.projectionTarget.label(), err)
 	}
@@ -423,148 +435,7 @@ func (scope *connScope) requireAuthorityGoverns(in journal.OperationInput, effec
 // authority must strictly precede the effect by JournalID (never by RecordedAt,
 // §12).
 func (scope *connScope) authorityGovernsTaskAt(authJID journal.JournalID, targetTask journal.TaskID, beforeJID int64) (bool, error) {
-	if int64(authJID) >= beforeJID {
-		return false, nil // authority does not precede the effect (§9.3)
-	}
-	var kind = -1
-	err := scope.conn.QueryRowContext(scope.ctx, "SELECT authority_kind_id FROM journal_authorities WHERE journal_id = ?1", int64(authJID)).Scan(&kind)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return false, fmt.Errorf("authority kind %d: %w", authJID, err)
-	}
-	switch kind {
-	case authKindBootstrapID:
-		return true, nil
-	case authKindAssignmentID:
-		return scope.assignmentAuthorityGoverns(authJID, targetTask, beforeJID)
-	default:
-		return false, nil // unknown/absent authority governs nothing
-	}
-}
-
-// assignmentAuthorityGoverns implements the §14.5 governance predicate for
-// an assignment authority at beforeJID: the authority's episode E governs
-// targetTask when (a) E's own task is targetTask and E is active at beforeJID, or
-// (b) some episode on targetTask reaches E by following ParentAssignmentID
-// citations with EVERY episode on that chain — the child through each cited
-// ancestor up to E — active at beforeJID. The walk is bounded and visited-tracked;
-// a corrupted stored chain that cycles fails closed with ErrCorruptParentChain
-// rather than looping.
-func (scope *connScope) assignmentAuthorityGoverns(authJID journal.JournalID, targetTask journal.TaskID, beforeJID int64) (bool, error) {
-	// Resolve the assignment episode this authority (a transition row) belongs to.
-	var authEpisode string
-	err := scope.conn.QueryRowContext(scope.ctx, "SELECT assignment_id FROM journal_authority_assignment_transitions WHERE journal_id = ?1", int64(authJID)).Scan(&authEpisode)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return false, fmt.Errorf("authority assignment %d: %w", authJID, err)
-	}
-	if authEpisode == "" {
-		return false, nil
-	}
-	authAssignment := journal.AssignmentID(authEpisode)
-	// The authority's own episode E must itself be active at the effect position:
-	// an ended authority governs nothing, directly or by delegation.
-	authActive, err := scope.episodeActiveAt(authAssignment, beforeJID)
-	if err != nil {
-		return false, err
-	}
-	if !authActive {
-		return false, nil
-	}
-	// (a) Direct: the authority's own episode task.
-	authTask, err := scope.episodeTask(authAssignment)
-	if err != nil {
-		return false, err
-	}
-	if authTask.String() == targetTask.String() {
-		return true, nil
-	}
-	// (b) Transitive: some active episode on targetTask reaches E by parent
-	// citations, every episode on the chain active at beforeJID.
-	starts, err := scope.episodesOnTask(targetTask)
-	if err != nil {
-		return false, err
-	}
-	for _, start := range starts {
-		active, err := scope.episodeActiveAt(start, beforeJID)
-		if err != nil {
-			return false, err
-		}
-		if !active {
-			continue // an inactive child episode roots no live delegation chain
-		}
-		reached, err := scope.parentChainReaches(start, authAssignment, beforeJID)
-		if err != nil {
-			return false, err // corrupted cyclic chain — fail closed (§14.5)
-		}
-		if reached {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-// episodesOnTask returns every episode whose task is `task` (§14.5 walk
-// entry points). A task typically has few episodes.
-func (scope *connScope) episodesOnTask(task journal.TaskID) ([]journal.AssignmentID, error) {
-	var out []journal.AssignmentID
-	if err := scope.queryRows("SELECT assignment_id FROM journal_authority_assignment_episodes WHERE task_id = ?1", []any{task.String()}, func(rows *sql.Rows) error {
-		var assignment string
-		if err := rows.Scan(&assignment); err != nil {
-			return err
-		}
-		out = append(out, journal.AssignmentID(assignment))
-		return nil
-	}); err != nil {
-		return nil, fmt.Errorf("episodes on task %q: %w", task, err)
-	}
-	return out, nil
-}
-
-// parentChainReaches walks up the ParentAssignmentID chain from `start`,
-// returning true when it reaches `target` with every intermediate cited ancestor
-// active at beforeJID (the caller has already verified `start` and `target` are
-// active). It fails closed with ErrCorruptParentChain when a cycle is detected
-// (a revisited episode or a step past the bounded cap), so a corrupted stored
-// chain halts authorization rather than looping (§14.5).
-func (scope *connScope) parentChainReaches(start, target journal.AssignmentID, beforeJID int64) (bool, error) {
-	visited := map[journal.AssignmentID]struct{}{}
-	cur := start
-	// Defense-in-depth bound: the number of episodes is a hard ceiling on any
-	// acyclic chain length; the visited set is the primary cycle guard.
-	maxSteps, err := scope.countEpisodes()
-	if err != nil {
-		return false, err
-	}
-	for step := 0; ; step++ {
-		if cur == target {
-			return true, nil
-		}
-		if _, seen := visited[cur]; seen || step > maxSteps {
-			return false, fmt.Errorf(
-				"%w: parent-citation walk from episode %q revisited %q before reaching %q — where: "+
-					"§14.5 governance walk; when: during per-effect authorization; impact: authorization "+
-					"fails closed and nothing is committed; fix: the stored parent_assignment_id chain is "+
-					"corrupt (a cycle only reachable by bypassing the start-effect citation guard); repair "+
-					"the journal", journal.ErrCorruptParentChain, start, cur, target)
-		}
-		visited[cur] = struct{}{}
-		parent, hasParent, err := scope.episodeParent(cur)
-		if err != nil {
-			return false, err
-		}
-		if !hasParent {
-			return false, nil // reached a citation root that is not the target
-		}
-		// Each cited ancestor on the chain must be active at the effect position;
-		// a chain broken by an ended middle episode delegates nothing past it.
-		active, err := scope.episodeActiveAt(parent, beforeJID)
-		if err != nil {
-			return false, err
-		}
-		if !active {
-			return false, nil
-		}
-		cur = parent
-	}
+	return v1AuthorityGoverns(scope.ctx, allocationSQLTx{conn: scope.conn}, authJID, targetTask, beforeJID)
 }
 
 func (scope *connScope) countEpisodes() (int, error) {
@@ -656,23 +527,341 @@ func (scope *connScope) requireNoParentCycle(newEpisode, parent journal.Assignme
 // episode on it (§8.1 / owner_responsibility regression c): the close and the
 // episode end must not drift apart.
 func (scope *connScope) validateClosesEndAssignments(anchor int64, effects []journal.Effect) error {
-	for _, eff := range effects {
-		if eff.Sort != journal.EffectTaskEvent || eff.EventKind != "provenance.task.closed" {
-			continue
+	return v1ValidateClosedEvents(scope.ctx, allocationSQLTx{conn: scope.conn}, effects)
+}
+
+// The v1 helpers below are neutral SQLTx journal primitives. Both ordinary
+// Journal.Apply and the governed-allocation composition reducer delegate here,
+// so authority semantics cannot fork between those production paths.
+func journalFoldError(stage, why, fix string, err error) error {
+	return fmt.Errorf("journal fold %s failed — why: %s; where: shared V1 journal reducer; when: folding the canonical effect before commit; impact: the operation returns no committed result and its transaction is rolled back; fix: %s: %w", stage, why, fix, err)
+}
+
+func foldV1TaskEvent(ctx context.Context, tx fusedtx.SQLTx, in journal.OperationInput, jid, recordedAt int64, effect journal.Effect) error {
+	if err := journal.ValidateEventKind(effect.EventKind); err != nil {
+		return err
+	}
+	if err := v1RequireAuthorityGoverns(ctx, tx, *in.AuthorityJournalID, effect.TaskID, jid); err != nil {
+		return err
+	}
+	payload := effect.Payload
+	if effect.Forced && journal.IsTransitionLifecycleKind(effect.EventKind) {
+		payload = journal.EncodeForcedTransitionPayload()
+	}
+	if len(payload) == 0 {
+		payload = []byte(`{}`)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO journal_task_events (journal_id,task_id,event_kind,payload) VALUES (?1,?2,?3,?4)`, jid, effect.TaskID.String(), string(effect.EventKind), string(payload)); err != nil {
+		return journalFoldError("task-event persistence", "the canonical task event row could not be inserted", "repair journal_task_events schema or effect references, then retry", err)
+	}
+	if err := persistV1TaskContexts(ctx, tx, jid, effect.Contexts); err != nil {
+		return err
+	}
+	return materializeV1TaskEvent(ctx, tx, effect, recordedAt)
+}
+
+func foldV1Evidence(ctx context.Context, tx fusedtx.SQLTx, in journal.OperationInput, jid int64, effect journal.Effect) error {
+	var taskArg any
+	if effect.TaskID.Namespace != "" {
+		if err := v1RequireAuthorityGoverns(ctx, tx, *in.AuthorityJournalID, effect.TaskID, jid); err != nil {
+			return err
 		}
-		active, err := scope.taskHasActiveOwnerEpisode(eff.TaskID)
+		taskArg = effect.TaskID.String()
+	}
+	payload := effect.Payload
+	if len(payload) == 0 {
+		payload = []byte(`{}`)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO journal_evidence (journal_id,evidence_kind,task_id,content_digest,payload) VALUES (?1,?2,?3,?4,?5)`, jid, string(effect.EvidenceKind), taskArg, effect.ContentDigest, string(payload)); err != nil {
+		return journalFoldError("evidence persistence", "the canonical evidence row could not be inserted", "repair journal_evidence schema or effect references, then retry", err)
+	}
+	return persistV1FactContexts(ctx, tx, `INSERT INTO journal_evidence_contexts (evidence_journal_id,context_kind,context_identity) VALUES (?1,?2,?3)`, jid, effect.Contexts)
+}
+
+func foldV1EdgeAdd(ctx context.Context, tx fusedtx.SQLTx, in journal.OperationInput, jid, _ int64, effect journal.Effect) error {
+	if err := v1RequireAuthorityGoverns(ctx, tx, *in.AuthorityJournalID, effect.TaskID, jid); err != nil {
+		return err
+	}
+	if effect.EdgeRelKind == ptypes.EdgeBlockedBy {
+		var cycle int
+		err := tx.QueryRow(ctx, `WITH RECURSIVE reach(node) AS (
+			SELECT ?1 UNION SELECT e.target_id FROM edges e JOIN reach r ON e.source_id=r.node WHERE e.kind_id=?3
+		) SELECT ?4 FROM reach WHERE node=?2 LIMIT ?5`, effect.EdgeTargetID, effect.TaskID.String(), int(ptypes.EdgeBlockedBy), 1, 1).Scan(&cycle)
+		if err == nil {
+			return fmt.Errorf("%w: adding blocked-by edge %q -> %q would create a cycle", ptypes.ErrCycleDetected, effect.TaskID.String(), effect.EdgeTargetID)
+		}
+		if !fusedtx.IsNoRows(err) {
+			return journalFoldError("edge cycle check", "the existing edge graph could not be read", "repair the edges projection, then retry", err)
+		}
+	}
+	payload, err := journal.EncodeEdgeMutationPayload(effect.EdgeTargetID, effect.EdgeRelKind)
+	if err != nil {
+		return journalFoldError("edge payload encoding", "the typed edge operands could not be encoded", "supply a valid edge target and relationship kind", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO journal_task_events (journal_id,task_id,event_kind,payload) VALUES (?1,?2,?3,?4)`, jid, effect.TaskID.String(), string(journal.EventKindEdgeAdded), string(payload)); err != nil {
+		return journalFoldError("edge-event persistence", "the canonical edge event row could not be inserted", "repair journal_task_events schema or edge references, then retry", err)
+	}
+	return persistV1TaskContexts(ctx, tx, jid, effect.Contexts)
+}
+
+func foldV1ActivityCreate(ctx context.Context, tx fusedtx.SQLTx, in journal.OperationInput, jid, recordedAt int64, effect journal.Effect) error {
+	if effect.ActivityID.Namespace == "" || effect.ActivityAgentID.Namespace == "" {
+		return fmt.Errorf("operation %q ActivityCreate has an unnamespaced activity or agent identity — why: durable activity identities must include a namespace; where: shared V1 ActivityCreate validation; when: before persisting the activity; impact: the operation returns no committed result and its transaction is rolled back; fix: supply both ActivityID and ActivityAgentID as valid namespaced identities", in.OperationID)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO activities (id,agent_id,phase_id,stage_id,started_at,ended_at,notes) VALUES (?1,?2,?3,?4,?5,?6,?7)`, effect.ActivityID.String(), effect.ActivityAgentID.String(), int(effect.ActivityPhase), int(effect.ActivityStage), recordedAt, nil, effect.ActivityNotes); err != nil {
+		if isUniqueViolation(err) {
+			var existing int64
+			lookupErr := tx.QueryRow(ctx, `SELECT journal_id FROM journal_activity_creations WHERE activity_id=?1`, effect.ActivityID.String()).Scan(&existing)
+			if lookupErr != nil && !fusedtx.IsNoRows(lookupErr) {
+				return journalFoldError("attribute ActivityID collision", "the existing ActivityID could not be attributed to its journal row", "repair journal_activity_creations, then retry", lookupErr)
+			}
+			return &journal.ActivityConflict{ActivityID: effect.ActivityID, ExistingJournalID: journal.JournalID(existing)}
+		}
+		return journalFoldError("activity persistence", "the activity row could not be inserted", "register the cited agent and repair activity references, then retry", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO journal_activity_creations (journal_id,activity_id) VALUES (?1,?2)`, jid, effect.ActivityID.String()); err != nil {
+		return journalFoldError("activity journal binding", "the activity could not be bound to its producing journal row", "repair journal_activity_creations schema or references, then retry", err)
+	}
+	return nil
+}
+
+func persistV1TaskContexts(ctx context.Context, tx fusedtx.SQLTx, jid int64, contexts []journal.EventContext) error {
+	canonical, err := journal.CanonicalEventContexts(contexts)
+	if err != nil {
+		return err
+	}
+	for _, value := range canonical {
+		kind, identity, err := journal.EncodeStoredEventContext(value)
 		if err != nil {
 			return err
 		}
-		if active {
-			return fmt.Errorf(
-				"%w: task %q was closed but retains an active owner-responsibility episode — where: "+
-					"close-ends-assignment gate (§8.1); when: before commit; impact: nothing committed; "+
-					"fix: end the active owner episode in the same operation as the close",
-				journal.ErrCloseWithoutEnding, eff.TaskID)
+		if _, err := tx.Exec(ctx, `INSERT OR IGNORE INTO journal_task_event_contexts (event_journal_id,context_kind,context_identity,attached_by_journal_id) VALUES (?1,?2,?3,?4)`, jid, string(kind), identity, jid); err != nil {
+			return journalFoldError("task-context persistence", "a canonical task context could not be inserted", "repair journal_task_event_contexts schema or references, then retry", err)
 		}
 	}
 	return nil
+}
+
+func persistV1FactContexts(ctx context.Context, tx fusedtx.SQLTx, statement string, jid int64, contexts []journal.EventContext) error {
+	canonical, err := journal.CanonicalEventContexts(contexts)
+	if err != nil {
+		return err
+	}
+	for _, value := range canonical {
+		kind, identity, err := journal.EncodeStoredEventContext(value)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, statement, jid, string(kind), identity); err != nil {
+			return journalFoldError("fact-context persistence", "a canonical fact context could not be inserted", "repair the fact-context schema or references, then retry", err)
+		}
+	}
+	return nil
+}
+
+func materializeV1TaskEvent(ctx context.Context, tx fusedtx.SQLTx, effect journal.Effect, recordedAt int64) error {
+	closeReasonSet := effect.EventKind == journal.EventKindTaskClosed && effect.CloseReason != ""
+	if effect.UpdateTitle == nil && effect.UpdateDescription == nil && effect.UpdatePriority == nil && effect.UpdatePhase == nil && effect.UpdateNotes == nil && !closeReasonSet {
+		return nil
+	}
+	value := func(pointer *string) any {
+		if pointer == nil {
+			return nil
+		}
+		return *pointer
+	}
+	flag := func(set bool) int {
+		if set {
+			return 1
+		}
+		return 0
+	}
+	var priority, phase any
+	if effect.UpdatePriority != nil {
+		priority = int(*effect.UpdatePriority)
+	}
+	if effect.UpdatePhase != nil {
+		phase = int(*effect.UpdatePhase)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE tasks SET updated_at=?1,
+		title=CASE WHEN ?2 THEN ?3 ELSE title END, description=CASE WHEN ?4 THEN ?5 ELSE description END,
+		priority_id=CASE WHEN ?6 THEN ?7 ELSE priority_id END, phase_id=CASE WHEN ?8 THEN ?9 ELSE phase_id END,
+		notes=CASE WHEN ?10 THEN ?11 ELSE notes END, close_reason=CASE WHEN ?12 THEN ?13 ELSE close_reason END WHERE id=?14`,
+		recordedAt, flag(effect.UpdateTitle != nil), value(effect.UpdateTitle), flag(effect.UpdateDescription != nil), value(effect.UpdateDescription), flag(effect.UpdatePriority != nil), priority, flag(effect.UpdatePhase != nil), phase, flag(effect.UpdateNotes != nil), value(effect.UpdateNotes), flag(closeReasonSet), effect.CloseReason, effect.TaskID.String()); err != nil {
+		return journalFoldError("task-event materialization", "the canonical task event could not update the task projection", "repair the tasks projection schema or referenced task, then retry", err)
+	}
+	return nil
+}
+
+func v1ProjectEdgeAdd(ctx context.Context, tx fusedtx.SQLTx, source journal.TaskID, target string, kind ptypes.EdgeKind, recordedAt int64) error {
+	if _, err := tx.Exec(ctx, `INSERT OR IGNORE INTO edges (source_id,target_id,kind_id,created_at) VALUES (?1,?2,?3,?4)`, source.String(), target, int(kind), recordedAt); err != nil {
+		return fmt.Errorf("project journal edge-add %s->%s: %w", source, target, err)
+	}
+	return nil
+}
+
+func v1InsertAttribution(ctx context.Context, tx fusedtx.SQLTx, task journal.TaskID, actor journal.ActorID, jid int64) error {
+	if _, err := tx.Exec(ctx, `INSERT OR IGNORE INTO task_attributions (task_id,actor_id,first_journal_id) VALUES (?1,?2,?3)`, task.String(), actor.String(), jid); err != nil {
+		return fmt.Errorf("attribute journal task event: %w", err)
+	}
+	return nil
+}
+
+func v1AdvanceWatermark(ctx context.Context, tx fusedtx.SQLTx, task journal.TaskID, jid int64) error {
+	if _, err := tx.Exec(ctx, `UPDATE tasks SET last_journal_id=?1 WHERE id=?2`, jid, task.String()); err != nil {
+		return fmt.Errorf("advance journal task watermark: %w", err)
+	}
+	return nil
+}
+
+func v1ValidateClosedEvents(ctx context.Context, tx fusedtx.SQLTx, effects []journal.Effect) error {
+	for _, effect := range effects {
+		if effect.Sort != journal.EffectTaskEvent || effect.EventKind != journal.EventKindTaskClosed {
+			continue
+		}
+		var active int
+		err := tx.QueryRow(ctx, `SELECT 1 FROM journal_authority_assignment_episodes e
+			WHERE e.task_id=?1 AND e.slot_id=?2
+			AND EXISTS (SELECT 1 FROM journal_authority_assignment_transitions s WHERE s.assignment_id=e.assignment_id AND s.transition_id=?3)
+			AND NOT EXISTS (SELECT 1 FROM journal_authority_assignment_transitions x WHERE x.assignment_id=e.assignment_id AND x.transition_id=?4) LIMIT ?5`, effect.TaskID.String(), slotOwnerResponsibilityID, transitionStartedID, transitionEndedID, 1).Scan(&active)
+		if err == nil {
+			return fmt.Errorf("%w: journal task %q was closed but retains an active owner-responsibility assignment — why: close and assignment-end must be atomic; where: shared V1 journal close gate; when: before commit; impact: the operation returns no committed result and is rolled back; fix: end the active owner episode in the same operation as the close", journal.ErrCloseWithoutEnding, effect.TaskID.String())
+		}
+		if !fusedtx.IsNoRows(err) {
+			return journalFoldError("active-owner close check", "active owner assignments could not be read", "repair assignment episode and transition rows, then retry", err)
+		}
+	}
+	return nil
+}
+
+func v1RequireAuthorityGoverns(ctx context.Context, tx fusedtx.SQLTx, authority journal.JournalID, task journal.TaskID, before int64) error {
+	governs, err := v1AuthorityGoverns(ctx, tx, authority, task, before)
+	if err != nil {
+		return err
+	}
+	if !governs {
+		return fmt.Errorf("%w: journal authority %d does not govern task %q at journal position %d — why: the cited authority is absent, inactive, too new, or outside the task ancestry; where: shared V1 journal authority gate; when: before persisting the consuming effect; impact: the operation returns no committed result and is rolled back; fix: cite an earlier active authority that governs this task", journal.ErrAuthorityScope, authority, task.String(), before)
+	}
+	return nil
+}
+
+func v1AuthorityGoverns(ctx context.Context, tx fusedtx.SQLTx, authority journal.JournalID, task journal.TaskID, before int64) (bool, error) {
+	if int64(authority) >= before {
+		return false, nil
+	}
+	var kind int
+	err := tx.QueryRow(ctx, `SELECT authority_kind_id FROM journal_authorities WHERE journal_id=?1`, int64(authority)).Scan(&kind)
+	if fusedtx.IsNoRows(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("resolve journal authority %d: %w", authority, err)
+	}
+	if kind == int(journal.AuthorityKindBootstrap) {
+		return true, nil
+	}
+	if kind != int(journal.AuthorityKindAssignment) {
+		return false, nil
+	}
+	var authorityAssignment string
+	if err := tx.QueryRow(ctx, `SELECT assignment_id FROM journal_authority_assignment_transitions WHERE journal_id=?1`, int64(authority)).Scan(&authorityAssignment); err != nil {
+		if fusedtx.IsNoRows(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("resolve journal assignment authority %d: %w", authority, err)
+	}
+	active, err := v1EpisodeActiveAt(ctx, tx, journal.AssignmentID(authorityAssignment), before)
+	if err != nil || !active {
+		return false, err
+	}
+	var authorityTask string
+	if err := tx.QueryRow(ctx, `SELECT task_id FROM journal_authority_assignment_episodes WHERE assignment_id=?1`, authorityAssignment).Scan(&authorityTask); err != nil {
+		return false, err
+	}
+	parsedAuthorityTask, err := journalParseTask(authorityTask)
+	if err != nil {
+		return false, fmt.Errorf("parse durable task identity %q for journal assignment authority %d — where: shared V1 authority lookup; when: authorizing an effect; impact: authorization fails closed and nothing is committed; fix: repair the malformed task_id in journal_authority_assignment_episodes: %w", authorityTask, authority, err)
+	}
+	if parsedAuthorityTask == task {
+		return true, nil
+	}
+	rows, err := tx.Query(ctx, `SELECT assignment_id FROM journal_authority_assignment_episodes WHERE task_id=?1`, task.String())
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var candidate string
+		if err := rows.Scan(&candidate); err != nil {
+			return false, err
+		}
+		candidateActive, err := v1EpisodeActiveAt(ctx, tx, journal.AssignmentID(candidate), before)
+		if err != nil {
+			return false, err
+		}
+		if !candidateActive {
+			continue
+		}
+		reaches, err := v1ParentChainReaches(ctx, tx, journal.AssignmentID(candidate), journal.AssignmentID(authorityAssignment), before)
+		if err != nil {
+			return false, err
+		}
+		if reaches {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+func v1EpisodeActiveAt(ctx context.Context, tx fusedtx.SQLTx, assignment journal.AssignmentID, before int64) (bool, error) {
+	var started int
+	err := tx.QueryRow(ctx, `SELECT 1 FROM journal_authority_assignment_transitions WHERE assignment_id=?1 AND transition_id=?2 AND journal_id<?3 LIMIT ?4`, string(assignment), transitionStartedID, before, 1).Scan(&started)
+	if fusedtx.IsNoRows(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var ended int
+	err = tx.QueryRow(ctx, `SELECT 1 FROM journal_authority_assignment_transitions WHERE assignment_id=?1 AND transition_id=?2 AND journal_id<?3 LIMIT ?4`, string(assignment), transitionEndedID, before, 1).Scan(&ended)
+	if fusedtx.IsNoRows(err) {
+		return true, nil
+	}
+	return false, err
+}
+
+func v1ParentChainReaches(ctx context.Context, tx fusedtx.SQLTx, start, target journal.AssignmentID, before int64) (bool, error) {
+	var maxSteps int
+	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM journal_authority_assignment_episodes`).Scan(&maxSteps); err != nil {
+		return false, fmt.Errorf("count journal authority episodes: %w", err)
+	}
+	seen := map[journal.AssignmentID]struct{}{}
+	current := start
+	for step := 0; ; step++ {
+		if current == target {
+			return true, nil
+		}
+		if _, duplicate := seen[current]; duplicate || step > maxSteps {
+			return false, fmt.Errorf("%w: journal authority parent chain from %q revisits %q before reaching %q — where: ordinary journal authority traversal; when: authorizing an effect; impact: authorization fails closed and nothing is committed; fix: repair the stored parent_assignment_id chain", journal.ErrCorruptParentChain, start, current, target)
+		}
+		seen[current] = struct{}{}
+		var parent *string
+		err := tx.QueryRow(ctx, `SELECT parent_assignment_id FROM journal_authority_assignment_episodes WHERE assignment_id=?1`, string(current)).Scan(&parent)
+		if fusedtx.IsNoRows(err) {
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("read parent of journal authority episode %q while walking from %q to %q — where: shared V1 authority parent-chain traversal; when: authorizing an effect; impact: authorization fails closed and nothing is committed; fix: repair the authority episode store or retry after the database read failure: %w", current, start, target, err)
+		}
+		if parent == nil {
+			return false, nil
+		}
+		current = journal.AssignmentID(*parent)
+		active, err := v1EpisodeActiveAt(ctx, tx, current, before)
+		if err != nil || !active {
+			return false, err
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -925,6 +1114,14 @@ func isUniqueViolation(err error) bool {
 		}
 	}
 	return errors.Is(err, errUniqueSentinel)
+}
+
+func isForeignKeyViolation(err error) bool {
+	if err == nil {
+		return false
+	}
+	var sqliteErr *moderncsqlite.Error
+	return errors.As(err, &sqliteErr) && sqliteErr.Code() == 787 // SQLITE_CONSTRAINT_FOREIGNKEY
 }
 
 // errUniqueSentinel keeps the predicate total for an explicitly wrapped test or

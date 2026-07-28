@@ -5,10 +5,12 @@
 package allocation
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/dayvidpham/provenance/internal/journal"
@@ -19,13 +21,20 @@ import (
 const (
 	// MaxChildren is the largest governed batch accepted by the MVP contract.
 	MaxChildren = 128
-	// MaxAuthorityDepth includes the root assignment.
-	MaxAuthorityDepth = 64
 
 	maxCommandBytes      = 1024
 	maxAssignmentIDBytes = 256
 	maxTitleBytes        = 4096
 	maxDescriptionBytes  = 64 << 10
+	// A result contains at most MaxChildren child bindings and one emitted-row
+	// and slot binding per accepted canonical effect. Six is JSON's worst-case
+	// expansion for each input byte (a \uXXXX escape). Derive the private decoder
+	// ceiling from the already accepted aggregate input bounds rather than an
+	// unrelated one-MiB limit that could reject a valid committed result.
+	maxAcceptedChildInputBytes = maxAssignmentIDBytes + maxTitleBytes + maxDescriptionBytes + maxCommandBytes
+	maxResultWireBytes         = 6*(MaxChildren*maxAcceptedChildInputBytes+journal.MaxCanonicalEffects*maxAssignmentIDBytes) + 64<<10
+	maxResultWireTokens        = 64 + MaxChildren*48 + journal.MaxCanonicalEffects*16
+	maxResultWireDepth         = 16
 )
 
 // ErrorKind is the closed classification for governed-allocation failures.
@@ -117,6 +126,85 @@ type GovernedAllocationRequest struct {
 	Command            string
 	ParentAssignmentID journal.AssignmentID
 	Children           []ChildSpec
+}
+
+// CompositionVersion identifies the closed governed-allocation composition
+// receipt. It is deliberately separate from the canonical journal mutation
+// version: one governs the allocation-plus-supplements envelope, the other
+// governs the canonical representation of each ordered supplemental effect.
+type CompositionVersion uint8
+
+const (
+	// CompositionV1 is the only supported allocation/supplement envelope.
+	CompositionV1 CompositionVersion = iota + 1
+)
+
+// SupplementPolicy identifies the statically closed supplemental effect set.
+// It is a named policy rather than a caller-configured allow-list so a caller
+// cannot widen allocation authority at runtime.
+type SupplementPolicy uint8
+
+const (
+	// SupplementPolicyV1 permits only evidence, edge-add, task-event, and
+	// activity-create effects. Allocation and assignment effects remain owned by
+	// the governed allocator itself.
+	SupplementPolicyV1 SupplementPolicy = iota + 1
+)
+
+func (policy SupplementPolicy) String() string {
+	switch policy {
+	case SupplementPolicyV1:
+		return "governed-allocation-supplement-policy.v1"
+	default:
+		return fmt.Sprintf("SupplementPolicy(%d)", policy)
+	}
+}
+
+// ReferenceScopeKind is the closed set of additional task-reference domains a
+// composed request may cite. Zero means no additional references (legacy).
+type ReferenceScopeKind uint8
+
+const (
+	// ReferenceScopeDescendants admits only explicitly named tasks whose stored
+	// assignment lineage is proven to descend from Allocation.ParentAssignmentID.
+	ReferenceScopeDescendants ReferenceScopeKind = iota + 1
+)
+
+// ReferenceScope explicitly names existing descendant subjects used by generic
+// supplemental effects. It grants no allocation authority; every task is
+// transaction-locally proven inside the allocation parent's assignment domain.
+type ReferenceScope struct {
+	Kind     ReferenceScopeKind
+	Subjects []ptypes.TaskID
+}
+
+// ComposedRequest atomically allocates Children and then reduces the ordered
+// SupplementalEffects through the canonical journal reducer in the same
+// transaction. Version must be CompositionV1. SupplementalEffects are a
+// strongly typed journal.Effect list; there is no stringly-typed side channel.
+//
+// OperationID remains Allocation.OperationID. The reducer derives a
+// domain-separated, transaction-local journal operation identity only for the
+// supplemental reducer rows; that internal identity is never an external API
+// operation key.
+type ComposedRequest struct {
+	Version    CompositionVersion
+	Allocation GovernedAllocationRequest
+	// Conditions are ordered canonical journal fact assertions evaluated by the
+	// fused transaction before the composition commits. The exported root package
+	// aliases journal.Condition, so callers never need to import this internal
+	// package to construct them.
+	Conditions          []journal.Condition
+	ReferenceScope      ReferenceScope
+	SupplementalEffects []journal.Effect
+}
+
+// GovernedAllocationSupplementOperationID returns the stable persistence
+// identity for a composed allocation's reducer-owned supplemental operation.
+// It intentionally returns only the correlation identity, not the internal
+// capability token required to execute a reserved operation.
+func GovernedAllocationSupplementOperationID(external journal.OperationID) journal.OperationID {
+	return journal.NewGovernedAllocationSupplementOperationID(external).OperationID()
 }
 
 // RootGenesisRequest creates the one initial root task and its initial root
@@ -220,6 +308,77 @@ func (c OperationClosure) Equal(other OperationClosure) bool {
 	return true
 }
 
+// ComposedResult is the copy-safe receipt returned by a composed allocation.
+// Closure is retained through an accessor so retry/recovery cannot expose a
+// mutable slice. The supplemental journal result is intentionally represented
+// as its useful stable bindings rather than as a writable CommittedResult.
+type ComposedResult struct {
+	closure       OperationClosure
+	emittedEvents []journal.JournalID
+	resultSlots   []journal.ResultSlotBinding
+	replayed      bool
+}
+
+// WithComposedReplay returns a defensive copy carrying invocation-local replay
+// metadata. The flag is deliberately omitted from composedResultWire: it
+// describes this call, not the canonical durable receipt.
+func WithComposedReplay(result ComposedResult, replayed bool) ComposedResult {
+	copy := NewComposedResult(result.Closure(), journal.CommittedResult{
+		EmittedEvents: result.SupplementalEmittedEvents(),
+		ResultSlots:   result.SupplementalResultSlots(),
+	})
+	copy.replayed = replayed
+	return copy
+}
+
+// Replayed reports whether this invocation reconstructed an existing composed
+// operation or retrieved an already-completed workflow.
+func (r ComposedResult) Replayed() bool { return r.replayed }
+
+// NewComposedResult constructs a receipt from a governed closure and the
+// canonical journal result. It defensively copies all result slices and pointed
+// identities before storing them.
+func NewComposedResult(closure OperationClosure, result journal.CommittedResult) ComposedResult {
+	return ComposedResult{
+		closure:       NewClosure(closure.OperationID(), closure.Kind(), closure.AnchorJournalID(), closure.Children()),
+		emittedEvents: append([]journal.JournalID(nil), result.EmittedEvents...),
+		resultSlots:   copyResultSlots(result.ResultSlots),
+	}
+}
+
+// Closure returns a fresh immutable governed-allocation closure value.
+func (r ComposedResult) Closure() OperationClosure {
+	return NewClosure(r.closure.OperationID(), r.closure.Kind(), r.closure.AnchorJournalID(), r.closure.Children())
+}
+
+// SupplementalEmittedEvents returns the canonical journal task-event closure
+// in JournalID order as a fresh slice.
+func (r ComposedResult) SupplementalEmittedEvents() []journal.JournalID {
+	return append([]journal.JournalID(nil), r.emittedEvents...)
+}
+
+// SupplementalResultSlots returns resolved canonical journal result-slot
+// bindings as a fresh slice, including fresh pointed TaskID/ActivityID values.
+func (r ComposedResult) SupplementalResultSlots() []journal.ResultSlotBinding {
+	return copyResultSlots(r.resultSlots)
+}
+
+func copyResultSlots(in []journal.ResultSlotBinding) []journal.ResultSlotBinding {
+	out := make([]journal.ResultSlotBinding, len(in))
+	for i := range in {
+		out[i] = in[i]
+		if in[i].TaskID != nil {
+			value := *in[i].TaskID
+			out[i].TaskID = &value
+		}
+		if in[i].ActivityID != nil {
+			value := *in[i].ActivityID
+			out[i].ActivityID = &value
+		}
+	}
+	return out
+}
+
 type closureWire struct {
 	Version     int               `json:"version"`
 	OperationID string            `json:"operationID"`
@@ -244,18 +403,156 @@ func (c OperationClosure) MarshalJSON() ([]byte, error) {
 // positions before replacing the receiver's immutable state.
 func (c *OperationClosure) UnmarshalJSON(data []byte) error {
 	var wire closureWire
-	if err := json.Unmarshal(data, &wire); err != nil {
+	if err := decodeStrictResultWire(data, &wire); err != nil {
 		return fmt.Errorf("decode governed operation closure: %w", err)
 	}
-	if wire.Version != 1 || !wire.Kind.valid() || wire.OperationID == "" || wire.Anchor == 0 || len(wire.Children) == 0 {
+	operationID := journal.OperationID(wire.OperationID)
+	if wire.Version != 1 || !wire.Kind.valid() || journal.ValidateExternalOperationID(operationID) != nil || wire.Anchor <= 0 || (wire.Kind == RequestKindGenesis && len(wire.Children) != 1) || (wire.Kind == RequestKindAllocation && (len(wire.Children) < 1 || len(wire.Children) > MaxChildren)) {
 		return errors.New("decode governed operation closure: unsupported or structurally incomplete closure; restore a valid version-1 operation output")
 	}
+	seenRows := make(map[journal.JournalID]struct{}, len(wire.Children)*2)
 	for ordinal, child := range wire.Children {
-		if child.Ordinal != ordinal || child.TaskRow.OperationID != journal.OperationID(wire.OperationID) || child.TaskRow.EffectOrdinal != ordinal || child.TaskRow.Subordinal != 0 || child.TaskRow.JournalID == 0 || child.AssignmentRow.OperationID != journal.OperationID(wire.OperationID) || child.AssignmentRow.EffectOrdinal != ordinal || child.AssignmentRow.Subordinal != 1 || child.AssignmentRow.JournalID == 0 {
+		if child.Ordinal != ordinal || !validTaskID(child.TaskID) || !validAssignmentID(child.AssignmentID) || !validActorID(child.Occupant) || child.TaskRow.OperationID != operationID || child.TaskRow.EffectOrdinal != ordinal || child.TaskRow.Subordinal != 0 || child.TaskRow.JournalID <= 0 || child.AssignmentRow.OperationID != operationID || child.AssignmentRow.EffectOrdinal != ordinal || child.AssignmentRow.Subordinal != 1 || child.AssignmentRow.JournalID <= 0 || child.TaskRow.JournalID == child.AssignmentRow.JournalID {
 			return errors.New("decode governed operation closure: child binding structural positions do not match the operation; restore a valid version-1 operation output")
+		}
+		for _, row := range []journal.JournalID{child.TaskRow.JournalID, child.AssignmentRow.JournalID} {
+			if _, duplicate := seenRows[row]; duplicate {
+				return errors.New("decode governed operation closure: duplicate produced journal row; restore a valid version-1 operation output")
+			}
+			seenRows[row] = struct{}{}
 		}
 	}
 	*c = NewClosure(journal.OperationID(wire.OperationID), wire.Kind, wire.Anchor, wire.Children)
+	return nil
+}
+
+type composedResultWire struct {
+	Version       int                         `json:"version"`
+	Closure       OperationClosure            `json:"closure"`
+	EmittedEvents []journal.JournalID         `json:"emittedEvents"`
+	ResultSlots   []journal.ResultSlotBinding `json:"resultSlots"`
+}
+
+// MarshalJSON preserves the private copy-safe state when DBOS checkpoints a
+// fused composed result. The wire contains only copied values.
+func (r ComposedResult) MarshalJSON() ([]byte, error) {
+	return json.Marshal(composedResultWire{
+		Version:       1,
+		Closure:       r.Closure(),
+		EmittedEvents: r.SupplementalEmittedEvents(),
+		ResultSlots:   r.SupplementalResultSlots(),
+	})
+}
+
+// UnmarshalJSON validates each externally serialized slot before restoring
+// private receipt state, so a corrupt DBOS output cannot become a replay result.
+func (r *ComposedResult) UnmarshalJSON(data []byte) error {
+	var wire composedResultWire
+	if err := decodeStrictResultWire(data, &wire); err != nil {
+		return fmt.Errorf("decode composed governed allocation result: %w", err)
+	}
+	if wire.Version != 1 || wire.Closure.OperationID() == "" {
+		return errors.New("decode composed governed allocation result: unsupported or structurally incomplete version-1 result; restore a valid DBOS operation output")
+	}
+	for i, event := range wire.EmittedEvents {
+		if event <= 0 || (i > 0 && wire.EmittedEvents[i-1] >= event) {
+			return fmt.Errorf("decode composed governed allocation result: emitted event %d has non-positive JournalID", i)
+		}
+	}
+	for i, binding := range wire.ResultSlots {
+		if err := journal.ValidateResultSlotBinding(binding); err != nil {
+			return fmt.Errorf("decode composed governed allocation result: result slot %d: %w", i, err)
+		}
+		if binding.ProducedJournalID <= 0 || (i > 0 && wire.ResultSlots[i-1].Slot >= binding.Slot) {
+			return fmt.Errorf("decode composed governed allocation result: result slots are duplicated, unsorted, or have an invalid produced row at index %d", i)
+		}
+	}
+	*r = ComposedResult{
+		closure:       NewClosure(wire.Closure.OperationID(), wire.Closure.Kind(), wire.Closure.AnchorJournalID(), wire.Closure.Children()),
+		emittedEvents: append([]journal.JournalID(nil), wire.EmittedEvents...),
+		resultSlots:   copyResultSlots(wire.ResultSlots),
+	}
+	return nil
+}
+
+// decodeStrictResultWire is the private, bounded DBOS-result decoder. The
+// standard decoder accepts duplicate keys, so first walk the token stream and
+// reject ambiguous objects before decoding into the closed wire struct.
+func decodeStrictResultWire(data []byte, out any) error {
+	if len(data) == 0 || len(data) > maxResultWireBytes {
+		return fmt.Errorf("result wire length %d is outside 1..%d bytes", len(data), maxResultWireBytes)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	tokens := 0
+	if err := inspectResultWireValue(decoder, 0, &tokens); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return errors.New("result wire contains trailing JSON values")
+	}
+	decoder = json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(out); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("result wire contains trailing JSON")
+	}
+	return nil
+}
+
+func inspectResultWireValue(decoder *json.Decoder, depth int, tokens *int) error {
+	if depth > maxResultWireDepth {
+		return errors.New("result wire exceeds maximum nesting depth")
+	}
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	*tokens++
+	if *tokens > maxResultWireTokens {
+		return errors.New("result wire exceeds maximum token count")
+	}
+	delim, compound := token.(json.Delim)
+	if !compound {
+		return nil
+	}
+	switch delim {
+	case '{':
+		keys := map[string]struct{}{}
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return errors.New("result wire object key is not a string")
+			}
+			if _, duplicate := keys[key]; duplicate {
+				return fmt.Errorf("result wire contains duplicate field %q", key)
+			}
+			keys[key] = struct{}{}
+			if err := inspectResultWireValue(decoder, depth+1, tokens); err != nil {
+				return err
+			}
+		}
+	case '[':
+		for decoder.More() {
+			if err := inspectResultWireValue(decoder, depth+1, tokens); err != nil {
+				return err
+			}
+		}
+	default:
+		return errors.New("result wire has an unexpected closing delimiter")
+	}
+	closing, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if closing != json.Delim(map[json.Delim]json.Delim{'{': '}', '[': ']'}[delim]) {
+		return errors.New("result wire has mismatched delimiters")
+	}
 	return nil
 }
 
@@ -271,6 +568,19 @@ type canonicalWire struct {
 	Command            string      `json:"command"`
 	ParentAssignmentID string      `json:"parentAssignmentID,omitempty"`
 	Children           []childWire `json:"children"`
+}
+
+type composedCanonicalWire struct {
+	Version               CompositionVersion  `json:"version"`
+	Policy                SupplementPolicy    `json:"policy"`
+	AllocationCanonical   []byte              `json:"allocationCanonical"`
+	SupplementalCanonical []byte              `json:"supplementalCanonical"`
+	ReferenceScope        *referenceScopeWire `json:"referenceScope,omitempty"`
+}
+
+type referenceScopeWire struct {
+	Kind     ReferenceScopeKind `json:"kind,omitempty"`
+	Subjects []string           `json:"subjects,omitempty"`
 }
 
 type childWire struct {
@@ -309,6 +619,210 @@ func CanonicalizeAllocation(request GovernedAllocationRequest) ([]byte, [sha256.
 		ParentAssignmentID: string(request.ParentAssignmentID),
 		Children:           toChildWire(request.Children),
 	})
+}
+
+// CanonicalizeComposed validates and encodes the full allocation-plus-effects
+// request identity. The allocation child order and supplemental effect order are
+// both represented verbatim in their canonical sub-receipts. A retry therefore
+// cannot reuse an OperationID with a changed payload, order, or result slot.
+func CanonicalizeComposed(request ComposedRequest) ([]byte, [sha256.Size]byte, error) {
+	if request.Version != CompositionV1 {
+		return nil, [sha256.Size]byte{}, validationError(request.Allocation.OperationID, "Version", "the composed allocation request has an unsupported version", "nothing was written", "use CompositionV1")
+	}
+	if len(request.SupplementalEffects) == 0 {
+		return nil, [sha256.Size]byte{}, validationError(request.Allocation.OperationID, "SupplementalEffects", "CompositionV1 requires at least one supplemental effect", "the DBOS workflow and reducer were not entered", "use the simple governed allocation API for allocation-only work, or supply at least one supported supplemental effect")
+	}
+	scopeWire, err := canonicalReferenceScope(request.Allocation.OperationID, request.ReferenceScope)
+	if err != nil {
+		return nil, [sha256.Size]byte{}, err
+	}
+	allocationCanonical, _, err := CanonicalizeAllocation(request.Allocation)
+	if err != nil {
+		return nil, [sha256.Size]byte{}, err
+	}
+	for index, effect := range request.SupplementalEffects {
+		if !allowedSupplementSort(effect.Sort) {
+			return nil, [sha256.Size]byte{}, validationError(request.Allocation.OperationID, fmt.Sprintf("SupplementalEffects[%d].Sort", index), fmt.Sprintf("effect sort %s is not permitted by static %s", effect.Sort, SupplementPolicyV1), "the DBOS workflow and reducer were not entered", "use only EffectEvidence, EffectEdgeAdd, EffectTaskEvent, or EffectActivityCreate")
+		}
+		if effect.Sort == journal.EffectTaskEvent && journal.IsReducerDerivedTaskEventKind(effect.EventKind) {
+			return nil, [sha256.Size]byte{}, validationError(request.Allocation.OperationID, fmt.Sprintf("SupplementalEffects[%d].EventKind", index), fmt.Sprintf("task event kind %q is reducer-derived and cannot be supplied as a generic supplemental task event", effect.EventKind), "the DBOS workflow and reducer were not entered", "use EffectEdgeAdd for relationship mutations, or a caller-domain task event kind for supplemental events")
+		}
+	}
+	// Canonicalize is the existing semantic and result-slot validation boundary.
+	// A synthetic non-zero authority is sufficient here because canonicalization
+	// validates shape, while the exact parent authority is checked in the owned
+	// transaction before any rows are inserted.
+	authority := journal.JournalID(1)
+	prepared, err := journal.Canonicalize(journal.OperationInput{
+		OperationID:        GovernedAllocationSupplementOperationID(request.Allocation.OperationID),
+		ActorID:            request.Allocation.ActorID,
+		AuthorityJournalID: &authority,
+		CommandDigest:      supplementalCommandDigest(allocationCanonical),
+		Effects:            copyEffects(request.SupplementalEffects),
+		Conditions:         copyConditions(request.Conditions),
+	})
+	if err != nil {
+		return nil, [sha256.Size]byte{}, validationError(request.Allocation.OperationID, "SupplementalEffects", err.Error(), "the DBOS workflow and reducer were not entered", "supply canonical allowed effects with unique valid result slots")
+	}
+	return marshalComposedCanonical(composedCanonicalWire{
+		Version:               CompositionV1,
+		Policy:                SupplementPolicyV1,
+		AllocationCanonical:   allocationCanonical,
+		SupplementalCanonical: prepared.CanonicalBytes(),
+		ReferenceScope:        scopeWire,
+	})
+}
+
+func canonicalReferenceScope(operation journal.OperationID, scope ReferenceScope) (*referenceScopeWire, error) {
+	if scope.Kind == 0 && len(scope.Subjects) == 0 {
+		return nil, nil
+	}
+	if scope.Kind != ReferenceScopeDescendants || len(scope.Subjects) == 0 || len(scope.Subjects) > MaxChildren {
+		return nil, validationError(operation, "ReferenceScope", "the reference scope must use ReferenceScopeDescendants with 1..128 explicit subjects", "the composed request was not admitted", "name only existing descendant tasks required by supplemental effects")
+	}
+	out := referenceScopeWire{Kind: scope.Kind, Subjects: make([]string, len(scope.Subjects))}
+	seen := make(map[string]struct{}, len(scope.Subjects))
+	for i, subject := range scope.Subjects {
+		if !validTaskID(subject) {
+			return nil, validationError(operation, fmt.Sprintf("ReferenceScope.Subjects[%d]", i), "the subject TaskID is invalid", "the composed request was not admitted", "supply a valid namespaced TaskID")
+		}
+		text := subject.String()
+		if _, duplicate := seen[text]; duplicate {
+			return nil, validationError(operation, fmt.Sprintf("ReferenceScope.Subjects[%d]", i), "the subject is duplicated", "the composed request was not admitted", "list each descendant subject exactly once")
+		}
+		seen[text] = struct{}{}
+		out.Subjects[i] = text
+	}
+	return &out, nil
+}
+
+func allowedSupplementSort(sort journal.EffectSort) bool {
+	switch sort {
+	case journal.EffectEvidence, journal.EffectEdgeAdd, journal.EffectTaskEvent, journal.EffectActivityCreate:
+		return true
+	default:
+		return false
+	}
+}
+
+func marshalComposedCanonical(wire composedCanonicalWire) ([]byte, [sha256.Size]byte, error) {
+	encoded, err := json.Marshal(wire)
+	if err != nil {
+		return nil, [sha256.Size]byte{}, fmt.Errorf("encode canonical composed governed allocation: %w", err)
+	}
+	return encoded, sha256.Sum256(encoded), nil
+}
+
+// DecodeComposedRequest reconstructs a fully validated request from its exact
+// canonical receipt. It rejects a reserialized or policy-widened representation
+// before a recovered fused workflow can enter a transaction.
+func DecodeComposedRequest(encoded []byte) (ComposedRequest, error) {
+	var wire composedCanonicalWire
+	if err := json.Unmarshal(encoded, &wire); err != nil {
+		return ComposedRequest{}, fmt.Errorf("decode canonical composed governed allocation: %w", err)
+	}
+	if wire.Version != CompositionV1 || wire.Policy != SupplementPolicyV1 || len(wire.AllocationCanonical) == 0 {
+		return ComposedRequest{}, errors.New("decode canonical composed governed allocation: unsupported version, policy, or missing allocation receipt")
+	}
+	allocationRequest, err := DecodeAllocationRequest(wire.AllocationCanonical)
+	if err != nil {
+		return ComposedRequest{}, fmt.Errorf("decode canonical composed governed allocation allocation: %w", err)
+	}
+	prepared, err := journal.DecodeCanonicalMutation(wire.SupplementalCanonical)
+	if err != nil {
+		return ComposedRequest{}, fmt.Errorf("decode canonical composed governed allocation supplements: %w", err)
+	}
+	request := ComposedRequest{
+		Version:             wire.Version,
+		Allocation:          allocationRequest,
+		SupplementalEffects: prepared.NormalizedEffects(),
+		Conditions:          prepared.NormalizedConditions(),
+	}
+	if wire.ReferenceScope != nil {
+		request.ReferenceScope.Kind = wire.ReferenceScope.Kind
+		request.ReferenceScope.Subjects = make([]ptypes.TaskID, len(wire.ReferenceScope.Subjects))
+		for i, raw := range wire.ReferenceScope.Subjects {
+			task, parseErr := ptypes.ParseTaskID(raw)
+			if parseErr != nil {
+				return ComposedRequest{}, fmt.Errorf("decode canonical composed governed allocation reference subject %d: %w", i, parseErr)
+			}
+			request.ReferenceScope.Subjects[i] = task
+		}
+	}
+	reserialized, _, err := CanonicalizeComposed(request)
+	if err != nil || !bytes.Equal(reserialized, encoded) {
+		return ComposedRequest{}, errors.New("decode canonical composed governed allocation: stored bytes are not canonical; restore the matching allocation and supplemental receipt")
+	}
+	return request, nil
+}
+
+// SupplementalOperation prepares the one internal canonical journal operation
+// that reduces a composition's supplemental effects. Its OperationID is a
+// deterministic SHA-256 derivation with a fixed domain separator; it cannot be
+// supplied by callers and is not a second external operation identity.
+func SupplementalOperation(request ComposedRequest, authority journal.JournalID) (journal.OperationInput, journal.CanonicalMutation, error) {
+	allocationCanonical, _, err := CanonicalizeAllocation(request.Allocation)
+	if err != nil {
+		return journal.OperationInput{}, journal.CanonicalMutation{}, err
+	}
+	input := journal.OperationInput{
+		OperationID:        GovernedAllocationSupplementOperationID(request.Allocation.OperationID),
+		ActorID:            request.Allocation.ActorID,
+		AuthorityJournalID: &authority,
+		CommandDigest:      supplementalCommandDigest(allocationCanonical),
+		Effects:            copyEffects(request.SupplementalEffects),
+		Conditions:         copyConditions(request.Conditions),
+	}
+	prepared, err := journal.Canonicalize(input)
+	if err != nil {
+		return journal.OperationInput{}, journal.CanonicalMutation{}, err
+	}
+	input.Effects = prepared.NormalizedEffects()
+	input.Conditions = prepared.NormalizedConditions()
+	input.MutationDigest = prepared.DerivedDigest()
+	return input, prepared, nil
+}
+
+func copyConditions(in []journal.Condition) []journal.Condition {
+	if len(in) == 0 {
+		return nil
+	}
+	prepared, err := journal.Canonicalize(journal.OperationInput{Conditions: in})
+	if err != nil {
+		return append([]journal.Condition(nil), in...)
+	}
+	return prepared.NormalizedConditions()
+}
+
+func supplementalCommandDigest(allocationCanonical []byte) []byte {
+	hash := sha256.New()
+	_, _ = hash.Write([]byte("provenance.governed-allocation.supplement.command.v1\x00"))
+	_, _ = hash.Write(allocationCanonical)
+	return hash.Sum(nil)
+}
+
+func copyEffects(in []journal.Effect) []journal.Effect {
+	// Canonicalize returns independently allocated normalized effects. This first
+	// pass prevents a caller changing a payload slice while the request is being
+	// prepared from altering the persisted identity.
+	prepared, err := journal.Canonicalize(journal.OperationInput{Effects: in})
+	if err == nil {
+		return prepared.NormalizedEffects()
+	}
+	// The caller will receive the canonical validation error in the primary path;
+	// use a minimal deep copy here solely to avoid retaining its mutable bytes.
+	out := make([]journal.Effect, len(in))
+	for i := range in {
+		out[i] = in[i]
+		out[i].Payload = append([]byte(nil), in[i].Payload...)
+		out[i].ContentDigest = append([]byte(nil), in[i].ContentDigest...)
+		out[i].Contexts = append([]journal.EventContext(nil), in[i].Contexts...)
+		if in[i].RecordedAtOverride != nil {
+			value := *in[i].RecordedAtOverride
+			out[i].RecordedAtOverride = &value
+		}
+	}
+	return out
 }
 
 // CanonicalizeGenesis validates and encodes the exact one-root request.
@@ -450,7 +964,7 @@ func decodeCanonical(encoded []byte) (decodedCanonical, error) {
 }
 
 func validateCommon(operationID journal.OperationID, actor ptypes.ActorID, command string) error {
-	if err := journal.ValidateOperationID(operationID); err != nil {
+	if err := journal.ValidateExternalOperationID(operationID); err != nil {
 		return validationError(operationID, "OperationID", err.Error(), "nothing was written", "supply a valid stable OperationID")
 	}
 	if !validActorID(actor) {

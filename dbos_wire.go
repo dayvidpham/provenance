@@ -56,9 +56,25 @@ type DBOSOperationContextBytes []byte
 // DBOSMutationBytes carries the canonical mutation. Its digest is always derived.
 type DBOSMutationBytes []byte
 
+// dbosOperationKind selects the adapter workflow that consumes one otherwise
+// shared canonical operation envelope. The empty kind preserves the original
+// generic Apply contract; transfer has a distinct durable workflow identity so
+// it cannot attach to a generic operation with the same OperationID.
+type dbosOperationKind string
+
+const (
+	dbosOperationKindApply              dbosOperationKind = ""
+	dbosOperationKindAssignmentTransfer dbosOperationKind = "assignment-transfer"
+)
+
+func (k dbosOperationKind) known() bool {
+	return k == dbosOperationKindApply || k == dbosOperationKindAssignmentTransfer
+}
+
 // DBOSApplyInput is the closed durable workflow input.
 type DBOSApplyInput struct {
 	Schema   string                    `json:"schema"`
+	Kind     dbosOperationKind         `json:"kind,omitempty"`
 	Context  DBOSOperationContextBytes `json:"context"`
 	Mutation DBOSMutationBytes         `json:"mutation"`
 }
@@ -175,6 +191,9 @@ func validateUniqueJSONValue(decoder *json.Decoder, depth int) error {
 }
 
 func encodeApplyInput(contract dbosContractSnapshot, in journal.OperationInput) (DBOSApplyInput, journal.OperationInput, error) {
+	if err := journal.ValidateOperationID(in.OperationID); err != nil {
+		return DBOSApplyInput{}, journal.OperationInput{}, fmt.Errorf("provenance: public DBOS apply rejects invalid operation identity %q before workflow creation: %w", in.OperationID, err)
+	}
 	prepared, err := journal.Canonicalize(in)
 	if err != nil {
 		return DBOSApplyInput{}, journal.OperationInput{}, err
@@ -189,7 +208,7 @@ func encodeApplyInput(contract dbosContractSnapshot, in journal.OperationInput) 
 	if err != nil {
 		return DBOSApplyInput{}, journal.OperationInput{}, err
 	}
-	return DBOSApplyInput{Schema: contract.applyInputSchema, Context: contextBytes, Mutation: prepared.CanonicalBytes()}, in, nil
+	return DBOSApplyInput{Schema: contract.applyInputSchema, Kind: dbosOperationKindApply, Context: contextBytes, Mutation: prepared.CanonicalBytes()}, in, nil
 }
 
 func decodeApplyInput(contract dbosContractSnapshot, input DBOSApplyInput) (journal.OperationInput, error) {
@@ -198,6 +217,12 @@ func decodeApplyInput(contract dbosContractSnapshot, input DBOSApplyInput) (jour
 			DBOSDiagFieldSchema, DBOSDiagStageContextDecode,
 			fmt.Sprintf("outer input schema %q is not supported schema %q", input.Schema, contract.applyInputSchema),
 			"restore the original envelope or recover it with a build supporting its schema")
+	}
+	if input.Kind != dbosOperationKindApply {
+		return journal.OperationInput{}, dbosContextFrameError(
+			DBOSDiagFieldKind, DBOSDiagStageContextDecode,
+			fmt.Sprintf("workflow input kind %q is not the generic apply kind", input.Kind),
+			"route assignment-transfer inputs through DBOSAdapter.TransferAssignment")
 	}
 	in, err := decodeDBOSContext(contract, input.Context)
 	if err != nil {
@@ -218,6 +243,29 @@ func decodeApplyInput(contract dbosContractSnapshot, input DBOSApplyInput) (jour
 	in.Effects = prepared.NormalizedEffects()
 	in.MutationDigest = prepared.DerivedDigest()
 	return in, nil
+}
+
+// encodeAssignmentTransferInput reuses the normal canonical operation envelope.
+// The kind is only a durable routing and collision boundary; transfer semantics
+// remain in the canonical mutation and Session.TransferAssignment.
+func encodeAssignmentTransferInput(contract dbosContractSnapshot, in journal.OperationInput) (DBOSApplyInput, journal.OperationInput, error) {
+	input, normalized, err := encodeApplyInput(contract, in)
+	if err != nil {
+		return DBOSApplyInput{}, journal.OperationInput{}, err
+	}
+	input.Kind = dbosOperationKindAssignmentTransfer
+	return input, normalized, nil
+}
+
+func decodeAssignmentTransferInput(contract dbosContractSnapshot, input DBOSApplyInput) (journal.OperationInput, error) {
+	if input.Kind != dbosOperationKindAssignmentTransfer {
+		return journal.OperationInput{}, dbosContextFrameError(
+			DBOSDiagFieldKind, DBOSDiagStageContextDecode,
+			fmt.Sprintf("workflow input kind %q is not assignment-transfer", input.Kind),
+			"restore the assignment-transfer envelope or invoke DBOSAdapter.Apply for a generic operation")
+	}
+	input.Kind = dbosOperationKindApply
+	return decodeApplyInput(contract, input)
 }
 
 func encodeDBOSContext(contract dbosContractSnapshot, in journal.OperationInput) ([]byte, error) {

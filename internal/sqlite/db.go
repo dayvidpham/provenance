@@ -9,6 +9,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"net/url"
@@ -125,6 +126,17 @@ func (scope *connScope) release() {
 			scope.releaseFunc()
 		}
 	})
+}
+
+// discard marks a leased connection unusable before releasing its scope. This
+// is reserved for transaction-cleanup paths where returning the underlying
+// SQLite connection to the pool could expose unknown transaction/PRAGMA state.
+func (scope *connScope) discard() {
+	if scope == nil || scope.conn == nil {
+		return
+	}
+	_ = scope.conn.Raw(func(any) error { return driver.ErrBadConn })
+	scope.release()
 }
 
 func (scope *connScope) cancel() {

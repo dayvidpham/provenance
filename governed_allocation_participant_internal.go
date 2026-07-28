@@ -53,15 +53,30 @@ func copyOperationClosure(closure OperationClosure) OperationClosure {
 type governedAllocationParticipantFailure struct {
 	operation OperationID
 	cause     error
+	stage     governedAllocationParticipantFailureStage
 }
 
-func newGovernedAllocationParticipantFailure(operation OperationID, cause error) error {
-	return &governedAllocationParticipantFailure{operation: operation, cause: cause}
+type governedAllocationParticipantFailureStage uint8
+
+const (
+	governedAllocationParticipantFailureAfterAllocation governedAllocationParticipantFailureStage = iota
+	governedAllocationParticipantFailureAfterComposedAllocation
+)
+
+func newGovernedAllocationParticipantFailure(operation OperationID, cause error, stage governedAllocationParticipantFailureStage) error {
+	return &governedAllocationParticipantFailure{operation: operation, cause: cause, stage: stage}
 }
 
 func (e *governedAllocationParticipantFailure) Error() string {
+	if e.stage == governedAllocationParticipantFailureAfterAllocation {
+		return fmt.Sprintf(
+			"provenance.FusedGovernedAllocator.allocateWorkflow: governed allocation participant failed for operation %q -- where: fused DBOS transaction after allocation reducer success and before checkpoint; why: %v; impact: DBOS rolls back governed domain rows, participant writes, and the successful operation_outputs checkpoint; fix: make the participant's OperationID-bound audit write and immutable-data validation succeed before retrying",
+			e.operation,
+			e.cause,
+		)
+	}
 	return fmt.Sprintf(
-		"provenance.FusedGovernedAllocator.allocateWorkflow: governed allocation participant failed for operation %q -- where: fused DBOS transaction after reducer success and before checkpoint; why: %v; impact: DBOS rolls back governed domain rows, participant writes, and the successful operation_outputs checkpoint; fix: make the participant's OperationID-bound audit write and immutable-data validation succeed before retrying",
+		"provenance.FusedGovernedAllocator.allocateComposedWorkflow: governed allocation participant failed for operation %q -- where: fused DBOS transaction after allocation and supplemental reducer success and before checkpoint; why: %v; impact: DBOS rolls back governed domain rows, supplemental journal rows, participant writes, and the successful operation_outputs checkpoint; fix: make the participant's OperationID-bound audit write and immutable-data validation succeed before retrying",
 		e.operation,
 		e.cause,
 	)

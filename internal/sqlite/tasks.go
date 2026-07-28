@@ -13,7 +13,7 @@ import (
 // direct un-journaled *DB mutator. Creation is the fold's own watermark-carrying INSERT
 // (foldTaskCreate in operations.go), reached only through a journaled
 // EffectTaskCreate (Session.Create / an Atomic op). Metadata updates and closure are the
-// fold's materialization step (materializeTaskEventColumns), reached through a
+// fold's V1 materializer (materializeV1TaskEvent), reached through a
 // journaled EffectTaskEvent (Session.Update / Session.CloseTask); status and owner are
 // reducer-exclusive projections advanced only by lifecycle events and assignment
 // episodes. The former direct-write mutators were retired for this single path:

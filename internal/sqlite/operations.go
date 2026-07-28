@@ -412,13 +412,26 @@ func (db *DB) JournalIsEmpty() (bool, error) {
 // per-effect authorization (§9.3), persists result slots (§3.2), and runs the
 // subtype-integrity and close-ends-assignment gates before commit.
 func (db *DB) Apply(in journal.OperationInput) (res journal.CommittedResult, err error) {
+	in, prepared, callerMutationDigest, err := prepareApplyInput(in)
+	if err != nil {
+		return journal.CommittedResult{}, err
+	}
+	return db.applyPreparedOperation(in, prepared, callerMutationDigest, foldOptions{})
+}
+
+// prepareApplyInput is the one canonical operation preparation path shared by
+// generic Apply and the distinct assignment-transfer entrypoint.
+func prepareApplyInput(in journal.OperationInput) (journal.OperationInput, journal.CanonicalMutation, []byte, error) {
+	if err := journal.ValidateOperationID(in.OperationID); err != nil {
+		return journal.OperationInput{}, journal.CanonicalMutation{}, nil, err
+	}
 	// Canonicalize before acquiring write ownership or allocating (§9.1).
 	// This validates and normalizes conditions and effects; a failure here is a
 	// pure input error and nothing has been written.
 	callerMutationDigest := append([]byte(nil), in.MutationDigest...)
 	prepared, err := journal.Canonicalize(in)
 	if err != nil {
-		return journal.CommittedResult{}, fmt.Errorf("Apply: prepare canonical mutation before any write: %w", err)
+		return journal.OperationInput{}, journal.CanonicalMutation{}, nil, fmt.Errorf("Apply: prepare canonical mutation before any write: %w", err)
 	}
 	// Canonical bytes, not caller assertions, define mutation identity. Execute the
 	// decoded normalized values so identity and behavior cannot drift.
@@ -426,8 +439,15 @@ func (db *DB) Apply(in journal.OperationInput) (res journal.CommittedResult, err
 	in.Effects = prepared.NormalizedEffects()
 	in.MutationDigest = prepared.DerivedDigest()
 	if err := validateApplyInput(in); err != nil {
-		return journal.CommittedResult{}, err
+		return journal.OperationInput{}, journal.CanonicalMutation{}, nil, err
 	}
+	return in, prepared, callerMutationDigest, nil
+}
+
+// applyPreparedOperation owns the BEGIN IMMEDIATE transaction shared by all
+// canonical operation entrypoints. foldOptions is package-private; public Apply
+// always supplies the zero value.
+func (db *DB) applyPreparedOperation(in journal.OperationInput, prepared journal.CanonicalMutation, callerMutationDigest []byte, options foldOptions) (res journal.CommittedResult, err error) {
 	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return journal.CommittedResult{}, fmt.Errorf("Apply: lease pooled connection before write transaction: %w", err)
@@ -441,7 +461,7 @@ func (db *DB) Apply(in journal.OperationInput) (res journal.CommittedResult, err
 	// transient infrastructure — the 5 s busy_timeout (set in Open) retries it.
 	if transactionErr := runImmediateTransaction(scope.ctx, scope.conn, func() error {
 		var foldErr error
-		res, foldErr = scope.foldPreparedOperation(in, prepared, callerMutationDigest, nil)
+		res, foldErr = scope.foldPreparedOperation(in, prepared, callerMutationDigest, options)
 		return foldErr
 	}); transactionErr != nil {
 		// A replay conflict intentionally returns both its closed result variant and
@@ -456,7 +476,7 @@ func (db *DB) Apply(in journal.OperationInput) (res journal.CommittedResult, err
 // Apply and the internal foldOperation callers (migration, replay).
 func validateApplyInput(in journal.OperationInput) error {
 	if err := journal.ValidateOperationID(in.OperationID); err != nil {
-		return fmt.Errorf("Apply: %w", err)
+		return err
 	}
 	if in.ActorID.Namespace == "" {
 		return fmt.Errorf("Apply: operation %q: committing actor is required", in.OperationID)
@@ -466,6 +486,13 @@ func validateApplyInput(in journal.OperationInput) error {
 			"Apply: operation %q: CommandDigest is required — where: Apply input validation; "+
 				"impact: nothing committed; fix: supply the command provenance digest; the mutation digest is derived from canonical effects",
 			in.OperationID)
+	}
+	return nil
+}
+
+func validateExternalApplyOperationID(operationID journal.OperationID) error {
+	if err := journal.ValidateExternalOperationID(operationID); err != nil {
+		return fmt.Errorf("%w: reserved OperationID %q belongs to the governed-allocation supplemental namespace and cannot enter the generic reducer — why: this identity is reducer-owned, not caller-owned (%v); where: foldPreparedOperation reserved-identity admission; when: before anchor, effect, or DBOS work; impact: zero durable writes and no committed result; fix: supply a fresh caller-owned OperationID and let the composed governed-allocation operation mint and own its supplemental identity", journal.ErrOperationConflict, operationID, err)
 	}
 	return nil
 }
@@ -481,6 +508,9 @@ func validateApplyInput(in journal.OperationInput) error {
 // each effect index is folded; a non-nil return aborts and rolls back the whole
 // operation, committing nothing.
 func (scope *connScope) foldOperation(in journal.OperationInput, faultHook func(effectIndex int) error) (journal.CommittedResult, error) {
+	if err := journal.ValidateOperationID(in.OperationID); err != nil {
+		return journal.CommittedResult{}, err
+	}
 	callerMutationDigest := append([]byte(nil), in.MutationDigest...)
 	prepared, err := journal.Canonicalize(in)
 	if err != nil {
@@ -489,13 +519,13 @@ func (scope *connScope) foldOperation(in journal.OperationInput, faultHook func(
 	in.Conditions = prepared.NormalizedConditions()
 	in.Effects = prepared.NormalizedEffects()
 	in.MutationDigest = prepared.DerivedDigest()
-	return scope.foldPreparedOperation(in, prepared, callerMutationDigest, faultHook)
+	return scope.foldPreparedOperation(in, prepared, callerMutationDigest, foldOptions{faultHook: faultHook})
 }
 
 // foldPreparedOperation owns the savepoint-based fold. Public DB.Apply calls it
 // after BEGIN IMMEDIATE acquires write ownership; foldOperation calls it after
 // canonicalizing raw input.
-func (scope *connScope) foldPreparedOperation(in journal.OperationInput, prepared journal.CanonicalMutation, callerMutationDigest []byte, faultHook func(effectIndex int) error) (journal.CommittedResult, error) {
+func (scope *connScope) foldPreparedOperation(in journal.OperationInput, prepared journal.CanonicalMutation, callerMutationDigest []byte, options foldOptions) (journal.CommittedResult, error) {
 	// SAVEPOINT (not BEGIN) so foldOperation composes as a nested transaction when
 	// migration folds many per-task operations inside one outer savepoint (§9.5,
 	// §13 whole-batch atomicity); standalone it behaves as an ordinary atomic
@@ -520,6 +550,22 @@ func (scope *connScope) foldPreparedOperation(in journal.OperationInput, prepare
 		txErr = lookErr
 		return journal.CommittedResult{}, txErr
 	}
+	if journal.IsReservedInternalOperationID(in.OperationID) {
+		var owner string
+		ownerErr := scope.conn.QueryRowContext(scope.ctx, `SELECT governed_operation_id FROM governed_composed_supplement_owners WHERE supplement_operation_id=?1`, string(in.OperationID)).Scan(&owner)
+		if ownerErr == nil {
+			txErr = fmt.Errorf("%w: reserved OperationID %q is already owned by composed governed allocation %q and cannot enter the generic reducer — why: replay authority belongs to its owning composed operation; where: foldPreparedOperation reserved-identity admission; when: before anchor, effect, or DBOS work; impact: zero durable writes and no committed result; fix: retry or inspect the owning composed operation %q instead of submitting its supplemental OperationID directly", journal.ErrOperationConflict, in.OperationID, owner, owner)
+			return journal.CommittedResult{}, txErr
+		}
+		if !errors.Is(ownerErr, sql.ErrNoRows) {
+			txErr = fmt.Errorf("Apply: classify reserved operation %q ownership before replay: %w", in.OperationID, ownerErr)
+			return journal.CommittedResult{}, txErr
+		}
+		if !found {
+			txErr = validateExternalApplyOperationID(in.OperationID)
+			return journal.CommittedResult{}, txErr
+		}
+	}
 	if found {
 		// A committed row for this OperationID already exists: an exact four-field
 		// identity match short-circuits (§9.4), any mismatch is the typed
@@ -530,6 +576,14 @@ func (scope *connScope) foldPreparedOperation(in journal.OperationInput, prepare
 			txErr = err
 		}
 		return res, err
+	}
+	// The distinct transfer path authenticates predecessor liveness only after
+	// replay/conflict admission. Generic Apply always has a nil lease here.
+	if options.assignmentTransfer != nil {
+		if authErr := scope.authenticateAssignmentTransfer(in, options.assignmentTransfer); authErr != nil {
+			txErr = authErr
+			return journal.CommittedResult{}, txErr
+		}
 	}
 
 	// Evaluate pre-conditions inside the write transaction (§9.5).
@@ -579,7 +633,7 @@ func (scope *connScope) foldPreparedOperation(in journal.OperationInput, prepare
 	// state produced by all earlier effects of this same operation (§9.3).
 	for i := range in.Effects {
 		eff := in.Effects[i]
-		producedJID, err := scope.foldEffect(in, anchorJID, eff, i)
+		producedJID, err := scope.foldEffect(in, anchorJID, eff, i, options.assignmentTransfer)
 		if err != nil {
 			txErr = err
 			return journal.CommittedResult{}, txErr
@@ -600,12 +654,22 @@ func (scope *connScope) foldPreparedOperation(in journal.OperationInput, prepare
 		}
 		// Fail-closed atomicity seam (§9.5): an injected fault/cancellation after
 		// effect i rolls back every effect 1..i and the anchor as one transaction.
-		if faultHook != nil {
-			if err := faultHook(i); err != nil {
+		if options.assignmentTransfer != nil {
+			if err := options.assignmentTransfer.recordFoldedEffect(eff, i); err != nil {
 				txErr = err
 				return journal.CommittedResult{}, txErr
 			}
 		}
+		if options.faultHook != nil {
+			if err := options.faultHook(i); err != nil {
+				txErr = err
+				return journal.CommittedResult{}, txErr
+			}
+		}
+	}
+	if options.assignmentTransfer != nil && !options.assignmentTransfer.complete() {
+		txErr = assignmentTransferValidationError("lease", "the exact predecessor-end/successor-start closure did not consume its transaction-local lease", "retry through Session.TransferAssignment without altering the canonical operation")
+		return journal.CommittedResult{}, txErr
 	}
 
 	// Post-fold gates: subtype integrity (§10 rule 8), anchor-only actor placement
@@ -638,7 +702,7 @@ func (scope *connScope) foldPreparedOperation(in journal.OperationInput, prepare
 // on the input and dispatches to the sort-specific reducer step, each of which
 // authorizes against current transaction state (all earlier effects already
 // inserted, §9.3).
-func (scope *connScope) foldEffect(in journal.OperationInput, anchorJID int64, eff journal.Effect, index int) (int64, error) {
+func (scope *connScope) foldEffect(in journal.OperationInput, anchorJID int64, eff journal.Effect, index int, transferLease *assignmentTransferLease) (int64, error) {
 	// A subordinate (operation-produced) row carries no stored actor: the committing
 	// actor lives once on the anchor and is derived (§2.1, §8.5). Apply therefore
 	// rejects any input effect that would stamp an actor on a produced row — the
@@ -673,7 +737,7 @@ func (scope *connScope) foldEffect(in journal.OperationInput, anchorJID int64, e
 	case journal.EffectBootstrapAuthority:
 		return jid, scope.foldBootstrapAuthority(jid, eff)
 	case journal.EffectAssignmentStart:
-		return jid, scope.foldAssignmentStart(in, jid, eff)
+		return jid, scope.foldAssignmentStart(in, jid, eff, index, transferLease)
 	case journal.EffectAssignmentEnd:
 		return jid, scope.foldAssignmentEnd(in, jid, eff)
 	case journal.EffectDecision:
@@ -774,105 +838,11 @@ func (scope *connScope) foldTaskCreate(in journal.OperationInput, jid int64, eff
 }
 
 func (scope *connScope) foldTaskEvent(in journal.OperationInput, jid int64, eff journal.Effect) error {
-	if err := journal.ValidateEventKind(eff.EventKind); err != nil {
-		return err
-	}
-	if err := scope.requireAuthorityGoverns(in, jid, eff.TaskID); err != nil {
-		return err
-	}
-	payload := eff.Payload
-	// A forced TRANSITION lifecycle event records its FSM-bypass intent in the journal
-	// row itself (§8.1), so the coercion is reproducible from history and the shared
-	// reducer skips the FSM for exactly this row. Forced never applies to a
-	// non-transition kind, and never bypasses the authorization above.
-	if eff.Forced && journal.IsTransitionLifecycleKind(eff.EventKind) {
-		payload = journal.EncodeForcedTransitionPayload()
-	}
-	if len(payload) == 0 {
-		payload = json.RawMessage(`{}`)
-	}
-	if !json.Valid(payload) {
-		return fmt.Errorf("Apply: task_event payload for %q is not valid JSON", eff.EventKind)
-	}
-	if _, err := scope.conn.ExecContext(scope.ctx, insertJournalTaskEventSQL, jid, eff.TaskID.String(), string(eff.EventKind), string(payload)); err != nil {
-		return fmt.Errorf("Apply: insert journal_task_events: %w", err)
-	}
-	contexts, err := journal.CanonicalEventContexts(eff.Contexts)
-	if err != nil {
-		return fmt.Errorf("Apply: canonical contexts: %w", err)
-	}
-	for _, ctx := range contexts {
-		ck, identity, encErr := journal.EncodeStoredEventContext(ctx)
-		if encErr != nil {
-			return fmt.Errorf("Apply: encode context: %w", encErr)
-		}
-		if _, err := scope.conn.ExecContext(scope.ctx, "INSERT OR IGNORE INTO journal_task_event_contexts (event_journal_id, context_kind, context_identity, attached_by_journal_id)\n\t\t\t VALUES (?1, ?2, ?3, ?4)", jid, string(ck), identity, jid); err != nil {
-			return fmt.Errorf("Apply: insert context edge: %w", err)
-		}
-	}
-	// Materialize the complete tasks-row state carried by update/close events. Startup
-	// independently re-derives and compares these fields from canonical effects.
-	if err := scope.materializeTaskEventColumns(in, jid, eff); err != nil {
-		return err
-	}
-	// Projections (attribution, watermark, and any lifecycle-status transition)
-	// are advanced by the shared reducer step projectJournalRow after this
-	// row is inserted — the single fold Apply and Open both run (§9.2).
-	return nil
-}
-
-// materializeTaskEventColumns writes the journal-reproducible tasks-row columns a
-// task_event carries (§8.1): the provenance.task.updated metadata columns and the
-// provenance.task.closed close_reason. It touches nothing when the effect carries no
-// such column (a plain caller-domain event), and it updates updated_at to the effect's
-// recorded time so the mutable row's display timestamp stays honest. It runs only on
-// the live Apply fold; replay derives the equivalent shadow state separately.
-func (scope *connScope) materializeTaskEventColumns(in journal.OperationInput, jid int64, eff journal.Effect) error {
 	recordedAt := in.RecordedAt
 	if eff.RecordedAtOverride != nil {
 		recordedAt = *eff.RecordedAtOverride
 	}
-	value := func(p *string) any {
-		if p == nil {
-			return nil
-		}
-		return *p
-	}
-	flag := func(set bool) int {
-		if set {
-			return 1
-		}
-		return 0
-	}
-	closeReasonSet := journal.EventKind(eff.EventKind) == journal.EventKindTaskClosed && eff.CloseReason != ""
-	// Only updated_at would change (no metadata/close column): nothing material to
-	// write, so skip the UPDATE entirely (a bare updated_at bump on an unrelated event
-	// would be noise).
-	if eff.UpdateTitle == nil && eff.UpdateDescription == nil && eff.UpdatePriority == nil && eff.UpdatePhase == nil && eff.UpdateNotes == nil && !closeReasonSet {
-		return nil
-	}
-	var priority, phase any
-	if eff.UpdatePriority != nil {
-		priority = int(*eff.UpdatePriority)
-	}
-	if eff.UpdatePhase != nil {
-		phase = int(*eff.UpdatePhase)
-	}
-	if _, err := scope.conn.ExecContext(scope.ctx, "UPDATE tasks SET\n\t\tupdated_at=?1,\n\t\ttitle=CASE WHEN ?2 THEN ?3 ELSE title END,\n\t\tdescription=CASE WHEN ?4 THEN ?5 ELSE description END,\n\t\tpriority_id=CASE WHEN ?6 THEN ?7 ELSE priority_id END,\n\t\tphase_id=CASE WHEN ?8 THEN ?9 ELSE phase_id END,\n\t\tnotes=CASE WHEN ?10 THEN ?11 ELSE notes END,\n\t\tclose_reason=CASE WHEN ?12 THEN ?13 ELSE close_reason END\n\t\tWHERE id=?14",
-		recordedAt,
-		flag(eff.UpdateTitle != nil), value(eff.UpdateTitle),
-		flag(eff.UpdateDescription != nil), value(eff.UpdateDescription),
-		flag(eff.UpdatePriority != nil), priority,
-		flag(eff.UpdatePhase != nil), phase,
-		flag(eff.UpdateNotes != nil), value(eff.UpdateNotes),
-		flag(closeReasonSet), eff.CloseReason,
-		eff.TaskID.String(),
-	); err != nil {
-		return fmt.Errorf(
-			"Apply: operation %q materialize task-event columns for %q: %w",
-			in.OperationID, eff.TaskID, err)
-	}
-	return nil
+	return foldV1TaskEvent(scope.ctx, allocationSQLTx{conn: scope.conn}, in, jid, recordedAt, eff)
 }
 
 func (scope *connScope) foldBootstrapAuthority(jid int64, eff journal.Effect) error {
@@ -893,9 +863,11 @@ func (scope *connScope) foldBootstrapAuthority(jid int64, eff journal.Effect) er
 	return nil
 }
 
-func (scope *connScope) foldAssignmentStart(in journal.OperationInput, jid int64, eff journal.Effect) error {
-	if err := scope.requireAuthorityGoverns(in, jid, eff.TaskID); err != nil {
-		return err
+func (scope *connScope) foldAssignmentStart(in journal.OperationInput, jid int64, eff journal.Effect, index int, transferLease *assignmentTransferLease) error {
+	if transferLease == nil || !transferLease.permitsSuccessorStart(in, eff, index) {
+		if err := scope.requireAuthorityGoverns(in, jid, eff.TaskID); err != nil {
+			return err
+		}
 	}
 	occupant := eff.Occupant
 	if occupant.Namespace == "" {
@@ -1023,25 +995,5 @@ func (scope *connScope) foldDecision(in journal.OperationInput, jid int64, eff j
 }
 
 func (scope *connScope) foldEvidence(in journal.OperationInput, jid int64, eff journal.Effect) error {
-	// §9.3 names journal_evidence as a consuming effect: a task-scoped evidence row
-	// is authorized against the operation's authority at this effect's own
-	// JournalID. An untasked evidence row (§6.2 permits a NULL task_id) skips it.
-	var taskID any
-	if eff.TaskID.Namespace != "" {
-		if err := scope.requireAuthorityGoverns(in, jid, eff.TaskID); err != nil {
-			return err
-		}
-		taskID = eff.TaskID.String()
-	}
-	payload := eff.Payload
-	if len(payload) == 0 {
-		payload = json.RawMessage(`{}`)
-	}
-	if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO journal_evidence (journal_id, evidence_kind, task_id, content_digest, payload) VALUES (?1, ?2, ?3, ?4, ?5)", jid, string(eff.EvidenceKind), taskID, eff.ContentDigest, string(payload)); err != nil {
-		return fmt.Errorf("Apply: insert journal_evidence: %w", err)
-	}
-	if err := scope.persistFactContexts(factContextEvidence, jid, eff.Contexts); err != nil {
-		return fmt.Errorf("Apply: persist evidence contexts: %w", err)
-	}
-	return nil
+	return foldV1Evidence(scope.ctx, allocationSQLTx{conn: scope.conn}, in, jid, eff)
 }

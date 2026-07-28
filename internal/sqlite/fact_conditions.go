@@ -1,8 +1,11 @@
 package sqlite
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 
+	"github.com/dayvidpham/provenance/internal/fusedtx"
 	"github.com/dayvidpham/provenance/internal/journal"
 )
 
@@ -22,88 +25,85 @@ import (
 // checkConditions evaluates conditions through the caller-owned connection
 // scope and returns the first typed *journal.ConditionFailure.
 func checkConditions(scope *connScope, in journal.OperationInput) error {
-	for i, cond := range in.Conditions {
-		if err := checkOneCondition(scope, cond, i); err != nil {
+	reader := allocationSQLTx{conn: scope.conn}
+	return checkConditionsInTransaction(scope.ctx, reader, in.Conditions, func(relation factContextRelation, id journal.JournalID) error {
+		_, err := verifySelectedFactContextInTransaction(scope.ctx, reader, relation, int64(id))
+		return err
+	})
+}
+
+type selectedFactVerifier func(factContextRelation, journal.JournalID) error
+
+// checkConditionsInTransaction is the single condition/fact-selection engine
+// used by ordinary Apply and composed allocation.  Callers provide only the
+// transaction reader and the selected-row integrity verifier appropriate to
+// their transaction adapter.
+func checkConditionsInTransaction(ctx context.Context, reader fusedtx.SQLReader, conditions []journal.Condition, verify selectedFactVerifier) error {
+	for i, cond := range conditions {
+		if err := checkOneConditionInTransaction(ctx, reader, verify, cond, i); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// checkOneCondition evaluates one condition and returns a typed
-// *journal.ConditionFailure when the assertion is not satisfied.
-func checkOneCondition(scope *connScope, cond journal.Condition, index int) error {
-	switch cond.Kind {
-	case journal.ConditionExactFact:
-		return checkExactFact(scope, cond, index)
-	case journal.ConditionCurrentFact:
-		return checkCurrentFact(scope, cond, index)
-	default:
-		// Canonical validation rejects unknown kinds before Apply; treat as internal error.
-		return fmt.Errorf(
-			"checkOneCondition: unrecognized condition kind %s at index %d — "+
-				"where: Apply condition evaluation; when: before effects; "+
-				"impact: operation rejected; "+
-				"fix: use ConditionExactFact or ConditionCurrentFact",
-			cond.Kind, index)
-	}
-}
-
-func checkExactFact(scope *connScope, cond journal.Condition, index int) error {
-	actual, matched, err := evaluateExactFactSelector(scope, cond.Selector, cond.AssertedJournalID)
+func checkOneConditionInTransaction(ctx context.Context, reader fusedtx.SQLReader, verify selectedFactVerifier, cond journal.Condition, index int) error {
+	binding, err := buildFactMatchBinding(cond.Selector, 0, 0)
 	if err != nil {
-		return fmt.Errorf("Apply: condition[%d] ExactFact evaluation: %w", index, err)
+		return fmt.Errorf("condition[%d] selector binding: %w", index, err)
+	}
+	latest, found, err := latestFactMatchReader(ctx, reader, binding)
+	if err != nil {
+		return fmt.Errorf("condition[%d] current-fact lookup: %w", index, err)
+	}
+	if found {
+		if err := verify(binding.contexts, latest); err != nil {
+			return err
+		}
+	}
+	matched := false
+	switch cond.Kind {
+	case journal.ConditionCurrentFact:
+		matched = (!found && cond.AssertedJournalID == 0) || (found && latest == cond.AssertedJournalID)
+	case journal.ConditionExactFact:
+		if cond.AssertedJournalID > 0 {
+			exactArgs := append(append([]any(nil), binding.args...), int64(cond.AssertedJournalID))
+			var exact int64
+			exactErr := reader.QueryRow(ctx, binding.kind.exactMatchSQL(), exactArgs...).Scan(&exact)
+			matched = exactErr == nil
+			if exactErr != nil && !fusedtx.IsNoRows(exactErr) {
+				return fmt.Errorf("condition[%d] exact-fact lookup: %w", index, exactErr)
+			}
+			if matched {
+				if err := verify(binding.contexts, cond.AssertedJournalID); err != nil {
+					return err
+				}
+			}
+		}
+	default:
+		return fmt.Errorf("condition[%d] has unsupported kind %s", index, cond.Kind)
 	}
 	if matched {
 		return nil
 	}
-	// Not matched: determine precise reason.
-	reason := journal.ConditionFactMissing
-	if actual != 0 {
-		reason = journal.ConditionFactMismatch
-	}
-	return &journal.ConditionFailure{
-		Index:             index,
-		Kind:              journal.ConditionExactFact,
-		Reason:            reason,
-		AssertedJournalID: cond.AssertedJournalID,
-		ActualJournalID:   actual,
-	}
-}
-
-func checkCurrentFact(scope *connScope, cond journal.Condition, index int) error {
-	actual, found, err := evaluateCurrentFactSelector(scope, cond.Selector)
-	if err != nil {
-		return fmt.Errorf("Apply: condition[%d] CurrentFact evaluation: %w", index, err)
-	}
-
-	if cond.AssertedJournalID == 0 {
-		// Absence assertion: no matching row must exist.
-		if !found {
-			return nil // success
-		}
-		return &journal.ConditionFailure{
-			Index:             index,
-			Kind:              journal.ConditionCurrentFact,
-			Reason:            journal.ConditionCurrentMismatch,
-			AssertedJournalID: 0,
-			ActualJournalID:   actual,
-		}
-	}
-
-	// Presence assertion: the asserted JournalID must be the highest match.
-	if found && actual == cond.AssertedJournalID {
-		return nil // success
-	}
 	reason := journal.ConditionFactMissing
 	if found {
-		reason = journal.ConditionCurrentMismatch
+		if cond.Kind == journal.ConditionExactFact {
+			reason = journal.ConditionFactMismatch
+		} else {
+			reason = journal.ConditionCurrentMismatch
+		}
 	}
-	return &journal.ConditionFailure{
-		Index:             index,
-		Kind:              journal.ConditionCurrentFact,
-		Reason:            reason,
-		AssertedJournalID: cond.AssertedJournalID,
-		ActualJournalID:   actual,
+	return &journal.ConditionFailure{Index: index, Kind: cond.Kind, Reason: reason, AssertedJournalID: cond.AssertedJournalID, ActualJournalID: latest}
+}
+
+func latestFactMatchReader(ctx context.Context, reader fusedtx.SQLReader, binding factMatchBinding) (journal.JournalID, bool, error) {
+	var latest sql.NullInt64
+	if err := reader.QueryRow(ctx, binding.kind.latestMatchSQL(), binding.args...).Scan(&latest); err != nil {
+		return 0, false, err
 	}
+	if !latest.Valid {
+		return 0, false, nil
+	}
+	return journal.JournalID(latest.Int64), true, nil
 }
