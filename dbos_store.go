@@ -409,6 +409,10 @@ func (j *borrowedJournal) NamespaceClaims() ([]ActorNamespaceClaim, error) {
 }
 
 func (j *borrowedJournal) Apply(in OperationInput) (CommittedResult, error) {
+	return j.ApplyContext(context.Background(), in)
+}
+
+func (j *borrowedJournal) ApplyContext(ctx context.Context, in OperationInput) (CommittedResult, error) {
 	if err := j.owner.available("Journal.Apply"); err != nil {
 		return CommittedResult{}, err
 	}
@@ -416,6 +420,9 @@ func (j *borrowedJournal) Apply(in OperationInput) (CommittedResult, error) {
 		if err := j.owner.journalApplyFault(); err != nil {
 			return CommittedResult{}, err
 		}
+	}
+	if journal, ok := j.inner.(ContextJournal); ok {
+		return journal.ApplyContext(ctx, in)
 	}
 	return j.inner.Apply(in)
 }

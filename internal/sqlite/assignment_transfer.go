@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 
@@ -94,7 +95,7 @@ func (db *DB) ApplyAssignmentTransfer(in journal.OperationInput) (journal.Commit
 	if err != nil {
 		return journal.CommittedResult{}, fmt.Errorf("ApplyAssignmentTransfer: validate exact semantic shape before write ownership: %w", err)
 	}
-	return db.applyPreparedOperation(normalized, prepared, callerMutationDigest, foldOptions{assignmentTransfer: lease})
+	return db.applyPreparedOperation(context.Background(), normalized, prepared, callerMutationDigest, foldOptions{assignmentTransfer: lease})
 }
 
 // authenticateAssignmentTransfer runs only after OperationID admission reports

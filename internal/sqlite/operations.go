@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/dayvidpham/provenance/internal/allocation"
 	"github.com/dayvidpham/provenance/internal/journal"
@@ -412,11 +413,23 @@ func (db *DB) JournalIsEmpty() (bool, error) {
 // per-effect authorization (§9.3), persists result slots (§3.2), and runs the
 // subtype-integrity and close-ends-assignment gates before commit.
 func (db *DB) Apply(in journal.OperationInput) (res journal.CommittedResult, err error) {
+	return db.ApplyContext(context.Background(), in)
+}
+
+// ApplyContext commits one logical operation atomically while bounding SQLite
+// lock acquisition by ctx. A nil context has the same no-deadline behavior as Apply.
+func (db *DB) ApplyContext(ctx context.Context, in journal.OperationInput) (res journal.CommittedResult, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return journal.CommittedResult{}, fmt.Errorf("Apply: caller deadline expired before leasing a SQLite connection; no transaction was opened and nothing was committed; retry with a live or longer context: %w", err)
+	}
 	in, prepared, callerMutationDigest, err := prepareApplyInput(in)
 	if err != nil {
 		return journal.CommittedResult{}, err
 	}
-	return db.applyPreparedOperation(in, prepared, callerMutationDigest, foldOptions{})
+	return db.applyPreparedOperation(ctx, in, prepared, callerMutationDigest, foldOptions{})
 }
 
 // prepareApplyInput is the one canonical operation preparation path shared by
@@ -447,9 +460,12 @@ func prepareApplyInput(in journal.OperationInput) (journal.OperationInput, journ
 // applyPreparedOperation owns the BEGIN IMMEDIATE transaction shared by all
 // canonical operation entrypoints. foldOptions is package-private; public Apply
 // always supplies the zero value.
-func (db *DB) applyPreparedOperation(in journal.OperationInput, prepared journal.CanonicalMutation, callerMutationDigest []byte, options foldOptions) (res journal.CommittedResult, err error) {
-	scope, err := db.bindScope(context.Background(), projectionTargetLive)
+func (db *DB) applyPreparedOperation(ctx context.Context, in journal.OperationInput, prepared journal.CanonicalMutation, callerMutationDigest []byte, options foldOptions) (res journal.CommittedResult, err error) {
+	scope, err := db.bindScope(ctx, projectionTargetLive)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return journal.CommittedResult{}, fmt.Errorf("Apply: caller deadline expired while leasing a SQLite connection; no transaction was opened and nothing was committed; retry with a longer context or reduce pool contention: %w", ctxErr)
+		}
 		return journal.CommittedResult{}, fmt.Errorf("Apply: lease pooled connection before write transaction: %w", err)
 	}
 	defer scope.release()
@@ -464,6 +480,9 @@ func (db *DB) applyPreparedOperation(in journal.OperationInput, prepared journal
 		res, foldErr = scope.foldPreparedOperation(in, prepared, callerMutationDigest, options)
 		return foldErr
 	}); transactionErr != nil {
+		if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= 10*time.Millisecond {
+			transactionErr = fmt.Errorf("caller deadline expired while acquiring SQLite write ownership; transaction was rolled back and nothing was committed; retry with a longer context or reduce writer contention: %w", errors.Join(context.DeadlineExceeded, transactionErr))
+		}
 		// A replay conflict intentionally returns both its closed result variant and
 		// its typed error. The transaction rolls back because no new durable state
 		// may accompany the conflict, but callers still need its classified axis.

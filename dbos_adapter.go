@@ -166,8 +166,15 @@ func (a *DBOSAdapter) Apply(ctx context.Context, in journal.OperationInput) (Com
 	// before any DBOS lookup/start: only an exact unmarked historical replay may
 	// continue; fresh or composition-owned identities fail without a checkpoint.
 	if journal.IsReservedInternalOperationID(normalized.OperationID) {
-		if _, err := a.tracker.Journal().Apply(normalized); err != nil {
-			return CommittedResult{}, fmt.Errorf("provenance.DBOSAdapter.Apply: classify reserved operation %q before workflow work: %w", normalized.OperationID, err)
+		journalAPI := a.tracker.Journal()
+		var applyErr error
+		if contextual, ok := journalAPI.(ContextJournal); ok {
+			_, applyErr = contextual.ApplyContext(ctx, normalized)
+		} else {
+			_, applyErr = journalAPI.Apply(normalized)
+		}
+		if applyErr != nil {
+			return CommittedResult{}, fmt.Errorf("provenance.DBOSAdapter.Apply: classify reserved operation %q before workflow work: %w", normalized.OperationID, applyErr)
 		}
 	}
 
@@ -192,7 +199,14 @@ func (a *DBOSAdapter) Apply(ctx context.Context, in journal.OperationInput) (Com
 		return CommittedResult{}, fmt.Errorf("provenance.DBOSAdapter.Apply: preflight LookupCommitted for operation %q: %w", normalized.OperationID, err)
 	}
 	if existing.Kind == journal.CommittedExact {
-		validated, applyErr := a.tracker.Journal().Apply(normalized)
+		journalAPI := a.tracker.Journal()
+		var validated CommittedResult
+		var applyErr error
+		if contextual, ok := journalAPI.(ContextJournal); ok {
+			validated, applyErr = contextual.ApplyContext(ctx, normalized)
+		} else {
+			validated, applyErr = journalAPI.Apply(normalized)
+		}
 		if applyErr != nil {
 			return CommittedResult{}, applyErr
 		}

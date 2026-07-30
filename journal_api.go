@@ -6,6 +6,8 @@ package provenance
 // Tracker.
 
 import (
+	"context"
+
 	"github.com/dayvidpham/provenance/internal/journal"
 )
 
@@ -291,6 +293,14 @@ type Journal interface {
 	PreflightSchema() error
 	ReplayProjections() (ReplayResult, error)
 	MigrateLegacyBaseline(in MigrationInput) (MigrationResult, error)
+}
+
+// ContextJournal is the optional deadline-aware extension to Journal. ApplyContext
+// uses the caller context while waiting for SQLite write ownership. Journal remains
+// unchanged so existing external implementations continue to compile.
+type ContextJournal interface {
+	Journal
+	ApplyContext(ctx context.Context, in OperationInput) (CommittedResult, error)
 }
 
 // Journal returns the ordered global-journal surface backed by the same SQLite
