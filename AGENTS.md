@@ -37,6 +37,12 @@ Before changing test fixtures, scheduling, or CI flags, read the measured
 - Run `go vet ./...` and `ast-grep scan --config sgconfig.yml --globs '!vendor/**' --globs '!worktree/**' .`; the latter
   rejects production `time.Sleep`, keeping local contention waits in SQLite's
   `busy_timeout=5000` and durable retries in DBOS.
+  The single sanctioned exception is `internal/sqlite` schema activation, which
+  bounds one operation in a 30s outer budget whose per-attempt wait is still
+  `busy_timeout` (it must, because `BEGIN IMMEDIATE` now holds the write lock
+  across the O(journal) integrity and replay probes, so concurrent openers
+  serialise past one 5s window). Do not extend it to storage operations; DBOS
+  step options own durable retry. See TESTING.md, "Waiting and retries".
 - Run `nix flake check --no-build` for the Nix evaluation gate.
 - There is no supported CGO-disabled test or race mode. Do not interpret the
   CGO-disabled build gate as permission to run a package, focused, full, or

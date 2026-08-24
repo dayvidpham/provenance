@@ -1116,6 +1116,29 @@ func isUniqueViolation(err error) bool {
 	return errors.Is(err, errUniqueSentinel)
 }
 
+// isBusyError reports whether SQLite refused an operation because another
+// connection held the lock it needed. These are the codes for which retrying the
+// whole operation is meaningful; every other SQLite failure is permanent for this
+// attempt and must surface to the caller unchanged.
+func isBusyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var sqliteErr *moderncsqlite.Error
+	if !errors.As(err, &sqliteErr) {
+		return false
+	}
+	switch sqliteErr.Code() {
+	case 5, 6: // SQLITE_BUSY, SQLITE_LOCKED
+		return true
+	case 261, 517, 773: // SQLITE_BUSY_RECOVERY, SQLITE_BUSY_SNAPSHOT, SQLITE_BUSY_TIMEOUT
+		return true
+	case 262: // SQLITE_LOCKED_SHAREDCACHE
+		return true
+	}
+	return false
+}
+
 func isForeignKeyViolation(err error) bool {
 	if err == nil {
 		return false
