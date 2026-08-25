@@ -77,6 +77,15 @@ func OpenSystem(ctx context.Context, config SystemConfig) (*System, error) {
 		return nil, fmt.Errorf("fusedtx.OpenSystem: ping owned SQLite system handle: %w", err)
 	}
 
+	// Constructing the context also creates DBOS's reserved internal queue, whose
+	// worker and supervisor each poll once a second for the life of the system.
+	// That cadence is not configurable: v0.20.0 registers the queue in memory
+	// with the package default, exposes no polling field on dbos.Config, and
+	// refuses both a same-named RegisterQueue and a SetPollingInterval on a queue
+	// that is not database-backed. Provenance neither registers a queue nor
+	// enqueues a workflow, so the residual polling is background work only, never
+	// a latency path. Measured evidence and the upstream ask are recorded in
+	// docs/test-performance.md.
 	root, err := dbos.NewDBOSContext(ctx, dbos.Config{
 		AppName:            config.AppName,
 		ApplicationVersion: config.ApplicationVersion,
