@@ -63,16 +63,17 @@ func (table AdversarialSubtypeTable) deleteQuery() string {
 	}
 }
 
-func (db *DB) AdversarialDeleteSubtypeRow(jid journal.JournalID, table AdversarialSubtypeTable) error {
+func (db *DB) AdversarialDeleteSubtypeRow(jid journal.JournalID, table AdversarialSubtypeTable) (err error) {
 	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return fmt.Errorf("AdversarialDeleteSubtypeRow: lease connection: %w", err)
 	}
 	defer scope.release()
-	if _, err := scope.conn.ExecContext(scope.ctx, "PRAGMA foreign_keys=OFF"); err != nil {
-		return fmt.Errorf("AdversarialDeleteSubtypeRow %q: disable FK: %w", table, err)
+	restoreFK, err := scope.pauseForeignKeys("AdversarialDeleteSubtypeRow")
+	if err != nil {
+		return err
 	}
-	defer func() { _, _ = scope.conn.ExecContext(scope.ctx, "PRAGMA foreign_keys=ON") }()
+	defer func() { err = restoreFK(err) }()
 	// The table is one of the closed subtype-table constants above, never caller
 	// input, so identifier interpolation is safe here.
 	result, err := scope.conn.ExecContext(scope.ctx, table.deleteQuery(), int64(jid))
@@ -128,7 +129,7 @@ func (db *DB) AdversarialRewriteDiscriminator(jid journal.JournalID, newKind jou
 // toggled off so the anchor rows can be removed; the database is left in the
 // deliberately truncated state the corpus drives ReplayProjections against. n must
 // be positive and smaller than the journal length.
-func (db *DB) AdversarialTruncateTail(n int) error {
+func (db *DB) AdversarialTruncateTail(n int) (err error) {
 	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return fmt.Errorf("AdversarialTruncateTail: lease connection: %w", err)
@@ -144,10 +145,11 @@ func (db *DB) AdversarialTruncateTail(n int) error {
 	if n >= total {
 		return fmt.Errorf("AdversarialTruncateTail: n=%d must be smaller than the journal length %d (truncating the whole spine is a different case)", n, total)
 	}
-	if _, err := scope.conn.ExecContext(scope.ctx, "PRAGMA foreign_keys=OFF"); err != nil {
-		return fmt.Errorf("AdversarialTruncateTail: disable FK: %w", err)
+	restoreFK, err := scope.pauseForeignKeys("AdversarialTruncateTail")
+	if err != nil {
+		return err
 	}
-	defer func() { _, _ = scope.conn.ExecContext(scope.ctx, "PRAGMA foreign_keys=ON") }()
+	defer func() { err = restoreFK(err) }()
 	// The n highest JournalIDs are the tail. Delete their subtype/detail rows first,
 	// then the supertype rows, so no dangling subtype row is left behind (the tail is
 	// removed cleanly — only the projection, not the spine's own integrity, diverges).

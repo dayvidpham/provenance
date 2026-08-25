@@ -81,14 +81,14 @@ func (scope *connScope) countUnanchoredTasks() (int, error) {
 // exact connection. PRAGMA foreign_keys is connection-local and cannot change
 // inside a transaction, so it is toggled before the explicit BEGIN IMMEDIATE.
 func (scope *connScope) rebuildTasksWatermark(shape tasksWatermarkShape) (err error) {
-	if _, err = scope.conn.ExecContext(scope.ctx, "PRAGMA foreign_keys=OFF"); err != nil {
-		return fmt.Errorf("rebuildTasksWatermark: disable FK enforcement: %w", err)
+	restoreFK, err := scope.pauseForeignKeys("rebuildTasksWatermark")
+	if err != nil {
+		return err
 	}
-	defer func() {
-		if _, restoreErr := scope.conn.ExecContext(scope.ctx, "PRAGMA foreign_keys=ON"); restoreErr != nil && err == nil {
-			err = fmt.Errorf("rebuildTasksWatermark: restore FK enforcement: %w", restoreErr)
-		}
-	}()
+	// The restore is reported even when the rebuild itself failed: losing
+	// enforcement is a distinct fault from the rebuild's, and dropping it on the
+	// already-failed path is how a connection silently stops enforcing.
+	defer func() { err = restoreFK(err) }()
 	return runImmediateTransaction(scope.ctx, scope.conn, func() error {
 		if _, err := scope.conn.ExecContext(scope.ctx, shape.createRebuildQuery()); err != nil {
 			return fmt.Errorf("rebuildTasksWatermark: create rebuild table: %w", err)

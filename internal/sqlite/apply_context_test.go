@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -87,7 +88,20 @@ func TestApplyContextBoundsContendedWriterByCallerDeadline(t *testing.T) {
 	}
 }
 
-func TestApplyWithoutDeadlineRetainsBusyTimeout(t *testing.T) {
+// TestApplyWithoutDeadlineIsBoundedByBusyTimeoutNotTheCaller pins the
+// no-deadline contract: an Apply with no caller deadline is bounded by SQLite's
+// own busy handler, so it fails with a BUSY result code while the contended
+// writer lock is still held, rather than waiting for the lock or for a caller
+// deadline that does not exist.
+//
+// The oracle is the observable outcome — a BUSY error, no context error, the
+// lock never released — not a wall-clock window. The contender's single pooled
+// connection carries a deliberately small busy_timeout so the arm proves the
+// dependency on that pragma and costs a fraction of a second; the only time in
+// the test is an outer guard that fails a hang instead of measuring a duration.
+func TestApplyWithoutDeadlineIsBoundedByBusyTimeoutNotTheCaller(t *testing.T) {
+	t.Parallel()
+	const contenderBusyTimeoutMS = 150
 	path := t.TempDir() + "/apply-no-deadline.db"
 	owner, err := Open(path, nil)
 	if err != nil {
@@ -102,6 +116,16 @@ func TestApplyWithoutDeadlineRetainsBusyTimeout(t *testing.T) {
 	actor := ptypes.ActorID{Namespace: "provenance-test", UUID: uuid.New()}
 	seedActor(t, owner, actor)
 
+	// One connection makes the connection Apply leases provably the connection
+	// configured here, so the busy handler under test is the one this test set.
+	contender.db.SetMaxOpenConns(1)
+	configured := takePoolScope(t, contender)
+	if _, err := configured.conn.ExecContext(configured.ctx, fmt.Sprintf("PRAGMA busy_timeout=%d", contenderBusyTimeoutMS)); err != nil {
+		configured.release()
+		t.Fatalf("configure the contender connection's busy timeout: %v", err)
+	}
+	configured.release()
+
 	lock := takePoolScope(t, owner)
 	defer lock.release()
 	if _, err := lock.conn.ExecContext(lock.ctx, "BEGIN IMMEDIATE"); err != nil {
@@ -109,21 +133,50 @@ func TestApplyWithoutDeadlineRetainsBusyTimeout(t *testing.T) {
 	}
 	defer func() { _, _ = lock.conn.ExecContext(context.Background(), "ROLLBACK") }()
 
-	started := time.Now()
-	_, applyErr := contender.Apply(journal.OperationInput{
-		OperationID: "apply-no-deadline", ActorID: actor, CommandDigest: []byte("command"),
-		Effects: []journal.Effect{{Sort: journal.EffectBootstrapAuthority, BootstrapLabel: "no-deadline", ResultSlot: "authority"}},
-	})
-	elapsed := time.Since(started)
+	applied := make(chan error, 1)
+	go func() {
+		_, err := contender.Apply(journal.OperationInput{
+			OperationID: "apply-no-deadline", ActorID: actor, CommandDigest: []byte("command"),
+			Effects: []journal.Effect{{Sort: journal.EffectBootstrapAuthority, BootstrapLabel: "no-deadline", ResultSlot: "authority"}},
+		})
+		applied <- err
+	}()
+
+	var applyErr error
+	select {
+	case applyErr = <-applied:
+	case <-time.After(noDeadlineApplyGuard):
+		t.Fatalf("Apply without a deadline never returned while the writer lock was held; it must be bounded by the connection's %dms busy_timeout", contenderBusyTimeoutMS)
+	}
+
+	// The lock is still held: nothing in this test released it, so a returned Apply
+	// can only have been ended by SQLite's busy handler.
 	if applyErr == nil {
-		t.Fatal("legacy Apply unexpectedly acquired contended writer lock")
+		t.Fatal("Apply without a deadline acquired the contended writer lock; the lock owner still holds it")
 	}
-	busyTimeout := time.Duration(busyTimeoutMS) * time.Millisecond
-	if elapsed < busyTimeout*3/4 || elapsed > busyTimeout*2 {
-		t.Fatalf("legacy Apply lock wait = %v, want behavior governed by %v busy_timeout", elapsed, busyTimeout)
+	if errors.Is(applyErr, context.DeadlineExceeded) || errors.Is(applyErr, context.Canceled) {
+		t.Fatalf("Apply without a deadline failed with a context error (%v); a no-deadline caller must not bound the wait", applyErr)
 	}
-	t.Logf("legacy no-deadline lock wait: %v (busy_timeout: %v)", elapsed, busyTimeout)
+	if !isBusyError(applyErr) {
+		t.Fatalf("Apply without a deadline error = %v, want a SQLite BUSY/LOCKED result from the busy handler", applyErr)
+	}
+
+	// The governing pragma is unchanged: with no caller deadline there is nothing
+	// to cap it to, so the connection still carries the value configured above.
+	governing := takePoolScope(t, contender)
+	defer governing.release()
+	var busyTimeout int64
+	if err := governing.conn.QueryRowContext(governing.ctx, "PRAGMA busy_timeout").Scan(&busyTimeout); err != nil {
+		t.Fatalf("read the contender connection's busy timeout: %v", err)
+	}
+	if busyTimeout != contenderBusyTimeoutMS {
+		t.Fatalf("contender busy_timeout = %dms after a no-deadline Apply, want the configured %dms", busyTimeout, contenderBusyTimeoutMS)
+	}
 }
+
+// noDeadlineApplyGuard fails a hung Apply. It is a liveness backstop, not the
+// oracle: the assertions above are on the returned error and the lock's state.
+const noDeadlineApplyGuard = 60 * time.Second
 
 func seedActor(t *testing.T, db *DB, actor journal.ActorID) {
 	t.Helper()

@@ -12,10 +12,25 @@ import (
 	"github.com/dayvidpham/provenance/internal/journal"
 )
 
-// factQuerySnapshotBarrierHook is nil in production. Package tests install it
-// around one deterministic reader/writer barrier to prove that the transaction
-// snapshot is acquired before the bounded page SQL runs.
-var factQuerySnapshotBarrierHook func(factSelectorKind, int64)
+// factQueryTestHooks are unexported, no-op-by-default seams a package test
+// installs on ONE DB instance before that instance is queried. snapshotBarrier
+// fires inside the fact-query read transaction, after the snapshot is fixed and
+// before the bounded page SQL runs, so a test can prove the ordering.
+//
+// These are per-DB, not package-global: the fact-query path is read by many
+// parallel tests at once, and a package-global hook would be a shared variable
+// written by one test while the others read it on their hot path.  A test
+// installs its barrier with installFactQuerySnapshotBarrier on the DB it owns,
+// before starting the goroutines that query it.
+type factQueryTestHooks struct {
+	snapshotBarrier func(factSelectorKind, int64)
+}
+
+// installFactQuerySnapshotBarrier installs a test barrier on this DB instance.
+// It must be called before any concurrent query against the same instance.
+func (db *DB) installFactQuerySnapshotBarrier(barrier func(factSelectorKind, int64)) {
+	db.factHooks.snapshotBarrier = barrier
+}
 
 type factPageRow struct {
 	journalID                   journal.JournalID
@@ -150,7 +165,7 @@ func (db *DB) queryFacts(kind factSelectorKind, page journal.FactPageRequest, fi
 				return bindErr
 			}
 		}
-		if barrier := factQuerySnapshotBarrierHook; barrier != nil {
+		if barrier := db.factHooks.snapshotBarrier; barrier != nil {
 			barrier(kind, int64(snapshot))
 		}
 		if err := scope.requireCanonicalFactContextSchema("bounded fact query"); err != nil {
