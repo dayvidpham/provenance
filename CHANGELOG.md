@@ -35,6 +35,15 @@ All notable changes to this project will be documented in this file.
   same decision: `DBOSApplyInput` carries canonical mutation bytes in the new
   layout and gained a `kind` field, so an in-flight workflow input written before
   v0.0.4 is not replayable.
+- Checkpointed DBOS *step outputs* are covered too, for the same reason and by
+  the same decision. `DBOSStepOutcome` and its `CanonicalApplyFailure` arm are
+  persisted as JSON and decoded through a strict decoder that rejects unknown and
+  duplicate keys. `CanonicalApplyFailure` was reshaped in this release — the
+  `conflict_field` string is gone, and `conflict_axis`, `conflict_index`, the
+  five condition fields, and the two activity fields are new — so a pre-v0.0.4
+  checkpoint fails to decode on its `conflict_field` key rather than being read
+  with a missing field. Delete the durable store along with the database; there
+  is no partial-recovery path.
 
 #### Public API
 
@@ -62,11 +71,41 @@ All notable changes to this project will be documented in this file.
   `DBOSDiagFieldConditionReason`, `DBOSDiagFieldAssertedJournalID`,
   `DBOSDiagFieldActualJournalID`, `DBOSDiagFieldActivityID`, and
   `DBOSDiagFieldExistingJournalID` fields.
+- `CanonicalApplyFailure` — the public checkpointed failure arm of
+  `DBOSStepOutcome` — loses its `ConflictField string` member
+  (`json:"conflict_field"`) and gains `ConflictAxis *journal.ConflictAxis` plus
+  `ConflictIndex *int` (`json:"conflict_axis"` / `json:"conflict_index"`),
+  matching the `OperationConflict` reshape above. It also gains the optional
+  condition metadata (`ConditionIndex`, `ConditionKind`, `ConditionReason`,
+  `AssertedJournalID`, `ActualJournalID`) and activity metadata (`ActivityID`,
+  `ExistingJournalID`). Code that read `failure.ConflictField` must switch over
+  `failure.ConflictAxis` and `failure.ConflictIndex`; the JSON reshape is also a
+  durable-state break, recorded above.
 - `OpenBorrowedSQLite` no longer opens a second internal connection on the
   borrowed database's file: it activates the schema on the borrowed `*sql.DB`
   pool itself. The signature is unchanged, but the borrowed pool now carries all
-  Provenance traffic, so its size, lifetime, and pragmas govern Provenance's
-  behaviour.
+  Provenance traffic, so its size and lifetime govern Provenance's throughput and
+  availability. Its *pragmas* do not govern Provenance's own writes: every lease
+  Provenance takes on the borrowed pool forces `foreign_keys=ON` for the lease,
+  and returns the connection with the caller's captured value, verified by
+  read-back — a restore that cannot be proven retires the connection instead of
+  returning it. So Provenance's writes are always foreign-key enforced regardless
+  of how the caller configured the pool, and the caller's own statements always
+  see the caller's own value. Everything else on the connection remains the
+  caller's, and the caller's DSN must supply them: Provenance never sets
+  `journal_mode` or `synchronous` on a borrowed pool (unlike `Open`, which owns
+  its pool and sets WAL there), and it rewrites `busy_timeout` only for the span
+  of schema activation on the one activation connection, restoring the captured
+  value — again verified by read-back — before handing that connection back. A
+  shared file therefore wants a WAL, non-zero-`busy_timeout` DSN from the caller.
+The four removals that follow are recorded for completeness, not as breaks a
+released consumer can hit: `BindGovernedAllocator`, `GovernedAllocationDepth`,
+`GovernedAllocationSupplementPolicy`/`GovernedAllocationSupplementPolicyV1`, and
+the `GovernedAllocationComposedBatch*` aliases were all introduced *and* removed
+after v0.0.3 and appear in no released tag. Upgrading from v0.0.3 requires no
+action for any of them; only code tracking this branch between releases is
+affected.
+
 - `BindGovernedAllocator` is removed. It could not succeed: every call returned
   an error because the pinned DBOS release exposes no way to prove that a
   supplied `*sql.DB` is the handle stored inside the supplied root. Use
@@ -129,7 +168,19 @@ All notable changes to this project will be documented in this file.
   `DBOSDiagFieldConflictField` → `DBOSDiagFieldConflictAxis`.
 - Replace `conflict.Field` string comparisons with a switch over
   `conflict.Axis`, and match conflicts with `errors.As(err, &target)` where
-  `target` is a `*OperationConflict`.
+  `target` is a `*OperationConflict`. The same applies to the checkpointed
+  `CanonicalApplyFailure.ConflictField` → `ConflictAxis`/`ConflictIndex`.
+- `GovernedAllocationErrorKind` values are renumbered. Removing the unreachable
+  `GovernedAllocationDepth` from the middle of the closed set shifted the three
+  kinds after it: `Collision` 6 → 5, `Genesis` 7 → 6, `Corruption` 8 → 7. Source
+  code that names the constants needs no change. The numbers matter because the
+  kind is a `uint8` that rides in DBOS durable output (the checkpointed governed
+  allocation failure arm), so a failure checkpointed by an earlier build would
+  now decode as the wrong kind. This is a durable-state break and it is covered
+  by the same ratified window as the rest of this release — pre-v0.0.4 durable
+  state is already declared non-replayable — so it is documented here rather than
+  guarded. Never renumber this set again without a deliberate drain-and-cut:
+  append new kinds at the end.
 
 ## v0.0.3 - 2026-07-23
 
