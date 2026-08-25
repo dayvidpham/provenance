@@ -1,0 +1,176 @@
+name: Release
+
+# Tag-on-merge: when a version bump lands on main (flake.nix's `version`
+# field changes), tag that exact merged commit and publish a GitHub Release
+# whose body is the matching dated CHANGELOG section — no build/asset
+# pipeline. provenance is a Go library; consumers pin it by tag through the
+# Go module proxy, so the release IS the tag plus release notes.
+#
+# Flow: bump flake.nix's `version` + rename CHANGELOG.md's "## Unreleased"
+# section to "## vX.Y.Z - <date>" on a branch -> PR -> merge -> this runs.
+# Modeled on pasture's tag-on-merge release.yml; adapted for a library with
+# no binaries and a stricter, CHANGELOG-driven notes source.
+#
+# Requires two repo secrets for the tag push (a GitHub App, already installed
+# on this repo):
+#   RELEASE_APP_ID           — the App's ID
+#   RELEASE_APP_PRIVATE_KEY  — the App's private key (PEM)
+# The App needs Contents: write on this repo. See docs/releasing.md.
+
+on:
+  push:
+    branches: [main]
+    paths: ["flake.nix"]
+  workflow_dispatch: {} # manual re-release of the current main version
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    name: Detect version bump + tag
+    runs-on: ubuntu-latest
+    outputs:
+      released: ${{ steps.check.outputs.released }}
+      version: ${{ steps.check.outputs.version }}
+      notes: ${{ steps.notes.outputs.notes }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 2 # HEAD + parent, to diff the version
+          # Don't persist the default GITHUB_TOKEN as a git credential — its
+          # http.extraheader would override the App token in the tag-push URL
+          # below (causing a 403 as github-actions[bot]). With this false, the
+          # App token minted next is the only credential used for the push.
+          persist-credentials: false
+
+      - name: Mint GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - name: Detect version bump (refuse a duplicate tag)
+        id: check
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          new="$(grep -m1 -oP 'version\s*=\s*"\K[0-9]+\.[0-9]+\.[0-9]+' flake.nix || true)"
+          if [ -z "$new" ]; then
+            echo "::error::release detect step: could not find a \`version = \"X.Y.Z\";\` line in flake.nix." \
+                 "This happened while parsing the PROJECT CONFIGURATION block flake.nix defines" \
+                 "for the version-of-record. It means the release workflow cannot compute" \
+                 "the tag to publish. Fix: restore the \`version = \"X.Y.Z\";\` line under" \
+                 "the '# Package metadata' section of flake.nix."
+            exit 1
+          fi
+          echo "version=$new" >> "$GITHUB_OUTPUT"
+
+          # On push: only release if the version actually changed vs the parent
+          # commit. On manual dispatch: proceed whenever the tag is missing.
+          changed=true
+          if [ "${{ github.event_name }}" = "push" ] && git rev-parse HEAD~1 >/dev/null 2>&1; then
+            old="$(git show HEAD~1:flake.nix 2>/dev/null | grep -m1 -oP 'version\s*=\s*"\K[0-9]+\.[0-9]+\.[0-9]+' || echo '')"
+            [ "$new" = "$old" ] && changed=false
+          fi
+
+          if [ "$changed" != "true" ]; then
+            echo "flake.nix version unchanged ($new) — skipping release"
+            echo "released=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Duplicate-tag refusal: unlike a silent skip, an already-existing
+          # tag for the version we're about to release means something is
+          # wrong (a stale manual tag, a re-used version number, or a
+          # previous run that tagged but failed before publishing) and needs
+          # a human decision, not a quiet no-op.
+          if git rev-parse "v$new" >/dev/null 2>&1 \
+             || git ls-remote --tags origin "refs/tags/v$new" | grep -q .; then
+            echo "::error::release detect step: tag v$new already exists." \
+                 "This happened while checking for a duplicate tag before pushing" \
+                 "v$new from commit $(git rev-parse --short HEAD) on $(date -u +%Y-%m-%dT%H:%M:%SZ)." \
+                 "It means either flake.nix's version was reused, or an earlier run" \
+                 "tagged v$new but failed before publishing the Release. Refusing to" \
+                 "overwrite or reuse the tag. Fix: if the earlier run only tagged and" \
+                 "never published, delete the errant tag (git push origin :refs/tags/v$new)" \
+                 "and re-run this workflow via workflow_dispatch; otherwise bump" \
+                 "flake.nix's version to a number that has not been tagged yet."
+            echo "released=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          echo "released=true" >> "$GITHUB_OUTPUT"
+
+      - name: Extract CHANGELOG section for v${{ steps.check.outputs.version }}
+        if: steps.check.outputs.released == 'true'
+        id: notes
+        env:
+          VERSION: ${{ steps.check.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          # Pull the "## vX.Y.Z - <date>" section (up to, not including, the
+          # next "## " heading) straight out of CHANGELOG.md. This repo's
+          # CHANGELOG discipline requires the "## Unreleased" heading to be
+          # renamed to a dated version heading as part of the release-prep
+          # commit, so the section MUST exist by the time this runs.
+          section="$(awk -v ver="## v${VERSION}" '
+            $0 ~ "^"ver"([^0-9.].*)?$" { found=1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md)"
+
+          if [ -z "$(echo "$section" | tr -d '[:space:]')" ]; then
+            echo "::error::release notes step: CHANGELOG.md has no '## v${VERSION}' section." \
+                 "This happened while building the GitHub Release body for tag v${VERSION}" \
+                 "by scanning CHANGELOG.md for a heading matching '## v${VERSION}'." \
+                 "It means the release-prep commit bumped flake.nix's version without" \
+                 "renaming CHANGELOG.md's '## Unreleased' heading to" \
+                 "'## v${VERSION} - YYYY-MM-DD' (or misspelled the version in it)," \
+                 "so this run cannot publish a Release with real notes." \
+                 "Fix: on main, rename the '## Unreleased' heading in CHANGELOG.md to" \
+                 "'## v${VERSION} - YYYY-MM-DD', commit, then re-run this workflow via" \
+                 "workflow_dispatch. The tag v${VERSION} was NOT pushed by this run."
+            exit 1
+          fi
+
+          {
+            echo "notes<<PROVENANCE_RELEASE_NOTES_EOF"
+            echo "$section"
+            echo "PROVENANCE_RELEASE_NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Tag and push
+        if: steps.check.outputs.released == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          VERSION: ${{ steps.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name  "provenance-release[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v$VERSION" -m "Release v$VERSION"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" "v$VERSION"
+          echo "tagged v$VERSION on $(git rev-parse --short HEAD)"
+
+  release:
+    name: Publish GitHub Release
+    needs: detect
+    if: needs.detect.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
+        with:
+          tag_name: v${{ needs.detect.outputs.version }}
+          name: v${{ needs.detect.outputs.version }}
+          body: ${{ needs.detect.outputs.notes }}
+          generate_release_notes: false
