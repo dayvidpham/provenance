@@ -50,6 +50,7 @@ func takePoolScope(t *testing.T, db *DB) *connScope {
 }
 
 func TestPoolSizesMatchRatifiedTargets(t *testing.T) {
+	t.Parallel()
 	if runtimePoolSize != 4 {
 		t.Errorf("runtimePoolSize = %d, want 4", runtimePoolSize)
 	}
@@ -65,6 +66,7 @@ func TestPoolSizesMatchRatifiedTargets(t *testing.T) {
 }
 
 func TestFilePoolConnectionsShareStateAndRuntimePragmas(t *testing.T) {
+	t.Parallel()
 	db := openPoolFileDB(t)
 	scopes := make([]*connScope, 0, runtimePoolSize)
 	for range runtimePoolSize {
@@ -106,6 +108,7 @@ func TestFilePoolConnectionsShareStateAndRuntimePragmas(t *testing.T) {
 }
 
 func TestPoolCapacityHonorsContextCancellation(t *testing.T) {
+	t.Parallel()
 	db := openPoolFileDB(t)
 	held := make([]*connScope, 0, runtimePoolSize)
 	for range runtimePoolSize {
@@ -131,6 +134,7 @@ func TestPoolCapacityHonorsContextCancellation(t *testing.T) {
 }
 
 func TestConnScopeReleaseIsIdempotentAndPreservesTarget(t *testing.T) {
+	t.Parallel()
 	db := openPoolFileDB(t)
 	scope, err := db.bindScope(context.Background(), projectionTargetShadow)
 	if err != nil {
@@ -158,6 +162,7 @@ func TestConnScopeReleaseIsIdempotentAndPreservesTarget(t *testing.T) {
 }
 
 func TestPinnedConnectionKeepsTempStateLocal(t *testing.T) {
+	t.Parallel()
 	db := openPoolFileDB(t)
 	scopes := make([]*connScope, 0, runtimePoolSize)
 	for range runtimePoolSize {
@@ -184,6 +189,7 @@ func TestPinnedConnectionKeepsTempStateLocal(t *testing.T) {
 }
 
 func TestMemoryOpenIsolatedAndPreservesState(t *testing.T) {
+	t.Parallel()
 	first := openPoolMemoryDB(t)
 	second := openPoolMemoryDB(t)
 	scope := takePoolScope(t, first)
@@ -210,6 +216,7 @@ func TestMemoryOpenIsolatedAndPreservesState(t *testing.T) {
 }
 
 func TestCloseIsConcurrentAndRejectsNewLeases(t *testing.T) {
+	t.Parallel()
 	db, err := Open(t.TempDir()+"/close.db", nil)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -243,6 +250,7 @@ func TestCloseIsConcurrentAndRejectsNewLeases(t *testing.T) {
 }
 
 func TestCloseWaitsForCanceledPinnedTransactionBeforeClosingPool(t *testing.T) {
+	t.Parallel()
 	db, err := Open(t.TempDir()+"/in-flight-close.db", nil)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -313,6 +321,7 @@ func TestCloseWaitsForCanceledPinnedTransactionBeforeClosingPool(t *testing.T) {
 }
 
 func TestCloseResultPublishesOneError(t *testing.T) {
+	t.Parallel()
 	sentinel := errors.New("sentinel close failure")
 	var result closeResult
 	const callers = 8

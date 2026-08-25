@@ -79,6 +79,7 @@ func snapshotAllDurableTables(t *testing.T, db *DB) map[string][][]string {
 }
 
 func TestFactContextsPersistCanonicalReopenAndExactReplay(t *testing.T) {
+	t.Parallel()
 	path := t.TempDir() + "/fact-contexts.db"
 	db, err := Open(path, nil)
 	if err != nil {
@@ -145,6 +146,7 @@ func TestFactContextsPersistCanonicalReopenAndExactReplay(t *testing.T) {
 }
 
 func TestFactContextApplyRollbackLeavesNoAnchorsFactsOrContexts(t *testing.T) {
+	t.Parallel()
 	db := newJournalDB(t)
 	actor, task, boot := newFactContextEnvironment(t, db)
 	ctx, err := journal.TaskContext(task)
@@ -171,6 +173,7 @@ func TestFactContextApplyRollbackLeavesNoAnchorsFactsOrContexts(t *testing.T) {
 }
 
 func TestFactContextLegacyActivationBackfillsCanonicalOnly(t *testing.T) {
+	t.Parallel()
 	t.Run("canonical backfill is one-time", func(t *testing.T) {
 		path := t.TempDir() + "/e66-canonical.db"
 		db, actor, task, boot := openFactContextFixture(t, path)
@@ -254,6 +257,7 @@ func TestFactContextLegacyActivationBackfillsCanonicalOnly(t *testing.T) {
 }
 
 func TestFactContextStartupFailuresPreserveFiles(t *testing.T) {
+	t.Parallel()
 	t.Run("only one relation", func(t *testing.T) {
 		path := t.TempDir() + "/one-relation.db"
 		db, _, _, _ := openFactContextFixture(t, path)
@@ -322,6 +326,7 @@ func TestFactContextStartupFailuresPreserveFiles(t *testing.T) {
 }
 
 func TestFactContextRowStartupFailuresPreserveFiles(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		name    string
 		corrupt func(t *testing.T, conn *sql.DB, result journal.CommittedResult, actor journal.ActorID, taskContext journal.EventContext)
@@ -403,6 +408,7 @@ func TestFactContextRowStartupFailuresPreserveFiles(t *testing.T) {
 }
 
 func TestFactContextRuntimeRejectsMissingRelationsAfterActivation(t *testing.T) {
+	t.Parallel()
 	db := newJournalDB(t)
 	dropFactContextRelations(t, db)
 	if err := db.VerifyIntegrity(); !errors.Is(err, journal.ErrFactContextIntegrity) {
@@ -420,6 +426,7 @@ func TestFactContextRuntimeRejectsMissingRelationsAfterActivation(t *testing.T) 
 }
 
 func TestFactContextIntegrityRejectsStoredCorruption(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		name    string
 		corrupt func(t *testing.T, db *DB, result journal.CommittedResult, actor journal.ActorID)

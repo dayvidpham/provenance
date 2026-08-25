@@ -139,14 +139,19 @@ var _ = context.Background
 
 `
 	seeded := map[string]string{
-		"runtime parameter":     `func bad(ctx context.Context, db *sql.DB, query string) { _, _ = db.ExecContext(ctx, query) }`,
-		"runtime call":          "func bad(ctx context.Context, db *sql.DB) { _, _ = db.ExecContext(ctx, queryFor()) }\nfunc queryFor() string { return \"SELECT id FROM \" + tableName() }\nfunc tableName() string { return \"rows\" }",
-		"multi hop":             `func bad(ctx context.Context, db *sql.DB, query string) { first := query; second := first; _, _ = db.ExecContext(ctx, second) }`,
-		"concatenated column":   `func bad(ctx context.Context, db *sql.DB, column string) { _, _ = db.ExecContext(ctx, "SELECT "+column+" FROM rows") }`,
-		"formatted table":       `func bad(ctx context.Context, db *sql.DB, table string) { _, _ = db.QueryContext(ctx, fmt.Sprintf("SELECT id FROM %s", table)) }`,
-		"reassigned local":      `func bad(ctx context.Context, db *sql.DB, table string) { query := staticQuery; query = "SELECT id FROM " + table; _, _ = db.ExecContext(ctx, query) }`,
-		"non-context sink":      "func bad(ctx context.Context, db *sql.DB, query string) { _ = ctx; _, _ = db.Exec(query) }",
-		"prepared statement":    `func bad(ctx context.Context, db *sql.DB, query string) { _, _ = db.PrepareContext(ctx, query) }`,
+		"runtime parameter":   `func bad(ctx context.Context, db *sql.DB, query string) { _, _ = db.ExecContext(ctx, query) }`,
+		"runtime call":        "func bad(ctx context.Context, db *sql.DB) { _, _ = db.ExecContext(ctx, queryFor()) }\nfunc queryFor() string { return \"SELECT id FROM \" + tableName() }\nfunc tableName() string { return \"rows\" }",
+		"multi hop":           `func bad(ctx context.Context, db *sql.DB, query string) { first := query; second := first; _, _ = db.ExecContext(ctx, second) }`,
+		"concatenated column": `func bad(ctx context.Context, db *sql.DB, column string) { _, _ = db.ExecContext(ctx, "SELECT "+column+" FROM rows") }`,
+		"formatted table":     `func bad(ctx context.Context, db *sql.DB, table string) { _, _ = db.QueryContext(ctx, fmt.Sprintf("SELECT id FROM %s", table)) }`,
+		"reassigned local":    `func bad(ctx context.Context, db *sql.DB, table string) { query := staticQuery; query = "SELECT id FROM " + table; _, _ = db.ExecContext(ctx, query) }`,
+		"non-context sink":    "func bad(ctx context.Context, db *sql.DB, query string) { _ = ctx; _, _ = db.Exec(query) }",
+		"prepared statement":  `func bad(ctx context.Context, db *sql.DB, query string) { _, _ = db.PrepareContext(ctx, query) }`,
+		"prepared statement reused": "func bad(ctx context.Context, db *sql.DB, table string) {\n" +
+			"\tstatement, err := db.PrepareContext(ctx, \"SELECT id FROM \"+table)\n" +
+			"\tif err != nil {\n\t\treturn\n\t}\n" +
+			"\tdefer statement.Close()\n" +
+			"\t_, _ = statement.ExecContext(ctx)\n}",
 		"retired driver method": "type retiredConn struct{}\nfunc (retiredConn) ExecuteTransient(query string) error { return nil }\nfunc bad(ctx context.Context, conn retiredConn) { _ = ctx; _ = conn.ExecuteTransient }",
 		"unverified helper": "func bad(ctx context.Context, db *sql.DB, query string) { run(ctx, db, query) }\n" +
 			`func run(ctx context.Context, db *sql.DB, query string) { _, _ = db.ExecContext(ctx, query) }`,
@@ -239,6 +244,19 @@ func fine(ctx context.Context, db *sql.DB, id int64, timeoutMS int) error {
 			return err
 		}
 	}
+	statement, err := db.PrepareContext(ctx, staticQuery)
+	if err != nil {
+		return err
+	}
+	defer statement.Close()
+	// Reuse of an already-prepared statement: the text was decided at
+	// PrepareContext above, and these arguments are bound values, not SQL.
+	if _, err := statement.ExecContext(ctx, id); err != nil {
+		return err
+	}
+	if _, err := statement.QueryContext(ctx, id); err != nil {
+		return err
+	}
 	return each(ctx, db, staticQuery)
 }
 
@@ -249,8 +267,10 @@ func each(ctx context.Context, db *sql.DB, query string) error {
 `
 	program := parseSQLProgram(t, "accepted", accepted)
 	findings := program.inspect()
-	if program.sinks != 6 {
-		t.Fatalf("accepted fixture recognised %d sinks, want 6", program.sinks)
+	// Seven text-carrying sinks. The two calls on the already-prepared statement
+	// are deliberately not among them: they carry bound values, not SQL.
+	if program.sinks != 7 {
+		t.Fatalf("accepted fixture recognised %d sinks, want 7", program.sinks)
 	}
 	for _, finding := range findings {
 		t.Errorf("decidable statement shape rejected: %s", finding)
@@ -450,6 +470,9 @@ func (program *sqlProgram) inspectCall(call *ast.CallExpr) {
 	if _, sink := sqlSinkMethods[selector.Sel.Name]; !sink {
 		return
 	}
+	if program.isPreparedStatementCall(selector) {
+		return
+	}
 	index, argument := program.stringArgument(call)
 	if argument == nil {
 		return
@@ -459,6 +482,41 @@ func (program *sqlProgram) inspectCall(call *ast.CallExpr) {
 	if reason := program.decide(argument, 0); reason != "" {
 		program.report(call, "%s receives SQL text that is not decidable from source: %s", selector.Sel.Name, reason)
 	}
+}
+
+// isPreparedStatementCall reports whether a sink call is being made on an
+// already-prepared *database/sql.Stmt.
+//
+// Such a call carries no statement text: its arguments are bound values, and its
+// text was fixed at the Prepare or PrepareContext that produced the statement —
+// a sink the guard checks in its own right. Without this, the guard would read
+// the call's first string-typed argument as if it were SQL, which is both a
+// false positive on legitimate prepared-statement reuse and, worse, a check of
+// the wrong expression: it would decide a data value and never look at the
+// statement at all.
+//
+// The rule is safe because a *sql.Stmt inside a guarded package can only be
+// produced by Prepare or PrepareContext, both of which are sinks. A statement
+// prepared outside a guarded package and passed in would not be covered here;
+// no guarded package accepts one today, and one that starts to must carry the
+// obligation across that boundary explicitly.
+func (program *sqlProgram) isPreparedStatementCall(selector *ast.SelectorExpr) bool {
+	if program.info == nil {
+		return false
+	}
+	receiver := program.info.TypeOf(selector.X)
+	if receiver == nil {
+		return false
+	}
+	if pointer, ok := receiver.(*types.Pointer); ok {
+		receiver = pointer.Elem()
+	}
+	named, ok := receiver.(*types.Named)
+	if !ok {
+		return false
+	}
+	object := named.Obj()
+	return object != nil && object.Name() == "Stmt" && object.Pkg() != nil && object.Pkg().Path() == "database/sql"
 }
 
 // stringArgument returns the first string-typed argument, which is the

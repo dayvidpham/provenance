@@ -13,6 +13,8 @@ import (
 )
 
 func TestApplyContextBoundsContendedWriterByCallerDeadline(t *testing.T) {
+	// Deliberately serial: this test asserts the caller deadline fires before
+	// SQLite's busy timeout, an ordering between two wall-clock durations.
 	path := t.TempDir() + "/apply-context.db"
 	owner, err := Open(path, nil)
 	if err != nil {

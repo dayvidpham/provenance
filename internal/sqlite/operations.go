@@ -350,16 +350,26 @@ func (scope *connScope) completeJournalOperationFK() error {
 	if _, err := scope.conn.ExecContext(scope.ctx, "DROP VIEW IF EXISTS journal_attributed"); err != nil {
 		return fmt.Errorf("completeJournalOperationFK: drop view: %w", err)
 	}
-	if _, err := scope.conn.ExecContext(scope.ctx, "CREATE TABLE journal_new (journal_id INTEGER PRIMARY KEY AUTOINCREMENT,kind_id INTEGER NOT NULL REFERENCES journal_kinds(id),actor_id TEXT REFERENCES agents(id),recorded_at INTEGER NOT NULL,produced_by_operation_journal_id INTEGER REFERENCES journal_operations(journal_id),CHECK ((actor_id IS NULL) = (produced_by_operation_journal_id IS NOT NULL)),CHECK (kind_id <> 1 OR produced_by_operation_journal_id IS NOT NULL)) STRICT"); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, rebuildJournalRelationDDL); err != nil {
 		return fmt.Errorf("completeJournalOperationFK: create table: %w", err)
 	}
 	if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO journal_new (journal_id, kind_id, actor_id, recorded_at, produced_by_operation_journal_id) SELECT journal_id, kind_id, actor_id, recorded_at, produced_by_operation_journal_id FROM journal"); err != nil {
 		return fmt.Errorf("completeJournalOperationFK: copy rows: %w", err)
 	}
-	for _, stmt := range []string{"DROP TABLE journal", "ALTER TABLE journal_new RENAME TO journal", "CREATE INDEX IF NOT EXISTS idx_journal_kind ON journal (kind_id)", "CREATE INDEX IF NOT EXISTS idx_journal_actor ON journal (actor_id)", "CREATE INDEX IF NOT EXISTS idx_journal_pboj ON journal (produced_by_operation_journal_id)", "CREATE INDEX IF NOT EXISTS idx_journal_recorded_at ON journal (recorded_at, journal_id)", journalAttributedViewDDL} {
+	for _, stmt := range []string{"DROP TABLE journal", "ALTER TABLE journal_new RENAME TO journal"} {
 		if _, err := scope.conn.ExecContext(scope.ctx, stmt); err != nil {
 			return fmt.Errorf("completeJournalOperationFK: rebuild DDL: %w", err)
 		}
+	}
+	// The index set and the view come from the same shared definitions the fresh
+	// create uses, so a migrated database converges on the created shape.
+	for _, stmt := range journalRelationIndexDDL {
+		if _, err := scope.conn.ExecContext(scope.ctx, stmt); err != nil {
+			return fmt.Errorf("completeJournalOperationFK: rebuild index %q: %w", stmt, err)
+		}
+	}
+	if _, err := scope.conn.ExecContext(scope.ctx, journalAttributedViewDDL); err != nil {
+		return fmt.Errorf("completeJournalOperationFK: recreate view: %w", err)
 	}
 	// Step 10 of the canonical rebuild: foreign_key_check runs INSIDE the
 	// transaction, before COMMIT, so a detected violation ROLLBACKs the whole
