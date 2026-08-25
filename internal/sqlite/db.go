@@ -62,6 +62,9 @@ type DB struct {
 	activeScopes sync.WaitGroup
 	scopeCancels map[*connScope]context.CancelFunc
 	close        closeResult
+	// factHooks are per-instance test seams; production leaves them nil. See
+	// factQueryTestHooks in facts.go.
+	factHooks factQueryTestHooks
 }
 
 // foreignKeyDiscipline is the closed selector for how a lease establishes

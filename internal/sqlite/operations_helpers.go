@@ -1128,12 +1128,17 @@ func isBusyError(err error) bool {
 	if !errors.As(err, &sqliteErr) {
 		return false
 	}
-	switch sqliteErr.Code() {
+	return isBusyResultCode(sqliteErr.Code())
+}
+
+// isBusyResultCode classifies one SQLite result code. An extended result code is
+// the primary code in its low byte plus a sub-code in the upper bits, so the low
+// byte is the whole classification: masking covers every BUSY/LOCKED extension,
+// including ones an explicit list missed (SQLITE_LOCKED_VTAB = 518) and ones
+// SQLite has not defined yet, without this predicate tracking sub-codes.
+func isBusyResultCode(code int) bool {
+	switch code & 0xff {
 	case 5, 6: // SQLITE_BUSY, SQLITE_LOCKED
-		return true
-	case 261, 517, 773: // SQLITE_BUSY_RECOVERY, SQLITE_BUSY_SNAPSHOT, SQLITE_BUSY_TIMEOUT
-		return true
-	case 262: // SQLITE_LOCKED_SHAREDCACHE
 		return true
 	}
 	return false

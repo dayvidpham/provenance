@@ -712,8 +712,9 @@ func TestFactPageSQLKeepsTopologyValidationBoundedToCandidatePage(t *testing.T) 
 }
 
 func TestFactQueryDecisionSnapshotBarrierPinsPreCommitRows(t *testing.T) {
-	factQuerySnapshotBarrierHook = nil
-	defer func() { factQuerySnapshotBarrierHook = nil }()
+	// The snapshot barrier is installed on this test's own DB instance, so this
+	// test runs alongside the other fact-query readers.
+	t.Parallel()
 	db, actor, task, boot := newFileFactDB(t, "decision-barrier.db")
 	defer db.Close()
 	want := []journal.JournalID{
@@ -724,13 +725,13 @@ func TestFactQueryDecisionSnapshotBarrierPinsPreCommitRows(t *testing.T) {
 	}
 	entered, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
-	factQuerySnapshotBarrierHook = func(kind factSelectorKind, _ int64) {
+	db.installFactQuerySnapshotBarrier(func(kind factSelectorKind, _ int64) {
 		if kind != factSelectorDecision {
 			return
 		}
 		once.Do(func() { close(entered) })
 		<-release
-	}
+	})
 	type result struct {
 		page journal.DecisionPage
 		err  error
@@ -792,8 +793,9 @@ func TestFactQueryDecisionSnapshotBarrierPinsPreCommitRows(t *testing.T) {
 }
 
 func TestFactQueryEvidenceSnapshotBarrierPinsPreCommitRows(t *testing.T) {
-	factQuerySnapshotBarrierHook = nil
-	defer func() { factQuerySnapshotBarrierHook = nil }()
+	// The snapshot barrier is installed on this test's own DB instance, so this
+	// test runs alongside the other fact-query readers.
+	t.Parallel()
 	db, actor, task, boot := newFileFactDB(t, "evidence-barrier.db")
 	defer db.Close()
 	want := []journal.JournalID{
@@ -804,13 +806,13 @@ func TestFactQueryEvidenceSnapshotBarrierPinsPreCommitRows(t *testing.T) {
 	}
 	entered, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
-	factQuerySnapshotBarrierHook = func(kind factSelectorKind, _ int64) {
+	db.installFactQuerySnapshotBarrier(func(kind factSelectorKind, _ int64) {
 		if kind != factSelectorEvidence {
 			return
 		}
 		once.Do(func() { close(entered) })
 		<-release
-	}
+	})
 	type result struct {
 		page journal.EvidencePage
 		err  error
