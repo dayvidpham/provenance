@@ -94,10 +94,13 @@ All notable changes to this project will be documented in this file.
   see the caller's own value. Everything else on the connection remains the
   caller's, and the caller's DSN must supply them: Provenance never sets
   `journal_mode` or `synchronous` on a borrowed pool (unlike `Open`, which owns
-  its pool and sets WAL there), and it rewrites `busy_timeout` only for the span
-  of schema activation on the one activation connection, restoring the captured
-  value — again verified by read-back — before handing that connection back. A
+  its pool and sets WAL there), and it rewrites `busy_timeout` for the span
+  of schema activation on the one activation connection (restoring the captured
+  value — again verified by read-back — before handing that connection back),
+  and for the span of any transaction whose caller deadline is shorter than the
+  pool's configured value. A
   shared file therefore wants a WAL, non-zero-`busy_timeout` DSN from the caller.
+
 The four removals that follow are recorded for completeness, not as breaks a
 released consumer can hit: `BindGovernedAllocator`, `GovernedAllocationDepth`,
 `GovernedAllocationSupplementPolicy`/`GovernedAllocationSupplementPolicyV1`, and
