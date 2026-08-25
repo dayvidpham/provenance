@@ -109,7 +109,7 @@ jobs:
       - name: Set up Node (for ast-grep CLI)
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
-          node-version: "22"
+          node-version: "26"
 
       - name: Install ast-grep
         # Pinned to the exact version the flake.nix dev shell currently
