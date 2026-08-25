@@ -307,7 +307,10 @@ func OpenBorrowed(runtime *sql.DB, models []ptypes.ModelEntry) (*DB, error) {
 		return nil, fmt.Errorf("lease borrowed activation connection: %w", err)
 	}
 	activation := borrowConnScope(activationConn, projectionTargetLive)
-	err = activateSchema(activation, models)
+	// The borrowed pool's file is shared by definition, so activation waits out a
+	// concurrent activation or migration within the bounded budget instead of
+	// failing this open on the first contended attempt.
+	err = activateSchemaWithRetry(activation, models, defaultActivationRetryPolicy())
 	closeErr := activationConn.Close()
 	if err != nil {
 		return nil, fmt.Errorf("activate borrowed database/schema: %w", err)
@@ -511,7 +514,9 @@ func openInMemory(target openTarget, models []ptypes.ModelEntry) (*DB, error) {
 		return nil, fmt.Errorf("lease in-memory activation connection %q: %w", target.display, err)
 	}
 	activation := borrowConnScope(activationConn, projectionTargetLive)
-	if err := activateSchema(activation, models); err != nil {
+	// A process-unique memory database has no other writer, so there is nothing to
+	// wait for beyond the single attempt's own busy timeout.
+	if err := activateSchema(activation, models, defaultActivationRetryPolicy()); err != nil {
 		_ = activationConn.Close()
 		_ = runtime.Close()
 		return nil, fmt.Errorf("activate in-memory database %q: %w", target.display, err)
@@ -540,9 +545,19 @@ func openFileBacked(target openTarget, existingJournal bool, models []ptypes.Mod
 		err = fmt.Errorf("schema changed between read-only preflight (journal=%t) and activation (journal=%t); retry after concurrent schema work finishes", existingJournal, actualExisting)
 	}
 	if err == nil {
-		err = activateSchema(activation, models)
+		// A file-backed open contends with any other process holding this path's
+		// write lock, so it shares the borrowed path's bounded activation budget.
+		err = activateSchemaWithRetry(activation, models, defaultActivationRetryPolicy())
 	}
 	if err == nil {
+		// Pre-existing, deliberately left as is: these two pragmas run after the
+		// activation budget, so two processes creating the SAME new file can still
+		// race the journal-mode switch and surface SQLite's own non-actionable
+		// "delete, want wal" mismatch. Folding them into the budget would mean
+		// retrying the entire schema activation (O(journal) replay included) to
+		// redo one pragma, and widening the retry surface past the single
+		// sanctioned exception; the right fix is a narrower journal-mode
+		// reconciliation, which is out of scope for this contention fix.
 		err = activation.enableWAL()
 	}
 	if err == nil {
@@ -567,11 +582,141 @@ func openFileBacked(target openTarget, existingJournal bool, models []ptypes.Mod
 	return &DB{db: runtime, ownsPool: true}, nil
 }
 
-func activateSchema(scope *connScope, models []ptypes.ModelEntry) error {
-	if err := scope.applyActivationPragmas(); err != nil {
+// activationRetryPolicy bounds a contended schema activation. attemptBusyTimeout
+// is the connection-local SQLite busy wait each attempt gets (SQLite's own
+// contention wait, honoured because activation now begins with BEGIN IMMEDIATE);
+// ceiling bounds the total wall time spent across attempts, and the delays shape
+// the backoff between them. Values are injectable so contention tests can pin the
+// ceiling behaviour without waiting the production budget.
+type activationRetryPolicy struct {
+	attemptBusyTimeout time.Duration
+	ceiling            time.Duration
+	initialDelay       time.Duration
+	maxDelay           time.Duration
+}
+
+// defaultActivationRetryPolicy is the production activation budget: SQLite's
+// standard busy_timeout per attempt, retried with backoff for up to 30 seconds so
+// a concurrent migrator holding the shared file's write lock across several
+// busy_timeout windows delays this open instead of failing it.
+func defaultActivationRetryPolicy() activationRetryPolicy {
+	return activationRetryPolicy{
+		attemptBusyTimeout: busyTimeoutMS * time.Millisecond,
+		ceiling:            30 * time.Second,
+		initialDelay:       10 * time.Millisecond,
+		maxDelay:           time.Second,
+	}
+}
+
+// activateSchemaWithRetry runs activation against a database file that other
+// processes or pools may be writing. A single attempt already waits out ordinary
+// contention inside SQLite (attemptBusyTimeout); the loop exists only for the
+// case where a concurrent activation or migration holds the write lock longer
+// than one busy window. Retrying is safe because a failed attempt commits
+// nothing: runScopedTransaction rolls back on every error path and the pragmas
+// are re-applied at the head of each attempt.
+//
+// This is not a general storage retry framework, and it is not a substitute for
+// busy_timeout: it is the bounded outer wait for exactly one operation, whose
+// per-attempt wait is still SQLite's. See TESTING.md, "Waiting and retries":
+// activation is the single sanctioned exception, and it does not extend to
+// storage operations, which still make one inner attempt.
+//
+// The budget is uncancellable in practice today: both retrying call sites reach
+// this through borrowConnScope, whose ctx is context.Background, because Open and
+// OpenBorrowed take no context. The cancellation arm below is kept so that a
+// future context-carrying caller is honoured the moment one exists, rather than
+// silently waiting out the whole budget.
+func activateSchemaWithRetry(scope *connScope, models []ptypes.ModelEntry, policy activationRetryPolicy) error {
+	started := time.Now()
+	deadline := started.Add(policy.ceiling)
+	// A non-positive delay would turn the bounded wait into a spin, so the backoff
+	// always starts at a real duration.
+	delay := max(policy.initialDelay, time.Millisecond)
+	for attempt := 1; ; attempt++ {
+		err := activateSchema(scope, models, policy)
+		if err == nil {
+			return nil
+		}
+		if !isBusyError(err) {
+			return err
+		}
+		if !time.Now().Before(deadline) {
+			return activationContendedError(scope, policy, attempt, time.Since(started), err)
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-scope.ctx.Done():
+			timer.Stop()
+			cancelTarget, _ := activationTargetDisplay(scope)
+			return fmt.Errorf(
+				"activate SQLite schema on %s: canceled after %d contended attempt(s) while waiting for the file's write lock (%w); "+
+					"nothing was written — every attempt rolled back; retry the open once the caller's context is live again",
+				cancelTarget, attempt, errors.Join(scope.ctx.Err(), err),
+			)
+		case <-timer.C:
+		}
+		delay *= 2
+		if policy.maxDelay > 0 && delay > policy.maxDelay {
+			delay = policy.maxDelay
+		}
+	}
+}
+
+// activationContendedError reports an exhausted activation budget in the terms
+// the operator needs: which file, how long was spent, what is holding it, that
+// nothing was written, and how to clear it.
+func activationContendedError(scope *connScope, policy activationRetryPolicy, attempts int, elapsed time.Duration, last error) error {
+	target, resolved := activationTargetDisplay(scope)
+	// The budget bounds when the last attempt may START, so the measured elapsed
+	// time legitimately exceeds it by up to one attempt plus one backoff delay.
+	// Report what was actually spent and name the budget separately rather than
+	// implying the two are the same number.
+	identify := ""
+	if resolved {
+		identify = fmt.Sprintf(", or identify the holder with `fuser %s` (or `lsof %s`) and stop it before retrying", target, target)
+	}
+	return fmt.Errorf(
+		"activate SQLite schema on %s: gave up after %s; budget %s; %d attempt(s) with the database still locked (%w) — "+
+			"where: internal/sqlite.activateSchemaWithRetry, startup schema activation; "+
+			"why: another process or pool held this file's write lock for the whole budget, most likely a concurrent migrator "+
+			"activating the same database; "+
+			"impact: this open failed and no schema or seed row was written, because every attempt rolled back; "+
+			"fix: wait for the other writer to finish and retry the open%s",
+		target, elapsed.Round(time.Millisecond), policy.ceiling, attempts, last, identify,
+	)
+}
+
+// activationTargetDisplay names the contended file for operator-facing errors.
+// It asks SQLite itself so a borrowed pool, whose path this package never sees,
+// still reports a real path. It runs only on a failure path.
+func activationTargetDisplay(scope *connScope) (display string, resolved bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var file string
+	if err := scope.conn.QueryRowContext(ctx, "SELECT file FROM pragma_database_list WHERE name = 'main'").Scan(&file); err != nil || file == "" {
+		return "the activating SQLite database", false
+	}
+	return file, true
+}
+
+func activateSchema(scope *connScope, models []ptypes.ModelEntry, policy activationRetryPolicy) error {
+	if err := scope.applyActivationPragmas(policy.attemptBusyTimeout); err != nil {
 		return err
 	}
-	err := runScopedTransaction(scope.ctx, scope.conn, "BEGIN", func() error {
+	// BEGIN IMMEDIATE, not BEGIN. Activation reads before it writes (~30 CREATE
+	// TABLE IF NOT EXISTS statements precede the reference-data seeding), and a
+	// deferred transaction would take the read lock first and then need a
+	// read-to-write promotion, on which SQLite never invokes the busy handler:
+	// contention would fail instantly and bypass busy_timeout entirely.
+	//
+	// Tradeoff, accepted deliberately: taking the write lock at BEGIN holds it
+	// for the read-only integrity and replay probes too, lengthening the lock
+	// hold. Those probes are not hoisted out of the transaction because
+	// activation's contract is that the schema, its verification, and the replay
+	// commit or roll back together; verifying outside the write lock would
+	// validate a snapshot that another writer could invalidate before COMMIT.
+	err := runImmediateTransaction(scope.ctx, scope.conn, func() error {
 		if err := scope.ensureSchema(models); err != nil {
 			return fmt.Errorf("apply schema: %w", err)
 		}
@@ -699,8 +844,12 @@ func runImmediateTransaction(ctx context.Context, conn *sql.Conn, operation func
 
 // Pragmas --------------------------------------------------------------------
 
-func (scope *connScope) applyActivationPragmas() error {
-	if _, err := scope.conn.ExecContext(scope.ctx, fmt.Sprintf("PRAGMA busy_timeout=%d", busyTimeoutMS)); err != nil {
+func (scope *connScope) applyActivationPragmas(busyTimeout time.Duration) error {
+	busyTimeoutMilliseconds := busyTimeout.Milliseconds()
+	if busyTimeoutMilliseconds < 0 {
+		busyTimeoutMilliseconds = 0
+	}
+	if _, err := scope.conn.ExecContext(scope.ctx, fmt.Sprintf("PRAGMA busy_timeout=%d", busyTimeoutMilliseconds)); err != nil {
 		return fmt.Errorf("set activation busy timeout: %w", err)
 	}
 	if _, err := scope.conn.ExecContext(scope.ctx, "PRAGMA foreign_keys=OFF"); err != nil {
@@ -1075,7 +1224,8 @@ func preflightActivationClone(source *sql.Conn, models []ptypes.ModelEntry) erro
 	}
 
 	activation := borrowConnScope(cloneConn, projectionTargetLive)
-	if err := activateSchema(activation, models); err != nil {
+	// The clone is a private copy owned by this preflight; no other writer exists.
+	if err := activateSchema(activation, models, defaultActivationRetryPolicy()); err != nil {
 		return fmt.Errorf("isolated activation clone rejected existing database: %w", err)
 	}
 	return nil

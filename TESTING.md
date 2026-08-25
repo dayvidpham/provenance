@@ -211,3 +211,30 @@ Borrowed operations make one inner attempt and return escaped `BUSY`/`LOCKED`
 unchanged; DBOS step options own durable retry policy. Assert attempts,
 callbacks, durable state, typed outcomes, and replay behavior, not elapsed time
 or observed sleep intervals.
+
+### The one sanctioned exception: schema activation
+
+`internal/sqlite` schema activation is the single place that wraps a bounded
+outer retry around an operation. `activateSchemaWithRetry`, reached from `Open`
+and `OpenBorrowed`, retries the whole activation with backoff up to a 30s budget
+and then fails with an actionable error naming the file, the measured elapsed
+time, the budget, the likely concurrent migrator, that nothing was written, and
+how to clear it. Each attempt's wait is still SQLite's own `busy_timeout=5000`:
+the loop does not replace `busy_timeout`, it bounds how long an open keeps
+re-offering itself to it.
+
+Why the exception exists. Activation begins with `BEGIN IMMEDIATE`. It must: a
+deferred `BEGIN` established the read snapshot over the `CREATE TABLE IF NOT
+EXISTS` statements and then needed a read-to-write promotion on the first seed
+write, and SQLite never invokes the busy handler for a promotion, so contention
+failed instantly with `SQLITE_BUSY` and bypassed `busy_timeout` entirely. Taking
+the write lock at `BEGIN` fixes that, but it also means the lock is now held
+across `verifyIntegrity` and `replayProjections`, which are O(journal) per open.
+N concurrent openers therefore serialise, and the resulting queue can exceed a
+single 5s busy window even when nothing is wrong. The bounded outer budget is
+what keeps that queue from turning an ordinary concurrent open into a failure.
+
+The exception is deliberately narrow: bounded, non-durable, one operation, and
+the per-attempt wait remains SQLite's. Do not extend it to storage operations —
+those still make one inner attempt and return escaped `BUSY`/`LOCKED` unchanged,
+and DBOS step options own durable retry.

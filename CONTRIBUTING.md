@@ -299,6 +299,13 @@ Each target can be run independently. All four quality gates (`fmt`, `lint`, `te
 Do not run full tests or race tests with `CGO_ENABLED=0`; that mode is reserved
 for `go build ./...`. The ast-grep lint gate rejects production `time.Sleep`, so
 SQLite `busy_timeout=5000` remains the sole local wait and DBOS owns retries.
+The single sanctioned exception is `internal/sqlite` schema activation: it bounds
+one operation in a 30s outer budget whose per-attempt wait is still
+`busy_timeout`, because `BEGIN IMMEDIATE` holds the write lock across the
+O(journal) integrity and replay probes and concurrent openers can therefore
+serialise past one 5s window. Do not extend this exception to storage
+operations; DBOS step options own durable retry. See TESTING.md, "Waiting and
+retries".
 
 ## Troubleshooting
 
