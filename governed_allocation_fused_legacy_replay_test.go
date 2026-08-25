@@ -15,7 +15,13 @@ import (
 	"github.com/google/uuid"
 )
 
+// This test is parallel: it owns a private t.TempDir database and DBOS application
+// name, its participant counter is local to its own closure, and its frozen baseline
+// expectations are immutable literals rather than shared fixture state.
+
 func TestFusedLegacyRunAllocateReopensBaselineWorkflowWithoutParticipant(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	dsn := "file:" + filepath.Join(t.TempDir(), "legacy-fused-replay.db") + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
 	var participantCalls int

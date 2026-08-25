@@ -14,11 +14,18 @@ import (
 	"github.com/google/uuid"
 )
 
+// Every top-level test in this file is parallel under the isolation proof
+// documented above openGovernedTracker in governed_allocation_integration_test.go:
+// each test owns a private t.TempDir database, a private DBOS application name,
+// and a snapshot closure local to itself.
+
 // TestGovernedAllocationLateActivityFailureRollsBackWholeV1Fold exercises the
 // production DBOS transaction with ActivityCreate last, after the other three V1
 // families have written. Every operation-owned row must disappear together while
 // DBOS retains only its terminal error checkpoint.
 func TestGovernedAllocationLateActivityFailureRollsBackWholeV1Fold(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	fused, db := openFusedAllocatorWithDatabase(t, "v1-late-activity-rollback")
 	actor := registerGovernedActor(t, fused.Tracker(), "v1-late-activity-rollback")

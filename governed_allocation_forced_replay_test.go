@@ -13,12 +13,19 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// Every top-level test in this file is parallel under the isolation proof
+// documented above openGovernedTracker in governed_allocation_integration_test.go:
+// this test owns a private t.TempDir database that only it opens, closes, and
+// reopens.
+
 // TestFusedGovernedAllocationComposedForcedTransitionsSurviveReopen pins the
 // production composition path to the shared journal replay contract. The second
 // start is deliberately invalid under the ordinary FSM (in_progress ->
 // in_progress), so replay can converge only when both forced events preserve
 // their durable marker.
 func TestFusedGovernedAllocationComposedForcedTransitionsSurviveReopen(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "composed-forced-replay.db")
 	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"

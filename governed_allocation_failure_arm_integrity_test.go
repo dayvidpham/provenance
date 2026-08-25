@@ -13,7 +13,14 @@ import (
 	provenance "github.com/dayvidpham/provenance"
 )
 
+// Every top-level test in this file is parallel under the isolation proof
+// documented above openGovernedTracker in governed_allocation_integration_test.go:
+// each test, and each subtest that reopens a fixture, owns a private t.TempDir
+// database and closure-local participant counters.
+
 func TestGovernedAllocationCommittedSuccessCannotBeReplacedByValidFailureArm(t *testing.T) {
+	t.Parallel()
+
 	for _, composed := range []bool{false, true} {
 		name := "simple"
 		if composed {
@@ -98,6 +105,8 @@ func TestGovernedAllocationCommittedSuccessCannotBeReplacedByValidFailureArm(t *
 }
 
 func TestComposedParticipantFailureRollsBackEveryGovernedTable(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	fused, db := openFusedAllocatorWithParticipantAndDatabase(t, "participant-failure-rollback", func(ctx context.Context, tx provenance.GovernedAllocationTransaction, request provenance.GovernedAllocationRequest, closure provenance.OperationClosure) error {
 		_, err := tx.Exec(ctx, `INSERT INTO fused_governed_participant_audit(operation_id,anchor_journal_id,child_task_id) VALUES(?1,?2,?3)`, request.OperationID, closure.AnchorJournalID(), closure.Children()[0].TaskID.String())
@@ -148,6 +157,8 @@ func governedDomainRowCounts(t *testing.T, db *sql.DB) []int {
 }
 
 func TestComposedReceiptDetectsForeignProducerMutationOnCanonicalAndExtraRows(t *testing.T) {
+	t.Parallel()
+
 	for _, extra := range []bool{false, true} {
 		t.Run(map[bool]string{false: "canonical", true: "extra"}[extra], func(t *testing.T) {
 			ctx := context.Background()
@@ -184,6 +195,8 @@ func TestComposedReceiptDetectsForeignProducerMutationOnCanonicalAndExtraRows(t 
 }
 
 func TestFreshWorkflowRejectsWrongParentAuthorityBeforeWrites(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	calls := 0
 	fused, db := openFusedAllocatorWithParticipantAndDatabase(t, "wrong-parent-authority", func(context.Context, provenance.GovernedAllocationTransaction, provenance.GovernedAllocationRequest, provenance.OperationClosure) error {
@@ -214,6 +227,8 @@ func TestFreshWorkflowRejectsWrongParentAuthorityBeforeWrites(t *testing.T) {
 }
 
 func TestJoinedParticipantAndCleanupFailureCannotAuthenticateDomainRejection(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	domainLike := &provenance.GovernedAllocationError{Kind: provenance.GovernedAllocationAuthority, Operation: "forged-domain", Why: "participant supplied", Impact: "none", Fix: "none"}
 	fused, db := openFusedAllocatorWithParticipantAndDatabase(t, "joined-participant-failure", func(context.Context, provenance.GovernedAllocationTransaction, provenance.GovernedAllocationRequest, provenance.OperationClosure) error {

@@ -23,9 +23,13 @@ import (
 // These integration tests exercise the public governed-allocation API against
 // real Modernc SQLite and, below, the exact-handle DBOS transaction path. They
 // intentionally use fixed caller identities so exact retries and reopen results
-// compare byte-for-byte by their immutable closure value.
+// compare byte-for-byte by their immutable closure value. Those identities are
+// scoped to one test's own database, so they stay unique under parallel
+// execution; the isolation proof is documented above openGovernedTracker.
 
 func TestGovernedGenesisRetryAndConflictingSecondGenesis(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	tr, actor := openGovernedTracker(t)
 	root := governedChild("root", actor)
@@ -57,6 +61,8 @@ func TestGovernedGenesisRetryAndConflictingSecondGenesis(t *testing.T) {
 }
 
 func TestGovernedAllocationBatchBoundariesRetriesAndOrder(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	tr, actor := openGovernedTracker(t)
 	root := initializeRoot(t, tr, actor)
@@ -112,6 +118,8 @@ func TestGovernedAllocationBatchBoundariesRetriesAndOrder(t *testing.T) {
 }
 
 func TestGovernedAllocationRejectsBeforeWriting(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	tr, actor := openGovernedTracker(t)
 	root := initializeRoot(t, tr, actor)
@@ -170,6 +178,8 @@ func TestGovernedAllocationRejectsBeforeWriting(t *testing.T) {
 }
 
 func TestSessionAllocateGovernedRejectsDifferentActiveParentAuthorityWithoutWrites(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	tr, actor := openGovernedTracker(t)
 	root := initializeRoot(t, tr, actor)
@@ -189,6 +199,8 @@ func TestSessionAllocateGovernedRejectsDifferentActiveParentAuthorityWithoutWrit
 }
 
 func TestGovernedAllocationRejectsRevokedMiddleAncestorWithoutWrites(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	tr, actor := openGovernedTracker(t)
 	root := initializeRoot(t, tr, actor)
@@ -225,6 +237,8 @@ func TestGovernedAllocationRejectsRevokedMiddleAncestorWithoutWrites(t *testing.
 }
 
 func TestGovernedAllocationRejectsRevocationWithoutWrites(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	tr, actor := openGovernedTracker(t)
 	root := initializeRoot(t, tr, actor)
@@ -258,6 +272,8 @@ func TestGovernedAllocationRejectsRevocationWithoutWrites(t *testing.T) {
 }
 
 func TestGovernedClosureReopensAndCorruptionFailsClosed(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "reopen.db")
 	tr, err := provenance.OpenSQLite(path)
@@ -326,6 +342,8 @@ func TestGovernedClosureReopensAndCorruptionFailsClosed(t *testing.T) {
 }
 
 func TestGovernedAllocationStandaloneAndExactHandleFusedParity(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	standalone, actor := openGovernedTracker(t)
 	root := initializeRoot(t, standalone, actor)
@@ -381,6 +399,8 @@ func TestGovernedAllocationStandaloneAndExactHandleFusedParity(t *testing.T) {
 }
 
 func TestSessionAllocationReplayRequiresExactAuthorityAndSurvivesLaterRevocation(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	tr, actor, db := openGovernedTrackerWithDatabase(t)
 	root := initializeRoot(t, tr, actor)
@@ -438,6 +458,8 @@ func TestSessionAllocationReplayRequiresExactAuthorityAndSurvivesLaterRevocation
 }
 
 func TestFusedWorkflowIDReplayMatchesCanonicalRequestAndAuthority(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	fused, db := openFusedAllocatorWithDatabase(t, "workflow-input-replay")
 	tr := fused.Tracker()
@@ -506,6 +528,8 @@ func TestFusedWorkflowIDReplayMatchesCanonicalRequestAndAuthority(t *testing.T) 
 }
 
 func TestFusedGovernedAllocationParticipantCommitsDomainAuditAndCheckpoint(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	var calls int
 	participant := provenance.GovernedAllocationParticipant(func(ctx context.Context, tx provenance.GovernedAllocationTransaction, request provenance.GovernedAllocationRequest, closure provenance.OperationClosure) error {
@@ -587,6 +611,8 @@ func TestFusedGovernedAllocationParticipantCommitsDomainAuditAndCheckpoint(t *te
 }
 
 func TestFusedGovernedAllocationParticipantErrorRollsBackDomainAuditAndSuccessfulCheckpoint(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	const participantFailure = "participant audit dependency unavailable"
 	participant := provenance.GovernedAllocationParticipant(func(ctx context.Context, tx provenance.GovernedAllocationTransaction, request provenance.GovernedAllocationRequest, closure provenance.OperationClosure) error {
@@ -631,6 +657,8 @@ func TestFusedGovernedAllocationParticipantErrorRollsBackDomainAuditAndSuccessfu
 }
 
 func TestFusedGovernedAllocationParticipantExactReplaySkipsCallbackAndDistinctWorkflowIsIdempotent(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	var calls int
 	participant := provenance.GovernedAllocationParticipant(func(ctx context.Context, tx provenance.GovernedAllocationTransaction, request provenance.GovernedAllocationRequest, closure provenance.OperationClosure) error {
@@ -704,6 +732,8 @@ func TestFusedGovernedAllocationParticipantExactReplaySkipsCallbackAndDistinctWo
 }
 
 func TestFusedGovernedAllocationParticipantReceivesDefensiveRequestAndClosureCopies(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	participant := provenance.GovernedAllocationParticipant(func(_ context.Context, _ provenance.GovernedAllocationTransaction, request provenance.GovernedAllocationRequest, closure provenance.OperationClosure) error {
 		request.Children[0].Title = "participant-mutated-title"
@@ -746,6 +776,8 @@ func TestFusedGovernedAllocationParticipantReceivesDefensiveRequestAndClosureCop
 }
 
 func TestFusedGovernedAllocationComposedPersistsAllowedSupplementsAndReplays(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	fused, db := openFusedAllocatorWithDatabase(t, "composed-success")
 	tr := fused.Tracker()
@@ -799,6 +831,8 @@ func TestFusedGovernedAllocationComposedPersistsAllowedSupplementsAndReplays(t *
 }
 
 func TestFusedGovernedAllocationComposedRejectsStructurallyForgedSQLiteReceipts(t *testing.T) {
+	t.Parallel()
+
 	mutations := []struct {
 		name   string
 		mutate func(*testing.T, *sql.DB, provenance.GovernedChildBinding, provenance.GovernedAllocationComposedRequest)
@@ -927,6 +961,8 @@ func TestFusedGovernedAllocationComposedRejectsStructurallyForgedSQLiteReceipts(
 }
 
 func TestFusedGovernedAllocationRejectsForgedDBOSOutputAfterReopen(t *testing.T) {
+	t.Parallel()
+
 	for _, name := range []string{"simple", "composed-activity", "composed-event"} {
 		t.Run(name, func(t *testing.T) {
 			composed := name != "simple"
@@ -1074,6 +1110,8 @@ func mutateDBOSWorkflowOutput(t *testing.T, db *sql.DB, workflow, variant string
 }
 
 func TestSessionAllocateGovernedComposedUsesSameReducer(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	tr, actor := openGovernedTracker(t)
 	root := initializeRoot(t, tr, actor)
@@ -1104,6 +1142,8 @@ func TestSessionAllocateGovernedComposedUsesSameReducer(t *testing.T) {
 }
 
 func TestFusedGovernedAllocationComposedReducerAndParticipantFailuresRollBack(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	for _, test := range []struct {
 		name        string
@@ -1169,6 +1209,8 @@ func TestFusedGovernedAllocationComposedReducerAndParticipantFailuresRollBack(t 
 }
 
 func TestFusedGovernedAllocationComposedConflictsAndDefensiveCopies(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	fused, db := openFusedAllocatorWithDatabase(t, "composed-conflicts")
 	actor := registerGovernedActor(t, fused.Tracker(), "composed-conflicts")
@@ -1237,6 +1279,8 @@ func TestFusedGovernedAllocationComposedConflictsAndDefensiveCopies(t *testing.T
 }
 
 func TestGovernedAllocationComposedRejectsUnsupportedAndUnrelatedReferencesBeforeAllocation(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	participantCalls := 0
 	fused, db := openFusedAllocatorWithParticipantAndDatabase(t, "composed-reject", func(context.Context, provenance.GovernedAllocationTransaction, provenance.GovernedAllocationRequest, provenance.OperationClosure) error {
@@ -1399,6 +1443,8 @@ func TestGovernedAllocationComposedRejectsUnsupportedAndUnrelatedReferencesBefor
 }
 
 func TestComposedAllocationReservesItsDerivedInternalOperationID(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	fused, db := openFusedAllocatorWithDatabase(t, "composed-reserved-operation")
 	tr := fused.Tracker()
@@ -1446,6 +1492,8 @@ func TestComposedAllocationReservesItsDerivedInternalOperationID(t *testing.T) {
 }
 
 func TestFusedGovernedAllocationComposedExactReopenReplayIsStableAndSkipsParticipant(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "composed-reopen.db")
 	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
@@ -1551,6 +1599,19 @@ func composedSupplementOperationIDForTest(external provenance.OperationID) prove
 	return provenance.OperationID("provenance.governed-supplement.v1." + fmt.Sprintf("%x", sum[:]))
 }
 
+// Isolation proof for the governed-allocation family.
+//
+// Every constructor below gives its caller a private database: openGovernedTracker
+// an in-memory tracker, and openGovernedTrackerWithDatabase, openFusedAllocator*
+// and openFusedReceiptProof a file under the calling test's own t.TempDir. Each
+// fused allocator also carries its own DBOS application name and its own
+// registered actor namespace, and every observer handle is closed by that test's
+// own t.Cleanup. Nothing in the family reads or writes package-level state, the
+// process working directory, the environment, or a shared fixture file, and no
+// test in it uses leakCheck or any other process-global assertion. Counters live
+// in each test's own closure, so a participant callback observes only its own
+// test. That is the whole condition TESTING.md sets for t.Parallel, which is why
+// the family's top-level tests are parallel.
 func openGovernedTracker(t *testing.T) (provenance.Tracker, provenance.ActorID) {
 	t.Helper()
 	tr, err := provenance.OpenMemory()

@@ -30,6 +30,13 @@ should be expected to take roughly twice these wall times; the reported
 | `baseline-race.json.gz` / `inventory-baseline-race.md` | `CGO_ENABLED=1 go test -race -shuffle=on -fullpath -timeout=20m -count=1 ./...` | 418s |
 | `after-parallel-forged-receipts-race.json.gz` / `inventory-after-parallel-forged-receipts-race.md` | race, at commit `19e29e6` | 291s |
 
+[parallel-governed-allocation-family.md](parallel-governed-allocation-family.md)
+records the peak-RSS measurements, the `-parallel` bounding experiment, and the
+pre-existing load flake found while parallelising the rest of that family. It has
+no `go test -json` stream: its host was shared with two other test-optimization
+workers, so its wall times are provisional and only its comparative measurements
+are load-independent.
+
 The `-count=1` and `-json` flags are measurement instrumentation. They are not
 part of the authoritative gate, which specifies no `-count`.
 

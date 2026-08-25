@@ -13,7 +13,14 @@ import (
 	"github.com/dayvidpham/provenance"
 )
 
+// Every top-level test in this file is parallel under the isolation proof
+// documented above openGovernedTracker in governed_allocation_integration_test.go:
+// each test owns a private t.TempDir database and DBOS application name, and its
+// participant counters live in its own closure.
+
 func TestFusedGovernedAllocationComposedBatchCommitsOrderedCompleteClosureAndReplays(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	participantChildren := 0
 	participant := provenance.GovernedAllocationParticipant(func(_ context.Context, _ provenance.GovernedAllocationTransaction, _ provenance.GovernedAllocationRequest, closure provenance.OperationClosure) error {
@@ -96,6 +103,8 @@ func TestFusedGovernedAllocationComposedBatchCommitsOrderedCompleteClosureAndRep
 }
 
 func TestFusedComposedBatchConditionIsCanonicalAtomicAndReplaySafe(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	participant := provenance.GovernedAllocationParticipant(func(ctx context.Context, tx provenance.GovernedAllocationTransaction, request provenance.GovernedAllocationRequest, _ provenance.OperationClosure) error {
 		_, err := tx.Exec(ctx, `INSERT INTO condition_participant_audit(operation_id) VALUES (?1)`, request.OperationID)
@@ -159,6 +168,8 @@ func TestFusedComposedBatchConditionIsCanonicalAtomicAndReplaySafe(t *testing.T)
 }
 
 func TestFusedComposedReferenceScopeProvesDescendantAndRejectsUnrelated(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	fused, _ := openFusedAllocatorWithDatabase(t, "composed-reference-scope")
 	actor := registerGovernedActor(t, fused.Tracker(), "composed-reference-scope")
@@ -204,6 +215,8 @@ func mustBatchGovernedError(t *testing.T, err error, kind provenance.GovernedAll
 }
 
 func TestFusedGovernedAllocationComposedBatchReopenReplayPreservesOrder(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	dsn := "file:" + filepath.Join(t.TempDir(), "composed-batch-reopen.db") + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
 	config := provenance.FusedGovernedAllocatorConfig{SQLiteDSN: dsn, AppName: "composed-batch-reopen", ApplicationVersion: "test-v1", Logger: slog.Default()}
@@ -243,6 +256,8 @@ func TestFusedGovernedAllocationComposedBatchReopenReplayPreservesOrder(t *testi
 }
 
 func TestFusedGovernedAllocationComposedBatchInvalidSecondChildWritesNothing(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	fused, db := openFusedAllocatorWithDatabase(t, "composed-batch-invalid")
 	actor := registerGovernedActor(t, fused.Tracker(), "composed-batch-invalid")
@@ -265,6 +280,8 @@ func TestFusedGovernedAllocationComposedBatchInvalidSecondChildWritesNothing(t *
 }
 
 func TestGovernedAllocationComposedRejectsMoreThanOneChild(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	fused, _ := openFusedAllocatorWithDatabase(t, "composed-one-child-entry")
 	actor := registerGovernedActor(t, fused.Tracker(), "composed-one-child-entry")

@@ -7,7 +7,14 @@ import (
 	provenance "github.com/dayvidpham/provenance"
 )
 
+// Every top-level test in this file is parallel under the isolation proof
+// documented above openGovernedTracker in governed_allocation_integration_test.go:
+// each test owns a private t.TempDir database; its subtests share only that one
+// test's allocator and run serially within it.
+
 func TestComposedGovernedAllocationOperationShapeConflictsBeforeOwnerMarker(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	fused, db := openFusedAllocatorWithDatabase(t, "composed-shape-conflict")
 	actor := registerGovernedActor(t, fused.Tracker(), "composed-shape-conflict")
@@ -38,6 +45,8 @@ func TestComposedGovernedAllocationOperationShapeConflictsBeforeOwnerMarker(t *t
 }
 
 func TestComposedGovernedAllocationExactReceiptMissingOwnerMarkerIsCorruption(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	fused, db := openFusedAllocatorWithDatabase(t, "composed-missing-owner")
 	actor := registerGovernedActor(t, fused.Tracker(), "composed-missing-owner")

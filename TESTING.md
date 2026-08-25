@@ -154,9 +154,22 @@ files, and mutable expected data private.
 
 Add `t.Parallel()` only after proving there is no package-global mutation,
 shared file or sidecar, shared DBOS root, hidden environment/cwd dependency, or
-peak-RSS regression at CI concurrency. DBOS and shared-WAL tests remain serial
-initially. Correctness and deterministic diagnostics take priority over lower
-wall time.
+peak-RSS regression at CI concurrency. Correctness and deterministic diagnostics
+take priority over lower wall time.
+
+A DBOS or shared-WAL test may be parallel once it passes that proof, and the
+governed-allocation family is: every one of its tests owns a private `t.TempDir`
+or in-memory database, its own DBOS application name, and closure-local counters.
+A test stays serial when it asserts on process-global state instead. The
+`leakCheck` helper in `dbos_harness_test.go` compares `runtime.NumGoroutine`
+across the whole process, so its caller
+(`TestCancel_WhileGated_DurableWorkContinues`) can never be parallel, and neither
+can any future caller. Record the reason in the test when it stays serial.
+
+Peak RSS is measured, not assumed. For the root package it did not scale with
+parallel width; see
+[docs/perf/parallel-governed-allocation-family.md](docs/perf/parallel-governed-allocation-family.md)
+for the numbers and for the `-parallel` experiment behind that claim.
 
 Peasant's single-connection test pool, process-wide `TestMain` environment
 setup, and broad parallelization are not directly transferable. Peasant's pool
