@@ -847,6 +847,11 @@ func TestFusedGovernedAllocationComposedRejectsStructurallyForgedSQLiteReceipts(
 	for _, mutation := range mutations {
 		for _, replayMode := range []string{"distinct-workflow", "reopen"} {
 			t.Run(mutation.name+"/"+replayMode, func(t *testing.T) {
+				// Each case owns a private t.TempDir database, a private DBOS
+				// application name, and a participant counter local to this
+				// closure. Nothing here touches package state, the working
+				// directory, or another case's file, so the cases are isolated.
+				t.Parallel()
 				ctx := context.Background()
 				participantCalls := 0
 				name := "forged-receipt-" + strings.ReplaceAll(mutation.name+"-"+replayMode, " ", "-")
