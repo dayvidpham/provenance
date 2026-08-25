@@ -615,7 +615,7 @@ func (scope *connScope) validateCanonicalOperations() error {
 		}
 		prepared, err := journal.DecodeCanonicalMutation(op.wire)
 		if err != nil {
-			return fmt.Errorf("startup canonical validation operation %d: %w", op.anchor, err)
+			return fmt.Errorf("startup canonical validation operation %d: %w — where: startup canonical validation; when: decoding stored canonical operation bytes before the database is accepted; impact: the open fails closed and nothing is written; fix: %s", op.anchor, err, unsupportedPreV004DatabaseFix)
 		}
 		if op.version != prepared.EncodingVersion().String() {
 			return canonicalCorruption(op.anchor, "encoding version", op.version, prepared.EncodingVersion().String())
@@ -1113,7 +1113,7 @@ func (scope *connScope) canonicalEffectForJournalRow(jid int64) (journal.Effect,
 	}
 	prepared, err := journal.DecodeCanonicalMutation(wire)
 	if err != nil {
-		return journal.Effect{}, false, fmt.Errorf("operation %d canonical mutation: %w", anchor, err)
+		return journal.Effect{}, false, fmt.Errorf("operation %d canonical mutation: %w — where: canonical effect reconstruction during startup replay; when: decoding the producing operation's stored canonical bytes; impact: replay fails closed and no projection is written; fix: %s", anchor, err, unsupportedPreV004DatabaseFix)
 	}
 	if prepared.EncodingVersion().String() != version {
 		return journal.Effect{}, false, fmt.Errorf("operation %d canonical column version %q differs from registered wire version %q", anchor, version, prepared.EncodingVersion())

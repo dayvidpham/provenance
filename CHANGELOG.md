@@ -4,6 +4,90 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Breaking Changes
+
+#### Stored databases: pre-v0.0.4 files are unsupported
+
+- The canonical mutation wire layout changed while keeping the
+  `provenance.mutation.v1` tag. A mutation envelope now carries a
+  condition-count frame (and its encoded conditions) between the version field
+  and the effect count; before this release the effect count followed the
+  version directly. The tag is unchanged, so a pre-v0.0.4 row is not detected as
+  a different codec — it simply fails to decode.
+- **Databases created before v0.0.4 are out of scope and are not supported.**
+  There is no `provenance.mutation.v2` tag, no v1-layout decoder, and no
+  migration. Delete the database file and recreate it; there is nothing to
+  migrate and restoring the same database from a backup cannot help, because a
+  backup of a pre-v0.0.4 database is equally undecodable.
+- Rationale for the decision: this package has no external consumers at this
+  time, and its only user (pasture) runs fresh databases. Paying for a dual-codec
+  decode path and a migration for zero affected installations would add a
+  permanent legacy surface to the canonical encoding — the part of the system
+  that most needs one exact, verifiable shape.
+- Decode-failure diagnostics were corrected to match this decision: the startup
+  canonical preflight, the startup canonical validation and replay paths, the
+  fact-context backfill and validation paths, and stored-operation replay
+  comparison no longer tell the operator to "restore from backup". They now state
+  that a pre-v0.0.4 database is unsupported and must be deleted and recreated,
+  and that a decode failure on a v0.0.4-or-later database means that row is
+  corrupt.
+- DBOS durable workflow inputs recorded by an earlier build are covered by the
+  same decision: `DBOSApplyInput` carries canonical mutation bytes in the new
+  layout and gained a `kind` field, so an in-flight workflow input written before
+  v0.0.4 is not replayable.
+
+#### Public API
+
+- `JournalAPI` is renamed to `Journal`, and `Tracker.Journal()` now returns
+  `Journal`. Any code naming the old type must be updated.
+- The `Journal` interface gained `Facts() FactQueryAPI`. Any type outside this
+  module that implemented the old `JournalAPI` no longer satisfies it.
+- The `Tracker` interface gained
+  `InitializeGovernedRoot(context.Context, RootGenesisRequest) (OperationClosure, error)`.
+  Any type outside this module that implemented `Tracker` no longer satisfies it.
+- `PrepareMutationV1(effects []Effect)` is removed and replaced by
+  `Canonicalize(in OperationInput)`, the sole public preparation boundary. It
+  takes the whole operation input because conditions are now part of the
+  canonical envelope, not a bare effect slice.
+- `OperationConflict` is reshaped: the `Field string` member is replaced by
+  `Axis ConflictAxis` (the closed five-axis set `ConflictActor`,
+  `ConflictAuthority`, `ConflictCommand`, `ConflictCondition`, `ConflictEffect`)
+  plus `Index int`, which is `-1` for a scalar axis or a length mismatch and the
+  element index otherwise. `Error()` moved to a pointer receiver, so
+  `*OperationConflict` — not `OperationConflict` — is the type to use with
+  `errors.As`.
+- `DBOSDiagFieldConflictField` is removed and replaced by
+  `DBOSDiagFieldConflictAxis`, alongside new `DBOSDiagFieldConflictIndex`,
+  `DBOSDiagFieldConditionIndex`, `DBOSDiagFieldConditionKind`,
+  `DBOSDiagFieldConditionReason`, `DBOSDiagFieldAssertedJournalID`,
+  `DBOSDiagFieldActualJournalID`, `DBOSDiagFieldActivityID`, and
+  `DBOSDiagFieldExistingJournalID` fields.
+- `OpenBorrowedSQLite` no longer opens a second internal connection on the
+  borrowed database's file: it activates the schema on the borrowed `*sql.DB`
+  pool itself. The signature is unchanged, but the borrowed pool now carries all
+  Provenance traffic, so its size, lifetime, and pragmas govern Provenance's
+  behaviour.
+
+#### Dependencies
+
+- `github.com/dbos-inc/dbos-transact-golang` v0.16.0 → v0.20.0.
+- SQLite persistence moved from `zombiezen.com/go/sqlite` to
+  `modernc.org/sqlite` (`database/sql`). `zombiezen.com/go/sqlite` remains only
+  as an indirect dependency. Callers that shared a handle with Provenance through
+  the zombiezen API must supply a `database/sql` pool instead.
+
+### Migration
+
+- Delete and recreate any database created before v0.0.4; nothing about it is
+  recoverable by this build. There is no supported upgrade path and none is
+  planned.
+- `JournalAPI` → `Journal`; `PrepareMutationV1(effects)` →
+  `Canonicalize(OperationInput{Effects: effects})`;
+  `DBOSDiagFieldConflictField` → `DBOSDiagFieldConflictAxis`.
+- Replace `conflict.Field` string comparisons with a switch over
+  `conflict.Axis`, and match conflicts with `errors.As(err, &target)` where
+  `target` is a `*OperationConflict`.
+
 ## v0.0.3 - 2026-07-23
 
 ### Breaking Changes

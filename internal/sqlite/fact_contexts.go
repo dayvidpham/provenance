@@ -394,7 +394,7 @@ func (scope *connScope) backfillLegacyFactContexts() error {
 	for _, operation := range operations {
 		prepared, err := journal.DecodeCanonicalMutation(operation.wire)
 		if err != nil {
-			return fmt.Errorf("decode canonical operation %d for fact-context backfill: %w", operation.anchor, err)
+			return fmt.Errorf("decode canonical operation %d for fact-context backfill: %w — where: backfillLegacyFactContexts; when: startup, while deriving fact contexts from stored canonical operations; impact: the open fails closed and no synthetic context row is written; fix: %s", operation.anchor, err, unsupportedPreV004DatabaseFix)
 		}
 		effects := prepared.NormalizedEffects()
 		rows, err := scope.producedFactRows(operation.anchor)
@@ -752,7 +752,7 @@ func (scope *connScope) validateCanonicalFactContextSets() error {
 	for _, operation := range operations {
 		prepared, err := journal.DecodeCanonicalMutation(operation.wire)
 		if err != nil {
-			return fmt.Errorf("decode canonical operation %d for fact-context validation: %w", operation.anchor, err)
+			return fmt.Errorf("decode canonical operation %d for fact-context validation: %w — where: validateCanonicalFactContextSets; when: startup fact-context validation over stored canonical operations; impact: the open fails closed and no fact-context set is accepted; fix: %s", operation.anchor, err, unsupportedPreV004DatabaseFix)
 		}
 		effects := prepared.NormalizedEffects()
 		rows, err := scope.producedFactRows(operation.anchor)

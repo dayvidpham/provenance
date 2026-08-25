@@ -49,22 +49,23 @@ func newStoredOperationReplayIdentity(
 func decodeStoredOperationMutation(stored storedOperationReplayIdentity) (journal.CanonicalMutation, error) {
 	mutation, err := journal.DecodeCanonicalMutation(stored.canonicalMutation)
 	if err != nil {
-		return journal.CanonicalMutation{}, fmt.Errorf("decode stored operation %q canonical mutation: %w", stored.operationID, err)
+		return journal.CanonicalMutation{}, fmt.Errorf("decode stored operation %q canonical mutation: %w — where: decodeStoredOperationMutation; when: reading a committed operation's canonical bytes; impact: the caller fails closed and nothing is written; fix: %s", stored.operationID, err, unsupportedPreV004DatabaseFix)
 	}
 	return mutation, nil
 }
 
 // compareStoredOperationIdentity compares the stored canonical identity with the
 // candidate OperationInput. Only canonical (V1) operations with an encoding_version
-// and canonical_mutation are supported. A missing encoding version is a corruption error,
-// not a legacy-compatibility path — if you see this, restore from backup.
+// and canonical_mutation are supported. A missing encoding version is a corruption
+// error, not a legacy-compatibility path: pre-v0.0.4 databases are unsupported and
+// are recreated, never migrated or repaired.
 func compareStoredOperationIdentity(stored storedOperationReplayIdentity, candidate journal.OperationInput, reconcile allocatedTaskReconciler) error {
 	if stored.encodingVersion == "" {
 		// No opaque legacy compatibility: a missing encoding version in a journal row
 		// that also has or lacks canonical bytes is a corruption signal, not a pre-v0.0.4 row.
 		return storedIdentityIntegrityError(stored.operationID, "encoding_version",
-			"operation has no encoding_version — this indicates schema corruption or a row committed before v0.0.4; restore the canonical columns from a known-good backup",
-			"restore both encoding_version and canonical_mutation from the same committed backup")
+			"operation has no encoding_version — the row is either corrupt or was committed before v0.0.4",
+			unsupportedPreV004DatabaseFix)
 	}
 	if len(stored.canonicalMutation) == 0 {
 		return storedIdentityIntegrityError(stored.operationID, "canonical_mutation", "canonical operation has an empty byte stream", "restore the evolved V1 bytes committed for this operation")
@@ -79,7 +80,7 @@ func compareStoredOperationIdentity(stored storedOperationReplayIdentity, candid
 	}
 	decoded, err := journal.DecodeCanonicalMutation(stored.canonicalMutation)
 	if err != nil {
-		return fmt.Errorf("decode stored operation %q canonical identity: %w", stored.operationID, err)
+		return fmt.Errorf("decode stored operation %q canonical identity: %w — where: compareStoredOperationIdentity; when: replaying a stored operation against a candidate input; impact: the operation fails closed and nothing is written; fix: %s", stored.operationID, err, unsupportedPreV004DatabaseFix)
 	}
 	if decoded.EncodingVersion().String() != stored.encodingVersion {
 		return storedIdentityIntegrityError(stored.operationID, "encoding_version", "decoded mutation version does not match the stored version column", "restore the version and canonical bytes from the same committed operation")

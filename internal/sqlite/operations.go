@@ -277,18 +277,18 @@ func (scope *connScope) preflightCanonicalColumnsReadOnly() error {
 		wire := append([]byte(nil), storedWire...)
 		wireVersion, err := journal.InspectCanonicalMutationEncodingVersion(wire)
 		if err != nil {
-			return canonicalStartupPreflightError(err, fmt.Sprintf("operation %q has a malformed canonical wire-version frame", opID), "the canonical bytes do not begin with one valid framed version field", "restore canonical bytes and mutation digest from the same committed backup")
+			return canonicalStartupPreflightError(err, fmt.Sprintf("operation %q has a malformed canonical wire-version frame", opID), "the canonical bytes do not begin with one valid framed version field", unsupportedPreV004DatabaseFix)
 		}
 		if !wireVersion.MatchesStoredText(storedVersion) {
 			return canonicalStartupPreflightError(journal.ErrProjectionDivergence, fmt.Sprintf("operation %q column version %q differs from wire version (opaque inspected tag)", opID, storedVersion), "the redundant column and framed wire version identify different codecs", "restore mutation_encoding_version, canonical_mutation, and mutation_digest from the same committed operation")
 		}
 		registeredVersion, supported := wireVersion.RegisteredVersion()
 		if !supported || !journal.IsSupportedMutationEncoding(registeredVersion) {
-			cause := &journal.CanonicalMutationError{Field: "version", Reason: fmt.Sprintf("unsupported canonical codec version %q for operation %q", storedVersion, opID), Fix: "open with a build that supports this codec or restore bytes written by a supported codec"}
-			return canonicalStartupPreflightError(cause, fmt.Sprintf("operation %q uses unsupported canonical codec version %q", opID, storedVersion), "the column and wire agree, but this build has no registered decoder for that version", "upgrade to a codec-capable build, or restore the operation's version, bytes, and digest from a supported backup")
+			cause := &journal.CanonicalMutationError{Field: "version", Reason: fmt.Sprintf("unsupported canonical codec version %q for operation %q", storedVersion, opID), Fix: unsupportedPreV004DatabaseFix}
+			return canonicalStartupPreflightError(cause, fmt.Sprintf("operation %q uses unsupported canonical codec version %q", opID, storedVersion), "the column and wire agree, but this build has no registered decoder for that version", unsupportedPreV004DatabaseFix)
 		}
 		if _, err := journal.DecodeCanonicalMutation(wire); err != nil {
-			return canonicalStartupPreflightError(err, fmt.Sprintf("operation %q has malformed canonical wire for supported version %q", opID, storedVersion), "the full canonical frame is invalid, incomplete, duplicated, or has trailing data", "restore canonical bytes and mutation digest from the same committed operation")
+			return canonicalStartupPreflightError(err, fmt.Sprintf("operation %q has malformed canonical wire for supported version %q", opID, storedVersion), "the full canonical frame is invalid, incomplete, duplicated, or has trailing data", unsupportedPreV004DatabaseFix)
 		}
 		return nil
 	}); err != nil {
@@ -309,6 +309,22 @@ func canonicalColumnState(valid bool, n int) string {
 	}
 	return fmt.Sprintf("nonempty(%d bytes)", n)
 }
+
+// unsupportedPreV004DatabaseFix is the single operator remedy for a stored
+// canonical operation whose bytes this build cannot decode. The canonical
+// mutation wire layout changed in v0.0.4 — a condition-count frame now sits
+// between the version field and the effect count — under the retained
+// provenance.mutation.v1 tag, and databases written before v0.0.4 are
+// deliberately unsupported: there is no v1-layout decoder, no second version
+// tag, and no migration. Telling the operator to restore from backup would be
+// dishonest for that case, because a backup of a pre-v0.0.4 database is equally
+// undecodable; recreating the database is the only remedy.
+const unsupportedPreV004DatabaseFix = "if this database was created before v0.0.4 it is unsupported: " +
+	"the canonical mutation wire layout changed under the retained provenance.mutation.v1 tag and this build ships " +
+	"no legacy decoder and no migration, so restoring the same database from a backup cannot help — delete and " +
+	"recreate the database file this handle was opened on (its path is named in the enclosing open error) and " +
+	"repopulate it; if the database was created by v0.0.4 or later then this row is corrupt — restore " +
+	"mutation_encoding_version, canonical_mutation, and mutation_digest together from a backup written by v0.0.4 or later"
 
 func canonicalStartupPreflightError(cause error, what, why, fix string) error {
 	return fmt.Errorf("%w: canonical startup preflight failed — what: %s; why: %s; where: preflightCanonicalColumnsReadOnly on journal_operations; when: read-only startup before schema migration, activation transaction, or WAL enablement; impact: Open fails closed and the caller receives no tracker; no schema, journal, projection, or mode change is written; fix: %s", cause, what, why, fix)
