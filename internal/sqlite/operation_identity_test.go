@@ -13,6 +13,7 @@ import (
 )
 
 func TestStoredOperationIdentityUsesStructuralCanonicalComparison(t *testing.T) {
+	t.Parallel()
 	db := newJournalDB(t)
 	actorA, _ := ptypes.ParseActorID("fixture--018f0000-0000-7000-8000-000000000002")
 	actorB, _ := ptypes.ParseActorID("fixture--018f0000-0000-7000-8000-000000000003")
@@ -80,6 +81,7 @@ func TestStoredOperationIdentityUsesStructuralCanonicalComparison(t *testing.T) 
 }
 
 func TestStoredOperationIdentitySeparatesCorruptionFromOpaqueConflict(t *testing.T) {
+	t.Parallel()
 	actor, _ := ptypes.ParseActorID("fixture--018f0000-0000-7000-8000-000000000002")
 	canonicalBytes, err := os.ReadFile("../../testdata/contract/mutation_v1_v004.bin")
 	if err != nil {
@@ -104,6 +106,7 @@ func TestStoredOperationIdentitySeparatesCorruptionFromOpaqueConflict(t *testing
 }
 
 func TestApplyUsesStructuralStoredOperationIdentity(t *testing.T) {
+	t.Parallel()
 	db := newJournalDB(t)
 	actor, task := seedActorAndTask(t, db)
 	authority := genesisBoot(t, db, actor)
@@ -142,6 +145,7 @@ func TestApplyUsesStructuralStoredOperationIdentity(t *testing.T) {
 }
 
 func TestApplyReplayAxisAndIndexMatrixHasZeroDurableDelta(t *testing.T) {
+	t.Parallel()
 	db := newJournalDB(t)
 	actor, task := seedActorAndTask(t, db)
 	authority := genesisBoot(t, db, actor)
@@ -269,6 +273,7 @@ func TestApplyReplayAxisAndIndexMatrixHasZeroDurableDelta(t *testing.T) {
 // (CurrentFact: assertion of a non-existent evidence row being current) returns
 // typed ConditionFailure and produces zero persisted journal rows.
 func TestApplyConditionFailClosedWithZeroWrites(t *testing.T) {
+	t.Parallel()
 	db := newJournalDB(t)
 	actor, task := seedActorAndTask(t, db)
 	authority := genesisBoot(t, db, actor)
@@ -313,6 +318,7 @@ func TestApplyConditionFailClosedWithZeroWrites(t *testing.T) {
 // TestApplyConditionCurrentFactAbsenceSucceeds verifies that CurrentFact with
 // AssertedJournalID=0 (absence assertion) succeeds when no matching fact exists.
 func TestApplyConditionCurrentFactAbsenceSucceeds(t *testing.T) {
+	t.Parallel()
 	db := newJournalDB(t)
 	actor, task := seedActorAndTask(t, db)
 	authority := genesisBoot(t, db, actor)

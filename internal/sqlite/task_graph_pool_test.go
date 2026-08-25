@@ -37,6 +37,7 @@ func seedTaskGraphTask(t *testing.T, db *DB, task ptypes.Task) {
 }
 
 func TestTaskGraphPoolCRUDRoundTrips(t *testing.T) {
+	t.Parallel()
 	db := openTaskGraphPoolDB(t)
 	parent := taskGraphTask("pool-crud", "parent")
 	child := taskGraphTask("pool-crud", "child")
@@ -116,6 +117,7 @@ func TestTaskGraphPoolCRUDRoundTrips(t *testing.T) {
 }
 
 func TestTaskGraphPoolConcurrentReadersAndWriter(t *testing.T) {
+	t.Parallel()
 	db := openTaskGraphPoolDB(t)
 	first, second, writer := taskGraphTask("pool-wal", "first"), taskGraphTask("pool-wal", "second"), taskGraphTask("pool-wal", "writer")
 	for _, task := range []ptypes.Task{first, second, writer} {
@@ -159,6 +161,7 @@ func (err *taskGraphReadError) Error() string {
 }
 
 func TestTaskGraphPoolCloseRejectsNewCRUD(t *testing.T) {
+	t.Parallel()
 	dbPath := t.TempDir() + "/task-graph-close.db"
 	db, err := Open(dbPath, nil)
 	if err != nil {

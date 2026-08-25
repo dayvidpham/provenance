@@ -8,6 +8,7 @@ import (
 )
 
 func TestImmediateTransactionOwnsWriterWhileReaderKeepsSnapshot(t *testing.T) {
+	t.Parallel()
 	db := openPoolFileDB(t)
 	writer := takePoolScope(t, db)
 	reader := takePoolScope(t, db)
@@ -72,6 +73,7 @@ func TestImmediateTransactionOwnsWriterWhileReaderKeepsSnapshot(t *testing.T) {
 }
 
 func TestImmediateTransactionRollsBackOnCallbackFailure(t *testing.T) {
+	t.Parallel()
 	db := openPoolFileDB(t)
 	scope := takePoolScope(t, db)
 	defer scope.release()
