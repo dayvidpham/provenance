@@ -138,7 +138,18 @@ func assertDBOSAssignmentTransferOwner(t *testing.T, tracker Tracker, taskID Tas
 	}
 }
 
+// Isolation proof for this file's durable assignment-transfer tests.
+//
+// openDBOSAssignmentTransferStack takes the database path from its caller, and
+// each test passes a path under its own t.TempDir together with its own DBOS
+// application name. The tracker, adapter, entry counter, and every actor,
+// authority, and task identity are created inside that one database, and the
+// transfer/revocation race runs its two goroutines against that database alone.
+// No test here reads package-level state, the working directory, the environment,
+// or a process-global goroutine count, so all three run in parallel.
 func TestDBOSAdapterTransferAssignmentSuccessAndReplayAcrossWorkflows(t *testing.T) {
+	t.Parallel()
+
 	path := t.TempDir() + "/transfer.db"
 	const appName = "dbos-assignment-transfer"
 	firstStack := openDBOSAssignmentTransferStack(t, path, appName, "transfer-v1")
@@ -197,6 +208,8 @@ func TestDBOSAdapterTransferAssignmentSuccessAndReplayAcrossWorkflows(t *testing
 }
 
 func TestDBOSAdapterTransferAssignmentChangedInputConflicts(t *testing.T) {
+	t.Parallel()
+
 	stack := openDBOSAssignmentTransferStack(t, t.TempDir()+"/transfer.db", "dbos-transfer-conflict", "transfer-v1")
 	defer stack.close()
 	actorA, actorB, _, task, authority := establishDBOSAssignmentTransferFixture(t, stack, "conflict")
@@ -216,6 +229,8 @@ func TestDBOSAdapterTransferAssignmentChangedInputConflicts(t *testing.T) {
 }
 
 func TestDBOSAdapterTransferAssignmentRevocationRaceParity(t *testing.T) {
+	t.Parallel()
+
 	stack := openDBOSAssignmentTransferStack(t, t.TempDir()+"/transfer.db", "dbos-transfer-race", "transfer-v1")
 	defer stack.close()
 	actorA, actorB, boot, _, _ := establishDBOSAssignmentTransferFixture(t, stack, "race-seed")

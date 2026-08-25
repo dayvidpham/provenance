@@ -58,6 +58,11 @@ func TestCancel_AlreadyCancelled_StartsNothing(t *testing.T) {
 	}
 }
 
+// This test stays serial. Its shared resource is the process goroutine count:
+// leakCheck below reads runtime.NumGoroutine, which counts every goroutine in
+// the test binary, so a concurrently running test's DBOS workers would be
+// attributed to this adapter and the leak assertion would fail or, worse, pass
+// for the wrong reason. Any future leakCheck caller inherits the same rule.
 func TestCancel_WhileGated_DurableWorkContinues(t *testing.T) {
 	var bj *blockingJournal
 	s := newDBOSStack(t, func(real provenance.Tracker) provenance.Tracker {
