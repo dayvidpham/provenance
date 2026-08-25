@@ -69,6 +69,39 @@ func TestActionableErrorMessagesRenderCauseOnlyWhenThereIsOne(t *testing.T) {
 			mustNotHave: []string{"<nil>"},
 		},
 		{
+			name: "ambiguous apply failure with cause",
+			err: &AmbiguousApplyFailureError{
+				Class: DBOSDiagClassClassify, Field: DBOSDiagFieldDescriptorMatch, Stage: DBOSDiagStageDomainFoldClassify,
+				Reason: "the error graph matches multiple closed domain failure descriptors",
+				Impact: "nothing is checkpointed; DBOS treats the fold as a retryable Go error",
+				Fix:    "make the returned domain sentinel graph disjoint so exactly one ApplyFailureKind matches",
+				cause:  underlying,
+				kinds:  []ApplyFailureKind{FailureNotFound, FailureAlreadyClosed},
+			},
+			mustHave: []string{
+				"provenance: ambiguous apply failure",
+				"matched=[not_found already_closed]",
+				"reason: the error graph matches multiple closed domain failure descriptors",
+				"fix: make the returned domain sentinel graph disjoint so exactly one ApplyFailureKind matches",
+				"cause: driver: database is closed",
+			},
+			mustNotHave: []string{"<nil>"},
+		},
+		{
+			// The ambiguity is diagnosed from the error graph itself, so this arm can
+			// legitimately carry no underlying error and must not claim a lost one.
+			name: "ambiguous apply failure without cause",
+			err: &AmbiguousApplyFailureError{
+				Class: DBOSDiagClassClassify, Field: DBOSDiagFieldDescriptorMatch, Stage: DBOSDiagStageDomainFoldClassify,
+				Reason: "the error graph matches multiple closed domain failure descriptors",
+				Impact: "nothing is checkpointed; DBOS treats the fold as a retryable Go error",
+				Fix:    "make the returned domain sentinel graph disjoint so exactly one ApplyFailureKind matches",
+				kinds:  []ApplyFailureKind{FailureNotFound, FailureAlreadyClosed},
+			},
+			mustHave:    []string{"provenance: ambiguous apply failure", "impact: nothing is checkpointed"},
+			mustNotHave: []string{"cause"},
+		},
+		{
 			name:        "DBOS diagnostic without cause",
 			err:         &DBOSDiagnosticError{Class: DBOSDiagClassContextFrame, Field: DBOSDiagFieldOperation, Stage: DBOSDiagStageContextDecode, Operation: "op-5", Reason: "the operation ID is empty", Impact: "the workflow was not entered", Fix: "supply an operation ID"},
 			mustHave:    []string{"provenance DBOS diagnostic", "fix: supply an operation ID"},

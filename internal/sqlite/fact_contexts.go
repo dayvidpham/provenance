@@ -505,7 +505,10 @@ func verifySelectedFactContextInTransaction(ctx context.Context, reader fusedtx.
 	}
 	prepared, err := journal.DecodeCanonicalMutation(wire)
 	if err != nil {
-		return nil, factContextIntegrityError("cannot decode producing operation "+strconv.FormatInt(operationID.Int64, 10)+" for selected fact "+strconv.FormatInt(journalID, 10), "selected fact-context validation", "restore the operation's canonical mutation bytes: "+err.Error())
+		// A decode failure here is the same condition the startup paths diagnose, so
+		// it carries the same corrected guidance: restoring a backup of a pre-v0.0.4
+		// database cannot help, because that backup is equally undecodable.
+		return nil, factContextIntegrityError("cannot decode producing operation "+strconv.FormatInt(operationID.Int64, 10)+" for selected fact "+strconv.FormatInt(journalID, 10)+" ("+err.Error()+")", "selected fact-context validation", unsupportedPreV004DatabaseFix)
 	}
 	if version.String != prepared.EncodingVersion().String() {
 		return nil, factContextIntegrityError("selected fact journal "+strconv.FormatInt(journalID, 10)+" has canonical encoding version "+version.String+" but decoded operation requires "+prepared.EncodingVersion().String(), "selected fact-context validation", "restore mutation_encoding_version together with canonical_mutation")

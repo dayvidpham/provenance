@@ -88,25 +88,23 @@ func TestMigrationBaselineWaitsForConcurrentFileWriter(t *testing.T) {
 	release := holdFileWriteLock(t, path)
 
 	type migration struct {
-		result  MigrationResult
-		err     error
-		elapsed time.Duration
+		result MigrationResult
+		err    error
 	}
 	done := make(chan migration, 1)
-	start := time.Now()
 	go func() {
 		result, err := r.tr.Journal().MigrateLegacyBaseline(MigrationInput{
 			System: r.actorA, BootstrapAuthority: r.boot, Legacy: []LegacyTaskRow{legacy},
 		})
-		done <- migration{result: result, err: err, elapsed: time.Since(start)}
+		done <- migration{result: result, err: err}
 	}()
 
 	// The defect signature is an immediate return, so the first assertion is that the
 	// migration is still waiting for the lock while the holder owns it.
 	select {
 	case got := <-done:
-		t.Fatalf("contended MigrateLegacyBaseline returned after %s while another writer held the file write lock (err=%v); "+
-			"want it to wait for the lock inside busy_timeout instead of failing instantly on a read-to-write promotion", got.elapsed, got.err)
+		t.Fatalf("contended MigrateLegacyBaseline returned while another writer still held the file write lock (err=%v); "+
+			"want it to wait for the lock inside busy_timeout instead of failing instantly on a read-to-write promotion", got.err)
 	case <-time.After(migrationHoldWindow):
 	}
 
@@ -119,9 +117,9 @@ func TestMigrationBaselineWaitsForConcurrentFileWriter(t *testing.T) {
 		if got.result.TasksMigrated != 1 {
 			t.Fatalf("migration processed %d tasks, want 1", got.result.TasksMigrated)
 		}
-		if got.elapsed < migrationHoldWindow {
-			t.Fatalf("migration elapsed %s, want at least the %s lock hold", got.elapsed, migrationHoldWindow)
-		}
+		// No elapsed-time assertion: the select above already established, by state,
+		// that the migration was still blocked while the holder owned the lock, so a
+		// wall-clock lower bound here could only restate a fact it cannot disprove.
 	case <-time.After(30 * time.Second):
 		t.Fatal("migration did not finish within 30s of the write lock being released")
 	}
