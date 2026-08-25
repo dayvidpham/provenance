@@ -103,11 +103,20 @@ func (s *Session) AllocateGoverned(ctx context.Context, request GovernedAllocati
 	return closure, nil
 }
 
-// AllocateGovernedComposed is the source-compatible one-child convenience
-// wrapper over AllocateGovernedComposedBatch.
+// AllocateGovernedComposed is the one-child entry point over
+// AllocateGovernedComposedBatch, which takes the same request type with
+// 1..MaxGovernedAllocationChildren ordered children.
+//
+// The liveness gate runs before the child-count check so that every Session
+// verb reports the same failure on a store whose handle has been closed. The
+// other order would answer a dead store with a validation complaint about the
+// request, sending the caller to fix an argument that was never the problem.
 func (s *Session) AllocateGovernedComposed(ctx context.Context, request GovernedAllocationComposedRequest) (GovernedAllocationComposedResult, error) {
+	if err := s.checkGate("AllocateGovernedComposed"); err != nil {
+		return GovernedAllocationComposedResult{}, err
+	}
 	if len(request.Allocation.Children) != 1 {
-		return GovernedAllocationComposedResult{}, allocation.NewError(allocation.ErrorValidation, request.Allocation.OperationID, "Session.AllocateGovernedComposed", "the legacy composed allocation wrapper requires exactly one child", "nothing was written", "use AllocateGovernedComposedBatch for 1..128 ordered children", nil)
+		return GovernedAllocationComposedResult{}, allocation.NewError(allocation.ErrorValidation, request.Allocation.OperationID, "Session.AllocateGovernedComposed", "the one-child composed allocation entry point requires exactly one child", "nothing was written", "use AllocateGovernedComposedBatch for 1..128 ordered children", nil)
 	}
 	return s.AllocateGovernedComposedBatch(ctx, request)
 }

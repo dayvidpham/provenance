@@ -291,9 +291,20 @@ type AmbiguousApplyFailureError struct {
 	kinds  []ApplyFailureKind
 }
 
+// causeClause renders the wrapped cause, or nothing at all when there is none.
+// An error that always printed "cause: <nil>" told the reader that a cause was
+// expected and lost, which is a different and much more alarming claim than
+// "this failure was diagnosed here and has no underlying error".
+func causeClause(cause error) string {
+	if cause == nil {
+		return ""
+	}
+	return "; cause: " + cause.Error()
+}
+
 func (e *AmbiguousApplyFailureError) Error() string {
-	return fmt.Sprintf("provenance: ambiguous apply failure -- class=%s field=%s stage=%s matched=%v; reason: %s; impact: %s; fix: %s; cause: %v",
-		e.Class, e.Field, e.Stage, e.kinds, e.Reason, e.Impact, e.Fix, e.cause)
+	return fmt.Sprintf("provenance: ambiguous apply failure -- class=%s field=%s stage=%s matched=%v; reason: %s; impact: %s; fix: %s%s",
+		e.Class, e.Field, e.Stage, e.kinds, e.Reason, e.Impact, e.Fix, causeClause(e.cause))
 }
 
 func (e *AmbiguousApplyFailureError) Unwrap() error { return e.cause }

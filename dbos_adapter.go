@@ -748,8 +748,8 @@ type ApplyWaitCanceledError struct {
 
 func (e *ApplyWaitCanceledError) Error() string {
 	return fmt.Sprintf(
-		"provenance: apply wait canceled for operation %q -- stage: %s; impact: %s; fix: %s; cause: %v",
-		e.Operation, e.Stage, e.Impact, e.Fix, e.Cause)
+		"provenance: apply wait canceled for operation %q -- stage: %s; impact: %s; fix: %s%s",
+		e.Operation, e.Stage, e.Impact, e.Fix, causeClause(e.Cause))
 }
 
 func (e *ApplyWaitCanceledError) Unwrap() error { return e.Cause }
@@ -767,8 +767,8 @@ type CheckpointDivergenceError struct {
 
 func (e *CheckpointDivergenceError) Error() string {
 	return fmt.Sprintf(
-		"provenance: checkpoint divergence for operation %q -- stage: %s; impact: %s; fix: %s; cause: %v",
-		e.Operation, e.Stage, e.Impact, e.Fix, e.Cause)
+		"provenance: checkpoint divergence for operation %q -- stage: %s; impact: %s; fix: %s%s",
+		e.Operation, e.Stage, e.Impact, e.Fix, causeClause(e.Cause))
 }
 
 func (e *CheckpointDivergenceError) Unwrap() error { return e.Cause }

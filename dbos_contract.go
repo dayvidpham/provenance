@@ -290,8 +290,8 @@ type DBOSDiagnosticError struct {
 
 func (e *DBOSDiagnosticError) Error() string {
 	return fmt.Sprintf(
-		"provenance DBOS diagnostic: what: class=%s field=%s position=%v operation=%q workflow=%q value=%q; why: %s; where: DBOS adapter; when: %s; impact: %s; fix: %s; cause: %v",
-		e.Class, e.Field, e.Position, e.Operation, e.Workflow, e.Value, e.Reason, e.Stage, e.Impact, e.Fix, e.Cause)
+		"provenance DBOS diagnostic: what: class=%s field=%s position=%v operation=%q workflow=%q value=%q; why: %s; where: DBOS adapter; when: %s; impact: %s; fix: %s%s",
+		e.Class, e.Field, e.Position, e.Operation, e.Workflow, e.Value, e.Reason, e.Stage, e.Impact, e.Fix, causeClause(e.Cause))
 }
 
 func (e *DBOSDiagnosticError) Unwrap() error { return e.Cause }
