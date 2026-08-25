@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Matches go.mod's `go 1.25.0` directive plus one newer minor, same
+        # spread pasture's own CI carries.
+        go-version: ["1.25", "1.26"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Set up Go ${{ matrix.go-version }}
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: true
+
+      - name: Verify dependencies
+        run: go mod verify
+
+      - name: gofmt check
+        # No allowlist: every tracked file must already be gofmt-clean. The
+        # 5 files that failed this at the time this workflow was authored
+        # were fixed in a preceding mechanical commit — see git log.
+        run: |
+          files=$(gofmt -l .)
+          if [ -n "$files" ]; then
+            echo "The following files need formatting (run: gofmt -w <file>):"
+            echo "$files"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+        run: go build ./...
+
+      - name: Test
+        # Non-race pass. The race-instrumented pass runs separately in the
+        # "Race Tests" job so a race failure and a plain logic failure are
+        # never conflated in the same job's output.
+        run: go test -count=1 -shuffle=on ./...
+
+  race:
+    name: Race Tests
+    runs-on: ubuntu-latest
+    # The full race suite is CPU-heavy (SQLite + DBOS durable-execution
+    # journal tests) and takes on the order of 10 minutes on ubuntu-latest
+    # runners; this ceiling only guards against a genuine hang.
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Verify dependencies
+        run: go mod verify
+
+      - name: Race detector
+        # KNOWN FLAKES (documented, load-sensitive under CI contention — do
+        # NOT retry or skip; a red run here should be triaged against these
+        # named families before being treated as a new regression):
+        #   - apply-context deadline arm (governed_allocation_* deadline tests)
+        #   - fused decode (governed_allocation_fused* tests)
+        #   - tampering test (journal_spine_corruption_test.go family)
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race -count=1 -shuffle=on ./...
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: Set up Node (for ast-grep CLI)
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: "26"
+
+      - name: Install ast-grep
+        # Pinned to the exact version the flake.nix dev shell currently
+        # resolves (`ast-grep --version` inside `nix develop`), so a local
+        # `make lint` and this CI step scan with the same engine.
+        run: npm install -g @ast-grep/cli@0.41.1
+
+      - name: ast-grep scan
+        run: ast-grep scan --config sgconfig.yml --globs '!vendor/**' --globs '!worktree/**' .
+
+# `nix flake check` (which additionally builds the package derivation and
+# runs the same gates through the pinned nixpkgs toolchain) is intentionally
+# NOT wired into CI yet — it stays a local/manual gate until a nix job is
+# added in a follow-up.

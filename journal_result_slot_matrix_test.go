@@ -155,7 +155,7 @@ func TestResultSlotMatrix_MissingSlotRejected(t *testing.T) {
 		AuthorityJournalID: &boot,
 		CommandDigest:      env.digest("missing-slot"),
 		Effects: []Effect{{
-			Sort: EffectActivityCreate, // ResultSlot intentionally omitted
+			Sort:       EffectActivityCreate, // ResultSlot intentionally omitted
 			ActivityID: actID, ActivityAgentID: AgentID(env.actor),
 			ActivityPhase: PhaseWorkerSlices, ActivityStage: StageInProgress,
 		}},
