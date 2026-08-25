@@ -940,8 +940,82 @@ func pragmaOnOff(enabled bool) string {
 	return "OFF"
 }
 
-// setBooleanPragmaVerified writes a connection-local boolean PRAGMA and proves
-// the write landed by reading the value back.
+// pragmaWrite is the closed set of connection-local boolean PRAGMA writes this
+// package performs. Value and pragma are one enum, and the statements live in
+// zero-argument selector methods, because that is the only shape in which SQL
+// text stays decidable from source for the architecture guard.
+type pragmaWrite uint8
+
+const (
+	foreignKeysOn pragmaWrite = iota + 1
+	foreignKeysOff
+	ignoreCheckConstraintsOn
+	ignoreCheckConstraintsOff
+)
+
+// foreignKeysWrite selects the write that restores a captured enforcement value.
+func foreignKeysWrite(enabled bool) pragmaWrite {
+	if enabled {
+		return foreignKeysOn
+	}
+	return foreignKeysOff
+}
+
+// statement is the exact write this value performs.
+func (write pragmaWrite) statement() string {
+	switch write {
+	case foreignKeysOn:
+		return "PRAGMA foreign_keys=ON"
+	case foreignKeysOff:
+		return "PRAGMA foreign_keys=OFF"
+	case ignoreCheckConstraintsOn:
+		return "PRAGMA ignore_check_constraints=ON"
+	case ignoreCheckConstraintsOff:
+		return "PRAGMA ignore_check_constraints=OFF"
+	default:
+		panic("unknown pragma write")
+	}
+}
+
+// readStatement is the read-back that proves the write landed.
+func (write pragmaWrite) readStatement() string {
+	switch write {
+	case foreignKeysOn, foreignKeysOff:
+		return "PRAGMA foreign_keys"
+	case ignoreCheckConstraintsOn, ignoreCheckConstraintsOff:
+		return "PRAGMA ignore_check_constraints"
+	default:
+		panic("unknown pragma write")
+	}
+}
+
+// pragma names the pragma for diagnostics.
+func (write pragmaWrite) pragma() string {
+	switch write {
+	case foreignKeysOn, foreignKeysOff:
+		return "foreign_keys"
+	case ignoreCheckConstraintsOn, ignoreCheckConstraintsOff:
+		return "ignore_check_constraints"
+	default:
+		panic("unknown pragma write")
+	}
+}
+
+// enabled is the value this write establishes, and therefore the value the
+// read-back must report.
+func (write pragmaWrite) enabled() bool {
+	switch write {
+	case foreignKeysOn, ignoreCheckConstraintsOn:
+		return true
+	case foreignKeysOff, ignoreCheckConstraintsOff:
+		return false
+	default:
+		panic("unknown pragma write")
+	}
+}
+
+// setPragmaVerified performs one connection-local boolean PRAGMA write and
+// proves it landed by reading the value back.
 //
 // The read-back is the whole point. SQLite silently ignores PRAGMA foreign_keys
 // while a transaction is open on the connection (see pauseForeignKeys): the Exec
@@ -951,32 +1025,32 @@ func pragmaOnOff(enabled bool) string {
 // every write of a pragma this package captures and restores is verified, and an
 // unverifiable one is reported to the caller, whose fail-closed action is to
 // retire the connection.
-func setBooleanPragmaVerified(ctx context.Context, conn *sql.Conn, pragma string, enabled bool) error {
-	value := pragmaOnOff(enabled)
-	if _, err := conn.ExecContext(ctx, "PRAGMA "+pragma+"="+value); err != nil {
-		return fmt.Errorf("set PRAGMA %s=%s: %w", pragma, value, err)
+func setPragmaVerified(ctx context.Context, conn *sql.Conn, write pragmaWrite) error {
+	value := pragmaOnOff(write.enabled())
+	if _, err := conn.ExecContext(ctx, write.statement()); err != nil {
+		return fmt.Errorf("set PRAGMA %s=%s: %w", write.pragma(), value, err)
 	}
 	var readBack int
-	if err := conn.QueryRowContext(ctx, "PRAGMA "+pragma).Scan(&readBack); err != nil {
+	if err := conn.QueryRowContext(ctx, write.readStatement()).Scan(&readBack); err != nil {
 		return fmt.Errorf(
 			"read back PRAGMA %s after setting it to %s: %w; where: internal/sqlite, verified pragma write; "+
 				"impact: the write cannot be proven, so the connection's state is unknown; fix: verify the "+
-				"connection is still live and retry", pragma, value, err)
+				"connection is still live and retry", write.pragma(), value, err)
 	}
-	if (readBack != 0) != enabled {
+	if (readBack != 0) != write.enabled() {
 		return fmt.Errorf(
 			"set PRAGMA %s=%s: the connection still reports %s; why: SQLite ignores this pragma while a "+
 				"transaction is open on the connection, so the statement succeeded without taking effect; "+
 				"where: internal/sqlite, verified pragma write; impact: the connection's state is not the one "+
 				"this package requires, so it must not be handed back to the pool; fix: close every transaction "+
 				"on the connection before changing this pragma",
-			pragma, value, pragmaOnOff(readBack != 0))
+			write.pragma(), value, pragmaOnOff(readBack != 0))
 	}
 	return nil
 }
 
 // setBusyTimeoutVerified writes the connection-local busy timeout and proves the
-// write landed, for the same reason setBooleanPragmaVerified does: an
+// write landed, for the same reason setPragmaVerified does: an
 // unverified restore can leave a borrowed connection carrying a contention
 // budget its owner never chose.
 func setBusyTimeoutVerified(ctx context.Context, conn *sql.Conn, milliseconds int64) error {
@@ -1066,7 +1140,7 @@ func (scope *connScope) restoreBorrowedPragmas() {
 	// is open on the connection, the restore statement succeeds and does nothing,
 	// and the caller would get a connection back with Provenance's enforcement
 	// still on. The read-back is what turns that silent hole into a retirement.
-	if err := setBooleanPragmaVerified(ctx, scope.conn, "foreign_keys", false); err != nil {
+	if err := setPragmaVerified(ctx, scope.conn, foreignKeysOff); err != nil {
 		scope.markBad()
 		return
 	}
@@ -1104,7 +1178,7 @@ func (scope *connScope) pauseForeignKeys(what string) (func(error) error, error)
 		// on its own.
 		ctx, cancel := context.WithTimeout(context.Background(), pragmaControlTimeout)
 		defer cancel()
-		if err := setBooleanPragmaVerified(ctx, scope.conn, "foreign_keys", true); err != nil {
+		if err := setPragmaVerified(ctx, scope.conn, foreignKeysOn); err != nil {
 			scope.markBad()
 			return errors.Join(operationErr, fmt.Errorf(
 				"%s: restore foreign-key enforcement on the pinned connection: %w; "+
@@ -1135,7 +1209,7 @@ func (scope *connScope) pauseForeignKeys(what string) (func(error) error, error)
 //	}
 //	defer func() { err = restoreChecks(err) }()
 func (scope *connScope) suppressCheckConstraints(what string) (func(error) error, error) {
-	if err := setBooleanPragmaVerified(scope.ctx, scope.conn, "ignore_check_constraints", true); err != nil {
+	if err := setPragmaVerified(scope.ctx, scope.conn, ignoreCheckConstraintsOn); err != nil {
 		return nil, fmt.Errorf(
 			"%s: disable CHECK enforcement on the pinned connection: %w; "+
 				"where: internal/sqlite, before the bracketing transaction; impact: nothing ran and nothing "+
@@ -1147,7 +1221,7 @@ func (scope *connScope) suppressCheckConstraints(what string) (func(error) error
 		// on its own.
 		ctx, cancel := context.WithTimeout(context.Background(), pragmaControlTimeout)
 		defer cancel()
-		if err := setBooleanPragmaVerified(ctx, scope.conn, "ignore_check_constraints", false); err != nil {
+		if err := setPragmaVerified(ctx, scope.conn, ignoreCheckConstraintsOff); err != nil {
 			scope.markBad()
 			return errors.Join(operationErr, fmt.Errorf(
 				"%s: restore CHECK enforcement on the pinned connection: %w; "+
@@ -1195,7 +1269,7 @@ func captureBorrowedActivationPragmas(scope *connScope) (func() error, error) {
 		if err := setBusyTimeoutVerified(restoreCtx, scope.conn, busyTimeoutMS); err != nil {
 			restoreErr = errors.Join(restoreErr, fmt.Errorf("restore borrowed busy_timeout to %dms: %w", busyTimeoutMS, err))
 		}
-		if err := setBooleanPragmaVerified(restoreCtx, scope.conn, "foreign_keys", foreignKeys); err != nil {
+		if err := setPragmaVerified(restoreCtx, scope.conn, foreignKeysWrite(foreignKeys)); err != nil {
 			restoreErr = errors.Join(restoreErr, fmt.Errorf("restore borrowed foreign_keys to %s: %w", foreignKeysValue, err))
 		}
 		if restoreErr == nil {
