@@ -845,10 +845,14 @@ func limitTransactionBusyTimeout(ctx context.Context, conn sqlQueryer) (func() e
 		}
 		armCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
+		// Record the lowered value BEFORE the Exec: if the statement applies but
+		// its result is lost (armCtx expiring after SQLite ran it), restore must
+		// still put the original budget back rather than short-circuit and
+		// return a capped connection to the pool.
+		armedMS = limitMS
 		if _, err := conn.ExecContext(armCtx, fmt.Sprintf("PRAGMA busy_timeout=%d", limitMS)); err != nil {
 			return fmt.Errorf("limit SQLite busy timeout to caller deadline: %w", err)
 		}
-		armedMS = limitMS
 		return nil
 	}
 	restore := func() error {
