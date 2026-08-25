@@ -83,9 +83,14 @@ func OpenSystem(ctx context.Context, config SystemConfig) (*System, error) {
 	// with the package default, exposes no polling field on dbos.Config, and
 	// refuses both a same-named RegisterQueue and a SetPollingInterval on a queue
 	// that is not database-backed. Provenance neither registers a queue nor
-	// enqueues a workflow, so the residual polling is background work only, never
-	// a latency path. Measured evidence and the upstream ask are recorded in
-	// docs/test-performance.md.
+	// enqueues a workflow, so the polling never dequeues work and is not on any
+	// workflow-latency path. It is NOT free of side effects, though: the queue
+	// supervisor's once-a-second reconcile tick executes an UPDATE against the
+	// system database, and in fusedtx that database IS the application's SQLite
+	// file — so the tick periodically takes the single-writer lock and can
+	// surface as SQLITE_BUSY under concurrent application writes. See
+	// docs/perf/parallel-governed-allocation-family.md for the measured
+	// contention and docs/test-performance.md for the upstream ask.
 	root, err := dbos.NewDBOSContext(ctx, dbos.Config{
 		AppName:            config.AppName,
 		ApplicationVersion: config.ApplicationVersion,

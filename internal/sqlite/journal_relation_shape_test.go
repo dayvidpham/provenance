@@ -8,14 +8,18 @@ import (
 )
 
 // journalSchemaObjects returns SQLite's own stored definitions of the journal
-// supertype and everything attached to it, keyed by object name.
+// supertype and everything attached to it, keyed by object name. The
+// journal_attributed view is matched by its own name: a view's
+// sqlite_master.tbl_name is the view's name, not its base table's, so
+// tbl_name = 'journal' alone would leave the migration's view recreation
+// outside the convergence comparison.
 func journalSchemaObjects(t *testing.T, db *DB) map[string]string {
 	t.Helper()
 	scope := takePoolScope(t, db)
 	defer scope.release()
 	objects := map[string]string{}
 	if err := scope.queryRows(
-		`SELECT name, COALESCE(sql, '') FROM sqlite_master WHERE tbl_name = 'journal' ORDER BY name`,
+		`SELECT name, COALESCE(sql, '') FROM sqlite_master WHERE tbl_name = 'journal' OR name = 'journal_attributed' ORDER BY name`,
 		nil,
 		func(rows *sql.Rows) error {
 			var name, statement string
