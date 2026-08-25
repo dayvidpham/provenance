@@ -54,15 +54,38 @@ func (result *closeResult) do(closeFunc func() error) error {
 // DB is the pooled SQLite database handle and persistence owner. It owns the
 // database/sql lifecycle only; each operation explicitly leases a connScope.
 type DB struct {
-	db                 *sql.DB
-	ownsPool           bool
-	enforceForeignKeys bool
-	lifecycleMu        sync.Mutex
-	closed             bool
-	activeScopes       sync.WaitGroup
-	scopeCancels       map[*connScope]context.CancelFunc
-	close              closeResult
+	db           *sql.DB
+	ownsPool     bool
+	foreignKeys  foreignKeyDiscipline
+	lifecycleMu  sync.Mutex
+	closed       bool
+	activeScopes sync.WaitGroup
+	scopeCancels map[*connScope]context.CancelFunc
+	close        closeResult
 }
+
+// foreignKeyDiscipline is the closed selector for how a lease establishes
+// PRAGMA foreign_keys, which is connection-local in SQLite and therefore a
+// per-lease concern rather than a database-wide setting.
+type foreignKeyDiscipline uint8
+
+const (
+	// foreignKeysPoolOwned is the zero value and applies to a pool this package
+	// opened. The pool DSN already carries foreign_keys(1), so every connection
+	// starts enforcing; a lease re-arms it anyway (see armForeignKeys) and never
+	// restores anything on release, because ON is this pool's invariant.
+	foreignKeysPoolOwned foreignKeyDiscipline = iota
+	// foreignKeysPoolBorrowed applies to a caller-owned pool passed to
+	// OpenBorrowed. Provenance needs enforcement for the duration of its own
+	// lease, but the caller retains pool-configuration ownership, so the prior
+	// connection-local value is captured and restored on release.
+	foreignKeysPoolBorrowed
+)
+
+// pragmaControlTimeout bounds the out-of-band PRAGMA statements that capture and
+// restore a borrowed connection's state. They are not the caller's operation, so
+// they never inherit the caller's (possibly already expired) context.
+const pragmaControlTimeout = time.Second
 
 // sqlQueryer is the deliberately small package-internal SQL contract shared by
 // the reducer and query implementations. It is satisfied by both *sql.Conn and
@@ -115,6 +138,14 @@ type connScope struct {
 	releaseFunc      func()
 	cancelOnce       sync.Once
 	cancelFunc       context.CancelFunc
+	// restoreForeignKeysOff records that this lease turned PRAGMA foreign_keys ON
+	// over a borrowed connection that arrived with it OFF, so release owes the
+	// caller the OFF value back. It is written at bind and read at release, both
+	// on the scope's owning goroutine.
+	restoreForeignKeysOff bool
+	// discarded marks a connection already poisoned for the pool. Nothing further
+	// is executed on it.
+	discarded bool
 }
 
 func (scope *connScope) release() {
@@ -135,8 +166,19 @@ func (scope *connScope) discard() {
 	if scope == nil || scope.conn == nil {
 		return
 	}
-	_ = scope.conn.Raw(func(any) error { return driver.ErrBadConn })
+	scope.markBad()
 	scope.release()
+}
+
+// markBad poisons the underlying driver connection so database/sql retires it
+// instead of returning it to the pool. This is the fail-closed action for any
+// path that cannot prove the connection's transaction or PRAGMA state.
+func (scope *connScope) markBad() {
+	if scope == nil || scope.conn == nil {
+		return
+	}
+	scope.discarded = true
+	_ = scope.conn.Raw(func(any) error { return driver.ErrBadConn })
 }
 
 func (scope *connScope) cancel() {
@@ -188,11 +230,9 @@ func (db *DB) bindScope(ctx context.Context, target projectionTarget) (*connScop
 	scope.releaseFunc = func() {
 		db.releaseScope(scope)
 	}
-	if db.enforceForeignKeys {
-		if _, pragmaErr := conn.ExecContext(scope.ctx, "PRAGMA foreign_keys=ON"); pragmaErr != nil {
-			scope.release()
-			return nil, fmt.Errorf("sqlite: enable foreign-key enforcement on borrowed connection: %w", pragmaErr)
-		}
+	if err := scope.armForeignKeys(db.foreignKeys); err != nil {
+		scope.release()
+		return nil, err
 	}
 	return scope, nil
 }
@@ -211,6 +251,7 @@ func (db *DB) releaseScope(scope *connScope) {
 	if !registered {
 		return
 	}
+	scope.restoreBorrowedPragmas()
 	scope.cancel()
 	_ = scope.conn.Close()
 	db.activeScopes.Done()
@@ -307,18 +348,34 @@ func OpenBorrowed(runtime *sql.DB, models []ptypes.ModelEntry) (*DB, error) {
 		return nil, fmt.Errorf("lease borrowed activation connection: %w", err)
 	}
 	activation := borrowConnScope(activationConn, projectionTargetLive)
+	// Activation rewrites busy_timeout and foreign_keys on this connection, which
+	// belongs to the caller's pool. Snapshot both before the first attempt so the
+	// connection goes back exactly as it arrived.
+	restorePragmas, err := captureBorrowedActivationPragmas(activation)
+	if err != nil {
+		activation.markBad()
+		_ = activationConn.Close()
+		return nil, fmt.Errorf("activate borrowed database/schema: %w", err)
+	}
 	// The borrowed pool's file is shared by definition, so activation waits out a
 	// concurrent activation or migration within the bounded budget instead of
 	// failing this open on the first contended attempt.
 	err = activateSchemaWithRetry(activation, models, defaultActivationRetryPolicy())
+	restoreErr := restorePragmas()
 	closeErr := activationConn.Close()
 	if err != nil {
+		if restoreErr != nil {
+			return nil, fmt.Errorf("activate borrowed database/schema: %w", errors.Join(err, restoreErr))
+		}
 		return nil, fmt.Errorf("activate borrowed database/schema: %w", err)
+	}
+	if restoreErr != nil {
+		return nil, restoreErr
 	}
 	if closeErr != nil {
 		return nil, fmt.Errorf("return borrowed activation connection: %w", closeErr)
 	}
-	return &DB{db: runtime, enforceForeignKeys: true}, nil
+	return &DB{db: runtime, foreignKeys: foreignKeysPoolBorrowed}, nil
 }
 
 type openTarget struct {
@@ -843,6 +900,140 @@ func runImmediateTransaction(ctx context.Context, conn *sql.Conn, operation func
 }
 
 // Pragmas --------------------------------------------------------------------
+
+// readForeignKeysPragma reports this connection's current connection-local
+// foreign-key enforcement state.
+func readForeignKeysPragma(ctx context.Context, conn *sql.Conn) (bool, error) {
+	var enabled int
+	if err := conn.QueryRowContext(ctx, "PRAGMA foreign_keys").Scan(&enabled); err != nil {
+		return false, fmt.Errorf(
+			"sqlite: read PRAGMA foreign_keys on the leased connection: %w; "+
+				"where: internal/sqlite, connection lease; impact: this operation cannot establish or restore "+
+				"foreign-key enforcement and is refused rather than run unenforced; "+
+				"fix: verify the pool's connections are live and retry", err)
+	}
+	return enabled != 0, nil
+}
+
+// armForeignKeys establishes this package's lease invariant — PRAGMA
+// foreign_keys=ON for the whole lease — and decides what release owes the pool.
+//
+// Design decision (borrowed pools), recorded deliberately: the prior value is
+// captured and restored rather than demanded pool-wide at OpenBorrowed. A
+// verify-at-open alternative cannot actually be enforced: database/sql creates
+// connections lazily and exposes no way to enumerate or pin the pool's
+// connections, so a check at open would sample exactly one connection and assert
+// nothing about the others — false assurance, while still silently rewriting the
+// caller's configuration. Capture/restore is checkable on every connection this
+// package ever touches, and it keeps OpenBorrowed's documented contract that the
+// caller retains pool-configuration ownership: whatever the caller configured
+// (including foreign_keys OFF, and therefore whether ON DELETE CASCADE fires for
+// the caller's own statements) is what the caller gets back, on every connection
+// alike. Callers that need cascade must configure their own pool for it; this
+// package never makes that choice on their behalf, and never leaves half the
+// pool disagreeing with the other half.
+func (scope *connScope) armForeignKeys(discipline foreignKeyDiscipline) error {
+	switch discipline {
+	case foreignKeysPoolOwned:
+		// Self-healing. The owned pool's DSN already carries foreign_keys(1), but a
+		// lease that toggled enforcement OFF for a table rebuild and then failed to
+		// restore it would otherwise leave that one pooled connection unenforced for
+		// the rest of the process, making integrity depend on which connection an
+		// operation happened to draw. Re-arming here bounds that drift to a single
+		// lease. Nothing is restored on release: ON is this pool's invariant.
+		if _, err := scope.conn.ExecContext(scope.ctx, "PRAGMA foreign_keys=ON"); err != nil {
+			return fmt.Errorf(
+				"sqlite: enable foreign-key enforcement on the leased connection: %w; "+
+					"where: internal/sqlite, connection lease; impact: the operation is refused rather than run "+
+					"with foreign keys unenforced; fix: retry with a live context, or reopen the database", err)
+		}
+		return nil
+	case foreignKeysPoolBorrowed:
+		enabled, err := readForeignKeysPragma(scope.ctx, scope.conn)
+		if err != nil {
+			return err
+		}
+		if enabled {
+			return nil
+		}
+		if _, err := scope.conn.ExecContext(scope.ctx, "PRAGMA foreign_keys=ON"); err != nil {
+			return fmt.Errorf(
+				"sqlite: enable foreign-key enforcement on the borrowed connection: %w; "+
+					"where: internal/sqlite, borrowed-pool connection lease; impact: the operation is refused "+
+					"rather than run with foreign keys unenforced; fix: retry with a live context, or verify the "+
+					"borrowed pool is still open", err)
+		}
+		scope.restoreForeignKeysOff = true
+		return nil
+	default:
+		panic("unknown foreign key discipline")
+	}
+}
+
+// restoreBorrowedPragmas hands a borrowed connection back to its owner's pool
+// with exactly the connection-local PRAGMA state it arrived with. If the restore
+// cannot be proven, the connection is retired instead of returned, so the caller
+// can never draw a connection this package silently reconfigured.
+func (scope *connScope) restoreBorrowedPragmas() {
+	if scope == nil || scope.conn == nil || scope.discarded || !scope.restoreForeignKeysOff {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), pragmaControlTimeout)
+	defer cancel()
+	if _, err := scope.conn.ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {
+		scope.markBad()
+		return
+	}
+	scope.restoreForeignKeysOff = false
+}
+
+// captureBorrowedActivationPragmas snapshots the two connection-local pragmas
+// activation rewrites (busy_timeout and foreign_keys) on a borrowed connection
+// and returns the restore for the caller to run before handing the connection
+// back. The restore reports its own failure: unlike a per-operation lease, an
+// activation failure that also loses the caller's pool configuration is exactly
+// the condition the caller must be told about.
+func captureBorrowedActivationPragmas(scope *connScope) (func() error, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), pragmaControlTimeout)
+	defer cancel()
+	foreignKeys, err := readForeignKeysPragma(ctx, scope.conn)
+	if err != nil {
+		return nil, err
+	}
+	var busyTimeoutMS int64
+	if err := scope.conn.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&busyTimeoutMS); err != nil {
+		return nil, fmt.Errorf(
+			"sqlite: read PRAGMA busy_timeout on the borrowed activation connection: %w; "+
+				"where: internal/sqlite.OpenBorrowed, schema activation; impact: activation is refused because "+
+				"the caller's pool configuration could not be preserved; fix: verify the borrowed pool is live "+
+				"and retry OpenBorrowed", err)
+	}
+	foreignKeysValue := "OFF"
+	if foreignKeys {
+		foreignKeysValue = "ON"
+	}
+	return func() error {
+		restoreCtx, restoreCancel := context.WithTimeout(context.Background(), pragmaControlTimeout)
+		defer restoreCancel()
+		var restoreErr error
+		if _, err := scope.conn.ExecContext(restoreCtx, fmt.Sprintf("PRAGMA busy_timeout=%d", busyTimeoutMS)); err != nil {
+			restoreErr = errors.Join(restoreErr, fmt.Errorf("restore borrowed busy_timeout to %dms: %w", busyTimeoutMS, err))
+		}
+		if _, err := scope.conn.ExecContext(restoreCtx, "PRAGMA foreign_keys="+foreignKeysValue); err != nil {
+			restoreErr = errors.Join(restoreErr, fmt.Errorf("restore borrowed foreign_keys to %s: %w", foreignKeysValue, err))
+		}
+		if restoreErr == nil {
+			return nil
+		}
+		// Fail closed: the connection is retired rather than returned with a pragma
+		// state this package cannot prove.
+		scope.markBad()
+		return fmt.Errorf(
+			"sqlite.OpenBorrowed: %w; where: internal/sqlite.OpenBorrowed, returning the activation connection; "+
+				"impact: the borrowed connection was retired instead of returned to your pool, and this open "+
+				"failed; fix: verify the borrowed pool is healthy and retry OpenBorrowed", restoreErr)
+	}, nil
+}
 
 func (scope *connScope) applyActivationPragmas(busyTimeout time.Duration) error {
 	busyTimeoutMilliseconds := busyTimeout.Milliseconds()
