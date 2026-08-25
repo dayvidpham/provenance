@@ -170,17 +170,28 @@ var _ = context.Background
 // TestSQLGuardRejectsRetiredDriverImport covers the import half of the ban. It
 // parses rather than type-checks its fixture because the retired driver is not
 // a build dependency of this module — which is the very property being kept.
+//
+// It drives the fixture through inspect(), the same entry point the real guard
+// over production packages uses, rather than calling the import pass directly.
+// Calling the pass directly would leave inspect()'s single wiring line
+// unasserted: deleting that line would keep this suite green while a real
+// retired-driver import in production code went unreported.
 func TestSQLGuardRejectsRetiredDriverImport(t *testing.T) {
-	source := "package guarded\n\nimport (\n\tsqlite \"" + retiredSQLDriverModule + "\"\n\t\"" + retiredSQLDriverModule + "/sqlitex\"\n)\n\nvar _ *sqlite.Conn\nvar _ = sqlitex.Execute\n"
+	source := "package guarded\n\nimport (\n\tsqlite \"" + retiredSQLDriverModule + "\"\n\t\"" + retiredSQLDriverModule + "/sqlitex\"\n)\n\nvar _ *sqlite.Conn\n"
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "retired-import.go", source, 0)
 	if err != nil {
 		t.Fatalf("parse retired-driver fixture: %v", err)
 	}
 	program := &sqlProgram{fset: fset, files: []*ast.File{file}}
-	program.inspectRetiredDriverImports(file)
-	if len(program.findings) != 2 {
-		t.Fatalf("retired-driver import fixture produced %d findings, want one per import: %+v", len(program.findings), program.findings)
+	findings := program.inspect()
+	if len(findings) != 2 {
+		t.Fatalf("retired-driver import fixture produced %d findings through inspect(), want one per import: %+v", len(findings), findings)
+	}
+	for _, finding := range findings {
+		if !strings.Contains(finding.reason, "imports the retired driver") {
+			t.Errorf("finding %s is not the import ban; inspect() must route the fixture through the retired-driver import pass", finding)
+		}
 	}
 }
 
