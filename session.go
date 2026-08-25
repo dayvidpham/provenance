@@ -124,17 +124,17 @@ func (s *Session) AllocateGovernedComposed(ctx context.Context, request Governed
 // AllocateGovernedComposedBatch creates 1..128 ordered governed children and
 // reduces the shared ordered supplemental closure in the same SQLite
 // transaction. Supplements are authenticated against the complete child list.
-func (s *Session) AllocateGovernedComposedBatch(ctx context.Context, request GovernedAllocationComposedBatchRequest) (GovernedAllocationComposedBatchResult, error) {
+func (s *Session) AllocateGovernedComposedBatch(ctx context.Context, request GovernedAllocationComposedRequest) (GovernedAllocationComposedResult, error) {
 	if err := s.checkGate("AllocateGovernedComposedBatch"); err != nil {
-		return GovernedAllocationComposedBatchResult{}, err
+		return GovernedAllocationComposedResult{}, err
 	}
 	canonical, _, err := allocation.CanonicalizeComposed(request)
 	if err != nil {
-		return GovernedAllocationComposedBatchResult{}, fmt.Errorf("provenance.Session.AllocateGovernedComposedBatch: %w", err)
+		return GovernedAllocationComposedResult{}, fmt.Errorf("provenance.Session.AllocateGovernedComposedBatch: %w", err)
 	}
 	request, err = allocation.DecodeComposedRequest(canonical)
 	if err != nil {
-		return GovernedAllocationComposedBatchResult{}, fmt.Errorf("provenance.Session.AllocateGovernedComposedBatch: copy canonical request: %w", err)
+		return GovernedAllocationComposedResult{}, fmt.Errorf("provenance.Session.AllocateGovernedComposedBatch: copy canonical request: %w", err)
 	}
 	if request.Allocation.ActorID != s.actor {
 		return GovernedAllocationComposedResult{}, allocation.NewError(
@@ -145,7 +145,7 @@ func (s *Session) AllocateGovernedComposedBatch(ctx context.Context, request Gov
 	}
 	result, err := s.tr.db.AllocateGovernedComposedForAuthority(ctx, request, s.authority)
 	if err != nil {
-		return GovernedAllocationComposedBatchResult{}, fmt.Errorf("provenance.Session.AllocateGovernedComposedBatch: %w", err)
+		return GovernedAllocationComposedResult{}, fmt.Errorf("provenance.Session.AllocateGovernedComposedBatch: %w", err)
 	}
 	return result, nil
 }

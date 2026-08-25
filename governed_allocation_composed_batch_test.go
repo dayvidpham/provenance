@@ -52,19 +52,19 @@ func TestFusedGovernedAllocationComposedBatchCommitsOrderedCompleteClosureAndRep
 	beforeJournal := countFusedGovernedRows(t, db, `SELECT COUNT(*) FROM journal`)
 	beforeOutputs := countFusedGovernedRows(t, db, `SELECT COUNT(*) FROM operation_outputs`)
 
-	for _, mutate := range []func(*provenance.GovernedAllocationComposedBatchRequest){
-		func(changed *provenance.GovernedAllocationComposedBatchRequest) {
+	for _, mutate := range []func(*provenance.GovernedAllocationComposedRequest){
+		func(changed *provenance.GovernedAllocationComposedRequest) {
 			// Supplements intentionally retain the old child reference. Existing
 			// workflow identity must win over this now-stale reference preflight.
 			changed.Allocation.Children[0].TaskID = governedChild("composed-batch-stale-reference", changed.Allocation.Children[0].Occupant).TaskID
 		},
-		func(changed *provenance.GovernedAllocationComposedBatchRequest) {
+		func(changed *provenance.GovernedAllocationComposedRequest) {
 			changed.Allocation.Children[0], changed.Allocation.Children[1] = changed.Allocation.Children[1], changed.Allocation.Children[0]
 		},
-		func(changed *provenance.GovernedAllocationComposedBatchRequest) {
+		func(changed *provenance.GovernedAllocationComposedRequest) {
 			changed.SupplementalEffects[0].Payload = []byte(`{"changed":true}`)
 		},
-		func(changed *provenance.GovernedAllocationComposedBatchRequest) {
+		func(changed *provenance.GovernedAllocationComposedRequest) {
 			changed.Allocation.Children[1].Title += " changed metadata"
 		},
 	} {

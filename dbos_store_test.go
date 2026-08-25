@@ -281,7 +281,7 @@ func TestBorrowed_PostShutdown_SessionGated(t *testing.T) {
 	_, composedErr := sess.AllocateGovernedComposed(ctx, provenance.GovernedAllocationComposedRequest{})
 	mustGate("AllocateGovernedComposed", composedErr)
 
-	_, batchErr := sess.AllocateGovernedComposedBatch(ctx, provenance.GovernedAllocationComposedBatchRequest{})
+	_, batchErr := sess.AllocateGovernedComposedBatch(ctx, provenance.GovernedAllocationComposedRequest{})
 	mustGate("AllocateGovernedComposedBatch", batchErr)
 
 	_, transferErr := sess.TransferAssignment(provenance.AssignmentTransferRequest{})

@@ -73,9 +73,9 @@ func (a *HostBoundGovernedAllocator) RunAllocateComposed(ctx context.Context, wo
 	return a.RunAllocateComposedBatch(ctx, workflowID, authority, request)
 }
 
-func (a *HostBoundGovernedAllocator) RunAllocateComposedBatch(ctx context.Context, workflowID string, authority JournalID, request GovernedAllocationComposedBatchRequest) (GovernedAllocationComposedBatchResult, error) {
+func (a *HostBoundGovernedAllocator) RunAllocateComposedBatch(ctx context.Context, workflowID string, authority JournalID, request GovernedAllocationComposedRequest) (GovernedAllocationComposedResult, error) {
 	if a == nil || a.allocator == nil {
-		return GovernedAllocationComposedBatchResult{}, allocation.NewError(allocation.ErrorValidation, request.Allocation.OperationID, "HostBoundGovernedAllocator.RunAllocateComposedBatch", "the borrowed runner is nil or uninitialized", "no DBOS workflow was started", "construct it once with NewHostBoundGovernedAllocator before the engine launches its root", nil)
+		return GovernedAllocationComposedResult{}, allocation.NewError(allocation.ErrorValidation, request.Allocation.OperationID, "HostBoundGovernedAllocator.RunAllocateComposedBatch", "the borrowed runner is nil or uninitialized", "no DBOS workflow was started", "construct it once with NewHostBoundGovernedAllocator before the engine launches its root", nil)
 	}
 	return a.allocator.RunAllocateComposedBatch(ctx, workflowID, authority, request)
 }
@@ -145,9 +145,9 @@ func (a *BoundGovernedAllocator) RunAllocateComposed(ctx context.Context, workfl
 
 // RunAllocateComposedBatch executes an ordered multi-child composition through
 // the allocator bound to the host's exact DBOS/SQLite system handle.
-func (a *BoundGovernedAllocator) RunAllocateComposedBatch(ctx context.Context, workflowID string, authority JournalID, request GovernedAllocationComposedBatchRequest) (GovernedAllocationComposedBatchResult, error) {
+func (a *BoundGovernedAllocator) RunAllocateComposedBatch(ctx context.Context, workflowID string, authority JournalID, request GovernedAllocationComposedRequest) (GovernedAllocationComposedResult, error) {
 	if a == nil || a.allocator == nil {
-		return GovernedAllocationComposedBatchResult{}, allocation.NewError(allocation.ErrorValidation, request.Allocation.OperationID, "BoundGovernedAllocator.RunAllocateComposedBatch", "the bound allocator is nil or uninitialized", "no DBOS workflow was started", "construct it with OpenBoundGovernedAllocator before launch", nil)
+		return GovernedAllocationComposedResult{}, allocation.NewError(allocation.ErrorValidation, request.Allocation.OperationID, "BoundGovernedAllocator.RunAllocateComposedBatch", "the bound allocator is nil or uninitialized", "no DBOS workflow was started", "construct it with OpenBoundGovernedAllocator before launch", nil)
 	}
 	return a.allocator.RunAllocateComposedBatch(ctx, workflowID, authority, request)
 }
@@ -296,7 +296,7 @@ func (a *FusedGovernedAllocator) RunAllocateComposed(ctx context.Context, workfl
 
 // RunAllocateComposedBatch allocates the complete ordered child list and folds
 // its shared supplements in one DBOS-owned SQLite transaction.
-func (a *FusedGovernedAllocator) RunAllocateComposedBatch(ctx context.Context, workflowID string, authority JournalID, request GovernedAllocationComposedBatchRequest) (GovernedAllocationComposedBatchResult, error) {
+func (a *FusedGovernedAllocator) RunAllocateComposedBatch(ctx context.Context, workflowID string, authority JournalID, request GovernedAllocationComposedRequest) (GovernedAllocationComposedResult, error) {
 	if err := a.requireReady(ctx, request.Allocation.OperationID, "RunAllocateComposedBatch"); err != nil {
 		return GovernedAllocationComposedResult{}, err
 	}
@@ -309,12 +309,12 @@ func (a *FusedGovernedAllocator) RunAllocateComposedBatch(ctx context.Context, w
 	// would independently fail the cheap new-work preflight.
 	want, encodeErr := input.encoded()
 	if encodeErr != nil {
-		return GovernedAllocationComposedBatchResult{}, allocation.NewError(allocation.ErrorValidation, request.Allocation.OperationID, "FusedGovernedAllocator.RunAllocateComposedBatch identity admission", "the canonical batch workflow input could not be encoded", "no DBOS workflow or governed rows were written", "supply a supported batch request and authority", encodeErr)
+		return GovernedAllocationComposedResult{}, allocation.NewError(allocation.ErrorValidation, request.Allocation.OperationID, "FusedGovernedAllocator.RunAllocateComposedBatch identity admission", "the canonical batch workflow input could not be encoded", "no DBOS workflow or governed rows were written", "supply a supported batch request and authority", encodeErr)
 	}
 	if workflowID != "" {
 		found, verifyErr := a.verifyWorkflowInput(workflowID, request.Allocation.OperationID, "RunAllocateComposedBatch", want)
 		if verifyErr != nil {
-			return GovernedAllocationComposedBatchResult{}, verifyErr
+			return GovernedAllocationComposedResult{}, verifyErr
 		}
 		if found {
 			return a.retrieveFusedComposedWorkflow(workflowID, request.Allocation.OperationID, "RunAllocateComposedBatch", input)
@@ -327,11 +327,11 @@ func (a *FusedGovernedAllocator) RunAllocateComposedBatch(ctx context.Context, w
 	// stale or unauthorized.
 	store, storeErr := a.sqliteStore(request.Allocation.OperationID)
 	if storeErr != nil {
-		return GovernedAllocationComposedBatchResult{}, storeErr
+		return GovernedAllocationComposedResult{}, storeErr
 	}
 	exactReceipt, classifyErr := store.ClassifyComposedGovernedAllocationSnapshot(ctx, request, authority)
 	if classifyErr != nil {
-		return GovernedAllocationComposedBatchResult{}, classifyErr
+		return GovernedAllocationComposedResult{}, classifyErr
 	}
 	// This read-only preflight rejects task references that can already be
 	// resolved as unrelated, avoiding a durable DBOS error checkpoint for an

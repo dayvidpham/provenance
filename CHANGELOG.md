@@ -80,6 +80,22 @@ All notable changes to this project will be documented in this file.
   are removed. The supplemental policy is fixed by the canonical encoder and is
   never accepted from or returned to a caller, so the re-exports named a value
   callers could not supply or observe.
+- `GovernedAllocationComposedBatchRequest` and
+  `GovernedAllocationComposedBatchResult` are removed. They were transparent
+  aliases of `GovernedAllocationComposedRequest` and
+  `GovernedAllocationComposedResult` — the same types, not a second contract —
+  and having two names for one composed-allocation request implied a batch
+  contract that has never existed: both the one-child and the multi-child entry
+  points take the surviving type, which carries
+  1..`MaxGovernedAllocationChildren` ordered children. Migration: rename
+  `GovernedAllocationComposedBatchRequest` to
+  `GovernedAllocationComposedRequest` and
+  `GovernedAllocationComposedBatchResult` to
+  `GovernedAllocationComposedResult`. The method names are unchanged, so
+  `RunAllocateComposedBatch` and `AllocateGovernedComposedBatch` still name the
+  multi-child entry points. The one known consumer (pasture) is updated in
+  lockstep with its next dependency bump, so the rename never lands
+  un-atomically.
 
 #### Dependencies
 

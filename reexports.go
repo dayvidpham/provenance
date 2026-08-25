@@ -70,29 +70,24 @@ type (
 	// Governed allocation is the closed first-class primitive for creating a
 	// caller-identified child task and assignment under one exact parent.
 	GovernedAllocationRequest = allocation.GovernedAllocationRequest
-	// GovernedAllocationComposedRequest carries 1..MaxGovernedAllocationChildren
-	// ordered children. SupplementalEffects apply to the complete ordered
-	// allocation closure, not to one child independently.
-	GovernedAllocationComposedRequest = allocation.ComposedRequest
-	GovernedAllocationComposedResult  = allocation.ComposedResult
-	// GovernedAllocationComposedBatchRequest and
-	// GovernedAllocationComposedBatchResult are the same types as
-	// GovernedAllocationComposedRequest and GovernedAllocationComposedResult;
-	// they exist only as the spelling used at the RunAllocateComposedBatch call
-	// site. There is no separate batch contract.
-	GovernedAllocationComposedBatchRequest = allocation.ComposedRequest
-	GovernedAllocationComposedBatchResult  = allocation.ComposedResult
-	GovernedAllocationCompositionVersion   = allocation.CompositionVersion
-	GovernedAllocationReferenceScope       = allocation.ReferenceScope
-	GovernedAllocationReferenceScopeKind   = allocation.ReferenceScopeKind
-	RootGenesisRequest                     = allocation.RootGenesisRequest
-	GovernedChildSpec                      = allocation.ChildSpec
-	OperationClosure                       = allocation.OperationClosure
-	GovernedChildBinding                   = allocation.ChildBinding
-	GovernedProducedRow                    = allocation.ProducedRow
-	GovernedAllocationError                = allocation.Error
-	GovernedAllocationErrorKind            = allocation.ErrorKind
-	GovernedRequestKind                    = allocation.RequestKind
+	// GovernedAllocationComposedRequest is the one composed-allocation contract.
+	// It carries 1..MaxGovernedAllocationChildren ordered children, and its
+	// SupplementalEffects apply to the complete ordered allocation closure rather
+	// than to one child independently. Both the one-child and the multi-child
+	// entry points take this exact type; there is no separate batch contract.
+	GovernedAllocationComposedRequest    = allocation.ComposedRequest
+	GovernedAllocationComposedResult     = allocation.ComposedResult
+	GovernedAllocationCompositionVersion = allocation.CompositionVersion
+	GovernedAllocationReferenceScope     = allocation.ReferenceScope
+	GovernedAllocationReferenceScopeKind = allocation.ReferenceScopeKind
+	RootGenesisRequest                   = allocation.RootGenesisRequest
+	GovernedChildSpec                    = allocation.ChildSpec
+	OperationClosure                     = allocation.OperationClosure
+	GovernedChildBinding                 = allocation.ChildBinding
+	GovernedProducedRow                  = allocation.ProducedRow
+	GovernedAllocationError              = allocation.Error
+	GovernedAllocationErrorKind          = allocation.ErrorKind
+	GovernedRequestKind                  = allocation.RequestKind
 )
 
 // ---------------------------------------------------------------------------
