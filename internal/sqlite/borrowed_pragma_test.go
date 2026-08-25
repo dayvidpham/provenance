@@ -28,6 +28,11 @@ func borrowedCallerPool(t *testing.T, extraPragmas string) (*sql.DB, string) {
 		t.Fatalf("open caller-owned pool: %v", err)
 	}
 	pool.SetMaxOpenConns(borrowedPoolTestConns)
+	// Idle capacity matches open capacity so the pool-wide oracle really samples
+	// the connections operations used. With the default idle cap, database/sql
+	// would close the surplus on release and hand the oracle fresh connections
+	// carrying the DSN's pragmas — hiding exactly the leak these tests look for.
+	pool.SetMaxIdleConns(borrowedPoolTestConns)
 	t.Cleanup(func() { _ = pool.Close() })
 	return pool, path
 }
@@ -180,5 +185,63 @@ func TestOwnedPoolLeaseReArmsForeignKeys(t *testing.T) {
 	}
 	if enforced != 1 {
 		t.Fatalf("owned pool foreign_keys = %d on the next lease, want 1: a failed restore must not outlive one lease", enforced)
+	}
+}
+
+// TestBorrowedReleaseRetiresConnectionWhenRestoreCannotLand covers the silent
+// hole in an unverified restore. SQLite ignores PRAGMA foreign_keys while a
+// transaction is open on the connection: the restore statement reports success
+// and changes nothing. A release that trusts that success would hand the caller
+// back a connection carrying Provenance's foreign_keys=ON instead of the caller's
+// OFF, permanently and invisibly, for every later statement that drew it. The
+// contract is that an unprovable restore retires the connection instead.
+func TestBorrowedReleaseRetiresConnectionWhenRestoreCannotLand(t *testing.T) {
+	t.Parallel()
+	pool, _ := borrowedCallerPool(t, "")
+	store, err := OpenBorrowed(pool, nil)
+	if err != nil {
+		t.Fatalf("OpenBorrowed: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	scope := takePoolScope(t, store)
+	if !scope.restoreForeignKeysOff {
+		scope.release()
+		t.Fatal("lease over a caller pool with foreign_keys off did not record the restore it owes the caller")
+	}
+	if _, err := scope.conn.ExecContext(scope.ctx, "BEGIN"); err != nil {
+		scope.release()
+		t.Fatalf("open a transaction on the leased connection: %v", err)
+	}
+
+	// Demonstrate the hole directly: the naive restore succeeds and does nothing.
+	if _, err := scope.conn.ExecContext(scope.ctx, "PRAGMA foreign_keys=OFF"); err != nil {
+		scope.release()
+		t.Fatalf("unverified restore statement: %v", err)
+	}
+	var afterNaiveRestore int64
+	if err := scope.conn.QueryRowContext(scope.ctx, "PRAGMA foreign_keys").Scan(&afterNaiveRestore); err != nil {
+		scope.release()
+		t.Fatalf("read foreign_keys after the unverified restore: %v", err)
+	}
+	if afterNaiveRestore != 1 {
+		scope.release()
+		t.Fatalf("foreign_keys after the unverified restore = %d, want 1: this test no longer reproduces the no-op restore it guards", afterNaiveRestore)
+	}
+
+	scope.restoreBorrowedPragmas()
+	if !scope.discarded {
+		scope.release()
+		t.Fatal("connection was returned to the caller's pool with Provenance's foreign_keys=ON; an unprovable restore must retire the connection")
+	}
+	if scope.restoreForeignKeysOff != true {
+		t.Error("a failed restore cleared the debt it still owes the caller")
+	}
+	scope.release()
+
+	for i, got := range readPoolPragma(t, pool, "foreign_keys") {
+		if got != 0 {
+			t.Errorf("pool connection %d foreign_keys = %d after the retirement, want the caller's 0", i, got)
+		}
 	}
 }

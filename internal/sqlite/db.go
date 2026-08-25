@@ -918,6 +918,85 @@ func readForeignKeysPragma(ctx context.Context, conn *sql.Conn) (bool, error) {
 	return enabled != 0, nil
 }
 
+// readBusyTimeoutPragma reports this connection's current busy-timeout budget in
+// milliseconds.
+func readBusyTimeoutPragma(ctx context.Context, conn *sql.Conn) (int64, error) {
+	var busyTimeoutMS int64
+	if err := conn.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&busyTimeoutMS); err != nil {
+		return 0, fmt.Errorf(
+			"sqlite: read PRAGMA busy_timeout on the leased connection: %w; "+
+				"where: internal/sqlite, connection lease; impact: this operation cannot prove the connection's "+
+				"contention budget, so the connection's configuration cannot be established or restored; "+
+				"fix: verify the pool's connections are live and retry", err)
+	}
+	return busyTimeoutMS, nil
+}
+
+// pragmaOnOff renders a boolean pragma value the way SQLite reports it back.
+func pragmaOnOff(enabled bool) string {
+	if enabled {
+		return "ON"
+	}
+	return "OFF"
+}
+
+// setBooleanPragmaVerified writes a connection-local boolean PRAGMA and proves
+// the write landed by reading the value back.
+//
+// The read-back is the whole point. SQLite silently ignores PRAGMA foreign_keys
+// while a transaction is open on the connection (see pauseForeignKeys): the Exec
+// reports success and changes nothing. A restore that trusts that success hands
+// the connection back to its pool carrying the enforcement state this package
+// chose rather than the state its owner configured, and nothing ever notices. So
+// every write of a pragma this package captures and restores is verified, and an
+// unverifiable one is reported to the caller, whose fail-closed action is to
+// retire the connection.
+func setBooleanPragmaVerified(ctx context.Context, conn *sql.Conn, pragma string, enabled bool) error {
+	value := pragmaOnOff(enabled)
+	if _, err := conn.ExecContext(ctx, "PRAGMA "+pragma+"="+value); err != nil {
+		return fmt.Errorf("set PRAGMA %s=%s: %w", pragma, value, err)
+	}
+	var readBack int
+	if err := conn.QueryRowContext(ctx, "PRAGMA "+pragma).Scan(&readBack); err != nil {
+		return fmt.Errorf(
+			"read back PRAGMA %s after setting it to %s: %w; where: internal/sqlite, verified pragma write; "+
+				"impact: the write cannot be proven, so the connection's state is unknown; fix: verify the "+
+				"connection is still live and retry", pragma, value, err)
+	}
+	if (readBack != 0) != enabled {
+		return fmt.Errorf(
+			"set PRAGMA %s=%s: the connection still reports %s; why: SQLite ignores this pragma while a "+
+				"transaction is open on the connection, so the statement succeeded without taking effect; "+
+				"where: internal/sqlite, verified pragma write; impact: the connection's state is not the one "+
+				"this package requires, so it must not be handed back to the pool; fix: close every transaction "+
+				"on the connection before changing this pragma",
+			pragma, value, pragmaOnOff(readBack != 0))
+	}
+	return nil
+}
+
+// setBusyTimeoutVerified writes the connection-local busy timeout and proves the
+// write landed, for the same reason setBooleanPragmaVerified does: an
+// unverified restore can leave a borrowed connection carrying a contention
+// budget its owner never chose.
+func setBusyTimeoutVerified(ctx context.Context, conn *sql.Conn, milliseconds int64) error {
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout=%d", milliseconds)); err != nil {
+		return fmt.Errorf("set PRAGMA busy_timeout=%d: %w", milliseconds, err)
+	}
+	readBack, err := readBusyTimeoutPragma(ctx, conn)
+	if err != nil {
+		return err
+	}
+	if readBack != milliseconds {
+		return fmt.Errorf(
+			"set PRAGMA busy_timeout=%d: the connection still reports %dms; where: internal/sqlite, verified "+
+				"pragma write; impact: the connection's contention budget is not the one requested, so it must "+
+				"not be handed back to the pool; fix: verify nothing else is rewriting busy_timeout on this "+
+				"connection and retry", milliseconds, readBack)
+	}
+	return nil
+}
+
 // armForeignKeys establishes this package's lease invariant — PRAGMA
 // foreign_keys=ON for the whole lease — and decides what release owes the pool.
 //
@@ -983,7 +1062,11 @@ func (scope *connScope) restoreBorrowedPragmas() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), pragmaControlTimeout)
 	defer cancel()
-	if _, err := scope.conn.ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {
+	// Verified, not fire-and-forget: if this lease is released while a transaction
+	// is open on the connection, the restore statement succeeds and does nothing,
+	// and the caller would get a connection back with Provenance's enforcement
+	// still on. The read-back is what turns that silent hole into a retirement.
+	if err := setBooleanPragmaVerified(ctx, scope.conn, "foreign_keys", false); err != nil {
 		scope.markBad()
 		return
 	}
@@ -1021,13 +1104,57 @@ func (scope *connScope) pauseForeignKeys(what string) (func(error) error, error)
 		// on its own.
 		ctx, cancel := context.WithTimeout(context.Background(), pragmaControlTimeout)
 		defer cancel()
-		if _, err := scope.conn.ExecContext(ctx, "PRAGMA foreign_keys=ON"); err != nil {
+		if err := setBooleanPragmaVerified(ctx, scope.conn, "foreign_keys", true); err != nil {
 			scope.markBad()
 			return errors.Join(operationErr, fmt.Errorf(
 				"%s: restore foreign-key enforcement on the pinned connection: %w; "+
 					"where: internal/sqlite, after the bracketing transaction; impact: the connection was "+
 					"retired instead of returned to the pool, so no later operation runs unenforced; "+
 					"fix: verify the database is still open and retry the operation", what, err))
+		}
+		return operationErr
+	}, nil
+}
+
+// suppressCheckConstraints turns connection-local CHECK enforcement off for an
+// adversarial fixture that must land a row past a structural CHECK so a
+// production reducer-level guard is what catches it, and returns the restore.
+//
+// Same shape and same reasoning as pauseForeignKeys: the restore takes the
+// operation's own error and returns the error the caller should return, the
+// restore is proven by read-back, and a connection whose enforcement cannot be
+// proven restored is retired rather than returned to the pool. A fixture that
+// left CHECK enforcement off on a pooled connection would silently disarm the
+// schema for every later operation that drew it.
+//
+// Usage requires a named error return:
+//
+//	restoreChecks, err := scope.suppressCheckConstraints("Caller")
+//	if err != nil {
+//		return err
+//	}
+//	defer func() { err = restoreChecks(err) }()
+func (scope *connScope) suppressCheckConstraints(what string) (func(error) error, error) {
+	if err := setBooleanPragmaVerified(scope.ctx, scope.conn, "ignore_check_constraints", true); err != nil {
+		return nil, fmt.Errorf(
+			"%s: disable CHECK enforcement on the pinned connection: %w; "+
+				"where: internal/sqlite, before the bracketing transaction; impact: nothing ran and nothing "+
+				"was written; fix: retry with a live context on an open database", what, err)
+	}
+	return func(operationErr error) error {
+		// The caller's context may already be canceled or expired; restoring this
+		// connection's enforcement is not the caller's operation, so it is bounded
+		// on its own.
+		ctx, cancel := context.WithTimeout(context.Background(), pragmaControlTimeout)
+		defer cancel()
+		if err := setBooleanPragmaVerified(ctx, scope.conn, "ignore_check_constraints", false); err != nil {
+			scope.markBad()
+			return errors.Join(operationErr, fmt.Errorf(
+				"%s: restore CHECK enforcement on the pinned connection: %w; "+
+					"where: internal/sqlite, after the bracketing transaction; impact: the connection was "+
+					"retired instead of returned to the pool, so no later operation runs with CHECK "+
+					"constraints disabled; fix: verify the database is still open and retry the operation",
+				what, err))
 		}
 		return operationErr
 	}, nil
@@ -1046,13 +1173,12 @@ func captureBorrowedActivationPragmas(scope *connScope) (func() error, error) {
 	if err != nil {
 		return nil, err
 	}
-	var busyTimeoutMS int64
-	if err := scope.conn.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&busyTimeoutMS); err != nil {
+	busyTimeoutMS, err := readBusyTimeoutPragma(ctx, scope.conn)
+	if err != nil {
 		return nil, fmt.Errorf(
-			"sqlite: read PRAGMA busy_timeout on the borrowed activation connection: %w; "+
-				"where: internal/sqlite.OpenBorrowed, schema activation; impact: activation is refused because "+
-				"the caller's pool configuration could not be preserved; fix: verify the borrowed pool is live "+
-				"and retry OpenBorrowed", err)
+			"sqlite.OpenBorrowed: %w; where: internal/sqlite.OpenBorrowed, schema activation; impact: "+
+				"activation is refused because the caller's pool configuration could not be preserved; "+
+				"fix: verify the borrowed pool is live and retry OpenBorrowed", err)
 	}
 	foreignKeysValue := "OFF"
 	if foreignKeys {
@@ -1062,10 +1188,14 @@ func captureBorrowedActivationPragmas(scope *connScope) (func() error, error) {
 		restoreCtx, restoreCancel := context.WithTimeout(context.Background(), pragmaControlTimeout)
 		defer restoreCancel()
 		var restoreErr error
-		if _, err := scope.conn.ExecContext(restoreCtx, fmt.Sprintf("PRAGMA busy_timeout=%d", busyTimeoutMS)); err != nil {
+		// Both restores are proven by read-back: an activation that left a
+		// transaction open on this connection would otherwise make the foreign_keys
+		// statement a silent no-op and hand the caller a connection Provenance
+		// reconfigured.
+		if err := setBusyTimeoutVerified(restoreCtx, scope.conn, busyTimeoutMS); err != nil {
 			restoreErr = errors.Join(restoreErr, fmt.Errorf("restore borrowed busy_timeout to %dms: %w", busyTimeoutMS, err))
 		}
-		if _, err := scope.conn.ExecContext(restoreCtx, "PRAGMA foreign_keys="+foreignKeysValue); err != nil {
+		if err := setBooleanPragmaVerified(restoreCtx, scope.conn, "foreign_keys", foreignKeys); err != nil {
 			restoreErr = errors.Join(restoreErr, fmt.Errorf("restore borrowed foreign_keys to %s: %w", foreignKeysValue, err))
 		}
 		if restoreErr == nil {

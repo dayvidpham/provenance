@@ -137,7 +137,7 @@ func (db *DB) AdversarialJournalRowTwoSubtypes(actor journal.ActorID) (journal.J
 // matching journal_task_events row so the ONLY violation is actor placement, not
 // subtype totality. Returns the offending subordinate JournalID; the caller is
 // expected to VerifyIntegrity and observe ErrActorPlacement.
-func (db *DB) AdversarialSubordinateRowCarryingActor(actor journal.ActorID, task journal.TaskID) (journal.JournalID, error) {
+func (db *DB) AdversarialSubordinateRowCarryingActor(actor journal.ActorID, task journal.TaskID) (subordinate journal.JournalID, err error) {
 	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return 0, fmt.Errorf("AdversarialSubordinateRowCarryingActor: lease connection: %w", err)
@@ -145,10 +145,14 @@ func (db *DB) AdversarialSubordinateRowCarryingActor(actor journal.ActorID, task
 	defer scope.release()
 	// Bypass the structural CHECK so the reducer-level placement guard is what
 	// catches the row (the CHECK is exercised on the production write path instead).
-	if _, err := scope.conn.ExecContext(scope.ctx, "PRAGMA ignore_check_constraints=ON"); err != nil {
-		return 0, fmt.Errorf("AdversarialSubordinateRowCarryingActor: disable CHECK enforcement: %w", err)
+	// The bracket is the package's verified pattern: the restore is proven by
+	// read-back and joined into the returned error, and a connection that cannot be
+	// proven re-armed is retired rather than returned with CHECKs disabled.
+	restoreChecks, err := scope.suppressCheckConstraints("AdversarialSubordinateRowCarryingActor")
+	if err != nil {
+		return 0, err
 	}
-	defer func() { _, _ = scope.conn.ExecContext(scope.ctx, "PRAGMA ignore_check_constraints=OFF") }()
+	defer func() { err = restoreChecks(err) }()
 
 	var subordinateJID int64
 	if err := runImmediateTransaction(scope.ctx, scope.conn, func() error {
