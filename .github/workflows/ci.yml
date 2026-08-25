@@ -78,6 +78,12 @@ jobs:
     # journal tests) and takes on the order of 10 minutes on ubuntu-latest
     # runners; this ceiling only guards against a genuine hang.
     timeout-minutes: 30
+    # TEMPORARY (decided 2026-08-25): the full race suite runs only on push to
+    # main, not on pull requests, because the suite is currently sleep-bound
+    # (~600s+ in CI). Revert this condition to run on PRs again when the
+    # test-performance overhaul lands:
+    # https://github.com/dayvidpham/provenance/issues/27
+    if: github.event_name == 'push'
     steps:
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
