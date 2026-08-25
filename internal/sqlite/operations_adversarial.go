@@ -16,11 +16,12 @@ func (db *DB) AdversarialRemoveJournalOperationFK() (err error) {
 		return fmt.Errorf("AdversarialRemoveJournalOperationFK: lease connection: %w", err)
 	}
 	defer scope.release()
-	if _, err = scope.conn.ExecContext(scope.ctx, "PRAGMA foreign_keys=OFF"); err != nil {
+	restoreFK, err := scope.pauseForeignKeys("AdversarialRemoveJournalOperationFK")
+	if err != nil {
 		return err
 	}
-	defer func() { _, _ = scope.conn.ExecContext(scope.ctx, "PRAGMA foreign_keys=ON") }()
-	if err = runScopedTransaction(scope.ctx, scope.conn, "BEGIN", func() error {
+	defer func() { err = restoreFK(err) }()
+	if err = runImmediateTransaction(scope.ctx, scope.conn, func() error {
 		if _, err := scope.conn.ExecContext(scope.ctx, "DROP VIEW IF EXISTS journal_attributed"); err != nil {
 			return fmt.Errorf("remove journal operation FK fixture: drop view: %w", err)
 		}
@@ -50,11 +51,12 @@ func (db *DB) AdversarialInstallV1OperationConstraint() (err error) {
 		return fmt.Errorf("AdversarialInstallV1OperationConstraint: lease connection: %w", err)
 	}
 	defer scope.release()
-	if _, err = scope.conn.ExecContext(scope.ctx, "PRAGMA foreign_keys=OFF"); err != nil {
+	restoreFK, err := scope.pauseForeignKeys("AdversarialInstallV1OperationConstraint")
+	if err != nil {
 		return err
 	}
-	defer func() { _, _ = scope.conn.ExecContext(scope.ctx, "PRAGMA foreign_keys=ON") }()
-	err = runScopedTransaction(scope.ctx, scope.conn, "BEGIN", func() error {
+	defer func() { err = restoreFK(err) }()
+	err = runImmediateTransaction(scope.ctx, scope.conn, func() error {
 		for _, ddl := range []string{"DROP TRIGGER IF EXISTS journal_operations_canonical_insert", "DROP TRIGGER IF EXISTS journal_operations_canonical_update", "CREATE TABLE journal_operations_v1 (journal_id INTEGER PRIMARY KEY REFERENCES journal(journal_id),operation_id TEXT NOT NULL UNIQUE,authority_journal_id INTEGER REFERENCES journal_authorities(journal_id),command_digest BLOB NOT NULL,mutation_digest BLOB NOT NULL,mutation_encoding_version TEXT,canonical_mutation BLOB,CHECK ((mutation_encoding_version IS NULL AND canonical_mutation IS NULL) OR (mutation_encoding_version='provenance.mutation.v1' AND length(canonical_mutation)>0))) STRICT"} {
 			if _, err := scope.conn.ExecContext(scope.ctx, ddl); err != nil {
 				return fmt.Errorf("install V1 operation constraint fixture: %w", err)
@@ -82,6 +84,18 @@ func (db *DB) AdversarialInstallV1OperationConstraint() (err error) {
 // rule-9 result-slot integrity check (§3.2) against real violations. Production
 // paths (Apply) always write consistent rows; these seams are used only by the
 // corpus and are never part of the Journal surface.
+//
+// Every seam here writes, so each takes SQLite write ownership at BEGIN
+// IMMEDIATE. A deferred BEGIN would take the read lock first and then need a
+// read-to-write promotion, on which SQLite never invokes the busy handler, so a
+// concurrent writer would fail the seam instantly instead of waiting out
+// busy_timeout — the same defect fixed on the activation and migration paths.
+//
+// These seams compile into production builds. They are exported methods on *DB
+// consumed by tests in other packages (the root package's corpora), so a
+// test-only file or a build tag would require every consumer, the Makefile, and
+// the flake's check to opt in; that change spans files outside this package and
+// is left to a deliberate follow-up rather than made here.
 
 // AdversarialJournalRowTwoSubtypes writes one journal row of kind=decision and
 // gives it rows in BOTH journal_decisions and journal_evidence, violating
@@ -93,7 +107,7 @@ func (db *DB) AdversarialJournalRowTwoSubtypes(actor journal.ActorID) (journal.J
 	}
 	defer scope.release()
 	var jid int64
-	if err := runScopedTransaction(scope.ctx, scope.conn, "BEGIN", func() error {
+	if err := runImmediateTransaction(scope.ctx, scope.conn, func() error {
 		var err error
 		jid, err = scope.insertJournalRow(journal.JournalKindDecision, actor, 0, nil)
 		if err != nil {
@@ -137,7 +151,7 @@ func (db *DB) AdversarialSubordinateRowCarryingActor(actor journal.ActorID, task
 	defer func() { _, _ = scope.conn.ExecContext(scope.ctx, "PRAGMA ignore_check_constraints=OFF") }()
 
 	var subordinateJID int64
-	if err := runScopedTransaction(scope.ctx, scope.conn, "BEGIN", func() error {
+	if err := runImmediateTransaction(scope.ctx, scope.conn, func() error {
 		// Valid operation anchor (actor stored, PBOJID NULL) so the subordinate row's
 		// producing-operation FK resolves.
 		anchorJID, err := scope.insertJournalRow(journal.JournalKindOperation, actor, 0, nil)
@@ -172,7 +186,7 @@ func (db *DB) AdversarialSubtypeMismatchingKind(actor journal.ActorID) (journal.
 	}
 	defer scope.release()
 	var jid int64
-	if err := runScopedTransaction(scope.ctx, scope.conn, "BEGIN", func() error {
+	if err := runImmediateTransaction(scope.ctx, scope.conn, func() error {
 		var err error
 		jid, err = scope.insertJournalRow(journal.JournalKindDecision, actor, 0, nil)
 		if err != nil {
@@ -202,7 +216,7 @@ func (db *DB) AdversarialAuthorityDetailMismatch(actor journal.ActorID, task jou
 	}
 	defer scope.release()
 	var jid int64
-	if err := runScopedTransaction(scope.ctx, scope.conn, "BEGIN", func() error {
+	if err := runImmediateTransaction(scope.ctx, scope.conn, func() error {
 		var err error
 		jid, err = scope.insertJournalRow(journal.JournalKindAuthority, actor, 0, nil)
 		if err != nil {
@@ -363,16 +377,17 @@ func (drop AdversarialTableDrop) query() string {
 	}
 }
 
-func (db *DB) AdversarialDropTable(drop AdversarialTableDrop) error {
+func (db *DB) AdversarialDropTable(drop AdversarialTableDrop) (err error) {
 	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		return fmt.Errorf("AdversarialDropTable: lease connection: %w", err)
 	}
 	defer scope.release()
-	if _, err := scope.conn.ExecContext(scope.ctx, "PRAGMA foreign_keys=OFF"); err != nil {
-		return fmt.Errorf("AdversarialDropTable: disable FK: %w", err)
+	restoreFK, err := scope.pauseForeignKeys("AdversarialDropTable")
+	if err != nil {
+		return err
 	}
-	defer func() { _, _ = scope.conn.ExecContext(scope.ctx, "PRAGMA foreign_keys=ON") }()
+	defer func() { err = restoreFK(err) }()
 	// DDL identifier cannot be bound; table comes from the closed corpus.
 	if _, err := scope.conn.ExecContext(scope.ctx, drop.query()); err != nil {
 		return fmt.Errorf("AdversarialDropTable: %w", err)
@@ -582,7 +597,7 @@ func (db *DB) AdversarialCyclicParentChain(actor journal.ActorID, taskX, taskY, 
 	}
 	defer scope.release()
 	var jz, maxJID int64
-	if err := runScopedTransaction(scope.ctx, scope.conn, "BEGIN", func() error {
+	if err := runImmediateTransaction(scope.ctx, scope.conn, func() error {
 		if _, err := scope.seedActiveEpisode(actor, taskX, "cyclic-parent-X", nil); err != nil {
 			return err
 		}

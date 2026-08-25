@@ -987,6 +987,49 @@ func (scope *connScope) restoreBorrowedPragmas() {
 	scope.restoreForeignKeysOff = false
 }
 
+// pauseForeignKeys turns connection-local foreign-key enforcement off for a
+// table rebuild or an adversarial fixture that must move rows past their
+// constraints, and returns the restore. PRAGMA foreign_keys is a no-op inside a
+// transaction, so it brackets the transaction instead of living in it.
+//
+// The restore takes the operation's own error and returns the error the caller
+// should return, so a failed restore is never dropped on an already-failed path.
+// A connection whose enforcement cannot be proven restored is retired rather than
+// returned to the pool; on top of that, every lease re-arms enforcement at bind
+// (see armForeignKeys), so drift cannot outlive one lease either way.
+//
+// Usage requires a named error return:
+//
+//	restoreFK, err := scope.pauseForeignKeys("Caller")
+//	if err != nil {
+//		return err
+//	}
+//	defer func() { err = restoreFK(err) }()
+func (scope *connScope) pauseForeignKeys(what string) (func(error) error, error) {
+	if _, err := scope.conn.ExecContext(scope.ctx, "PRAGMA foreign_keys=OFF"); err != nil {
+		return nil, fmt.Errorf(
+			"%s: disable foreign-key enforcement on the pinned connection: %w; "+
+				"where: internal/sqlite, before the bracketing transaction; impact: nothing ran and nothing "+
+				"was written; fix: retry with a live context on an open database", what, err)
+	}
+	return func(operationErr error) error {
+		// The caller's context may already be canceled or expired; restoring this
+		// connection's enforcement is not the caller's operation, so it is bounded
+		// on its own.
+		ctx, cancel := context.WithTimeout(context.Background(), pragmaControlTimeout)
+		defer cancel()
+		if _, err := scope.conn.ExecContext(ctx, "PRAGMA foreign_keys=ON"); err != nil {
+			scope.markBad()
+			return errors.Join(operationErr, fmt.Errorf(
+				"%s: restore foreign-key enforcement on the pinned connection: %w; "+
+					"where: internal/sqlite, after the bracketing transaction; impact: the connection was "+
+					"retired instead of returned to the pool, so no later operation runs unenforced; "+
+					"fix: verify the database is still open and retry the operation", what, err))
+		}
+		return operationErr
+	}, nil
+}
+
 // captureBorrowedActivationPragmas snapshots the two connection-local pragmas
 // activation rewrites (busy_timeout and foreign_keys) on a borrowed connection
 // and returns the restore for the caller to run before handing the connection
