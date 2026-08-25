@@ -25,6 +25,100 @@ uncached race run.
 
 ## Recorded baseline
 
+### DBOS queue polling: no configuration seam, and no measurable cost: 2026-08-25
+
+An investigation asked whether the DBOS queue runner's one-second polling
+cadence could be lowered through a production configuration seam, on the
+hypothesis that it quantised every DBOS context launch. Both halves of the
+hypothesis failed: no such seam exists in `dbos-transact-golang v0.20.0`, and
+the cadence is not measurably part of the suite's cost. The dominant per-launch
+cost is durable construction — DBOS system-database migration plus Provenance
+schema activation — not waiting.
+
+#### Why no seam exists
+
+Read against the pinned `v0.20.0` module source:
+
+| Fact | Location |
+|---|---|
+| The only queue in a Provenance process is DBOS's reserved internal queue, created during context construction by the deprecated in-memory registration path | `dbos/dbos.go:573` |
+| Its base polling interval is the package default, one second, and no option is passed | `dbos/internal/models/queue.go:11` |
+| `dbos.Config` exposes no queue polling field; `SchedulerPollingInterval` covers only dynamic cron reconciliation | `dbos/dbos.go:36-53` |
+| `RegisterQueue` refuses the reserved name, because the in-memory registration already holds it | `dbos/queue.go:369` |
+| `SetPollingInterval` applies only to database-backed queues | `dbos/queue.go:168` |
+| `RetrieveQueue` and `ListQueues` read the `queues` table, which never contains the internal queue | `dbos/queue.go:451`, `dbos/queue.go:474` |
+| A worker reloads its configuration only when its queue is database-backed, so even a later row could not retune the already-running internal worker | `dbos/queue.go:703` |
+| The supervisor's own reconcile tick is a separate hard-coded one second | `dbos/queue.go:584` |
+
+A runtime probe against a live context confirmed the reading: before and after
+launch, `RetrieveQueue("_dbos_internal_queue")` returned a nil queue and a nil
+error, `ListQueues` returned zero queues, and `RegisterQueue` on that name
+failed with `cannot register database-backed queue "_dbos_internal_queue": an
+in-memory queue with that name already exists`.
+
+Reaching the interval would therefore require reflection or an internal import.
+Neither is acceptable, so nothing was wired. The upstream ask is to accept a
+polling interval for the internal queue on `dbos.Config`, or to let
+`RegisterQueue` retune the reserved queue. It is not fixed in the later
+`v1.2.0`, which hard-codes the same one-second default on a now-unexported
+internal queue value and rejects the reserved name explicitly
+(`dbos/queue.go:512`, `dbos/queue.go:324`).
+
+Separately, a Provenance-level polling knob would have had nothing to configure
+even if the library allowed it: Provenance registers no queue and enqueues no
+workflow. Every workflow runs through `dbos.RunWorkflow` on the owning context,
+so queue polling is never on a Provenance latency path.
+
+#### What the cadence actually costs
+
+A launch-heavy workload was run under the race detector with sixteen additional
+idle launched contexts alive — sixteen extra internal-queue workers and
+supervisors ticking every second — interleaved with the same workload run with
+none, three rounds alternating to control for drift:
+
+| Round | Bare | With 16 idle launched contexts |
+|---|---:|---:|
+| 0 | `6.151s` | `5.564s` |
+| 1 | `6.303s` | `6.693s` |
+| 2 | `6.793s` | `7.701s` |
+
+The difference changes sign between rounds and is smaller than the upward drift
+across the run, so the tick's contribution is below host noise on this host.
+These are single same-host runs taken while other work shared the machine; they
+bound the effect rather than measure it precisely.
+
+#### Where the per-launch cost is instead
+
+One `OpenBoundGovernedAllocator` + `Launch` + genesis + composed allocation +
+`Close` cycle, measured phase by phase over repeated isolated iterations:
+
+| Phase | Normal | Race |
+|---|---:|---:|
+| `sql.Open` + ping | `26-55ms` | `28-47ms` |
+| `dbos.NewDBOSContext` (system-database migration) | `342-695ms` | `492-589ms` |
+| `OpenBorrowedSQLite` (Provenance schema activation) | `39-44ms` | `990ms-1.019s` |
+| Launch | `~9ms` | `12-37ms` |
+| Genesis workflow | `29-42ms` | `65-94ms` |
+| Composed allocation workflow | `30-40ms` | `90-121ms` |
+| Close | `19-38ms` | `23-37ms` |
+
+Construction is therefore 85-95% of a launch, and schema activation is the part
+the race detector amplifies most, from tens of milliseconds to a full second.
+Against the recorded inventory of 161 context launches in one suite run, the
+construction phases alone account for roughly 245 seconds of race-mode work,
+which is the same order as the whole 291-second race baseline. The two levers
+that can move it are launching fewer contexts and making activation cheaper;
+polling cadence is not a lever.
+
+For comparison, the recorded heaviest single test,
+`TestFusedGovernedAllocationComposedRejectsStructurallyForgedSQLiteReceipts`
+with 51 launches, took `15.79s`, `16.54s`, and `16.26s` in three isolated race
+runs, versus `100.74s` in the loaded baseline inventory. That spread tracks
+contention over shared construction cost, not a polling quantum: a
+one-second-per-launch quantum could account for at most 51 seconds of an
+85-second gap, and the idle-context experiment above shows the tick does not
+produce it.
+
 ### Proposal 54 CPU and result-polling correction: 2026-07-22
 
 `-count=16` was rejected because it repeats every test sixteen times; it does
