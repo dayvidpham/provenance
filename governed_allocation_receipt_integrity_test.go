@@ -7,7 +7,13 @@ import (
 	provenance "github.com/dayvidpham/provenance"
 )
 
+// Every top-level test in this file is parallel under the isolation proof
+// documented above openGovernedTracker in governed_allocation_integration_test.go:
+// each test owns a private t.TempDir database and tampers only with its own rows.
+
 func TestGovernedAllocationReceiptRejectsCanonicalTaskProjectionTampering(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	participantCalls := 0
 	fused, db := openFusedAllocatorWithParticipantAndDatabase(t, "allocation-receipt-task-integrity", func(context.Context, provenance.GovernedAllocationTransaction, provenance.GovernedAllocationRequest, provenance.OperationClosure) error {
@@ -41,6 +47,8 @@ func TestGovernedAllocationReceiptRejectsCanonicalTaskProjectionTampering(t *tes
 }
 
 func TestComposedConflictProofRejectsMutatedAuthorityOwnerAndSupplement(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	participantCalls := 0
 	fused, db := openFusedAllocatorWithParticipantAndDatabase(t, "allocation-conflict-proof-integrity", func(context.Context, provenance.GovernedAllocationTransaction, provenance.GovernedAllocationRequest, provenance.OperationClosure) error {

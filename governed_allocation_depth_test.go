@@ -8,9 +8,16 @@ import (
 	"github.com/dayvidpham/provenance"
 )
 
+// Every top-level test in this file is parallel under the isolation proof
+// documented above openGovernedTracker in governed_allocation_integration_test.go:
+// each test owns a private in-memory or t.TempDir database; the deep-ancestry
+// lineage it builds is visible only to itself.
+
 const acyclicAuthorityProofDepth = 66
 
 func TestGovernedAllocationAcceptsDeepAcyclicAncestry(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	t.Run("standalone", func(t *testing.T) {
@@ -79,6 +86,8 @@ func TestGovernedAllocationAcceptsDeepAcyclicAncestry(t *testing.T) {
 }
 
 func TestGovernedAllocationRejectsCyclicAncestryWithoutWrites(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	tracker, actor, db := openGovernedTrackerWithDatabase(t)
 	root := initializeRoot(t, tracker, actor)

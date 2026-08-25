@@ -16,6 +16,7 @@ import (
 // database in a state a fresh database/sql pool can reopen. The reducer and
 // projection suites own their domain replay assertions separately.
 func TestFileActivationReopensWithWALAndRuntimePragmas(t *testing.T) {
+	t.Parallel()
 	path := t.TempDir() + "/reopen.db"
 	first, err := Open(path, nil)
 	if err != nil {
@@ -54,6 +55,7 @@ func TestFileActivationReopensWithWALAndRuntimePragmas(t *testing.T) {
 }
 
 func TestMigrationFaultPreservesLegacyTasksAndJournal(t *testing.T) {
+	t.Parallel()
 	db := openPoolFileDB(t)
 	system := registerSoftwareActor(t, db, "migration-system")
 	bootstrap := genesisBoot(t, db, system)
@@ -129,6 +131,7 @@ func TestMigrationFaultPreservesLegacyTasksAndJournal(t *testing.T) {
 }
 
 func TestReplayProjectionsUsesOneSnapshotAcrossConcurrentApply(t *testing.T) {
+	t.Parallel()
 	db := openPoolFileDB(t)
 	actor := registerSoftwareActor(t, db, "replay-snapshot-system")
 	bootstrap := genesisBoot(t, db, actor)

@@ -232,7 +232,11 @@ func TestMatrix_PresentSuccessChangedCanonicalOperand_ConflictsBeforeWorkflow(t 
 	}
 }
 
+// Each case builds its own stackWithJournal over a private t.TempDir database,
+// with a lookup transform and counters local to its own closure, so the cases are
+// isolated from each other and from every other test in this file.
 func TestMatrix_SuccessCheckpointRejectsResultSlotDivergence(t *testing.T) {
+	t.Parallel()
 
 	tests := map[string]func(*provenance.CommittedResult){
 		"over-limit": func(result *provenance.CommittedResult) {
@@ -271,6 +275,7 @@ func TestMatrix_SuccessCheckpointRejectsResultSlotDivergence(t *testing.T) {
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 			lookup := func(result provenance.CommittedResult, err error) (provenance.CommittedResult, error) {
 				if err == nil && result.Kind == provenance.CommittedExact {
 					result.ResultSlots = append([]provenance.ResultSlotBinding(nil), result.ResultSlots...)

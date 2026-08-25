@@ -76,6 +76,9 @@ func borrowedPool(t *testing.T, path string) *sql.DB {
 // instantly with SQLITE_BUSY and busy_timeout was never honoured. Activation must
 // now wait for the holder and then succeed.
 func TestBorrowedActivationWaitsOutConcurrentWriter(t *testing.T) {
+	// Deliberately serial: this test asserts how long a contended activation
+	// waits, so a CPU-saturated parallel phase would change the very quantity
+	// under test.
 	path := t.TempDir() + "/contended-activation.db"
 	seed, err := Open(path, nil)
 	if err != nil {
@@ -132,6 +135,9 @@ func TestBorrowedActivationWaitsOutConcurrentWriter(t *testing.T) {
 // invokes the busy handler for a read-to-write promotion. The lower bound is
 // asserted; no upper bound is, so a slow machine cannot make this flake.
 func TestSingleActivationAttemptHonoursBusyTimeout(t *testing.T) {
+	// Deliberately serial: this test asserts a lower bound on the wall time one
+	// attempt spends inside SQLite's busy handler, which competing parallel
+	// tests would distort.
 	path := t.TempDir() + "/single-attempt-activation.db"
 	seed, err := Open(path, nil)
 	if err != nil {
@@ -175,6 +181,8 @@ func TestSingleActivationAttemptHonoursBusyTimeout(t *testing.T) {
 // is enforced and that the message names the file, the budget, the likely
 // concurrent migrator, and that nothing was written.
 func TestActivationRetryCeilingReportsTheContendedFile(t *testing.T) {
+	// Deliberately serial: this test asserts the elapsed budget of an exhausted
+	// retry ceiling, a wall-clock quantity.
 	path := t.TempDir() + "/exhausted-activation.db"
 	seed, err := Open(path, nil)
 	if err != nil {
@@ -233,6 +241,8 @@ func TestActivationRetryCeilingReportsTheContendedFile(t *testing.T) {
 // only lock contention is retryable, and any other SQLite failure must surface on
 // the first attempt rather than being retried until the ceiling.
 func TestActivationRetryReturnsNonBusyFailuresUnchanged(t *testing.T) {
+	// Deliberately serial: this test asserts a non-busy failure returns without
+	// spending the retry budget, which is a wall-clock claim.
 	path := t.TempDir() + "/non-busy-activation.db"
 	pool := borrowedPool(t, path)
 	conn, err := pool.Conn(context.Background())
@@ -280,6 +290,7 @@ func TestActivationRetryReturnsNonBusyFailuresUnchanged(t *testing.T) {
 // through a named constant, a variable, or a helper call would slip past it. The
 // contention tests above are the backstop for that.
 func TestActivationTransactionIsImmediate(t *testing.T) {
+	t.Parallel()
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "db.go", nil, 0)
 	if err != nil {

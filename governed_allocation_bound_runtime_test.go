@@ -15,7 +15,14 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// Every top-level test in this file is parallel under the isolation proof
+// documented above openGovernedTracker in governed_allocation_integration_test.go:
+// each test builds its own bound or host-borrowed allocator over a private
+// t.TempDir database, with participant counters local to its own closure.
+
 func TestBoundGovernedAllocatorUsesHostRootAndReportsReplay(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	dsn := "file:" + filepath.Join(t.TempDir(), "host-bound.db") + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
 
@@ -127,6 +134,8 @@ func TestBoundGovernedAllocatorUsesHostRootAndReportsReplay(t *testing.T) {
 }
 
 func TestHostBoundGovernedAllocatorBorrowsEngineLifecycle(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	participantCalls := 0
 	participant := provenance.GovernedAllocationParticipant(func(ctx context.Context, tx provenance.GovernedAllocationTransaction, request provenance.GovernedAllocationRequest, closure provenance.OperationClosure) error {
@@ -276,6 +285,8 @@ func TestHostBoundGovernedAllocatorBorrowsEngineLifecycle(t *testing.T) {
 }
 
 func TestBoundGovernedAllocatorReopenReplaySuppressesParticipant(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	dsn := "file:" + filepath.Join(t.TempDir(), "bound-reopen.db") + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
 	calls, children := 0, 0

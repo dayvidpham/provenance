@@ -15,6 +15,15 @@ import (
 	"github.com/google/uuid"
 )
 
+// newJournalDB opens one private in-memory database per test.
+//
+// Why every test in this file may call t.Parallel(): sqlite.Open gives each
+// ":memory:" open a process-unique shared-cache name, so these databases cannot
+// observe one another, and the file-backed concerns that force serialization
+// elsewhere in this package — a shared path, a shared WAL, a measured busy wait
+// — do not exist here. No test in this file mutates a package global, an
+// environment variable, or the working directory. A test that starts sharing
+// state must lose its t.Parallel() and say what it shares.
 func newJournalDB(t *testing.T) *DB {
 	t.Helper()
 	db, err := Open(":memory:", nil)
@@ -166,6 +175,7 @@ func findEvent(t *testing.T, db *DB, jid journal.JournalID) journal.TaskEventRow
 }
 
 func TestQueryTaskEventsTreatsHostileTaskAndContextFiltersAsData(t *testing.T) {
+	t.Parallel()
 	for _, hostile := range []string{"' OR 1=1 --", "x' /* comment */ OR '1'='1", "nul\x00suffix"} {
 		t.Run(fmt.Sprintf("%q", hostile), func(t *testing.T) {
 			db := newJournalDB(t)
@@ -206,6 +216,7 @@ func TestQueryTaskEventsTreatsHostileTaskAndContextFiltersAsData(t *testing.T) {
 }
 
 func TestJournalKindsSeededMatchGoEnum(t *testing.T) {
+	t.Parallel()
 	db := newJournalDB(t)
 	got := map[int]string{}
 	scope, err := db.bindScope(context.Background(), projectionTargetLive)
@@ -236,6 +247,7 @@ func TestJournalKindsSeededMatchGoEnum(t *testing.T) {
 }
 
 func TestAppendTaskEventAdvancesProjections(t *testing.T) {
+	t.Parallel()
 	db := newJournalDB(t)
 	actor, task := seedActorAndTask(t, db)
 	boot := genesisBoot(t, db, actor)
@@ -286,6 +298,7 @@ func TestAppendTaskEventAdvancesProjections(t *testing.T) {
 }
 
 func TestQueryTaskEventsOrdersByJournalIDWithPaging(t *testing.T) {
+	t.Parallel()
 	db := newJournalDB(t)
 	actor, task := seedActorAndTask(t, db)
 	boot := genesisBoot(t, db, actor)
@@ -344,6 +357,7 @@ func TestQueryTaskEventsOrdersByJournalIDWithPaging(t *testing.T) {
 // with the journal_id tiebreak, even across an equal-timestamp tie and a backdated
 // row — while the canonical journal_id query still returns commit order.
 func TestQueryTaskEventsTimelineWalkComposite(t *testing.T) {
+	t.Parallel()
 	db := newJournalDB(t)
 	actor, task := seedActorAndTask(t, db)
 	boot := genesisBoot(t, db, actor)
@@ -410,6 +424,7 @@ func TestQueryTaskEventsTimelineWalkComposite(t *testing.T) {
 }
 
 func TestQueryTaskEventsFiltersByContexts(t *testing.T) {
+	t.Parallel()
 	db := newJournalDB(t)
 	actor, task := seedActorAndTask(t, db)
 
@@ -521,6 +536,7 @@ func equalJournalIDs(a, b []journal.JournalID) bool {
 // does see it — pinning the distinction between a pinned snapshot walk and a
 // fresh query.
 func TestQueryTaskEventsSnapshotWalkHidesLaterInserts(t *testing.T) {
+	t.Parallel()
 	db := newJournalDB(t)
 	actor, task := seedActorAndTask(t, db)
 	boot := genesisBoot(t, db, actor)
@@ -593,6 +609,7 @@ func TestQueryTaskEventsSnapshotWalkHidesLaterInserts(t *testing.T) {
 }
 
 func TestQueryTaskEventsRejectsNonJournalIDOrder(t *testing.T) {
+	t.Parallel()
 	db := newJournalDB(t)
 	_, qErr := db.QueryTaskEvents(journal.JournalQueryV1{OrderBy: journal.OrderDimension(7)})
 	if !errors.Is(qErr, journal.ErrUnsupportedOrderDimension) {
@@ -601,6 +618,7 @@ func TestQueryTaskEventsRejectsNonJournalIDOrder(t *testing.T) {
 }
 
 func TestVerifyIntegrityCleanJournal(t *testing.T) {
+	t.Parallel()
 	db := newJournalDB(t)
 	actor, task := seedActorAndTask(t, db)
 	boot := genesisBoot(t, db, actor)
@@ -616,6 +634,7 @@ func TestVerifyIntegrityCleanJournal(t *testing.T) {
 }
 
 func TestVerifyIntegrityRejectsBareJournalRow(t *testing.T) {
+	t.Parallel()
 	db := newJournalDB(t)
 	actor, _ := seedActorAndTask(t, db)
 	// A bare decision row (kind with a subtype table, but no subtype row) violates
@@ -634,6 +653,7 @@ func TestVerifyIntegrityRejectsBareJournalRow(t *testing.T) {
 // omitting the watermark is rejected. In production the only tasks-row INSERT is the
 // reducer fold, which always carries the watermark.
 func TestTasksWatermarkSchemaIsNotNull(t *testing.T) {
+	t.Parallel()
 	db := newJournalDB(t)
 	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
@@ -674,6 +694,7 @@ func registerSoftwareActor(t *testing.T, db *DB, name string) journal.ActorID {
 // fresh one. It asserts the DDL notNull bit directly (not just data-level anchoring):
 // column-less legacy DB -> migrate -> schema NOT NULL AND the migrated row is anchored.
 func TestMigrationReTightensWatermarkToNotNull(t *testing.T) {
+	t.Parallel()
 	db := newJournalDB(t)
 	system := registerSoftwareActor(t, db, "pasture-system")
 	owner := registerSoftwareActor(t, db, "actor-frank")
@@ -763,6 +784,7 @@ func TestMigrationReTightensWatermarkToNotNull(t *testing.T) {
 // anchored); with no journal-row violations, VerifyIntegrity reaches the watermark gate
 // and rejects the un-journaled task with ErrWatermarkMissing.
 func TestVerifyIntegrityRejectsUnwatermarkedTask(t *testing.T) {
+	t.Parallel()
 	db := newJournalDB(t)
 	seedActorAndTask(t, db)
 	if err := db.VerifyIntegrity(); !errors.Is(err, journal.ErrWatermarkMissing) {
@@ -771,6 +793,7 @@ func TestVerifyIntegrityRejectsUnwatermarkedTask(t *testing.T) {
 }
 
 func TestNamespaceClaimIdempotentAndConflict(t *testing.T) {
+	t.Parallel()
 	db := newJournalDB(t)
 	claim := journal.ActorNamespaceClaim{
 		Namespace: "pasture-system", ClaimantID: "pasture-system",
@@ -801,6 +824,7 @@ func TestNamespaceClaimIdempotentAndConflict(t *testing.T) {
 }
 
 func TestNamespaceClaimRejectsOverlap(t *testing.T) {
+	t.Parallel()
 	db := newJournalDB(t)
 	base := journal.ActorNamespaceClaim{
 		Namespace: "pasture-system", ClaimantID: "pasture-system",
@@ -823,6 +847,7 @@ func TestNamespaceClaimRejectsOverlap(t *testing.T) {
 // TestRegisterFixedSoftwareAgentSatisfiesManifestFK proves the aggregate
 // registration creates a readable software agent and its FK-backed manifest.
 func TestRegisterFixedSoftwareAgentSatisfiesManifestFK(t *testing.T) {
+	t.Parallel()
 	db := newJournalDB(t)
 	claim := journal.ActorNamespaceClaim{
 		Namespace: "pasture-system", ClaimantID: "pasture-system",
@@ -860,6 +885,7 @@ func TestRegisterFixedSoftwareAgentSatisfiesManifestFK(t *testing.T) {
 // TestRegisterFixedSoftwareAgentRetryAndDrift proves exact retry convergence and
 // deterministic conflict on changed agent data.
 func TestRegisterFixedSoftwareAgentRetryAndDrift(t *testing.T) {
+	t.Parallel()
 	db := newJournalDB(t)
 	claim := journal.ActorNamespaceClaim{
 		Namespace: "pasture-system", ClaimantID: "pasture-system",
@@ -883,6 +909,7 @@ func TestRegisterFixedSoftwareAgentRetryAndDrift(t *testing.T) {
 
 // TestRegisterFixedSoftwareAgentRejectsMalformed proves shape validation.
 func TestRegisterFixedSoftwareAgentRejectsMalformed(t *testing.T) {
+	t.Parallel()
 	db := newJournalDB(t)
 	reg := journal.FixedSoftwareAgentRegistration{
 		Claim: journal.ActorNamespaceClaim{Namespace: "pasture-system", ClaimantID: "pasture-system", Range: journal.UUIDRange{Min: journal.BigEndianUUID(0), Max: journal.BigEndianUUID(1)}, Codec: journal.OrdinalV1CodecName},
@@ -897,6 +924,7 @@ func TestRegisterFixedSoftwareAgentRejectsMalformed(t *testing.T) {
 // consistency requirement: a fixed ID whose UUID does not decode inside its
 // namespace's claimed range is rejected, exactly like RegisterFixedActorEntry.
 func TestRegisterFixedSoftwareAgentRejectsOutOfRange(t *testing.T) {
+	t.Parallel()
 	db := newJournalDB(t)
 	claim := journal.ActorNamespaceClaim{
 		Namespace: "pasture-system", ClaimantID: "pasture-system",
@@ -912,6 +940,7 @@ func TestRegisterFixedSoftwareAgentRejectsOutOfRange(t *testing.T) {
 }
 
 func TestFixedAgentActivationCommitErrorIsActionable(t *testing.T) {
+	t.Parallel()
 	cause := ptypes.ErrAgentAlreadyExists
 	err := fixedAgentActivationError(cause,
 		"the activation transaction could not commit",
@@ -937,6 +966,7 @@ func TestFixedAgentActivationCommitErrorIsActionable(t *testing.T) {
 // random-UUIDv7 registration path's signature and behavior are unaffected: it
 // still mints its own ID and needs no namespace claim at all.
 func TestRegisterSoftwareAgentUnchangedByFixedRegistration(t *testing.T) {
+	t.Parallel()
 	db := newJournalDB(t)
 	sa, err := db.RegisterSoftwareAgent("no-claim-needed", "agent", "1.0", "test")
 	if err != nil {

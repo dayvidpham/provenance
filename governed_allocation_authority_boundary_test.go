@@ -7,7 +7,13 @@ import (
 	"testing"
 )
 
+// This test is parallel: newRaceTracker gives it a private in-memory tracker with
+// its own genesis authority and actors, its task ids are fresh UUIDv7 values, and
+// it touches no package-level state, file, environment variable, or goroutine count.
+
 func TestOrdinaryJournalAuthorityBeyondGovernedDepthAndReplay(t *testing.T) {
+	t.Parallel()
+
 	r := newRaceTracker(t)
 	const lineageDepth = 66
 

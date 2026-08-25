@@ -77,6 +77,20 @@ func OpenSystem(ctx context.Context, config SystemConfig) (*System, error) {
 		return nil, fmt.Errorf("fusedtx.OpenSystem: ping owned SQLite system handle: %w", err)
 	}
 
+	// Constructing the context also creates DBOS's reserved internal queue, whose
+	// worker and supervisor each poll once a second for the life of the system.
+	// That cadence is not configurable: v0.20.0 registers the queue in memory
+	// with the package default, exposes no polling field on dbos.Config, and
+	// refuses both a same-named RegisterQueue and a SetPollingInterval on a queue
+	// that is not database-backed. Provenance neither registers a queue nor
+	// enqueues a workflow, so the polling never dequeues work and is not on any
+	// workflow-latency path. It is NOT free of side effects, though: the queue
+	// supervisor's once-a-second reconcile tick executes an UPDATE against the
+	// system database, and in fusedtx that database IS the application's SQLite
+	// file — so the tick periodically takes the single-writer lock and can
+	// surface as SQLITE_BUSY under concurrent application writes. See
+	// docs/perf/parallel-governed-allocation-family.md for the measured
+	// contention and docs/test-performance.md for the upstream ask.
 	root, err := dbos.NewDBOSContext(ctx, dbos.Config{
 		AppName:            config.AppName,
 		ApplicationVersion: config.ApplicationVersion,

@@ -38,6 +38,7 @@ func fixedRegistration(namespace string, min, max, ordinal uint64) journal.Fixed
 }
 
 func TestIdentityActivityReadsLeaseIndependentlyUnderWAL(t *testing.T) {
+	t.Parallel()
 	db := openIdentityActivityDB(t)
 	agent, err := db.RegisterHumanAgent("pooled", "reader", "")
 	if err != nil {
@@ -73,6 +74,7 @@ func TestIdentityActivityReadsLeaseIndependentlyUnderWAL(t *testing.T) {
 }
 
 func TestFixedAgentActivationContendingLeasesAreAtomic(t *testing.T) {
+	t.Parallel()
 	db := openIdentityActivityDB(t)
 	winner := fixedRegistration("fixed-a", 0, 10, 1)
 	contender := fixedRegistration("fixed-b", 5, 15, 6)
@@ -101,6 +103,7 @@ func TestFixedAgentActivationContendingLeasesAreAtomic(t *testing.T) {
 }
 
 func TestNamespaceClaimConflictAcrossContendingLeases(t *testing.T) {
+	t.Parallel()
 	db := openIdentityActivityDB(t)
 	firstClaim := journal.ActorNamespaceClaim{Namespace: "shared", ClaimantID: "first", Range: journal.UUIDRange{Min: journal.BigEndianUUID(20), Max: journal.BigEndianUUID(29)}, Codec: journal.OrdinalV1CodecName}
 	secondClaim := journal.ActorNamespaceClaim{Namespace: "shared", ClaimantID: "second", Range: journal.UUIDRange{Min: journal.BigEndianUUID(30), Max: journal.BigEndianUUID(39)}, Codec: journal.OrdinalV1CodecName}
@@ -126,6 +129,7 @@ func TestNamespaceClaimConflictAcrossContendingLeases(t *testing.T) {
 }
 
 func TestStartActivityWithIDConcurrentReplayReturnsCanonicalRow(t *testing.T) {
+	t.Parallel()
 	db := openIdentityActivityDB(t)
 	agent, err := db.RegisterSoftwareAgent("direct", "caller", "1", "test")
 	if err != nil {
@@ -165,6 +169,7 @@ func TestStartActivityWithIDConcurrentReplayReturnsCanonicalRow(t *testing.T) {
 }
 
 func TestIdentityActivityCloseRejectsNewLeases(t *testing.T) {
+	t.Parallel()
 	db := openIdentityActivityDB(t)
 	agent, err := db.RegisterHumanAgent("close", "reader", "")
 	if err != nil {
@@ -179,6 +184,7 @@ func TestIdentityActivityCloseRejectsNewLeases(t *testing.T) {
 }
 
 func TestConcurrentActivityLeaseReturn(t *testing.T) {
+	t.Parallel()
 	db := openIdentityActivityDB(t)
 	agent, err := db.RegisterHumanAgent("return", "activity", "")
 	if err != nil {

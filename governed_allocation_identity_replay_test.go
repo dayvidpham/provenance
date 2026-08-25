@@ -9,7 +9,14 @@ import (
 	provenance "github.com/dayvidpham/provenance"
 )
 
+// Every top-level test in this file is parallel under the isolation proof
+// documented above openGovernedTracker in governed_allocation_integration_test.go:
+// each test owns a private t.TempDir database, and newDBOSStack likewise wires its
+// stack over a private t.TempDir file.
+
 func TestGovernedPublicIngressRejectsReservedOperationIDsBeforeDBOS(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	fused, db := openFusedAllocatorWithDatabase(t, "reserved-governed-ingress")
 	actor := registerGovernedActor(t, fused.Tracker(), "reserved-governed-ingress")
@@ -55,6 +62,8 @@ func TestGovernedPublicIngressRejectsReservedOperationIDsBeforeDBOS(t *testing.T
 }
 
 func TestSessionGovernedIngressRejectsReservedOperationIDsWithoutWrites(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	fused, db := openFusedAllocatorWithDatabase(t, "reserved-session-ingress")
 	tracker := fused.Tracker()
@@ -97,6 +106,8 @@ func TestSessionGovernedIngressRejectsReservedOperationIDsWithoutWrites(t *testi
 }
 
 func TestRunInitializeRootRejectsReservedOperationIDBeforeDBOS(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	fused, db := openFusedAllocatorWithDatabase(t, "reserved-root-ingress")
 	actor := registerGovernedActor(t, fused.Tracker(), "reserved-root-ingress")
@@ -120,6 +131,8 @@ func TestRunInitializeRootRejectsReservedOperationIDBeforeDBOS(t *testing.T) {
 }
 
 func TestGenericReservedIdentityPreservesOnlyUnmarkedHistoricalReplay(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	fused, db := openFusedAllocatorWithDatabase(t, "reserved-generic-replay")
 	tracker := fused.Tracker()
@@ -194,6 +207,8 @@ func TestGenericReservedIdentityPreservesOnlyUnmarkedHistoricalReplay(t *testing
 }
 
 func TestDBOSAdapterReservedIdentityAdmission(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	stack := newDBOSStack(t, nil)
 	input := provenance.OperationInput{

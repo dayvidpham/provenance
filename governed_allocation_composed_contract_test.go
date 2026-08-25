@@ -9,7 +9,14 @@ import (
 	provenance "github.com/dayvidpham/provenance"
 )
 
+// Every top-level test in this file is parallel under the isolation proof
+// documented above openGovernedTracker in governed_allocation_integration_test.go:
+// each test owns a private t.TempDir database, or is a pure function test with no
+// external state at all.
+
 func TestGovernedAllocationSupplementOperationIDStableKnownValue(t *testing.T) {
+	t.Parallel()
+
 	const external provenance.OperationID = "known-external-operation"
 	const want provenance.OperationID = "provenance.governed-supplement.v1.3c505d51d26e8eee56122aa6db3440031e8bb872ea647e6b2e9f7510101f35f3"
 
@@ -21,6 +28,8 @@ func TestGovernedAllocationSupplementOperationIDStableKnownValue(t *testing.T) {
 }
 
 func TestComposedGovernedAllocationRejectsEmptyBeforeDBOS(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	participantCalls := 0
 	fused, db := openFusedAllocatorWithParticipantAndDatabase(t, "composed-empty-contract", func(context.Context, provenance.GovernedAllocationTransaction, provenance.GovernedAllocationRequest, provenance.OperationClosure) error {
@@ -51,6 +60,8 @@ func TestComposedGovernedAllocationRejectsEmptyBeforeDBOS(t *testing.T) {
 }
 
 func TestComposedGovernedAllocationReplayReceiptAndCopies(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	participantCalls := 0
 	fused, db := openFusedAllocatorWithParticipantAndDatabase(t, "composed-replay-contract", func(_ context.Context, _ provenance.GovernedAllocationTransaction, request provenance.GovernedAllocationRequest, closure provenance.OperationClosure) error {

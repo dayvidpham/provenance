@@ -8,6 +8,10 @@ import (
 	provenance "github.com/dayvidpham/provenance"
 )
 
+// Every top-level test in this file is parallel under the isolation proof
+// documented above openGovernedTracker in governed_allocation_integration_test.go:
+// each test and subtest owns a private tracker over its own database.
+
 // TestGovernedAllocationV1ReducerParity proves the Session admission path
 // rejects a request exactly as the DBOS-owned path does, for the same reason
 // and with the same absence of writes.
@@ -18,6 +22,8 @@ import (
 // second invocation proved nothing new and duplicated roughly three seconds of
 // race-detector time on every run.
 func TestGovernedAllocationV1ReducerParity(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	t.Run("zero authority", func(t *testing.T) {
@@ -135,6 +141,8 @@ func assertMatchingGovernedFailure(t *testing.T, simpleErr, composedErr error, w
 }
 
 func TestGovernedAllocationV1CloseGateMatchesOrdinaryReducer(t *testing.T) {
+	t.Parallel()
+
 	fused, db := openFusedAllocatorWithDatabase(t, "v1-close-gate")
 	actor := registerGovernedActor(t, fused.Tracker(), "v1-close-gate")
 	if err := fused.Launch(); err != nil {

@@ -12,7 +12,13 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// Every top-level test in this file is parallel under the isolation proof
+// documented above openGovernedTracker in governed_allocation_integration_test.go:
+// this test owns a private t.TempDir database, reopened only by itself.
+
 func TestComposedActivityChronologyRejectsTamperingAcrossReplayAndReopen(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "composed-activity-chronology.db")
 	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"

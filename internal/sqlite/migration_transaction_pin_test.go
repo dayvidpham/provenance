@@ -21,6 +21,7 @@ import (
 // through a named constant, a variable, or a helper call would slip past it. The
 // contention test is the backstop for that.
 func TestMigrationBaselineTransactionIsImmediate(t *testing.T) {
+	t.Parallel()
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "migration.go", nil, 0)
 	if err != nil {

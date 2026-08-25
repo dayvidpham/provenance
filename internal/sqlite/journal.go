@@ -62,6 +62,51 @@ const journalAttributedViewDDL = `CREATE VIEW IF NOT EXISTS journal_attributed A
 	LEFT JOIN journal anchor
 	  ON anchor.journal_id = j.produced_by_operation_journal_id`
 
+// journalRelationBody is the exact column and constraint text of the journal
+// supertype this build understands, including the
+// produced_by_operation_journal_id foreign key into journal_operations. It is a
+// shared const because two paths must produce byte-identical shapes: the fresh
+// create in ensureJournalSchema and the legacy rebuild in
+// completeJournalOperationFK. Restating either would let the two drift, and a
+// drifted rebuild target is indistinguishable from a corrupt migration.
+//
+// A database created from this text needs no rebuild, so an activation on a
+// current database never pays the drop/copy/rename/reparse cost that completing
+// the foreign key after the fact requires. The rebuild path stays for databases
+// written before the foreign key existed.
+//
+// The foreign key names journal_operations, which ensureOperationsSchema creates
+// later in the same activation transaction. SQLite resolves a foreign key's
+// parent at DML time, not at CREATE TABLE time, and activation writes no journal
+// row before both relations exist, so the forward reference is resolved by the
+// time the transaction commits.
+const journalRelationBody = "journal_id INTEGER PRIMARY KEY AUTOINCREMENT," +
+	"kind_id INTEGER NOT NULL REFERENCES journal_kinds(id)," +
+	"actor_id TEXT REFERENCES agents(id)," +
+	"recorded_at INTEGER NOT NULL," +
+	"produced_by_operation_journal_id INTEGER REFERENCES journal_operations(journal_id)," +
+	"CHECK ((actor_id IS NULL) = (produced_by_operation_journal_id IS NOT NULL))," +
+	"CHECK (kind_id <> 1 OR produced_by_operation_journal_id IS NOT NULL)"
+
+// createJournalRelationDDL creates the journal supertype in its current shape.
+const createJournalRelationDDL = "CREATE TABLE IF NOT EXISTS journal (" + journalRelationBody + ") STRICT"
+
+// rebuildJournalRelationDDL is the migration staging table for a database whose
+// journal predates the foreign key. It carries the same body as the fresh create
+// so a migrated database and a newly created one converge on one shape.
+const rebuildJournalRelationDDL = "CREATE TABLE journal_new (" + journalRelationBody + ") STRICT"
+
+// journalRelationIndexDDL is the journal supertype's complete index set. Both the
+// fresh create and the rebuild apply it, for the same anti-drift reason as the
+// table body: a rebuild that restored a different index set would silently change
+// query plans on migrated databases only.
+var journalRelationIndexDDL = []string{
+	"CREATE INDEX IF NOT EXISTS idx_journal_kind ON journal (kind_id)",
+	"CREATE INDEX IF NOT EXISTS idx_journal_actor ON journal (actor_id)",
+	"CREATE INDEX IF NOT EXISTS idx_journal_pboj ON journal (produced_by_operation_journal_id)",
+	"CREATE INDEX IF NOT EXISTS idx_journal_recorded_at ON journal (recorded_at, journal_id)",
+}
+
 const insertJournalTaskEventSQL = "INSERT INTO journal_task_events (journal_id, task_id, event_kind, payload) VALUES (?1, ?2, ?3, ?4)"
 
 const insertJournalAuthoritySQL = "INSERT INTO journal_authorities (journal_id, authority_kind_id, operation_authority_id) VALUES (?1, ?2, ?3)"
@@ -72,13 +117,7 @@ const insertJournalAuthoritySQL = "INSERT INTO journal_authorities (journal_id, 
 func (scope *connScope) ensureJournalSchema() error {
 	ddl := []string{
 		"CREATE TABLE IF NOT EXISTS journal_kinds (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE) STRICT",
-		`CREATE TABLE IF NOT EXISTS journal (
-			journal_id INTEGER PRIMARY KEY AUTOINCREMENT, kind_id INTEGER NOT NULL REFERENCES journal_kinds(id),
-			actor_id TEXT REFERENCES agents(id), recorded_at INTEGER NOT NULL, produced_by_operation_journal_id INTEGER,
-			CHECK ((actor_id IS NULL) = (produced_by_operation_journal_id IS NOT NULL))) STRICT`,
-		"CREATE INDEX IF NOT EXISTS idx_journal_kind ON journal (kind_id)",
-		"CREATE INDEX IF NOT EXISTS idx_journal_actor ON journal (actor_id)",
-		"CREATE INDEX IF NOT EXISTS idx_journal_recorded_at ON journal (recorded_at, journal_id)",
+		createJournalRelationDDL,
 		"CREATE TABLE IF NOT EXISTS journal_task_events (journal_id INTEGER PRIMARY KEY REFERENCES journal(journal_id), task_id TEXT NOT NULL REFERENCES tasks(id), event_kind TEXT NOT NULL, payload TEXT NOT NULL CHECK (json_valid(payload))) STRICT",
 		"CREATE INDEX IF NOT EXISTS idx_journal_task_events_task ON journal_task_events (task_id)",
 		"CREATE TABLE IF NOT EXISTS journal_task_event_contexts (event_journal_id INTEGER NOT NULL REFERENCES journal_task_events(journal_id), context_kind TEXT NOT NULL, context_identity TEXT NOT NULL, attached_by_journal_id INTEGER NOT NULL REFERENCES journal_task_events(journal_id), PRIMARY KEY (event_journal_id, context_kind, context_identity)) STRICT, WITHOUT ROWID",
@@ -90,6 +129,11 @@ func (scope *connScope) ensureJournalSchema() error {
 	for _, stmt := range ddl {
 		if _, err := scope.conn.ExecContext(scope.ctx, stmt); err != nil {
 			return fmt.Errorf("ensureJournalSchema: statement %q: %w", stmt, err)
+		}
+	}
+	for _, stmt := range journalRelationIndexDDL {
+		if _, err := scope.conn.ExecContext(scope.ctx, stmt); err != nil {
+			return fmt.Errorf("ensureJournalSchema: journal index %q: %w", stmt, err)
 		}
 	}
 

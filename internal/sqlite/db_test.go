@@ -16,6 +16,16 @@ import (
 )
 
 // openTestDB delegates to shared testutil.OpenTestDB.
+//
+// Why every test in this file may call t.Parallel(): the helper opens
+// ":memory:", and sqlite.Open gives each such open a process-unique shared-cache
+// name, so no two tests can reach the same database. There is no file, no
+// sidecar, and no WAL to share; task, agent, and activity identifiers are fresh
+// UUIDv7 values per call; the fixture corpus is decoded into a per-test value
+// from immutable embedded bytes; and no test in this file reads or writes a
+// package global, an environment variable, or the working directory. Each
+// database is closed by its own t.Cleanup. A test here that starts sharing state
+// with another must lose its t.Parallel() and say what it shares.
 func openTestDB(t *testing.T) *sqlite.DB { return testutil.OpenTestDB(t) }
 
 // makeTask delegates to shared testutil.MakeTask.
@@ -97,6 +107,7 @@ func journalApply(t *testing.T, db *sqlite.DB, actor ptypes.ActorID, boot journa
 // ---------------------------------------------------------------------------
 
 func TestOpenAndClose(t *testing.T) {
+	t.Parallel()
 	db, err := sqlite.Open(":memory:", testutil.TestModels())
 	if err != nil {
 		t.Fatalf("sqlite.Open(:memory:) returned error: %v", err)
@@ -111,6 +122,7 @@ func TestOpenAndClose(t *testing.T) {
 }
 
 func TestOpenRestoresRuntimeForeignKeyEnforcement(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	task := makeTask("test-ns", "foreign-key check")
 	missingOwner := ptypes.AgentID{Namespace: "test-ns", UUID: uuid.Must(uuid.NewV7())}
@@ -121,6 +133,7 @@ func TestOpenRestoresRuntimeForeignKeyEnforcement(t *testing.T) {
 }
 
 func TestSchemaTablesExist(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 
 	// Insert and retrieve a task to verify the schema is properly applied.
@@ -146,6 +159,7 @@ func TestSchemaTablesExist(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestInsertAndGetTask(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 
 	task := makeTask("ns", "Test Task")
@@ -178,6 +192,7 @@ func TestInsertAndGetTask(t *testing.T) {
 }
 
 func TestGetTaskNotFound(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 
 	fakeID := ptypes.TaskID{Namespace: "ns", UUID: uuid.Must(uuid.NewV7())}
@@ -195,6 +210,7 @@ func TestGetTaskNotFound(t *testing.T) {
 // reaches, and asserts the journal-reproducible columns land while the lifecycle
 // status projection is untouched. The retired db.UpdateTask direct-write mutator is gone.
 func TestFoldUpdateMaterializesMetadata(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	actor, boot := journalFold(t, db)
 	id := journalCreate(t, db, actor, boot, "ns", "Original Title", "original description",
@@ -235,6 +251,7 @@ func TestFoldUpdateMaterializesMetadata(t *testing.T) {
 // reducer projects status → closed and stamps closed_at, and the fold materializes the
 // close reason. The retired db.CloseTask direct-write mutator is gone.
 func TestFoldCloseMaterializes(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	actor, boot := journalFold(t, db)
 	id := journalCreate(t, db, actor, boot, "ns", "Task to close", "",
@@ -263,6 +280,7 @@ func TestFoldCloseMaterializes(t *testing.T) {
 }
 
 func TestListTasks(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 
 	task1 := makeTask("ns", "Task 1")
@@ -283,6 +301,7 @@ func TestListTasks(t *testing.T) {
 }
 
 func TestListTasksWithFilter(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 
 	task1 := makeTask("ns", "Bug task")
@@ -309,6 +328,7 @@ func TestListTasksWithFilter(t *testing.T) {
 }
 
 func TestReadyAndBlockedTasks(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 
 	parent := makeTask("ns", "Parent")
@@ -362,6 +382,7 @@ func TestReadyAndBlockedTasks(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestInsertAndGetEdges(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 
 	task1 := makeTask("ns", "Task 1")
@@ -390,6 +411,7 @@ func TestInsertAndGetEdges(t *testing.T) {
 }
 
 func TestDeleteEdge(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 
 	task1 := makeTask("ns", "Task 1")
@@ -419,6 +441,7 @@ func TestDeleteEdge(t *testing.T) {
 }
 
 func TestGetBlockedByEdges(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 
 	task1 := makeTask("ns", "Task 1")
@@ -452,6 +475,7 @@ func TestGetBlockedByEdges(t *testing.T) {
 }
 
 func TestGetDepTree(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 
 	// Create a chain: A -> B -> C (A blocked by B, B blocked by C)
@@ -486,6 +510,7 @@ func TestGetDepTree(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestAddAndGetLabels(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 
 	task := makeTask("ns", "Labeled task")
@@ -517,6 +542,7 @@ func TestAddAndGetLabels(t *testing.T) {
 }
 
 func TestAddLabelIdempotent(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 
 	task := makeTask("ns", "Labeled task")
@@ -542,6 +568,7 @@ func TestAddLabelIdempotent(t *testing.T) {
 }
 
 func TestRemoveLabel(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 
 	task := makeTask("ns", "Task")
@@ -569,6 +596,7 @@ func TestRemoveLabel(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestAddAndGetComments(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 
 	task := makeTask("ns", "Commented task")
@@ -606,6 +634,7 @@ func TestAddAndGetComments(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestRegisterAndGetHumanAgent(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 
 	ha, err := db.RegisterHumanAgent("ns", "Alice", "alice@example.com")
@@ -632,6 +661,7 @@ func TestRegisterAndGetHumanAgent(t *testing.T) {
 }
 
 func TestRegisterAndGetMLAgent(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 
 	mla, err := db.RegisterMLAgent("ns", ptypes.RoleWorker, ptypes.ProviderAnthropic, ptypes.ModelID("claude-opus-4-6"))
@@ -655,6 +685,7 @@ func TestRegisterAndGetMLAgent(t *testing.T) {
 }
 
 func TestRegisterMLAgentUnknownModel(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 
 	_, err := db.RegisterMLAgent("ns", ptypes.RoleWorker, ptypes.ProviderAnthropic, ptypes.ModelID("nonexistent_model"))
@@ -664,6 +695,7 @@ func TestRegisterMLAgentUnknownModel(t *testing.T) {
 }
 
 func TestRegisterAndGetSoftwareAgent(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 
 	sa, err := db.RegisterSoftwareAgent("ns", "beads-cli", "1.0.0", "https://github.com/example/beads")
@@ -687,6 +719,7 @@ func TestRegisterAndGetSoftwareAgent(t *testing.T) {
 }
 
 func TestGetAgent(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 
 	ha, err := db.RegisterHumanAgent("ns", "Bob", "bob@example.com")
@@ -704,6 +737,7 @@ func TestGetAgent(t *testing.T) {
 }
 
 func TestGetAgentNotFound(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 
 	fakeID := ptypes.AgentID{Namespace: "ns", UUID: uuid.Must(uuid.NewV7())}
@@ -718,6 +752,7 @@ func TestGetAgentNotFound(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestStartAndEndActivity(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 
 	agent, err := db.RegisterHumanAgent("ns", "Charlie", "")
@@ -746,6 +781,7 @@ func TestStartAndEndActivity(t *testing.T) {
 }
 
 func TestStartActivityWithID_Idempotent(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 
 	agent, err := db.RegisterHumanAgent("ns", "Eve", "")
@@ -806,6 +842,7 @@ func TestStartActivityWithID_Idempotent(t *testing.T) {
 }
 
 func TestGetActivities(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 
 	agent, err := db.RegisterHumanAgent("ns", "Dave", "")
@@ -844,6 +881,7 @@ func TestGetActivities(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestListTasksWithLabelFilter(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 
 	task1 := makeTask("ns", "Labeled")
@@ -870,6 +908,7 @@ func TestListTasksWithLabelFilter(t *testing.T) {
 }
 
 func TestBoundQueryValuesRemainOpaqueAcrossTaskActivityAndEdgeReads(t *testing.T) {
+	t.Parallel()
 	hostileValues := []string{"' OR 1=1 --", "x' /* comment */ OR '1'='1", "nul\x00suffix"}
 	for _, hostile := range hostileValues {
 		t.Run(fmt.Sprintf("%q", hostile), func(t *testing.T) {
@@ -1097,6 +1136,9 @@ func TestFoldUpdate_YAMLPermutations(t *testing.T) {
 	for _, fs := range fix.UpdateTask.UpdateFieldSets {
 		fs := fs // capture
 		t.Run(fs.Name, func(t *testing.T) {
+			// Private in-memory database and a locally copied field set: no case
+			// observes another's journal, tasks, or identifiers.
+			t.Parallel()
 			db := openTestDB(t)
 			actor, boot := journalFold(t, db)
 			id := journalCreate(t, db, actor, boot, "test-ns", "Original Title", "original description",
@@ -1192,6 +1234,9 @@ func TestListTasks_YAMLPermutations(t *testing.T) {
 	for _, fs := range fix.ListTasks.FilterSets {
 		fs := fs // capture
 		t.Run(fs.Name, func(t *testing.T) {
+			// Each filter set seeds its own private in-memory database, and every
+			// seeded task carries a fresh UUIDv7, so no case can see another's rows.
+			t.Parallel()
 			db := openTestDB(t)
 
 			// Seed all tasks. Map name → TaskID for expected-task lookup.
@@ -1266,6 +1311,8 @@ func TestRegisterMLAgent_YAMLPermutations(t *testing.T) {
 			roleVal, model := roleVal, model // capture
 			testName := fmt.Sprintf("role_%d/provider_%s/%s", roleVal, model.Provider, model.Name)
 			t.Run(testName, func(t *testing.T) {
+				// One private in-memory database per (role, model) pair.
+				t.Parallel()
 				db := openTestDB(t)
 
 				role := ptypes.Role(roleVal)
@@ -1308,6 +1355,8 @@ func TestRegisterMLAgent_YAMLPermutations(t *testing.T) {
 		model := model // capture
 		testName := fmt.Sprintf("unknown/provider_%s/%s", model.Provider, model.Name)
 		t.Run(testName, func(t *testing.T) {
+			// One private in-memory database per rejected model.
+			t.Parallel()
 			db := openTestDB(t)
 
 			provider := ptypes.Provider(model.Provider)
@@ -1336,6 +1385,10 @@ func TestStartActivity_YAMLPermutations(t *testing.T) {
 				phaseVal, stageVal, noteVar := phaseVal, stageVal, noteVar // capture
 				testName := fmt.Sprintf("phase_%d/stage_%d/%s", phaseVal, stageVal, noteVar.Name)
 				t.Run(testName, func(t *testing.T) {
+					// Each permutation owns a process-unique :memory: database and
+					// touches no file, package global, environment variable, or
+					// working directory, so the 104 cases are independent.
+					t.Parallel()
 					db := openTestDB(t)
 
 					agent, err := db.RegisterHumanAgent("test-ns", "ActivityAgent", "")
@@ -1409,6 +1462,10 @@ func TestAgentKindMismatch_YAMLPermutations(t *testing.T) {
 	for _, ak := range fix.AgentKindMismatch.AgentKinds {
 		ak := ak // capture
 		t.Run("kind_"+ak.Name, func(t *testing.T) {
+			// One private in-memory database per agent kind. The getter subtests
+			// below stay serial: they deliberately share this database and this
+			// agent identity, which is the state the mismatch contract is about.
+			t.Parallel()
 			db := openTestDB(t)
 
 			var agentID ptypes.AgentID
