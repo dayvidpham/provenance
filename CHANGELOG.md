@@ -100,6 +100,17 @@ All notable changes to this project will be documented in this file.
 #### Dependencies
 
 - `github.com/dbos-inc/dbos-transact-golang` v0.16.0 → v0.20.0.
+- The DBOS durable-contract fingerprint now derives from the library version the
+  module actually depends on. The pinned-library string fed into fingerprint
+  derivation still read `v0.16.0` after the dependency moved to `v0.20.0`, so
+  every fingerprint encoded a version claim that was false. Correcting it changes
+  every derived fingerprint, which would normally be a durable-state break — but
+  this release already declares pre-v0.0.4 durable state non-replayable, so the
+  correction costs nothing here and is made now rather than pinning the false
+  version into the contract permanently. The canonical wire encoding is
+  unaffected: every mutation digest in the independently pinned wire corpus is
+  byte-identical, and only the 15 fingerprint values in
+  `testdata/contract/dbos_wire_positive.yaml` were re-pinned.
 - SQLite persistence moved from `zombiezen.com/go/sqlite` to
   `modernc.org/sqlite` (`database/sql`). `zombiezen.com/go/sqlite` remains only
   as an indirect dependency. Callers that shared a handle with Provenance through

@@ -4,7 +4,7 @@ package provenance
 // adapter checkpoints through DBOS, and the deterministic operation-scoped
 // workflow identity plus full input fingerprint (issue dayvidpham/provenance#6).
 //
-// Pinned DBOS v0.16.0 serializes an ordinary Go error returned from a step as a
+// The pinned DBOS release serializes an ordinary Go error returned from a step as a
 // plain string, erasing its type. A Provenance DOMAIN failure (a §5/§9 typed
 // journal error) must survive recovery as a typed, errors.As/errors.Is-matchable
 // value, so a domain failure is NEVER returned as the step's Go error: it is
