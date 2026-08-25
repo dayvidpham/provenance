@@ -4,7 +4,7 @@ package provenance
 // adapter checkpoints through DBOS, and the deterministic operation-scoped
 // workflow identity plus full input fingerprint (issue dayvidpham/provenance#6).
 //
-// Pinned DBOS v0.16.0 serializes an ordinary Go error returned from a step as a
+// The pinned DBOS release serializes an ordinary Go error returned from a step as a
 // plain string, erasing its type. A Provenance DOMAIN failure (a §5/§9 typed
 // journal error) must survive recovery as a typed, errors.As/errors.Is-matchable
 // value, so a domain failure is NEVER returned as the step's Go error: it is
@@ -33,14 +33,15 @@ import (
 	"github.com/dayvidpham/provenance/pkg/ptypes"
 )
 
-// CanonicalResultSlot is one slot->produced-row binding in the canonical result:
-// the caller's local slot handle, the produced journal row, its JournalKind, and,
-// for a task_event row, the resolved TaskID (empty otherwise).
+// CanonicalResultSlot is one slot->produced-row binding in the canonical result.
+// TaskEvent carries only TaskID, Activity carries only ActivityID, and the
+// Authority/Decision/Evidence kinds carry neither entity arm.
 type CanonicalResultSlot struct {
 	Slot              string `json:"slot"`
 	ProducedJournalID int64  `json:"produced_journal_id"`
 	Kind              int    `json:"kind"`
 	TaskID            string `json:"task_id,omitempty"`
+	ActivityID        string `json:"activity_id,omitempty"`
 }
 
 // CanonicalMutationResult is the journal-anchored canonical result of one
@@ -67,6 +68,8 @@ type ApplyFailureKind string
 
 const (
 	FailureOperationConflict   ApplyFailureKind = "operation_conflict"
+	FailureConditionFailed     ApplyFailureKind = "condition_failed"
+	FailureActivityConflict    ApplyFailureKind = "activity_conflict"
 	FailureGenesis             ApplyFailureKind = "genesis"
 	FailureAuthorityScope      ApplyFailureKind = "authority_scope"
 	FailureAssignmentLifecycle ApplyFailureKind = "assignment_lifecycle"
@@ -95,24 +98,160 @@ type applyFailureDescriptor struct {
 
 func extractOperationConflict(err error, failure *CanonicalApplyFailure) error {
 	var conflict *journal.OperationConflict
-	if !errors.As(err, &conflict) || conflict.Field == "" {
-		return fmt.Errorf("operation conflict does not expose a non-empty *journal.OperationConflict.Field")
+	if !errors.As(err, &conflict) {
+		return fmt.Errorf("operation conflict does not expose a typed *journal.OperationConflict")
 	}
-	failure.ConflictField = conflict.Field
+	axis, index := conflict.Axis, conflict.Index
+	failure.ConflictAxis, failure.ConflictIndex = &axis, &index
 	return nil
 }
 
 func validateOperationConflict(failure *CanonicalApplyFailure) error {
-	if failure.ConflictField == "" {
-		return fmt.Errorf("operation conflict requires conflict_field")
+	if failure.ConflictAxis == nil {
+		return &conflictMetadataError{field: DBOSDiagFieldConflictAxis, reason: "operation conflict requires conflict_axis"}
+	}
+	if failure.ConflictIndex == nil {
+		return &conflictMetadataError{field: DBOSDiagFieldConflictIndex, reason: "operation conflict requires conflict_index"}
+	}
+	axis := *failure.ConflictAxis
+	// All five axes are nonzero; zero is invalid. ConflictEffect is the maximum.
+	if axis == 0 || axis > journal.ConflictEffect {
+		return &conflictMetadataError{field: DBOSDiagFieldConflictAxis, reason: fmt.Sprintf("invalid conflict axis %d (must be 1=%s..5=%s)", axis, journal.ConflictActor, journal.ConflictEffect)}
+	}
+	index := *failure.ConflictIndex
+	if axis <= journal.ConflictCommand && index != -1 {
+		return &conflictMetadataError{field: DBOSDiagFieldConflictIndex, reason: fmt.Sprintf("scalar conflict axis %s requires conflict_index -1, got %d", axis, index)}
+	}
+	if axis >= journal.ConflictCondition && index < -1 {
+		return &conflictMetadataError{field: DBOSDiagFieldConflictIndex, reason: fmt.Sprintf("collection conflict axis %s requires conflict_index >= -1, got %d", axis, index)}
+	}
+	if axis == journal.ConflictCondition && index >= MaxCanonicalConditions {
+		return &conflictMetadataError{field: DBOSDiagFieldConflictIndex, reason: fmt.Sprintf("condition conflict index %d exceeds maximum %d", index, MaxCanonicalConditions-1)}
+	}
+	if axis == journal.ConflictEffect && index >= MaxCanonicalEffects {
+		return &conflictMetadataError{field: DBOSDiagFieldConflictIndex, reason: fmt.Sprintf("effect conflict index %d exceeds maximum %d", index, MaxCanonicalEffects-1)}
 	}
 	return nil
 }
 
+type conflictMetadataError struct {
+	field  DBOSDiagnosticField
+	reason string
+}
+
+func (e *conflictMetadataError) Error() string { return e.reason }
+
 func reconstructOperationConflict(failure *CanonicalApplyFailure) error {
 	return fmt.Errorf("%s (recovered from checkpointed outcome): %w: %w", failure.Message,
 		journal.ErrOperationConflict,
-		&journal.OperationConflict{OperationID: journal.OperationID(failure.OperationID), Field: failure.ConflictField})
+		&journal.OperationConflict{OperationID: journal.OperationID(failure.OperationID), Axis: *failure.ConflictAxis, Index: *failure.ConflictIndex})
+}
+
+func extractConditionFailure(err error, failure *CanonicalApplyFailure) error {
+	var condition *journal.ConditionFailure
+	if !errors.As(err, &condition) {
+		return fmt.Errorf("condition failure does not expose a typed *journal.ConditionFailure")
+	}
+	index, kind, reason := condition.Index, condition.Kind, condition.Reason
+	asserted, actual := int64(condition.AssertedJournalID), int64(condition.ActualJournalID)
+	failure.ConditionIndex, failure.ConditionKind, failure.ConditionReason = &index, &kind, &reason
+	failure.AssertedJournalID, failure.ActualJournalID = &asserted, &actual
+	return nil
+}
+
+func validateConditionFailure(failure *CanonicalApplyFailure) error {
+	if failure.ConditionIndex == nil {
+		return &conflictMetadataError{field: DBOSDiagFieldConditionIndex, reason: "condition failure requires condition_index"}
+	}
+	if failure.ConditionKind == nil {
+		return &conflictMetadataError{field: DBOSDiagFieldConditionKind, reason: "condition failure requires condition_kind"}
+	}
+	if failure.ConditionReason == nil {
+		return &conflictMetadataError{field: DBOSDiagFieldConditionReason, reason: "condition failure requires condition_reason"}
+	}
+	if failure.AssertedJournalID == nil {
+		return &conflictMetadataError{field: DBOSDiagFieldAssertedJournalID, reason: "condition failure requires asserted_journal_id"}
+	}
+	if failure.ActualJournalID == nil {
+		return &conflictMetadataError{field: DBOSDiagFieldActualJournalID, reason: "condition failure requires actual_journal_id"}
+	}
+	if *failure.ConditionIndex < 0 || *failure.ConditionIndex >= MaxCanonicalConditions {
+		return &conflictMetadataError{field: DBOSDiagFieldConditionIndex, reason: fmt.Sprintf("condition_index %d is outside 0..%d", *failure.ConditionIndex, MaxCanonicalConditions-1)}
+	}
+	if *failure.ConditionKind != journal.ConditionExactFact && *failure.ConditionKind != journal.ConditionCurrentFact {
+		return &conflictMetadataError{field: DBOSDiagFieldConditionKind, reason: fmt.Sprintf("invalid condition_kind %d", *failure.ConditionKind)}
+	}
+	if *failure.ConditionReason < journal.ConditionFactMissing || *failure.ConditionReason > journal.ConditionCurrentMismatch {
+		return &conflictMetadataError{field: DBOSDiagFieldConditionReason, reason: fmt.Sprintf("invalid condition_reason %d", *failure.ConditionReason)}
+	}
+	if *failure.AssertedJournalID < 0 || *failure.ActualJournalID < 0 {
+		return &conflictMetadataError{field: DBOSDiagFieldAssertedJournalID, reason: "condition journal IDs must be non-negative"}
+	}
+	validCombination := (*failure.ConditionKind == journal.ConditionExactFact && (*failure.ConditionReason == journal.ConditionFactMissing || *failure.ConditionReason == journal.ConditionFactMismatch)) ||
+		(*failure.ConditionKind == journal.ConditionCurrentFact && (*failure.ConditionReason == journal.ConditionFactMissing || *failure.ConditionReason == journal.ConditionCurrentMismatch))
+	if !validCombination {
+		return &conflictMetadataError{field: DBOSDiagFieldConditionReason, reason: fmt.Sprintf("condition kind %s cannot report reason %s", *failure.ConditionKind, *failure.ConditionReason)}
+	}
+	if *failure.ConditionReason == journal.ConditionFactMissing && *failure.ActualJournalID != 0 {
+		return &conflictMetadataError{field: DBOSDiagFieldActualJournalID, reason: "FactMissing requires actual_journal_id 0"}
+	}
+	if *failure.ConditionKind == journal.ConditionCurrentFact && *failure.ConditionReason == journal.ConditionFactMissing && *failure.AssertedJournalID == 0 {
+		return &conflictMetadataError{field: DBOSDiagFieldAssertedJournalID, reason: "CurrentFact FactMissing requires a positive asserted_journal_id"}
+	}
+	if *failure.ConditionReason != journal.ConditionFactMissing && *failure.ActualJournalID <= 0 {
+		return &conflictMetadataError{field: DBOSDiagFieldActualJournalID, reason: "a mismatch reason requires a positive actual_journal_id"}
+	}
+	if *failure.ConditionReason == journal.ConditionFactMismatch && *failure.ActualJournalID == *failure.AssertedJournalID {
+		return &conflictMetadataError{field: DBOSDiagFieldActualJournalID, reason: "FactMismatch requires actual_journal_id different from asserted_journal_id"}
+	}
+	if *failure.ConditionReason == journal.ConditionCurrentMismatch && *failure.ActualJournalID == *failure.AssertedJournalID {
+		return &conflictMetadataError{field: DBOSDiagFieldActualJournalID, reason: "CurrentMismatch requires actual_journal_id different from asserted_journal_id"}
+	}
+	return nil
+}
+
+func reconstructConditionFailure(failure *CanonicalApplyFailure) error {
+	return fmt.Errorf("%s (recovered from checkpointed outcome): %w", failure.Message, &journal.ConditionFailure{
+		Index: *failure.ConditionIndex, Kind: *failure.ConditionKind, Reason: *failure.ConditionReason,
+		AssertedJournalID: journal.JournalID(*failure.AssertedJournalID), ActualJournalID: journal.JournalID(*failure.ActualJournalID),
+	})
+}
+
+func extractActivityConflict(err error, failure *CanonicalApplyFailure) error {
+	var activity *journal.ActivityConflict
+	if !errors.As(err, &activity) {
+		return fmt.Errorf("activity conflict does not expose a typed *journal.ActivityConflict")
+	}
+	failure.ActivityID = activity.ActivityID.String()
+	existing := int64(activity.ExistingJournalID)
+	failure.ExistingJournalID = &existing
+	return nil
+}
+
+func validateActivityConflict(failure *CanonicalApplyFailure) error {
+	if failure.ActivityID == "" {
+		return &conflictMetadataError{field: DBOSDiagFieldActivityID, reason: "activity conflict requires activity_id"}
+	}
+	if failure.ExistingJournalID == nil {
+		return &conflictMetadataError{field: DBOSDiagFieldExistingJournalID, reason: "activity conflict requires existing_journal_id"}
+	}
+	if _, err := ptypes.ParseActivityID(failure.ActivityID); err != nil {
+		return &conflictMetadataError{field: DBOSDiagFieldActivityID, reason: fmt.Sprintf("invalid activity_id: %v", err)}
+	}
+	if *failure.ExistingJournalID <= 0 {
+		return &conflictMetadataError{field: DBOSDiagFieldExistingJournalID, reason: "existing_journal_id must be positive"}
+	}
+	return nil
+}
+
+func reconstructActivityConflict(failure *CanonicalApplyFailure) error {
+	activity, err := ptypes.ParseActivityID(failure.ActivityID)
+	if err != nil {
+		return fmt.Errorf("reconstruct activity conflict: %w", err)
+	}
+	return fmt.Errorf("%s (recovered from checkpointed outcome): %w", failure.Message, &journal.ActivityConflict{
+		ActivityID: activity, ExistingJournalID: journal.JournalID(*failure.ExistingJournalID),
+	})
 }
 
 // canonicalApplyFailureDescriptors is the sole ordered descriptor literal. Each
@@ -121,6 +260,8 @@ func reconstructOperationConflict(failure *CanonicalApplyFailure) error {
 func canonicalApplyFailureDescriptors() []applyFailureDescriptor {
 	return []applyFailureDescriptor{
 		{kind: FailureOperationConflict, sentinel: journal.ErrOperationConflict, extract: extractOperationConflict, validate: validateOperationConflict, reconstruct: reconstructOperationConflict},
+		{kind: FailureConditionFailed, sentinel: journal.ErrConditionFailed, extract: extractConditionFailure, validate: validateConditionFailure, reconstruct: reconstructConditionFailure},
+		{kind: FailureActivityConflict, sentinel: journal.ErrActivityConflict, extract: extractActivityConflict, validate: validateActivityConflict, reconstruct: reconstructActivityConflict},
 		{kind: FailureGenesis, sentinel: journal.ErrGenesis},
 		{kind: FailureAuthorityScope, sentinel: journal.ErrAuthorityScope},
 		{kind: FailureAssignmentLifecycle, sentinel: journal.ErrAssignmentLifecycle},
@@ -150,9 +291,20 @@ type AmbiguousApplyFailureError struct {
 	kinds  []ApplyFailureKind
 }
 
+// causeClause renders the wrapped cause, or nothing at all when there is none.
+// An error that always printed "cause: <nil>" told the reader that a cause was
+// expected and lost, which is a different and much more alarming claim than
+// "this failure was diagnosed here and has no underlying error".
+func causeClause(cause error) string {
+	if cause == nil {
+		return ""
+	}
+	return "; cause: " + cause.Error()
+}
+
 func (e *AmbiguousApplyFailureError) Error() string {
-	return fmt.Sprintf("provenance: ambiguous apply failure -- class=%s field=%s stage=%s matched=%v; reason: %s; impact: %s; fix: %s; cause: %v",
-		e.Class, e.Field, e.Stage, e.kinds, e.Reason, e.Impact, e.Fix, e.cause)
+	return fmt.Sprintf("provenance: ambiguous apply failure -- class=%s field=%s stage=%s matched=%v; reason: %s; impact: %s; fix: %s%s",
+		e.Class, e.Field, e.Stage, e.kinds, e.Reason, e.Impact, e.Fix, causeClause(e.cause))
 }
 
 func (e *AmbiguousApplyFailureError) Unwrap() error { return e.cause }
@@ -209,11 +361,21 @@ func failureDescriptor(kind ApplyFailureKind) (applyFailureDescriptor, bool) {
 type CanonicalApplyFailure struct {
 	Kind    ApplyFailureKind `json:"kind"`
 	Message string           `json:"message"`
-	// ConflictField, when Kind is FailureOperationConflict, carries the first
-	// differing identity field so a decoded conflict re-exposes a typed
-	// *journal.OperationConflict via errors.As.
-	ConflictField string `json:"conflict_field,omitempty"`
-	OperationID   string `json:"operation_id,omitempty"`
+	// ConflictAxis and ConflictIndex are set on FailureOperationConflict.
+	// Index is -1 for scalar axes (Actor/Authority/Command) or collection-length mismatch.
+	ConflictAxis  *journal.ConflictAxis `json:"conflict_axis,omitempty"`
+	ConflictIndex *int                  `json:"conflict_index,omitempty"`
+	// Condition fields are set only on FailureConditionFailed. Pointers make
+	// omitted metadata distinguishable from its valid zero values on decode.
+	ConditionIndex    *int                            `json:"condition_index,omitempty"`
+	ConditionKind     *journal.ConditionKind          `json:"condition_kind,omitempty"`
+	ConditionReason   *journal.ConditionFailureReason `json:"condition_reason,omitempty"`
+	AssertedJournalID *int64                          `json:"asserted_journal_id,omitempty"`
+	ActualJournalID   *int64                          `json:"actual_journal_id,omitempty"`
+	// Activity fields are set only on FailureActivityConflict.
+	ActivityID        string `json:"activity_id,omitempty"`
+	ExistingJournalID *int64 `json:"existing_journal_id,omitempty"`
+	OperationID       string `json:"operation_id,omitempty"`
 }
 
 // DBOSStepOutcome is the closed step checkpoint: exactly one of Success or
@@ -233,6 +395,19 @@ type DBOSStepOutcome struct {
 	ShortCircuited bool `json:"short_circuited,omitempty"`
 }
 
+// UnmarshalJSON rejects unknown and duplicate fields before a recovered outcome
+// can reach post-validation. The semantic one-of and typed metadata checks stay
+// in decodeDBOSStepOutcome so direct and recovered delivery share one authority.
+func (o *DBOSStepOutcome) UnmarshalJSON(raw []byte) error {
+	type wire DBOSStepOutcome
+	var decoded wire
+	if err := decodeStrictDBOSJSON(raw, &decoded); err != nil {
+		return fmt.Errorf("decode DBOS step outcome JSON: %w", err)
+	}
+	*o = DBOSStepOutcome(decoded)
+	return nil
+}
+
 // encodeDBOSApplySuccess encodes a committed reducer result as a closed success
 // outcome. It validates the result is a CommittedExact, slot-sorts and
 // deduplicates the bindings, revalidates every typed ID, and stamps the exact
@@ -245,36 +420,37 @@ func encodeDBOSApplySuccess(contract dbosContractSnapshot, operation journal.Ope
 				"operation must reconstruct as CommittedExact",
 			operation, result.Kind)
 	}
+	if len(result.ResultSlots) > journal.MaxCanonicalResultSlots {
+		return DBOSStepOutcome{}, fmt.Errorf("%w: provenance: encode success outcome for operation %q -- result-slot count %d exceeds maximum %d -- where: step success encode; when: before allocating transport collections; impact: nothing is checkpointed; fix: split the operation into bounded mutations", journal.ErrResultSlotIntegrity, operation, len(result.ResultSlots), journal.MaxCanonicalResultSlots)
+	}
 	slots := make([]CanonicalResultSlot, 0, len(result.ResultSlots))
 	seen := make(map[string]struct{}, len(result.ResultSlots))
 	for _, b := range result.ResultSlots {
 		if _, dup := seen[string(b.Slot)]; dup {
 			return DBOSStepOutcome{}, fmt.Errorf(
-				"provenance: encode success outcome for operation %q -- duplicate result slot %q -- "+
+				"%w: provenance: encode success outcome for operation %q -- duplicate result slot %q -- "+
 					"where: step success encode; impact: the binding map is ambiguous; fix: each "+
 					"ResultSlotID must be unique within one operation (§3.2)",
-				operation, b.Slot)
+				journal.ErrResultSlotIntegrity, operation, b.Slot)
 		}
 		seen[string(b.Slot)] = struct{}{}
-		taskID := ""
-		if b.TaskID != nil {
-			if err := journalValidateTaskID(*b.TaskID); err != nil {
-				return DBOSStepOutcome{}, fmt.Errorf(
-					"provenance: encode success outcome for operation %q slot %q: %w", operation, b.Slot, err)
-			}
-			taskID = b.TaskID.String()
+		slot, err := canonicalResultSlotFromBinding(b)
+		if err != nil {
+			return DBOSStepOutcome{}, fmt.Errorf(
+				"provenance: encode success outcome for operation %q slot %q: %w", operation, b.Slot, err)
 		}
-		slots = append(slots, CanonicalResultSlot{
-			Slot:              string(b.Slot),
-			ProducedJournalID: int64(b.ProducedJournalID),
-			Kind:              int(b.Kind),
-			TaskID:            taskID,
-		})
+		slots = append(slots, slot)
 	}
 	sort.Slice(slots, func(i, j int) bool { return slots[i].Slot < slots[j].Slot })
+	if len(result.EmittedEvents) > MaxCanonicalEffects {
+		return DBOSStepOutcome{}, fmt.Errorf("%w: provenance: encode success outcome for operation %q -- emitted-event count %d exceeds maximum %d before allocation -- where: step success encode; impact: the checkpoint is rejected; fix: split the operation into bounded effects", journal.ErrResultSlotIntegrity, operation, len(result.EmittedEvents), MaxCanonicalEffects)
+	}
 	emitted := make([]int64, len(result.EmittedEvents))
-	for i, e := range result.EmittedEvents {
-		emitted[i] = int64(e)
+	for i, event := range result.EmittedEvents {
+		emitted[i] = int64(event)
+	}
+	if err := validateCanonicalMutationResult(int64(result.AnchorJournalID), emitted, slots); err != nil {
+		return DBOSStepOutcome{}, fmt.Errorf("provenance: encode success outcome for operation %q: %w", operation, err)
 	}
 	return DBOSStepOutcome{
 		Schema:         contract.outcomeSchema,
@@ -307,7 +483,7 @@ func encodeDBOSApplyFailure(contract dbosContractSnapshot, operation journal.Ope
 	}
 	if descriptor.extract != nil {
 		if extractErr := descriptor.extract(err, fail); extractErr != nil {
-			return DBOSStepOutcome{}, diagnostic(DBOSDiagClassClassify, DBOSDiagFieldConflictField,
+			return DBOSStepOutcome{}, diagnostic(DBOSDiagClassClassify, DBOSDiagFieldConflictAxis,
 				DBOSDiagStageOutcomeEncode, operation, "", extractErr.Error(), "nothing is checkpointed",
 				"return the descriptor's complete typed domain error", err)
 		}
@@ -350,7 +526,100 @@ func decodeDBOSStepOutcome(contract dbosContractSnapshot, o DBOSStepOutcome) (Ca
 		}
 		return CanonicalMutationResult{}, descriptor.asError(o.Failure)
 	}
+	if err := validateCanonicalMutationResult(o.Success.AnchorJournalID, o.Success.EmittedEvents, o.Success.ResultSlots); err != nil {
+		return CanonicalMutationResult{}, diagnostic(DBOSDiagClassOutcomeDecode, DBOSDiagFieldKind,
+			DBOSDiagStageOutcomeDecode, operation, "", err.Error(), "the malformed success checkpoint is rejected",
+			"restore slot metadata produced by the same committed operation", err)
+	}
 	return *o.Success, nil
+}
+
+func canonicalResultSlotFromBinding(binding journal.ResultSlotBinding) (CanonicalResultSlot, error) {
+	if err := journal.ValidateResultSlotBinding(binding); err != nil {
+		return CanonicalResultSlot{}, err
+	}
+	slot := CanonicalResultSlot{
+		Slot:              string(binding.Slot),
+		ProducedJournalID: int64(binding.ProducedJournalID),
+		Kind:              int(binding.Kind),
+	}
+	if binding.TaskID != nil {
+		slot.TaskID = binding.TaskID.String()
+	}
+	if binding.ActivityID != nil {
+		slot.ActivityID = binding.ActivityID.String()
+	}
+	return slot, nil
+}
+
+func resultSlotBindingFromCanonical(slot CanonicalResultSlot) (journal.ResultSlotBinding, error) {
+	binding := journal.ResultSlotBinding{
+		Slot:              journal.ResultSlotID(slot.Slot),
+		ProducedJournalID: journal.JournalID(slot.ProducedJournalID),
+		Kind:              journal.JournalKind(slot.Kind),
+	}
+	if slot.TaskID != "" {
+		taskID, err := ptypes.ParseTaskID(slot.TaskID)
+		if err != nil {
+			return journal.ResultSlotBinding{}, fmt.Errorf("%w: parse TaskID %q: %v", journal.ErrResultSlotIntegrity, slot.TaskID, err)
+		}
+		binding.TaskID = &taskID
+	}
+	if slot.ActivityID != "" {
+		activityID, err := ptypes.ParseActivityID(slot.ActivityID)
+		if err != nil {
+			return journal.ResultSlotBinding{}, fmt.Errorf("%w: parse ActivityID %q: %v", journal.ErrResultSlotIntegrity, slot.ActivityID, err)
+		}
+		binding.ActivityID = &activityID
+	}
+	if err := journal.ValidateResultSlotBinding(binding); err != nil {
+		return journal.ResultSlotBinding{}, err
+	}
+	return binding, nil
+}
+
+func validateCanonicalResultSlots(slots []CanonicalResultSlot) error {
+	if len(slots) > journal.MaxCanonicalResultSlots {
+		return fmt.Errorf("%w: result-slot count %d exceeds maximum %d before validation allocation", journal.ErrResultSlotIntegrity, len(slots), journal.MaxCanonicalResultSlots)
+	}
+	for i, slot := range slots {
+		if i > 0 && slots[i-1].Slot >= slot.Slot {
+			return fmt.Errorf("%w: result slots must be unique and sorted: slot %q follows %q", journal.ErrResultSlotIntegrity, slot.Slot, slots[i-1].Slot)
+		}
+		if _, err := resultSlotBindingFromCanonical(slot); err != nil {
+			return fmt.Errorf("result slot %d (%q): %w", i, slot.Slot, err)
+		}
+	}
+	return nil
+}
+
+// validateCanonicalMutationResult validates the complete journal-anchored
+// result, not only its slot arms. This is shared by success encode/decode and
+// equality so a malformed anchor/event closure cannot cross one boundary and
+// be accepted at another.
+func validateCanonicalMutationResult(anchor int64, emitted []int64, slots []CanonicalResultSlot) error {
+	if anchor <= 0 {
+		return fmt.Errorf("%w: anchor_journal_id must be positive", journal.ErrResultSlotIntegrity)
+	}
+	if len(emitted) > MaxCanonicalEffects {
+		return fmt.Errorf("%w: emitted-event count %d exceeds maximum %d before validation iteration", journal.ErrResultSlotIntegrity, len(emitted), MaxCanonicalEffects)
+	}
+	previous := anchor
+	for i, event := range emitted {
+		if event <= previous {
+			return fmt.Errorf("%w: emitted_events[%d]=%d is not strictly after %d", journal.ErrResultSlotIntegrity, i, event, previous)
+		}
+		previous = event
+	}
+	if err := validateCanonicalResultSlots(slots); err != nil {
+		return err
+	}
+	for i, slot := range slots {
+		if slot.ProducedJournalID <= anchor {
+			return fmt.Errorf("%w: result_slots[%d] produced journal %d is not after anchor %d", journal.ErrResultSlotIntegrity, i, slot.ProducedJournalID, anchor)
+		}
+	}
+	return nil
 }
 
 func validateApplyFailureEnvelope(outerOperation string, failure *CanonicalApplyFailure, descriptor applyFailureDescriptor) error {
@@ -372,15 +641,64 @@ func validateApplyFailureEnvelope(outerOperation string, failure *CanonicalApply
 	if failure.Message == "" {
 		return reject(DBOSDiagFieldMessage, "failure message is empty", "restore the original actionable domain failure message")
 	}
-	if descriptor.kind != FailureOperationConflict && failure.ConflictField != "" {
-		return reject(DBOSDiagFieldConflictField, "conflict_field is forbidden for this failure kind", "remove conflict metadata from non-conflict failures")
+	metadataReject := func(field DBOSDiagnosticField, reason, fix string) error {
+		return reject(field, reason, fix)
+	}
+	if descriptor.kind != FailureOperationConflict && (failure.ConflictAxis != nil || failure.ConflictIndex != nil) {
+		return metadataReject(DBOSDiagFieldConflictAxis, "operation conflict metadata is forbidden for this failure kind", failureMetadataRemovalFix(DBOSDiagFieldConflictAxis))
+	}
+	if descriptor.kind != FailureConditionFailed && (failure.ConditionIndex != nil || failure.ConditionKind != nil || failure.ConditionReason != nil || failure.AssertedJournalID != nil || failure.ActualJournalID != nil) {
+		return metadataReject(DBOSDiagFieldConditionIndex, "condition failure metadata is forbidden for this failure kind", failureMetadataRemovalFix(DBOSDiagFieldConditionIndex))
+	}
+	if descriptor.kind != FailureActivityConflict && (failure.ActivityID != "" || failure.ExistingJournalID != nil) {
+		return metadataReject(DBOSDiagFieldActivityID, "activity conflict metadata is forbidden for this failure kind", failureMetadataRemovalFix(DBOSDiagFieldActivityID))
 	}
 	if descriptor.validate != nil {
 		if err := descriptor.validate(failure); err != nil {
-			return reject(DBOSDiagFieldConflictField, err.Error(), "restore the descriptor-required conflict metadata")
+			field := DBOSDiagFieldConflictAxis
+			var metadata *conflictMetadataError
+			if errors.As(err, &metadata) {
+				field = metadata.field
+			}
+			return reject(field, err.Error(), failureRepairFix(descriptor.kind, field))
 		}
 	}
 	return nil
+}
+
+func failureRepairFix(kind ApplyFailureKind, field DBOSDiagnosticField) string {
+	switch kind {
+	case FailureOperationConflict:
+		return "restore conflict_axis and conflict_index from the canonical OperationConflict descriptor, using -1 for scalar or length-mismatch conflicts"
+	case FailureConditionFailed:
+		return "restore condition_index, kind, reason, and observed journal IDs from the canonical ConditionFailure descriptor"
+	case FailureActivityConflict:
+		return "restore activity_id and existing_journal_id from the canonical ActivityConflict descriptor"
+	default:
+		switch field {
+		case DBOSDiagFieldConflictAxis, DBOSDiagFieldConflictIndex:
+			return "remove operation-conflict metadata from this failure descriptor"
+		case DBOSDiagFieldConditionIndex, DBOSDiagFieldConditionKind, DBOSDiagFieldConditionReason, DBOSDiagFieldAssertedJournalID, DBOSDiagFieldActualJournalID:
+			return "remove condition-failure metadata from this failure descriptor"
+		case DBOSDiagFieldActivityID, DBOSDiagFieldExistingJournalID:
+			return "remove activity-conflict metadata from this failure descriptor"
+		default:
+			return "restore the complete metadata for the closed failure descriptor"
+		}
+	}
+}
+
+func failureMetadataRemovalFix(field DBOSDiagnosticField) string {
+	switch field {
+	case DBOSDiagFieldConflictAxis, DBOSDiagFieldConflictIndex:
+		return "remove operation-conflict metadata from this failure descriptor"
+	case DBOSDiagFieldConditionIndex, DBOSDiagFieldConditionKind, DBOSDiagFieldConditionReason, DBOSDiagFieldAssertedJournalID, DBOSDiagFieldActualJournalID:
+		return "remove condition-failure metadata from this failure descriptor"
+	case DBOSDiagFieldActivityID, DBOSDiagFieldExistingJournalID:
+		return "remove activity-conflict metadata from this failure descriptor"
+	default:
+		return "remove metadata that belongs to a different closed failure descriptor"
+	}
 }
 
 func (d applyFailureDescriptor) asError(failure *CanonicalApplyFailure) error {
@@ -403,14 +721,26 @@ func diagnostic(class DBOSDiagnosticClass, field DBOSDiagnosticField, stage DBOS
 // ID. Every canonical input variant for one OperationID must address one DBOS
 // workflow; fingerprint remains the stricter input/step collision guard below.
 func workflowIdentity(contract dbosContractSnapshot, applicationVersion string, operation OperationID) string {
+	return workflowIdentityForKind(contract, applicationVersion, operation, dbosOperationKindApply)
+}
+
+func workflowIdentityForKind(contract dbosContractSnapshot, applicationVersion string, operation OperationID, kind dbosOperationKind) string {
 	h := sha256.New()
-	for _, value := range [][]byte{
+	values := [][]byte{
 		[]byte(contract.applyInputSchema), []byte(contract.contextSchema),
 		[]byte(contract.outcomeSchema), []byte(contract.workflowSchema),
 		[]byte(contract.workflowPrefix), []byte(contract.stepPrefix),
+		// pinnedLibrary is a frozen salt, not a live version claim: see
+		// dbosPinnedLibraryConst. Its value keys this whole durable namespace.
 		[]byte(contract.pinnedLibrary),
 		[]byte(applicationVersion), []byte(operation),
-	} {
+	}
+	// Preserve generic workflow identities exactly; only typed extensions add a
+	// kind discriminator to avoid attaching to a generic workflow by OperationID.
+	if kind != dbosOperationKindApply {
+		values = append(values, []byte(kind))
+	}
+	for _, value := range values {
 		writeFingerprintValue(h, value)
 	}
 	return fmt.Sprintf("%x", h.Sum(nil))
@@ -427,6 +757,9 @@ func workflowIdentity(contract dbosContractSnapshot, applicationVersion string, 
 // via the adapter field, NOT from the package-level const aliases — the snapshot is
 // the sole identity authority per Proposal 54.
 func fingerprint(contract dbosContractSnapshot, applicationVersion string, input DBOSApplyInput) (string, error) {
+	if !input.Kind.known() {
+		return "", fmt.Errorf("unsupported DBOS operation kind %q", input.Kind)
+	}
 	identity, err := decodeDBOSContext(contract, input.Context)
 	if err != nil {
 		return "", err
@@ -444,6 +777,9 @@ func fingerprint(contract dbosContractSnapshot, applicationVersion string, input
 		binary.BigEndian.PutUint64(authority[:], uint64(*identity.AuthorityJournalID))
 		values = append(values, authority[:])
 	}
+	if input.Kind != dbosOperationKindApply {
+		values = append(values, []byte(input.Kind))
+	}
 	values = append(values, identity.CommandDigest, input.Mutation)
 	for _, value := range values {
 		writeFingerprintValue(h, value)
@@ -456,18 +792,4 @@ func writeFingerprintValue(h hash.Hash, value []byte) {
 	binary.BigEndian.PutUint64(size[:], uint64(len(value)))
 	_, _ = h.Write(size[:])
 	_, _ = h.Write(value)
-}
-
-// journalValidateTaskID mirrors the journal package's task-ID validity check for a
-// non-zero, parseable task identity, used when a result slot resolves a task_event
-// produced row.
-func journalValidateTaskID(id ptypes.TaskID) error {
-	if id == (ptypes.TaskID{}) {
-		return fmt.Errorf("%w: result-slot task ID is the zero value", ptypes.ErrInvalidID)
-	}
-	parsed, err := ptypes.ParseTaskID(id.String())
-	if err != nil || parsed != id {
-		return fmt.Errorf("%w: result-slot task ID does not round-trip", ptypes.ErrInvalidID)
-	}
-	return nil
 }

@@ -132,7 +132,10 @@ the independently authored wire, malformed-outcome, and exact retry-target
 contracts. Durable domain failures use a closed set of stable string discriminators
 (`ApplyFailureKind`). Exactly one descriptor match checkpoints the failure;
 zero or multiple matches leave the error on DBOS's retryable Go-error channel.
-SQLite's `busy_timeout=5000` is the sole local contention wait. A borrowed write
+SQLite's `busy_timeout=5000` is the sole local contention wait, with one
+sanctioned exception: schema activation (`activateSchemaWithRetry`, reached from
+`Open` and `OpenBorrowed`) wraps a bounded 30s outer budget around the whole
+activation, where each attempt's wait is still `busy_timeout`. A borrowed write
 performs one operation after its liveness check; any `BUSY` or `LOCKED` error
 that escapes SQLite is returned unchanged. Inside the adapter, DBOS owns the
 configured durable step retries for that escaped infrastructure error. There is

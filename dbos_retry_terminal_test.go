@@ -15,13 +15,12 @@ import (
 
 	dbos "github.com/dbos-inc/dbos-transact-golang/dbos"
 	"github.com/google/uuid"
-	zs "zombiezen.com/go/sqlite"
 )
 
 var errScriptedJournalFault = errors.New("scripted borrowed-journal dependency fault")
 
 type scriptedRetryJournal struct {
-	JournalAPI
+	Journal
 	mu          sync.Mutex
 	failures    int64
 	fault       error
@@ -59,7 +58,7 @@ func (j *scriptedRetryJournal) Apply(input OperationInput) (CommittedResult, err
 		}
 		return CommittedResult{}, fmt.Errorf("%w on attempt %d", fault, attempt)
 	}
-	result, err := j.JournalAPI.Apply(input)
+	result, err := j.Journal.Apply(input)
 	if err == nil {
 		j.writes.Add(1)
 	}
@@ -74,7 +73,7 @@ func (j *scriptedRetryJournal) LookupCommitted(operation OperationID) (Committed
 	if fault != nil {
 		return CommittedResult{}, fault
 	}
-	return j.JournalAPI.LookupCommitted(operation)
+	return j.Journal.LookupCommitted(operation)
 }
 
 type scriptedRetryTracker struct {
@@ -82,7 +81,7 @@ type scriptedRetryTracker struct {
 	journal *scriptedRetryJournal
 }
 
-func (t *scriptedRetryTracker) Journal() JournalAPI { return t.journal }
+func (t *scriptedRetryTracker) Journal() Journal { return t.journal }
 
 type retryTerminalStack struct {
 	root      dbos.DBOSContext
@@ -119,7 +118,7 @@ func newRetryTerminalStack(t *testing.T, name string, options DBOSStepOptions) *
 		t.Fatal(err)
 	}
 	authority, _ := slotJournalID(genesis, "authority")
-	journal := &scriptedRetryJournal{JournalAPI: borrowed.Journal()}
+	journal := &scriptedRetryJournal{Journal: borrowed.Journal()}
 	tracker := &scriptedRetryTracker{Tracker: borrowed, journal: journal}
 	adapter, err := NewDBOSAdapter(root, tracker, DBOSAdapterConfig{StepOptions: options})
 	if err != nil {
@@ -185,18 +184,21 @@ func TestDBOSRegisteredBorrowedJournalRetryAndTerminalSemantics(t *testing.T) {
 		}
 	})
 
-	for _, code := range []zs.ResultCode{zs.ResultBusy, zs.ResultLocked} {
-		code := code
-		t.Run("direct borrowed "+code.String()+" escapes unchanged after one attempt", func(t *testing.T) {
+	for _, faultCase := range []struct {
+		name  string
+		fault error
+	}{{"busy", errors.New("injected SQLite busy")}, {"locked", errors.New("injected SQLite locked")}} {
+		faultCase := faultCase
+		t.Run("direct borrowed "+faultCase.name+" escapes unchanged after one attempt", func(t *testing.T) {
 			maxOneRetry.reset(0, nil)
 			borrowed := maxOneRetry.borrowed.(*borrowedTracker)
-			fault := code.ToError()
+			fault := faultCase.fault
 			var calls atomic.Int64
 			borrowed.journalApplyFault = func() error {
 				calls.Add(1)
 				return fault
 			}
-			op := maxOneRetry.operation("retry-direct-operation-" + code.String())
+			op := maxOneRetry.operation("retry-direct-operation-" + faultCase.name)
 			before := snapshotSQLTables(t, maxOneRetry.db, auditedSnapshotTableNames(t, maxOneRetry.db)...)
 			_, err := maxOneRetry.borrowed.Journal().Apply(op)
 			if err != fault || calls.Load() != 1 {
@@ -209,17 +211,17 @@ func TestDBOSRegisteredBorrowedJournalRetryAndTerminalSemantics(t *testing.T) {
 			borrowed.journalApplyFault = nil
 		})
 
-		t.Run("DBOS "+code.String()+" retry recovers", func(t *testing.T) {
+		t.Run("DBOS "+faultCase.name+" retry recovers", func(t *testing.T) {
 			maxOneRetry.reset(0, nil)
 			borrowed := maxOneRetry.borrowed.(*borrowedTracker)
 			var borrowedCalls atomic.Int64
 			borrowed.journalApplyFault = func() error {
 				if borrowedCalls.Add(1) == 1 {
-					return code.ToError()
+					return faultCase.fault
 				}
 				return nil
 			}
-			op := maxOneRetry.operation("retry-dbos-operation-" + code.String())
+			op := maxOneRetry.operation("retry-dbos-operation-" + faultCase.name)
 			result, err := maxOneRetry.adapter.Apply(context.Background(), op)
 			if err != nil || result.Kind != CommittedExact {
 				t.Fatalf("Apply result=%#v err=%v", result, err)
@@ -243,12 +245,12 @@ func TestDBOSRegisteredBorrowedJournalRetryAndTerminalSemantics(t *testing.T) {
 			}
 		})
 
-		t.Run("DBOS "+code.String()+" exhaustion is terminal", func(t *testing.T) {
+		t.Run("DBOS "+faultCase.name+" exhaustion is terminal", func(t *testing.T) {
 			maxOneRetry.reset(0, nil)
 			borrowed := maxOneRetry.borrowed.(*borrowedTracker)
 			var borrowedCalls atomic.Int64
-			borrowed.journalApplyFault = func() error { borrowedCalls.Add(1); return code.ToError() }
-			op := maxOneRetry.operation("retry-dbos-exhaust-operation-" + code.String())
+			borrowed.journalApplyFault = func() error { borrowedCalls.Add(1); return faultCase.fault }
+			op := maxOneRetry.operation("retry-dbos-exhaust-operation-" + faultCase.name)
 			_, err := maxOneRetry.adapter.Apply(context.Background(), op)
 			assertTerminalDiagnostic(t, err, op.OperationID)
 			if maxOneRetry.callbacks.Load() != 2 || borrowedCalls.Load() != 2 || maxOneRetry.journal.attempts.Load() != 2 || maxOneRetry.journal.writes.Load() != 0 {

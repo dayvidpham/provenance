@@ -13,8 +13,6 @@ import (
 	"github.com/dayvidpham/provenance/pkg/ptypes"
 	"github.com/google/uuid"
 	"gopkg.in/yaml.v3"
-	zs "zombiezen.com/go/sqlite"
-	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 // openTestDB delegates to shared testutil.OpenTestDB.
@@ -114,17 +112,11 @@ func TestOpenAndClose(t *testing.T) {
 
 func TestOpenRestoresRuntimeForeignKeyEnforcement(t *testing.T) {
 	db := openTestDB(t)
-	db.Lock()
-	defer db.Unlock()
-	enabled := 0
-	if err := sqlitex.Execute(db.Conn(), "PRAGMA foreign_keys", &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
-		enabled = stmt.ColumnInt(0)
-		return nil
-	}}); err != nil {
-		t.Fatalf("read runtime foreign-key state: %v", err)
-	}
-	if enabled != 1 {
-		t.Fatalf("runtime foreign-key enforcement = %d after Open, want 1", enabled)
+	task := makeTask("test-ns", "foreign-key check")
+	missingOwner := ptypes.AgentID{Namespace: "test-ns", UUID: uuid.Must(uuid.NewV7())}
+	task.Owner = &missingOwner
+	if err := db.SeedLegacyTaskRow(task); err == nil {
+		t.Fatal("runtime connection accepted a task whose owner does not exist; foreign-key enforcement is disabled")
 	}
 }
 
@@ -1092,8 +1084,8 @@ func loadSQLiteFixtures(t *testing.T) sqliteFixtures {
 // Target 1: task metadata materialization — the journaled fold's dynamic SET clause
 // ---------------------------------------------------------------------------
 
-// TestFoldUpdate_YAMLPermutations exercises the production fold's dynamic materialized-
-// column SET construction (materializeTaskEventColumnsLocked) over every combination of
+// TestFoldUpdate_YAMLPermutations exercises the production V1 task-event materializer's
+// dynamic column SET construction (materializeV1TaskEvent) over every combination of
 // the metadata columns a provenance.task.updated event carries — title, description,
 // priority, phase, notes. It drives db.Apply directly, the same fold Session.Update
 // reaches; the retired db.UpdateTask direct-write mutator is gone. status and owner are

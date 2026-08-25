@@ -39,23 +39,23 @@ func IsMutationFamilyKind(kind EventKind) bool {
 	}
 }
 
+// IsReducerDerivedTaskEventKind reports task-event kinds that are emitted only
+// as the journal representation of another reducer-owned operation shape. A
+// generic supplemental TaskEvent must not impersonate task creation, migration,
+// or one of the typed relationship/annotation effect families.
+func IsReducerDerivedTaskEventKind(kind EventKind) bool {
+	switch kind {
+	case EventKindTaskCreated, EventKindTaskMigrated:
+		return true
+	default:
+		return IsMutationFamilyKind(kind)
+	}
+}
+
 // MutationFamilyKindForSort maps a relationship/annotation effect sort to the fixed
 // per-family EventKind its journal row carries. A non-family sort returns ok=false.
 func MutationFamilyKindForSort(sort EffectSort) (EventKind, bool) {
-	switch sort {
-	case EffectEdgeAdd:
-		return EventKindEdgeAdded, true
-	case EffectEdgeRemove:
-		return EventKindEdgeRemoved, true
-	case EffectLabelAdd:
-		return EventKindLabelAdded, true
-	case EffectLabelRemove:
-		return EventKindLabelRemoved, true
-	case EffectCommentAdd:
-		return EventKindCommentAdded, true
-	default:
-		return "", false
-	}
+	return semanticMutationFamilyKind(sort)
 }
 
 // ---------------------------------------------------------------------------

@@ -39,7 +39,7 @@
       # Vendor hash for buildGoModule. No vendor/ dir, so Nix
       # downloads deps and verifies against this hash.
       # Run `nix build` once with lib.fakeHash to get the real hash.
-      vendorHash = "sha256-aZ7zfq0M1U4xRRWqakTwa5aKacKhlmkoIXc39DGf5jY=";
+      vendorHash = "sha256-ORk/i5aXrq/BWeK/tUCdep3nyuh5dVVVLueg0jZjra0=";
 
       # CLI tools available in the dev shell
       devTools = pkgs: with pkgs; [
@@ -92,8 +92,7 @@
 
               checkPhase = ''
                 runHook preCheck
-                go test -count=1 -shuffle=on -fullpath -timeout=10m ./...
-                CGO_ENABLED=1 go test -race -count=1 -shuffle=on -fullpath -timeout=20m ./...
+                CGO_ENABLED=1 go test -race -shuffle=on -fullpath -timeout=20m ./...
                 CGO_ENABLED=0 go build ./...
                 ${extraCheckPhase}
                 runHook postCheck

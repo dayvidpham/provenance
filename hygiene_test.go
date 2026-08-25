@@ -32,10 +32,19 @@ const (
 	ymlExtension      shippedExtension = ".yml"
 )
 
+// enduringVocabularyRules reject names for transient delivery process artefacts
+// — the review round, wave, or task that produced a change. Such a name is
+// meaningless to a reader of the shipped source and goes stale the moment the
+// process moves on. Names for the durable protocol domain (the Reviewer role,
+// the review phase a task is in) are legitimate and are not matched here: the
+// rules require a process-artefact suffix (round, wave, cycle, pass, evidence,
+// finding, verdict) or an explicit round number.
 var enduringVocabularyRules = []vocabularyRule{
 	{"Aura task identifier", `\baura` + `-plugins-[a-z0-9]+\b`},
 	{"delivery-slice label", `\b` + `SliceS` + `[0-9]+\b`},
 	{"review-wave label", `\b` + `REVIEW-WAVE` + `-[A-Z0-9-]+\b`},
+	{"review-process identifier", `(?i)(func|type|var|const)[ \t]+[a-z0-9_]*` + `review` + `(er)?[_]?(round|wave|cycle|pass|evidence|finding|verdict)`},
+	{"numbered-round identifier", `(?i)(func|type|var|const)[ \t]+[a-z0-9_]*(` + `review|fix|blocker` + `)?[_]?(` + `round|wave|cycle` + `)[_]?[0-9]`},
 }
 
 var shippedExtensions = map[shippedExtension]struct{}{
@@ -69,9 +78,43 @@ func TestRepositoryTreeUsesEnduringVocabulary(t *testing.T) {
 	}
 }
 
+// vocabularyRuleFixtures pairs every rule with a source fragment it must
+// reject. TestRepositoryVocabularyScannerRejectsEveryRuleFixture asserts the
+// pairing is total, so a rule added without a proof-of-firing fixture — or a
+// rule whose pattern silently stops matching — fails the suite.
+var vocabularyRuleFixtures = map[string]string{
+	"Aura task identifier":      strings.Join([]string{"aura", "plugins", "forbidden"}, "-"),
+	"delivery-slice label":      strings.Join([]string{"Slice", "S3"}, ""),
+	"review-wave label":         strings.Join([]string{"REVIEW", "WAVE", "B2"}, "-"),
+	"review-process identifier": strings.Join([]string{"func Test", "Review", "Evidence", "Rejects"}, ""),
+	"numbered-round identifier": strings.Join([]string{"func fix", "Round", "2Counts"}, ""),
+}
+
+func TestRepositoryVocabularyScannerRejectsEveryRuleFixture(t *testing.T) {
+	if len(vocabularyRuleFixtures) != len(enduringVocabularyRules) {
+		t.Fatalf("vocabulary fixtures cover %d rules, want %d: every rule needs a known-bad fixture", len(vocabularyRuleFixtures), len(enduringVocabularyRules))
+	}
+	for _, rule := range enduringVocabularyRules {
+		fixture, ok := vocabularyRuleFixtures[rule.name]
+		if !ok {
+			t.Fatalf("rule %q has no known-bad fixture; add one to vocabularyRuleFixtures", rule.name)
+		}
+		findings := inspectVocabulary("fixture.go", "package fixture\n"+fixture+"() {}\n", enduringVocabularyRules)
+		matched := false
+		for _, finding := range findings {
+			if finding.rule == rule.name {
+				matched = true
+			}
+		}
+		if !matched {
+			t.Errorf("rule %q did not fire on its known-bad fixture %q; the pattern no longer detects the shape it was written for", rule.name, fixture)
+		}
+	}
+}
+
 func TestRepositoryVocabularyScannerDetectsForbiddenFixture(t *testing.T) {
 	root := t.TempDir()
-	fixture := strings.Join([]string{"aura", "plugins", "forbidden"}, "-")
+	fixture := vocabularyRuleFixtures["Aura task identifier"]
 	if err := os.WriteFile(filepath.Join(root, "shipped.go"), []byte("package fixture // "+fixture), 0o600); err != nil {
 		t.Fatal(err)
 	}

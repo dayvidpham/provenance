@@ -55,11 +55,13 @@ var dbosCanonicalFieldInventory = map[EffectSort][]string{
 	EffectLabelRemove:         {"ResultSlot", "RecordedAtOverride", "TaskID", "Label", "Contexts.count", "Contexts.kind", "Contexts.identity"},
 	EffectCommentAdd:          {"ResultSlot", "RecordedAtOverride", "TaskID", "CommentIdentity", "CommentAuthor", "CommentBody", "Contexts.count", "Contexts.kind", "Contexts.identity"},
 	EffectTaskCreateAllocated: {"ResultSlot", "RecordedAtOverride", "TaskID", "Payload", "Contexts.count", "Contexts.kind", "Contexts.identity", "Title", "Description", "Type", "Priority", "Phase"},
+	// ActivityCreate: ResultSlot is required (proof-of-allocation). SQLite fold in .1.2.
+	EffectActivityCreate: {"ResultSlot", "RecordedAtOverride", "ActivityID", "ActivityAgentID", "ActivityPhase", "ActivityStage", "ActivityNotes"},
 }
 
 func TestDBOSCanonicalFieldInventoryIsClosed(t *testing.T) {
-	if len(dbosCanonicalFieldInventory) != 13 {
-		t.Fatalf("family inventory has %d sorts, want closed set of 13", len(dbosCanonicalFieldInventory))
+	if len(dbosCanonicalFieldInventory) != 14 {
+		t.Fatalf("family inventory has %d sorts, want closed set of 14", len(dbosCanonicalFieldInventory))
 	}
 	covered := map[string]bool{}
 	for _, fields := range dbosCanonicalFieldInventory {
@@ -78,6 +80,26 @@ func TestDBOSCanonicalFieldInventoryIsClosed(t *testing.T) {
 		}
 		if !covered[field] {
 			t.Fatalf("canonical Effect field %s has no DBOS completed-retry inventory entry", field)
+		}
+	}
+}
+
+func TestDBOSResultSlotTransportInventoryIsClosed(t *testing.T) {
+	bindings := []ResultSlotBinding{
+		{Slot: "task", ProducedJournalID: 1, Kind: JournalKindTaskEvent, TaskID: &TaskID{Namespace: "inventory", UUID: uuid.Must(uuid.NewV7())}},
+		// Activity slot (JournalKindActivity) reserved for later vertical
+		{Slot: "authority", ProducedJournalID: 3, Kind: JournalKindAuthority},
+		{Slot: "decision", ProducedJournalID: 4, Kind: JournalKindDecision},
+		{Slot: "evidence", ProducedJournalID: 5, Kind: JournalKindEvidence},
+	}
+	for _, binding := range bindings {
+		wire, err := canonicalResultSlotFromBinding(binding)
+		if err != nil {
+			t.Fatalf("encode %s slot: %v", binding.Kind, err)
+		}
+		got, err := resultSlotBindingFromCanonical(wire)
+		if err != nil || !reflect.DeepEqual(got, binding) {
+			t.Fatalf("round-trip %s slot = %#v, %v; want %#v", binding.Kind, got, err, binding)
 		}
 	}
 }
@@ -117,7 +139,7 @@ func runDBOSFamilyBaseline(t *testing.T, env *dbosFamilyEnv, baseline dbosFamily
 			if len(diffs) != 1 || diffs[0] != wantDiff {
 				t.Fatalf("mutator changed fields %v, want exactly %s", diffs, wantDiff)
 			}
-			if _, err := PrepareMutationV1(candidate.Effects); err != nil {
+			if _, err := Canonicalize(OperationInput{Effects: candidate.Effects}); err != nil {
 				t.Fatalf("single-field candidate is not canonical: %v", err)
 			}
 			_, err := env.adapter.Apply(context.Background(), candidate)

@@ -6,6 +6,8 @@ package provenance
 // Tracker.
 
 import (
+	"context"
+
 	"github.com/dayvidpham/provenance/internal/journal"
 )
 
@@ -49,9 +51,33 @@ type (
 	ResultSlotBinding       = journal.ResultSlotBinding
 	CommittedResult         = journal.CommittedResult
 	OperationConflict       = journal.OperationConflict
+	// ConflictAxis is the broad discriminator on OperationConflict (five axes).
+	ConflictAxis            = journal.ConflictAxis
 	CanonicalMutation       = journal.CanonicalMutation
 	CanonicalMutationError  = journal.CanonicalMutationError
 	MutationEncodingVersion = journal.MutationEncodingVersion
+
+	// Condition types (§9.5 pre-conditions).
+	FactTaskScopeKind      = journal.FactTaskScopeKind
+	FactTaskScope          = journal.FactTaskScope
+	FactFilter             = journal.FactFilter
+	FactKind               = journal.FactKind
+	FactSelector           = journal.FactSelector
+	ConditionKind          = journal.ConditionKind
+	Condition              = journal.Condition
+	ConditionFailureReason = journal.ConditionFailureReason
+	ConditionFailure       = journal.ConditionFailure
+	FactPageRequest        = journal.FactPageRequest
+	DecisionQuery          = journal.DecisionQuery
+	EvidenceQuery          = journal.EvidenceQuery
+	FactCursor             = journal.FactCursor
+	DecisionRow            = journal.DecisionRow
+	EvidenceRow            = journal.EvidenceRow
+	DecisionPage           = journal.DecisionPage
+	EvidencePage           = journal.EvidencePage
+	FactQueryAPI           = journal.FactQueryAPI
+	// ActivityConflict is the typed conflict for ActivityCreate folds (later vertical).
+	ActivityConflict = journal.ActivityConflict
 
 	// Shared-reducer replay, migration, and preflight surface (§9, §13, §15).
 	TaskStatus                    = journal.TaskStatus
@@ -72,6 +98,7 @@ const (
 	JournalKindAuthority = journal.JournalKindAuthority
 	JournalKindDecision  = journal.JournalKindDecision
 	JournalKindEvidence  = journal.JournalKindEvidence
+	JournalKindActivity  = journal.JournalKindActivity
 
 	// OrderByRecordedAt is the non-causal readable-timeline display order and the
 	// default for display-facing listings; OrderByJournalID is the canonical order.
@@ -89,6 +116,23 @@ const (
 	MaxCanonicalContextsPerEffect = journal.MaxCanonicalContextsPerEffect
 	MaxCanonicalFieldBytes        = journal.MaxCanonicalFieldBytes
 	MaxCanonicalMutationBytes     = journal.MaxCanonicalMutationBytes
+	MaxCanonicalConditions        = journal.MaxCanonicalConditions
+	MaxFactFilterValues           = journal.MaxFactFilterValues
+	MaxFactQueryKinds             = journal.MaxFactQueryKinds
+	MaxFactPageSize               = journal.MaxFactPageSize
+	MaxCanonicalResultSlots       = journal.MaxCanonicalResultSlots
+
+	FactTaskAny      = journal.FactTaskAny
+	FactTaskUnscoped = journal.FactTaskUnscoped
+	FactTaskExact    = journal.FactTaskExact
+	FactDecision     = journal.FactDecision
+	FactEvidence     = journal.FactEvidence
+
+	ConditionExactFact       = journal.ConditionExactFact
+	ConditionCurrentFact     = journal.ConditionCurrentFact
+	ConditionFactMissing     = journal.ConditionFactMissing
+	ConditionFactMismatch    = journal.ConditionFactMismatch
+	ConditionCurrentMismatch = journal.ConditionCurrentMismatch
 
 	// Authority-kind and assignment-lifecycle closed enums (§4).
 	AuthorityKindBootstrap  = journal.AuthorityKindBootstrap
@@ -106,6 +150,16 @@ const (
 	EffectEvidence            = journal.EffectEvidence
 	EffectTaskCreate          = journal.EffectTaskCreate
 	EffectTaskCreateAllocated = journal.EffectTaskCreateAllocated
+	// EffectActivityCreate is the closed effect sort for activity birth (§Activity).
+	// Codec and normalization are complete in this vertical; SQLite fold in .1.2.
+	EffectActivityCreate = journal.EffectActivityCreate
+
+	// Conflict axes: five broad discriminators on OperationConflict (§11).
+	ConflictActor     = journal.ConflictActor
+	ConflictAuthority = journal.ConflictAuthority
+	ConflictCommand   = journal.ConflictCommand
+	ConflictCondition = journal.ConflictCondition
+	ConflictEffect    = journal.ConflictEffect
 
 	// Journaled relationship / annotation mutation-family effect sorts (§6 amendment).
 	EffectEdgeAdd     = journal.EffectEdgeAdd
@@ -161,26 +215,29 @@ var (
 	MigrationBaselineAssignmentID = journal.MigrationBaselineAssignmentID
 	StatusForEventKind            = journal.StatusForEventKind
 
-	// Static status FSM surface (§8.1, §16): the transition table and its forced escape
-	// hatch, re-exported so callers can validate/inspect transitions and recover the
-	// typed rejection.
+	// Static status FSM surface (§8.1, §16).
 	ValidateStatusTransition      = journal.ValidateStatusTransition
 	IsTransitionLifecycleKind     = journal.IsTransitionLifecycleKind
 	TransitionLifecycleKinds      = journal.TransitionLifecycleKinds
 	EncodeForcedTransitionPayload = journal.EncodeForcedTransitionPayload
 	DecodeForcedTransition        = journal.DecodeForcedTransition
 
-	// Journaled relationship / annotation mutation-family surface (§6 amendment):
-	// classification + payload codecs, re-exported so who-provenance queries can decode
-	// an edge/label/comment row's operands straight from the journal.
+	// Journaled relationship / annotation mutation-family surface (§6 amendment).
 	IsMutationFamilyKind         = journal.IsMutationFamilyKind
 	MutationFamilyKinds          = journal.MutationFamilyKinds
 	MutationFamilyKindForSort    = journal.MutationFamilyKindForSort
 	DecodeEdgeMutationPayload    = journal.DecodeEdgeMutationPayload
 	DecodeLabelMutationPayload   = journal.DecodeLabelMutationPayload
 	DecodeCommentMutationPayload = journal.DecodeCommentMutationPayload
-	PrepareMutationV1            = journal.PrepareMutationV1
-	DecodeCanonicalMutation      = journal.DecodeCanonicalMutation
+	// Canonicalize is the sole public preparation boundary.
+	Canonicalize              = journal.Canonicalize
+	DecodeCanonicalMutation   = journal.DecodeCanonicalMutation
+	ValidateResultSlotBinding = journal.ValidateResultSlotBinding
+	// ConflictAxes returns the closed five-axis set. All axes are nonzero.
+	ConflictAxes            = journal.ConflictAxes
+	FactTaskScopeKinds      = journal.FactTaskScopeKinds
+	ConditionKinds          = journal.ConditionKinds
+	ConditionFailureReasons = journal.ConditionFailureReasons
 )
 
 // Status-FSM typed error + sentinel (§8.1).
@@ -189,6 +246,7 @@ type InvalidStatusTransition = journal.InvalidStatusTransition
 // Journal sentinel errors, re-exported for errors.Is at call sites.
 var (
 	ErrUnsupportedOrderDimension = journal.ErrUnsupportedOrderDimension
+	ErrInvalidQuery              = journal.ErrInvalidQuery
 	ErrSubtypeIntegrity          = journal.ErrSubtypeIntegrity
 	ErrActorPlacement            = journal.ErrActorPlacement
 	ErrNamespaceRange            = journal.ErrNamespaceRange
@@ -197,6 +255,8 @@ var (
 
 	// Operations/authority sentinel errors (§4, §9, §14).
 	ErrOperationConflict   = journal.ErrOperationConflict
+	ErrConditionFailed     = journal.ErrConditionFailed
+	ErrActivityConflict    = journal.ErrActivityConflict
 	ErrGenesis             = journal.ErrGenesis
 	ErrAuthorityScope      = journal.ErrAuthorityScope
 	ErrAssignmentLifecycle = journal.ErrAssignmentLifecycle
@@ -218,72 +278,31 @@ var (
 	ErrCanonicalMutation           = journal.ErrCanonicalMutation
 )
 
-// JournalAPI is the ordered global-journal surface: commit operations (§9), query
-// task-event rows in strictly ascending JournalID order with a snapshot watermark
-// and exclusive JournalID cursor, read the cumulative attribution projection,
-// verify subtype integrity (§10 rule 8 / §15), and register the actor-namespace
-// reservation registry (§7).
-//
-// The bare AppendTaskEvent primitive is retired from this surface: every task event is
-// now produced by an operation (Session.Create/Update/CloseTask, an Atomic op, or a
-// migration baseline). The producer constraint enforces
-// produced_by_operation_journal_id NOT NULL for task events. A lower-level
-// append primitive exists only for controlled legacy migration and is not part
-// of this public API.
-type JournalAPI interface {
-	// QueryTaskEvents returns one page in the query's order: the readable-timeline
-	// (RecordedAt, JournalID) display order (the default) or the canonical JournalID
-	// order. An unexposed order dimension is rejected with ErrUnsupportedOrderDimension.
+// Journal is the ordered global-journal surface.
+type Journal interface {
+	Facts() FactQueryAPI
 	QueryTaskEvents(q JournalQueryV1) (JournalTaskEventPageV1, error)
-	// TaskAttributions returns a task's cumulative attribution edges (§8.2).
 	TaskAttributions(taskID TaskID) ([]TaskAttribution, error)
-	// VerifyIntegrity checks class-table-inheritance integrity across the whole
-	// journal (§10 rule 8), the convergence tool Open uses (§15).
 	VerifyIntegrity() error
-	// RegisterNamespaceClaim registers a reserved actor-namespace range (§7.1),
-	// rejecting range overlaps with ErrNamespaceRange (§7.3 rule 1).
 	RegisterNamespaceClaim(claim ActorNamespaceClaim) error
-	// RegisterFixedActorEntry registers a fixed system actor within a claimed
-	// range (§7.2), rejecting out-of-range entries with ErrEntryOutOfRange
-	// (§7.3 rule 2). The fixed UUID is derived from entry.ActorID.
 	RegisterFixedActorEntry(entry FixedActorEntry) error
-	// NamespaceClaims returns every registered claim.
 	NamespaceClaims() ([]ActorNamespaceClaim, error)
-
-	// Apply commits one logical operation atomically (§9.5): an atomic append
-	// plus domain mutation folding the operation's effects in caller list order
-	// with per-effect authorization (§9.3), the §9.4 idempotent-replay
-	// short-circuit, genesis discipline (§4.6), and the subtype-integrity gate.
 	Apply(in OperationInput) (CommittedResult, error)
-	// LookupCommitted returns the committed result for an OperationID: the closed
-	// Absent variant (no side effects) for a never-applied operation, or the
-	// Exact variant with the reconstructed EmittedEvents closure and slot map
-	// (§3.2, §9.4).
 	LookupCommitted(op OperationID) (CommittedResult, error)
-	// AuthorityGovernsTaskAt reports whether the authority at authJID governs
-	// task for an effect at beforeJID, ordering strictly by JournalID (§9.3, §12).
 	AuthorityGovernsTaskAt(authJID JournalID, task TaskID, beforeJID JournalID) (bool, error)
-
-	// PreflightSchema verifies the external pre-journal schema's exact expected
-	// shape in both directions before any transaction opens (§13), failing closed
-	// with a typed *SchemaPreflightError on a missing table, missing expected
-	// column, or unexpected extra column.
 	PreflightSchema() error
-	// ReplayProjections folds the entire journal in JournalID order through the
-	// same reducer step Apply uses (§9.2) and verifies the recomputed projection
-	// converges with the stored incremental one (§15). It runs the schema preflight
-	// first, so a corrupted topology fails closed before any fold. It returns the
-	// converged per-task projection, or a typed *ProjectionDivergenceError.
 	ReplayProjections() (ReplayResult, error)
-	// MigrateLegacyBaseline migrates pre-journal tasks into deterministic baseline
-	// journal entries under the genesis bootstrap authority (§13): honest legacy
-	// RecordedAt, whole-batch fail-closed atomicity, and per-task idempotent anchors.
-	// An unmappable owner fails the whole batch with a typed
-	// *MigrationOwnerUnmappableError; a schema mismatch fails with a typed
-	// *SchemaPreflightError; nothing is committed in either case.
 	MigrateLegacyBaseline(in MigrationInput) (MigrationResult, error)
+}
+
+// ContextJournal is the optional deadline-aware extension to Journal. ApplyContext
+// uses the caller context while waiting for SQLite write ownership. Journal remains
+// unchanged so existing external implementations continue to compile.
+type ContextJournal interface {
+	Journal
+	ApplyContext(ctx context.Context, in OperationInput) (CommittedResult, error)
 }
 
 // Journal returns the ordered global-journal surface backed by the same SQLite
 // connection as the task tracker.
-func (t *sqliteTracker) Journal() JournalAPI { return t.db }
+func (t *sqliteTracker) Journal() Journal { return t.db }

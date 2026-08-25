@@ -15,16 +15,20 @@ import (
 // Shared type aliases into the public ptypes domain. Kept so journal code and
 // its callers refer to one identity domain.
 type (
-	Task       = ptypes.Task
-	Status     = ptypes.Status
-	Phase      = ptypes.Phase
-	Stage      = ptypes.Stage
-	Priority   = ptypes.Priority
-	TaskType   = ptypes.TaskType
-	TaskID     = ptypes.TaskID
-	EdgeKind   = ptypes.EdgeKind
-	CommentID  = ptypes.CommentID
-	ActorID    = ptypes.ActorID
+	Task      = ptypes.Task
+	Status    = ptypes.Status
+	Phase     = ptypes.Phase
+	Stage     = ptypes.Stage
+	Priority  = ptypes.Priority
+	TaskType  = ptypes.TaskType
+	TaskID    = ptypes.TaskID
+	EdgeKind  = ptypes.EdgeKind
+	CommentID = ptypes.CommentID
+	ActorID   = ptypes.ActorID
+	// AgentID is the canonical domain type for agent identity. It is a type alias for
+	// ActorID (the two are identical on the wire). Use AgentID when the semantic role
+	// is "the agent responsible for an activity" to match StartActivityWithID's signature.
+	AgentID    = ptypes.AgentID
 	ActivityID = ptypes.ActivityID
 )
 

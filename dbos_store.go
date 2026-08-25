@@ -2,26 +2,18 @@ package provenance
 
 // dbos_store.go implements the borrowed-storage bridge that lets Provenance share
 // one physical SQLite database with a DBOS durable-execution root, plus the
-// StoreUnavailableError lifecycle error. Provenance persists through
-// zombiezen.com/go/sqlite, whose connection cannot be constructed from a
-// database/sql connection, so the bridge shares the database file and WAL rather
-// than a connection object.
+// StoreUnavailableError lifecycle error. Provenance persists through the same
+// Modernc database/sql pool supplied by the DBOS root.
 //
-// OpenBorrowedSQLite validates the borrowed *sql.DB, derives its on-disk path via
-// PRAGMA database_list ON THE BORROWED HANDLE, and opens ONE internal zombiezen
-// connection on THAT SAME FILE (same WAL lineage, same busy_timeout). There is no
-// second file and no second WAL; there is a second CONNECTION, but no second
-// LIFECYCLE: the borrowed *sql.DB remains the sole lifecycle token. Every public
-// operation first checks borrowed-handle liveness with a Ping sentinel; once the
-// DBOS root that owns the handle shuts down (closing the pool), every Provenance
-// read/write returns a StoreUnavailableError even though the zombiezen bridge
-// connection is technically still open. Cleanup (Tracker.Close) closes ONLY the
-// bridge connection, never the borrowed handle, and is repeat-safe. Provenance
-// migrations apply via the bridge INTO the borrowed handle's database, so the
-// caller observes the schema through its own handle. In-memory/temp/pathless
-// borrowed databases are rejected (a same-file bridge is impossible there).
+// OpenBorrowedSQLite validates the borrowed *sql.DB, retains it as the sole
+// lifecycle token, and activates the Provenance schema through that exact pool.
+// Every public operation checks borrowed-handle liveness first; after DBOS closes
+// its pool, reads and writes return StoreUnavailableError. Tracker.Close never
+// closes the borrowed pool. In-memory, temporary, and pathless databases remain
+// rejected because the public DBOS integration contract requires a durable file.
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -42,17 +34,16 @@ type StoreUnavailableError struct {
 
 func (e *StoreUnavailableError) Error() string {
 	return fmt.Sprintf(
-		"provenance: store unavailable during %s — store: %s; stage: %s; impact: %s; fix: %s; cause: %v",
-		e.Operation, e.Store, e.Stage, e.Impact, e.Fix, e.Cause)
+		"provenance: store unavailable during %s — store: %s; stage: %s; impact: %s; fix: %s%s",
+		e.Operation, e.Store, e.Stage, e.Impact, e.Fix, causeClause(e.Cause))
 }
 
 func (e *StoreUnavailableError) Unwrap() error { return e.Cause }
 
 // OpenBorrowedSQLite opens a Tracker that shares the borrowed *sql.DB's physical
-// database via an internal zombiezen bridge connection (Option B; see the package
-// deviation note above). The borrowed handle is never closed by Provenance and is
-// the sole lifecycle token: after it (or its owning DBOS root) closes, every
-// borrowed-tracker operation returns a StoreUnavailableError.
+// database via that exact handle. The borrowed handle is never closed by
+// Provenance and is the sole lifecycle token: after it (or its owning DBOS root)
+// closes, every borrowed-tracker operation returns a StoreUnavailableError.
 //
 // It rejects a nil handle, a handle that cannot be pinged, and an in-memory, temp,
 // or pathless database (a same-file bridge is impossible there), naming OpenMemory
@@ -75,9 +66,9 @@ func OpenBorrowedSQLite(db *sql.DB, opts ...Option) (Tracker, error) {
 	if err != nil {
 		return nil, err
 	}
-	inner, err := openTracker(path, opts...)
+	inner, err := openBorrowedTracker(db, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("provenance.OpenBorrowedSQLite: open bridge connection on shared file %q: %w", path, err)
+		return nil, fmt.Errorf("provenance.OpenBorrowedSQLite: activate the borrowed database/sql pool for shared file %q: %w", path, err)
 	}
 	return &borrowedTracker{inner: inner, sentinel: db, path: path}, nil
 }
@@ -112,8 +103,8 @@ func borrowedDatabasePath(db *sql.DB) (string, error) {
 	if path == "" {
 		return "", fmt.Errorf(
 			"provenance.OpenBorrowedSQLite: the borrowed *sql.DB has no on-disk main database (in-memory, " +
-				"temporary, or pathless) — where: path derivation; impact: a same-file zombiezen bridge is " +
-				"impossible without a shared file; fix: back the DBOS root with a file-backed SQLite database, " +
+				"temporary, or pathless) — where: path derivation; impact: the durable DBOS integration requires " +
+				"a file-backed shared database; fix: back the DBOS root with a file-backed SQLite database, " +
 				"or use OpenMemory for a standalone in-memory tracker")
 	}
 	return path, nil
@@ -123,10 +114,9 @@ func borrowedDatabasePath(db *sql.DB) (string, error) {
 // borrowedTracker — liveness-gated decorator over the bridge tracker
 // ---------------------------------------------------------------------------
 
-// borrowedTracker wraps the zombiezen bridge tracker and gates every public
+// borrowedTracker wraps the direct borrowed-pool tracker and gates every public
 // read/write on the borrowed handle's liveness. The sentinel is the borrowed
-// *sql.DB; the bridge connection lives inside inner and is the only thing Close
-// releases.
+// *sql.DB; Close releases no caller-owned database resource.
 type borrowedTracker struct {
 	inner    Tracker
 	sentinel *sql.DB
@@ -153,9 +143,9 @@ func (b *borrowedTracker) available(op string) error {
 	return nil
 }
 
-// Close releases ONLY the bridge connection, never the borrowed handle. It does
-// NOT gate on liveness (a caller closes after DBOS shutdown) and is repeat-safe
-// because the bridge DB.Close is idempotent.
+// Close invalidates this borrowed tracker without closing the caller-owned handle.
+// It does not gate on liveness (a caller may close after DBOS shutdown) and is
+// repeat-safe.
 func (b *borrowedTracker) Close() error { return b.inner.Close() }
 
 // As returns the mutation Session over the shared database. In borrowed mode the
@@ -171,8 +161,15 @@ func (b *borrowedTracker) As(actor ActorID, authority JournalID) *Session {
 	return sess
 }
 
+func (b *borrowedTracker) InitializeGovernedRoot(ctx context.Context, request RootGenesisRequest) (OperationClosure, error) {
+	if err := b.available("InitializeGovernedRoot"); err != nil {
+		return OperationClosure{}, err
+	}
+	return b.inner.InitializeGovernedRoot(ctx, request)
+}
+
 // Journal returns the liveness-gated ordered global-journal surface.
-func (b *borrowedTracker) Journal() JournalAPI {
+func (b *borrowedTracker) Journal() Journal {
 	return &borrowedJournal{inner: b.inner.Journal(), owner: b}
 }
 
@@ -331,12 +328,42 @@ func (b *borrowedTracker) Activities(agentID *AgentID) ([]Activity, error) {
 }
 
 // ---------------------------------------------------------------------------
-// borrowedJournal — liveness-gated JournalAPI
+// borrowedJournal — liveness-gated Journal
 // ---------------------------------------------------------------------------
 
 type borrowedJournal struct {
-	inner JournalAPI
+	inner Journal
 	owner *borrowedTracker
+}
+
+// Facts returns a liveness-gated reader over the same borrowed journal. The
+// accessor itself has no error result, so each query performs the owner check.
+func (j *borrowedJournal) Facts() FactQueryAPI {
+	return &borrowedFactQueries{inner: j.inner.Facts(), owner: j.owner}
+}
+
+type borrowedFactQueries struct {
+	inner FactQueryAPI
+	owner *borrowedTracker
+}
+
+var (
+	_ FactQueryAPI = (*borrowedFactQueries)(nil)
+	_ Journal      = (*borrowedJournal)(nil)
+)
+
+func (q *borrowedFactQueries) QueryDecisions(in DecisionQuery) (DecisionPage, error) {
+	if err := q.owner.available("Journal.Facts.QueryDecisions"); err != nil {
+		return DecisionPage{}, err
+	}
+	return q.inner.QueryDecisions(in)
+}
+
+func (q *borrowedFactQueries) QueryEvidence(in EvidenceQuery) (EvidencePage, error) {
+	if err := q.owner.available("Journal.Facts.QueryEvidence"); err != nil {
+		return EvidencePage{}, err
+	}
+	return q.inner.QueryEvidence(in)
 }
 
 func (j *borrowedJournal) QueryTaskEvents(q JournalQueryV1) (JournalTaskEventPageV1, error) {
@@ -382,6 +409,10 @@ func (j *borrowedJournal) NamespaceClaims() ([]ActorNamespaceClaim, error) {
 }
 
 func (j *borrowedJournal) Apply(in OperationInput) (CommittedResult, error) {
+	return j.ApplyContext(context.Background(), in)
+}
+
+func (j *borrowedJournal) ApplyContext(ctx context.Context, in OperationInput) (CommittedResult, error) {
 	if err := j.owner.available("Journal.Apply"); err != nil {
 		return CommittedResult{}, err
 	}
@@ -389,6 +420,9 @@ func (j *borrowedJournal) Apply(in OperationInput) (CommittedResult, error) {
 		if err := j.owner.journalApplyFault(); err != nil {
 			return CommittedResult{}, err
 		}
+	}
+	if journal, ok := j.inner.(ContextJournal); ok {
+		return journal.ApplyContext(ctx, in)
 	}
 	return j.inner.Apply(in)
 }

@@ -12,8 +12,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
-	"zombiezen.com/go/sqlite"
-	"zombiezen.com/go/sqlite/sqlitex"
+	moderncsqlite "modernc.org/sqlite"
 )
 
 func pinnedCreateOperationID(sequence int) OperationID {
@@ -21,13 +20,36 @@ func pinnedCreateOperationID(sequence int) OperationID {
 }
 
 func isSQLiteContentionError(err error) bool {
-	primary := sqlite.ErrCode(err) & 0xff
-	return primary == sqlite.ResultBusy || primary == sqlite.ResultLocked
+	var sqliteErr *moderncsqlite.Error
+	return errors.As(err, &sqliteErr) && (sqliteErr.Code()&0xff == 5 || sqliteErr.Code()&0xff == 6)
+}
+
+func newCanonicalOpsEnv(t *testing.T) (*opsEnv, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "canonical-ops.sqlite")
+	tr, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatalf("open file-backed canonical operation fixture: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := tr.Close(); err != nil {
+			t.Errorf("close file-backed canonical operation fixture: %v", err)
+		}
+	})
+	agent, err := tr.RegisterSoftwareAgent("provenance-test", "canonical-ops", "0", "test")
+	if err != nil {
+		t.Fatalf("register canonical operation fixture actor: %v", err)
+	}
+	return &opsEnv{
+		journalEnv: &journalEnv{tr: tr, actor: agent.ID},
+		actors:     map[string]ActorID{},
+		tasks:      map[string]TaskID{},
+	}, path
 }
 
 func TestCanonicalRetryIgnoresCallerMutationDigestButRejectsEffectChange(t *testing.T) {
 	t.Parallel()
-	env := newOpsEnv(t)
+	env, path := newCanonicalOpsEnv(t)
 	boot := env.genesis(t, "canonical-retry-genesis")
 	task := env.taskFor(t, "canonical-retry-task")
 	base := OperationInput{OperationID: "canonical-retry", ActorID: env.actor, AuthorityJournalID: &boot,
@@ -75,29 +97,28 @@ func TestCanonicalRetryIgnoresCallerMutationDigestButRejectsEffectChange(t *test
 	cases["effect"] = v
 	for name, candidate := range cases {
 		t.Run(name, func(t *testing.T) {
-			before := journalRowCount(t, env.tr)
+			before := journalRowCount(t, path)
 			if _, err := env.tr.Journal().Apply(candidate); !errors.Is(err, ErrOperationConflict) {
 				t.Fatalf("mismatch=%v, want conflict", err)
 			}
-			if after := journalRowCount(t, env.tr); after != before {
+			if after := journalRowCount(t, path); after != before {
 				t.Fatalf("conflicting retry wrote journal rows: before=%d after=%d", before, after)
 			}
 		})
 	}
 }
 
-func journalRowCount(t *testing.T, tr Tracker) int64 {
+func journalRowCount(t *testing.T, path string) int64 {
 	t.Helper()
-	db := tr.(*sqliteTracker).db
-	db.Lock()
-	defer db.Unlock()
 	var count int64
-	if err := sqlitex.Execute(db.Conn(), `SELECT count(*) FROM journal`, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error {
-		count = stmt.ColumnInt64(0)
-		return nil
-	}}); err != nil {
-		t.Fatal(err)
-	}
+	withRawSQLiteTestConn(t, path, func(conn *rawSQLiteConn) {
+		if err := rawExecute(conn, `SELECT count(*) FROM journal`, &rawExecOptions{ResultFunc: func(stmt *rawSQLiteStmt) error {
+			count = stmt.ColumnInt64(0)
+			return nil
+		}}); err != nil {
+			t.Fatal(err)
+		}
+	})
 	return count
 }
 
@@ -200,7 +221,7 @@ func TestCanonicalExactRetryAfterReopenReturnsCompleteResult(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	before := journalRowCount(t, reopened)
+	before := journalRowCount(t, path)
 	retry, err := reopened.Journal().Apply(op)
 	if err != nil {
 		t.Fatal(err)
@@ -212,7 +233,7 @@ func TestCanonicalExactRetryAfterReopenReturnsCompleteResult(t *testing.T) {
 	if !reflect.DeepEqual(retry, first) {
 		t.Fatalf("reopened retry result = %+v, want %+v", retry, first)
 	}
-	if after := journalRowCount(t, reopened); after != before {
+	if after := journalRowCount(t, path); after != before {
 		t.Fatalf("reopened exact retry wrote rows: before=%d after=%d", before, after)
 	}
 }
@@ -239,7 +260,7 @@ func TestPinnedSessionCreateAcrossIndependentHandles(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer second.Close()
-	before := readOperationCounts(t, first)
+	before := readOperationCounts(t, path)
 	for name, opID := range map[string]OperationID{"arbitrary": "pinned-create-request", "typed-v7": pinnedCreateOperationID(4)} {
 		t.Run(name, func(t *testing.T) {
 			var tasks [2]Task
@@ -292,7 +313,7 @@ func TestPinnedSessionCreateAcrossIndependentHandles(t *testing.T) {
 	if len(listed) != 2 {
 		t.Fatalf("created %d tasks, want one per OperationID form", len(listed))
 	}
-	after := readOperationCounts(t, first)
+	after := readOperationCounts(t, path)
 	if after.operations-before.operations != 2 || after.journal-before.journal != 4 || after.slots-before.slots != 2 {
 		t.Fatalf("simultaneous retries left extra/orphan rows: before=%+v after=%+v", before, after)
 	}
@@ -396,13 +417,13 @@ func TestPinnedSessionCreatePreservesOperationIDContract(t *testing.T) {
 			assertPinnedTaskV7(t, task)
 		})
 	}
-	before := readOperationCounts(t, tr)
+	before := readOperationCounts(t, path)
 	for name, opID := range map[string]OperationID{"empty": "", "control": "bad\nkey"} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := tr.As(actor.ID, boot).Create("canonical", "invalid", "invalid", TaskTypeTask, PriorityMedium, PhaseUnscoped, WithOperationID(opID)); err == nil {
 				t.Fatal("invalid OperationID accepted")
 			}
-			if after := readOperationCounts(t, tr); after != before {
+			if after := readOperationCounts(t, path); after != before {
 				t.Fatalf("invalid OperationID wrote rows: before=%+v after=%+v", before, after)
 			}
 		})
@@ -418,7 +439,7 @@ func assertPinnedTaskV7(t *testing.T, task Task) {
 
 func TestAllocatedCreateReconcilesOnlyProvisionalUUID(t *testing.T) {
 	t.Parallel()
-	env := newOpsEnv(t)
+	env, path := newCanonicalOpsEnv(t)
 	boot := env.genesis(t, "allocated-create-genesis")
 	opID := OperationID("allocated-create-retry")
 	firstID := newCorpusTaskID()
@@ -442,7 +463,7 @@ func TestAllocatedCreateReconcilesOnlyProvisionalUUID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	afterFirst := readOperationCounts(t, env.tr)
+	afterFirst := readOperationCounts(t, path)
 	exact := base
 	exact.Effects = append([]Effect(nil), base.Effects...)
 	exact.Effects[0].TaskID.UUID = uuid.Must(uuid.NewV7())
@@ -457,7 +478,7 @@ func TestAllocatedCreateReconcilesOnlyProvisionalUUID(t *testing.T) {
 	if !reflect.DeepEqual(first, retry) {
 		t.Fatalf("allocated UUID-only retry result changed: first=%+v retry=%+v", first, retry)
 	}
-	if afterRetry := readOperationCounts(t, env.tr); afterRetry != afterFirst {
+	if afterRetry := readOperationCounts(t, path); afterRetry != afterFirst {
 		t.Fatalf("allocated UUID-only retry wrote extra rows: first=%+v retry=%+v", afterFirst, afterRetry)
 	}
 	if taskID, ok := taskSlotID(first, "task"); !ok || taskID != firstID {
@@ -482,7 +503,7 @@ func TestAllocatedCreateReconcilesOnlyProvisionalUUID(t *testing.T) {
 		"priority":    func(effect *Effect) { effect.Priority = PriorityHigh },
 		"phase":       func(effect *Effect) { effect.Phase = PhaseWorkerSlices },
 	}
-	before := readOperationCounts(t, env.tr)
+	before := readOperationCounts(t, path)
 	for name, change := range changes {
 		t.Run(name, func(t *testing.T) {
 			candidate := base
@@ -493,7 +514,7 @@ func TestAllocatedCreateReconcilesOnlyProvisionalUUID(t *testing.T) {
 			if !errors.Is(err, ErrOperationConflict) || result.Kind != CommittedConflict {
 				t.Fatalf("changed allocated operand result=%+v err=%v, want canonical conflict", result, err)
 			}
-			if after := readOperationCounts(t, env.tr); after != before {
+			if after := readOperationCounts(t, path); after != before {
 				t.Fatalf("allocated conflict wrote rows: before=%+v after=%+v", before, after)
 			}
 		})
@@ -502,7 +523,7 @@ func TestAllocatedCreateReconcilesOnlyProvisionalUUID(t *testing.T) {
 
 func TestFixedTaskCreateDoesNotReconcileCallerSuppliedID(t *testing.T) {
 	t.Parallel()
-	env := newOpsEnv(t)
+	env, path := newCanonicalOpsEnv(t)
 	boot := env.genesis(t, "fixed-create-genesis")
 	firstID := newCorpusTaskID()
 	input := OperationInput{
@@ -516,7 +537,7 @@ func TestFixedTaskCreateDoesNotReconcileCallerSuppliedID(t *testing.T) {
 	if _, err := env.tr.Journal().Apply(input); err != nil {
 		t.Fatal(err)
 	}
-	before := readOperationCounts(t, env.tr)
+	before := readOperationCounts(t, path)
 	beforeTasks, err := env.tr.List(ListFilter{})
 	if err != nil {
 		t.Fatal(err)
@@ -529,7 +550,7 @@ func TestFixedTaskCreateDoesNotReconcileCallerSuppliedID(t *testing.T) {
 	if !errors.Is(err, ErrOperationConflict) || result.Kind != CommittedConflict {
 		t.Fatalf("fixed-ID retry result=%+v err=%v, want canonical conflict", result, err)
 	}
-	if after := readOperationCounts(t, env.tr); after != before {
+	if after := readOperationCounts(t, path); after != before {
 		t.Fatalf("fixed-ID conflict wrote rows: before=%+v after=%+v", before, after)
 	}
 	if _, err := env.tr.Show(otherID); !errors.Is(err, ErrNotFound) {
@@ -564,13 +585,7 @@ func TestStartupCanonicalValidationFailsClosedWithoutByteDrift(t *testing.T) {
 	if _, err := tracker.Journal().Apply(OperationInput{OperationID: "corrupt-create", ActorID: actor.ID, AuthorityJournalID: &boot, CommandDigest: []byte("c"), MutationDigest: []byte("ignored"), Effects: []Effect{{Sort: EffectTaskCreate, TaskID: task, Title: "canonical title", Description: "description", Type: TaskTypeTask, Priority: PriorityMedium, Phase: PhaseUnscoped}}}); err != nil {
 		t.Fatal(err)
 	}
-	store := tracker.(*sqliteTracker)
-	store.db.Lock()
-	err = sqlitex.Execute(store.db.Conn(), `UPDATE tasks SET title='corrupt title' WHERE id=?1`, &sqlitex.ExecOptions{Args: []any{task.String()}})
-	store.db.Unlock()
-	if err != nil {
-		t.Fatal(err)
-	}
+	corruptSQL(t, path, `UPDATE tasks SET title='corrupt title' WHERE id=?1`, task.String())
 	if err := tracker.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -666,7 +681,7 @@ func TestCanonicalSchemaMigrationAndMixedLegacyRowsAreIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	boot, _ := slotJournalID(genesis, "authority")
-	makeOperationsSchemaLegacy(t, tracker)
+	makeOperationsSchemaLegacy(t, path)
 	if err = tracker.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -674,34 +689,32 @@ func TestCanonicalSchemaMigrationAndMixedLegacyRowsAreIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("genuine pre-canonical migration: %v", err)
 	}
-	retried, err := tracker.Journal().Apply(legacyInput)
-	if err != nil || !retried.ShortCircuited {
-		t.Fatalf("legacy identity/result not preserved: %+v %v", retried, err)
-	}
-	retried.ShortCircuited = false
-	if !reflect.DeepEqual(retried, genesis) {
-		t.Fatalf("complete legacy result changed across migration: got=%+v want=%+v", retried, genesis)
+	// Since v0.0.4: opaque legacy rows (no encoding_version) are now rejected as
+	// corruption signals rather than silently replayed. A retry of a legacy operation
+	// that exists in the journal must fail with a CanonicalMutationError.
+	retried, retryErr := tracker.Journal().Apply(legacyInput)
+	var canonicalErr *CanonicalMutationError
+	if !errors.As(retryErr, &canonicalErr) || retried.Kind != CommittedAbsent {
+		t.Fatalf("legacy identity/result not preserved: %+v %v", retried, retryErr)
 	}
 	task := newCorpusTaskID()
 	if _, err = tracker.Journal().Apply(OperationInput{OperationID: "mixed-new", ActorID: actor.ID, AuthorityJournalID: &boot, CommandDigest: []byte("c"), Effects: []Effect{{Sort: EffectTaskCreate, TaskID: task, Title: "new", Type: TaskTypeTask, Priority: PriorityMedium, Phase: PhaseUnscoped}}}); err != nil {
 		t.Fatal(err)
 	}
-	store := tracker.(*sqliteTracker)
-	store.db.Lock()
 	legacyOK, canonicalOK := false, false
-	err = sqlitex.Execute(store.db.Conn(), `SELECT operation_id,mutation_encoding_version IS NULL,canonical_mutation IS NULL,hex(mutation_digest),length(canonical_mutation) FROM journal_operations ORDER BY journal_id`, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error {
-		switch stmt.ColumnText(0) {
-		case "mixed-genesis":
-			legacyOK = stmt.ColumnInt(1) == 1 && stmt.ColumnInt(2) == 1 && stmt.ColumnText(3) == "6C65676163792D646967657374"
-		case "mixed-new":
-			canonicalOK = stmt.ColumnInt(1) == 0 && stmt.ColumnInt(2) == 0 && stmt.ColumnInt(4) > 0
+	withRawSQLiteTestConn(t, path, func(conn *rawSQLiteConn) {
+		if err := rawExecute(conn, `SELECT operation_id,mutation_encoding_version IS NULL,canonical_mutation IS NULL,hex(mutation_digest),length(canonical_mutation) FROM journal_operations ORDER BY journal_id`, &rawExecOptions{ResultFunc: func(stmt *rawSQLiteStmt) error {
+			switch stmt.ColumnText(0) {
+			case "mixed-genesis":
+				legacyOK = stmt.ColumnInt(1) == 1 && stmt.ColumnInt(2) == 1 && stmt.ColumnText(3) == "6C65676163792D646967657374"
+			case "mixed-new":
+				canonicalOK = stmt.ColumnInt(1) == 0 && stmt.ColumnInt(2) == 0 && stmt.ColumnInt(4) > 0
+			}
+			return nil
+		}}); err != nil {
+			t.Fatal(err)
 		}
-		return nil
-	}})
-	store.db.Unlock()
-	if err != nil {
-		t.Fatal(err)
-	}
+	})
 	if !legacyOK || !canonicalOK {
 		t.Fatalf("mixed rows not preserved: legacy=%v canonical=%v", legacyOK, canonicalOK)
 	}
@@ -730,23 +743,22 @@ func TestCanonicalSchemaMigrationAndMixedLegacyRowsAreIdempotent(t *testing.T) {
 	}
 }
 
-func makeOperationsSchemaLegacy(t *testing.T, tracker Tracker) {
+func makeOperationsSchemaLegacy(t *testing.T, path string) {
 	t.Helper()
-	store := tracker.(*sqliteTracker)
-	store.db.Lock()
-	defer store.db.Unlock()
-	for _, statement := range []string{
-		`DROP TRIGGER journal_operations_canonical_insert`, `DROP TRIGGER journal_operations_canonical_update`,
-		`PRAGMA foreign_keys=OFF`, `PRAGMA legacy_alter_table=ON`,
-		`ALTER TABLE journal_operations RENAME TO journal_operations_canonical`,
-		`CREATE TABLE journal_operations (journal_id INTEGER PRIMARY KEY REFERENCES journal(journal_id),operation_id TEXT NOT NULL UNIQUE,authority_journal_id INTEGER REFERENCES journal_authorities(journal_id),command_digest BLOB NOT NULL,mutation_digest BLOB NOT NULL) STRICT`,
-		`INSERT INTO journal_operations SELECT journal_id,operation_id,authority_journal_id,command_digest,X'6c65676163792d646967657374' FROM journal_operations_canonical`,
-		`DROP TABLE journal_operations_canonical`, `PRAGMA foreign_keys=ON`,
-	} {
-		if err := sqlitex.ExecuteTransient(store.db.Conn(), statement, nil); err != nil {
-			t.Fatal(err)
+	withRawSQLiteTestConn(t, path, func(conn *rawSQLiteConn) {
+		for _, statement := range []string{
+			`DROP TRIGGER journal_operations_canonical_insert`, `DROP TRIGGER journal_operations_canonical_update`,
+			`PRAGMA foreign_keys=OFF`, `PRAGMA legacy_alter_table=ON`,
+			`ALTER TABLE journal_operations RENAME TO journal_operations_canonical`,
+			`CREATE TABLE journal_operations (journal_id INTEGER PRIMARY KEY REFERENCES journal(journal_id),operation_id TEXT NOT NULL UNIQUE,authority_journal_id INTEGER REFERENCES journal_authorities(journal_id),command_digest BLOB NOT NULL,mutation_digest BLOB NOT NULL) STRICT`,
+			`INSERT INTO journal_operations SELECT journal_id,operation_id,authority_journal_id,command_digest,X'6c65676163792d646967657374' FROM journal_operations_canonical`,
+			`DROP TABLE journal_operations_canonical`, `PRAGMA foreign_keys=ON`,
+		} {
+			if err := rawExecuteTransient(conn, statement, nil); err != nil {
+				t.Fatal(err)
+			}
 		}
-	}
+	})
 }
 
 func TestCorruptLegacySchemaStartupRollsBackWithoutByteDrift(t *testing.T) {
@@ -768,8 +780,8 @@ func TestCorruptLegacySchemaStartupRollsBackWithoutByteDrift(t *testing.T) {
 	if !ok {
 		t.Fatal("genesis result missing authority slot")
 	}
-	makeOperationsSchemaLegacy(t, tr)
-	corruptSQL(t, tr, `DELETE FROM journal_authority_bootstraps WHERE journal_id=?1`, int64(authority))
+	makeOperationsSchemaLegacy(t, path)
+	corruptSQL(t, path, `DELETE FROM journal_authority_bootstraps WHERE journal_id=?1`, int64(authority))
 	if err := tr.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -815,7 +827,7 @@ func TestMixedLegacyCanonicalMalformedPairsFailWithoutByteDrift(t *testing.T) {
 				t.Fatal(err)
 			}
 			boot, _ := slotJournalID(genesis, "authority")
-			makeOperationsSchemaLegacy(t, tr)
+			makeOperationsSchemaLegacy(t, path)
 			if err := tr.Close(); err != nil {
 				t.Fatal(err)
 			}
@@ -827,8 +839,8 @@ func TestMixedLegacyCanonicalMalformedPairsFailWithoutByteDrift(t *testing.T) {
 			if _, err = tr.Journal().Apply(OperationInput{OperationID: "mixed-pair-new", ActorID: actor.ID, AuthorityJournalID: &boot, CommandDigest: []byte("c"), Effects: []Effect{{Sort: EffectTaskCreate, TaskID: task, Title: "new", Type: TaskTypeTask, Priority: PriorityMedium, Phase: PhaseUnscoped}}}); err != nil {
 				t.Fatal(err)
 			}
-			corruptDDL(t, tr, `DROP TRIGGER journal_operations_canonical_update`)
-			corruptSQL(t, tr, statement)
+			corruptDDL(t, path, `DROP TRIGGER journal_operations_canonical_update`)
+			corruptSQL(t, path, statement)
 			if err := tr.Close(); err != nil {
 				t.Fatal(err)
 			}
@@ -881,23 +893,20 @@ func TestDeleteModeCorruptionPreflightIsByteAndModeReadOnly(t *testing.T) {
 				t.Fatal(err)
 			}
 			if legacy {
-				makeOperationsSchemaLegacy(t, tr)
+				makeOperationsSchemaLegacy(t, path)
 			}
 			if err := tr.Close(); err != nil {
 				t.Fatal(err)
 			}
-			conn, err := sqlite.OpenConn(path, sqlite.OpenReadWrite|sqlite.OpenURI)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := sqlitex.ExecuteTransient(conn, `PRAGMA journal_mode=DELETE`, nil); err != nil {
+			conn := openRawSQLiteTestConn(t, path, "rw")
+			if err := rawExecuteTransient(conn, `PRAGMA journal_mode=DELETE`, nil); err != nil {
 				t.Fatal(err)
 			}
 			if legacy {
-				if err := sqlitex.Execute(conn, `DELETE FROM journal_authority_bootstraps WHERE journal_id=?1`, &sqlitex.ExecOptions{Args: []any{int64(boot)}}); err != nil {
+				if err := rawExecute(conn, `DELETE FROM journal_authority_bootstraps WHERE journal_id=?1`, &rawExecOptions{Args: []any{int64(boot)}}); err != nil {
 					t.Fatal(err)
 				}
-			} else if err := sqlitex.Execute(conn, `UPDATE tasks SET title='corrupt' WHERE id=?1`, &sqlitex.ExecOptions{Args: []any{task.ID.String()}}); err != nil {
+			} else if err := rawExecute(conn, `UPDATE tasks SET title='corrupt' WHERE id=?1`, &rawExecOptions{Args: []any{task.ID.String()}}); err != nil {
 				t.Fatal(err)
 			}
 			if err := conn.Close(); err != nil {
@@ -937,15 +946,12 @@ func TestDeleteModeActivationSchemaFailureDoesNotPersistWAL(t *testing.T) {
 			if err := tr.Close(); err != nil {
 				t.Fatal(err)
 			}
-			conn, err := sqlite.OpenConn(path, sqlite.OpenReadWrite|sqlite.OpenURI)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := sqlitex.ExecuteTransient(conn, `PRAGMA journal_mode=DELETE`, nil); err != nil {
+			conn := openRawSQLiteTestConn(t, path, "rw")
+			if err := rawExecuteTransient(conn, `PRAGMA journal_mode=DELETE`, nil); err != nil {
 				t.Fatal(err)
 			}
 			for _, statement := range statements {
-				if err := sqlitex.ExecuteTransient(conn, statement, nil); err != nil {
+				if err := rawExecuteTransient(conn, statement, nil); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -991,13 +997,10 @@ func snapshotSQLiteFiles(t *testing.T, path string) map[string][]byte {
 
 func sqliteJournalMode(t *testing.T, path string) string {
 	t.Helper()
-	conn, err := sqlite.OpenConn(path, sqlite.OpenReadOnly|sqlite.OpenURI)
-	if err != nil {
-		t.Fatal(err)
-	}
+	conn := openRawSQLiteTestConn(t, path, "ro")
 	defer conn.Close()
 	mode := ""
-	if err := sqlitex.ExecuteTransient(conn, `PRAGMA journal_mode`, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error { mode = stmt.ColumnText(0); return nil }}); err != nil {
+	if err := rawExecuteTransient(conn, `PRAGMA journal_mode`, &rawExecOptions{ResultFunc: func(stmt *rawSQLiteStmt) error { mode = stmt.ColumnText(0); return nil }}); err != nil {
 		t.Fatal(err)
 	}
 	return mode
@@ -1033,7 +1036,7 @@ func TestMissingJournalOperationFKMigrationIsComposableAndIdempotent(t *testing.
 				t.Fatal(err)
 			}
 			if corrupt {
-				corruptSQL(t, tr, `UPDATE journal SET produced_by_operation_journal_id=999999 WHERE produced_by_operation_journal_id IS NOT NULL AND journal_id=(SELECT max(journal_id) FROM journal)`)
+				corruptSQL(t, path, `UPDATE journal SET produced_by_operation_journal_id=999999 WHERE produced_by_operation_journal_id IS NOT NULL AND journal_id=(SELECT max(journal_id) FROM journal)`)
 			}
 			if err := tr.Close(); err != nil {
 				t.Fatal(err)
@@ -1053,7 +1056,7 @@ func TestMissingJournalOperationFKMigrationIsComposableAndIdempotent(t *testing.
 			if err != nil {
 				t.Fatalf("supported pre-FK migration: %v", err)
 			}
-			if !journalOperationFKPresent(t, tr) {
+			if !journalOperationFKPresent(t, path) {
 				t.Fatal("migration did not add operation FK")
 			}
 			if err := tr.Close(); err != nil {
@@ -1064,7 +1067,7 @@ func TestMissingJournalOperationFKMigrationIsComposableAndIdempotent(t *testing.
 				t.Fatalf("idempotent reopen: %v", err)
 			}
 			defer tr.Close()
-			if !journalOperationFKPresent(t, tr) {
+			if !journalOperationFKPresent(t, path) {
 				t.Fatal("operation FK missing after idempotent reopen")
 			}
 		})
@@ -1073,26 +1076,26 @@ func TestMissingJournalOperationFKMigrationIsComposableAndIdempotent(t *testing.
 
 func TestCanonicalSQLConstraintsAreVersionAgnostic(t *testing.T) {
 	t.Parallel()
-	tr, err := OpenSQLite(filepath.Join(t.TempDir(), "generic-codec-schema.sqlite"))
+	path := filepath.Join(t.TempDir(), "generic-codec-schema.sqlite")
+	tr, err := OpenSQLite(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tr.Close()
-	db := tr.(*sqliteTracker).db
-	db.Lock()
-	defer db.Unlock()
-	if err := sqlitex.Execute(db.Conn(), `SELECT sql FROM sqlite_master WHERE name IN ('journal_operations','journal_operations_canonical_insert','journal_operations_canonical_update')`, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error {
-		sql := stmt.ColumnText(0)
-		if strings.Contains(sql, MutationEncodingV1.String()) {
-			t.Fatalf("SQLite schema embeds codec version: %s", sql)
+	withRawSQLiteTestConn(t, path, func(conn *rawSQLiteConn) {
+		if err := rawExecute(conn, `SELECT sql FROM sqlite_master WHERE name IN ('journal_operations','journal_operations_canonical_insert','journal_operations_canonical_update')`, &rawExecOptions{ResultFunc: func(stmt *rawSQLiteStmt) error {
+			sql := stmt.ColumnText(0)
+			if strings.Contains(sql, MutationEncodingV1.String()) {
+				t.Fatalf("SQLite schema embeds codec version: %s", sql)
+			}
+			if !strings.Contains(sql, "mutation_encoding_version") || !strings.Contains(sql, "canonical_mutation") {
+				t.Fatalf("schema lost structural canonical pairing: %s", sql)
+			}
+			return nil
+		}}); err != nil {
+			t.Fatal(err)
 		}
-		if !strings.Contains(sql, "mutation_encoding_version") || !strings.Contains(sql, "canonical_mutation") {
-			t.Fatalf("schema lost structural canonical pairing: %s", sql)
-		}
-		return nil
-	}}); err != nil {
-		t.Fatal(err)
-	}
+	})
 }
 
 func TestV1SpecificSQLAuthorityMigratesOnce(t *testing.T) {
@@ -1109,7 +1112,7 @@ func TestV1SpecificSQLAuthorityMigratesOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("migrate V1-specific schema: %v", err)
 	}
-	assertNoCodecVersionInSQLiteSchema(t, tr)
+	assertNoCodecVersionInSQLiteSchema(t, path)
 	if err := tr.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -1118,7 +1121,7 @@ func TestV1SpecificSQLAuthorityMigratesOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("idempotent reopen: %v", err)
 	}
-	assertNoCodecVersionInSQLiteSchema(t, tr)
+	assertNoCodecVersionInSQLiteSchema(t, path)
 	if err := tr.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -1128,34 +1131,32 @@ func TestV1SpecificSQLAuthorityMigratesOnce(t *testing.T) {
 	}
 }
 
-func assertNoCodecVersionInSQLiteSchema(t *testing.T, tr Tracker) {
+func assertNoCodecVersionInSQLiteSchema(t *testing.T, path string) {
 	t.Helper()
-	db := tr.(*sqliteTracker).db
-	db.Lock()
-	defer db.Unlock()
-	if err := sqlitex.Execute(db.Conn(), `SELECT sql FROM sqlite_master WHERE name IN ('journal_operations','journal_operations_canonical_insert','journal_operations_canonical_update')`, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error {
-		if sql := stmt.ColumnText(0); strings.Contains(sql, MutationEncodingV1.String()) {
-			t.Fatalf("SQLite schema embeds codec version: %s", sql)
+	withRawSQLiteTestConn(t, path, func(conn *rawSQLiteConn) {
+		if err := rawExecute(conn, `SELECT sql FROM sqlite_master WHERE name IN ('journal_operations','journal_operations_canonical_insert','journal_operations_canonical_update')`, &rawExecOptions{ResultFunc: func(stmt *rawSQLiteStmt) error {
+			if sql := stmt.ColumnText(0); strings.Contains(sql, MutationEncodingV1.String()) {
+				t.Fatalf("SQLite schema embeds codec version: %s", sql)
+			}
+			return nil
+		}}); err != nil {
+			t.Fatal(err)
 		}
-		return nil
-	}}); err != nil {
-		t.Fatal(err)
-	}
+	})
 }
 
-func journalOperationFKPresent(t *testing.T, tr Tracker) bool {
+func journalOperationFKPresent(t *testing.T, path string) bool {
 	t.Helper()
-	db := tr.(*sqliteTracker).db
-	db.Lock()
-	defer db.Unlock()
 	present := false
-	if err := sqlitex.ExecuteTransient(db.Conn(), `PRAGMA foreign_key_list(journal)`, &sqlitex.ExecOptions{ResultFunc: func(stmt *sqlite.Stmt) error {
-		if stmt.ColumnText(3) == "produced_by_operation_journal_id" && stmt.ColumnText(2) == "journal_operations" {
-			present = true
+	withRawSQLiteTestConn(t, path, func(conn *rawSQLiteConn) {
+		if err := rawExecuteTransient(conn, `PRAGMA foreign_key_list(journal)`, &rawExecOptions{ResultFunc: func(stmt *rawSQLiteStmt) error {
+			if stmt.ColumnText(3) == "produced_by_operation_journal_id" && stmt.ColumnText(2) == "journal_operations" {
+				present = true
+			}
+			return nil
+		}}); err != nil {
+			t.Fatal(err)
 		}
-		return nil
-	}}); err != nil {
-		t.Fatal(err)
-	}
+	})
 	return present
 }

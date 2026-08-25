@@ -29,7 +29,7 @@ import (
 // atomic domain fold. Zero fields are replaced by package defaults at adapter
 // construction; valid nonzero overrides are copied and validated before registration.
 //
-// These options map internally and exclusively to the pinned v0.16 options:
+// These options map internally and exclusively to the pinned DBOS options:
 //
 //   - MaxRetries   → dbos.WithStepMaxRetries
 //   - BaseInterval → dbos.WithBaseInterval
@@ -59,7 +59,7 @@ const (
 const dbosDefaultBackoffFactor = float64(2)
 
 // resolvedDBOSStepOptions is the fully-resolved, validated copy of DBOSStepOptions
-// that the adapter stores and uses to construct v0.16 step options.
+// that the adapter stores and uses to construct the pinned DBOS step options.
 type resolvedDBOSStepOptions struct {
 	maxRetries    int
 	baseInterval  time.Duration
@@ -158,8 +158,23 @@ const (
 	dbosWorkflowPrefixConst = "provenance.apply/"
 	// dbosStepPrefixConst is the prefix for durable step names within one workflow.
 	dbosStepPrefixConst = "provenance.apply-step/"
-	// dbosPinnedLibraryConst is the exact library/version string included in fingerprint derivation.
-	dbosPinnedLibraryConst = "github.com/dbos-inc/dbos-transact-golang v0.16.0"
+	// dbosPinnedLibraryConst is a FROZEN FINGERPRINT SALT, not a live version pin.
+	//
+	// It is hashed into workflowIdentityForKind and into the step fingerprint, so
+	// its value keys every durable workflow ID and step name this module has ever
+	// written. Changing the string does not describe a different library: it
+	// re-keys the durable namespace, and every in-flight workflow becomes
+	// unreachable under its new identity while its old rows keep the old one.
+	//
+	// It therefore deliberately DOES NOT track go.mod. Upgrading the DBOS
+	// dependency must leave this constant alone -- the pending v1.2 upgrade
+	// explicitly included. Changing it is a durable-state break that needs an
+	// operational decision first: drain every in-flight workflow, then cut.
+	//
+	// It reads v0.20.0 because the string was corrected from a stale v0.16.0 in
+	// the same release whose ratified breaking change already declared pre-v0.0.4
+	// durable state non-replayable. That was the free window, and it has closed.
+	dbosPinnedLibraryConst = "github.com/dbos-inc/dbos-transact-golang v0.20.0"
 )
 
 // dbosContractSnapshot is the captured unversioned DBOS contract value.
@@ -233,7 +248,15 @@ const (
 	DBOSDiagFieldNestedOpID            DBOSDiagnosticField = "nested_operation_id"
 	DBOSDiagFieldSuccessFailure        DBOSDiagnosticField = "success_failure"
 	DBOSDiagFieldMessage               DBOSDiagnosticField = "message"
-	DBOSDiagFieldConflictField         DBOSDiagnosticField = "conflict_field"
+	DBOSDiagFieldConflictAxis          DBOSDiagnosticField = "conflict_axis"
+	DBOSDiagFieldConflictIndex         DBOSDiagnosticField = "conflict_index"
+	DBOSDiagFieldConditionIndex        DBOSDiagnosticField = "condition_index"
+	DBOSDiagFieldConditionKind         DBOSDiagnosticField = "condition_kind"
+	DBOSDiagFieldConditionReason       DBOSDiagnosticField = "condition_reason"
+	DBOSDiagFieldAssertedJournalID     DBOSDiagnosticField = "asserted_journal_id"
+	DBOSDiagFieldActualJournalID       DBOSDiagnosticField = "actual_journal_id"
+	DBOSDiagFieldActivityID            DBOSDiagnosticField = "activity_id"
+	DBOSDiagFieldExistingJournalID     DBOSDiagnosticField = "existing_journal_id"
 	DBOSDiagFieldDescriptorMatch       DBOSDiagnosticField = "descriptor_match"
 	DBOSDiagFieldWorkflow              DBOSDiagnosticField = "workflow"
 	DBOSDiagFieldContext               DBOSDiagnosticField = "context"
@@ -282,8 +305,8 @@ type DBOSDiagnosticError struct {
 
 func (e *DBOSDiagnosticError) Error() string {
 	return fmt.Sprintf(
-		"provenance DBOS diagnostic: what: class=%s field=%s position=%v operation=%q workflow=%q value=%q; why: %s; where: DBOS adapter; when: %s; impact: %s; fix: %s; cause: %v",
-		e.Class, e.Field, e.Position, e.Operation, e.Workflow, e.Value, e.Reason, e.Stage, e.Impact, e.Fix, e.Cause)
+		"provenance DBOS diagnostic: what: class=%s field=%s position=%v operation=%q workflow=%q value=%q; why: %s; where: DBOS adapter; when: %s; impact: %s; fix: %s%s",
+		e.Class, e.Field, e.Position, e.Operation, e.Workflow, e.Value, e.Reason, e.Stage, e.Impact, e.Fix, causeClause(e.Cause))
 }
 
 func (e *DBOSDiagnosticError) Unwrap() error { return e.Cause }

@@ -1,11 +1,12 @@
 package sqlite
 
 import (
+	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 
 	"github.com/dayvidpham/provenance/internal/journal"
-	zs "zombiezen.com/go/sqlite"
-	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 // spine_corruption_adversarial.go holds narrow write seams that deliberately
@@ -24,7 +25,7 @@ import (
 // on-disk-corruption / partial-write shape), which is the class of damage §15's
 // from-empty convergence and §10's whole-journal scan exist to catch. Production
 // paths (Apply, migration) never delete or renumber committed rows; these seams are
-// used only by the corpus and are never part of the JournalAPI surface.
+// used only by the corpus and are never part of the Journal surface.
 
 // AdversarialDeleteSubtypeRow deletes the subtype row for a surviving supertype
 // journal row (an "orphaned anchor" — the subtype row deleted out from under it),
@@ -62,19 +63,28 @@ func (table AdversarialSubtypeTable) deleteQuery() string {
 	}
 }
 
-func (db *DB) AdversarialDeleteSubtypeRow(jid journal.JournalID, table AdversarialSubtypeTable) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	if err := sqlitex.ExecuteTransient(db.conn, "PRAGMA foreign_keys=OFF", nil); err != nil {
-		return fmt.Errorf("AdversarialDeleteSubtypeRow %q: disable FK: %w", table, err)
+func (db *DB) AdversarialDeleteSubtypeRow(jid journal.JournalID, table AdversarialSubtypeTable) (err error) {
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
+	if err != nil {
+		return fmt.Errorf("AdversarialDeleteSubtypeRow: lease connection: %w", err)
 	}
-	defer func() { _ = sqlitex.ExecuteTransient(db.conn, "PRAGMA foreign_keys=ON", nil) }()
+	defer scope.release()
+	restoreFK, err := scope.pauseForeignKeys("AdversarialDeleteSubtypeRow")
+	if err != nil {
+		return err
+	}
+	defer func() { err = restoreFK(err) }()
 	// The table is one of the closed subtype-table constants above, never caller
 	// input, so identifier interpolation is safe here.
-	if err := sqlitex.Execute(db.conn, table.deleteQuery(), &sqlitex.ExecOptions{Args: []any{int64(jid)}}); err != nil {
+	result, err := scope.conn.ExecContext(scope.ctx, table.deleteQuery(), int64(jid))
+	if err != nil {
 		return fmt.Errorf("AdversarialDeleteSubtypeRow %q journal_id=%d: %w", table, jid, err)
 	}
-	if changes := db.conn.Changes(); changes != 1 {
+	changes, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("AdversarialDeleteSubtypeRow %q journal_id=%d: count deleted rows: %w", table, jid, err)
+	}
+	if changes != 1 {
 		return fmt.Errorf("AdversarialDeleteSubtypeRow %q journal_id=%d: deleted %d rows, want exactly 1 (the seam must corrupt a real committed row)", table, jid, changes)
 	}
 	return nil
@@ -87,10 +97,13 @@ func (db *DB) AdversarialDeleteSubtypeRow(jid journal.JournalID, table Adversari
 // discriminator is fixed at insert. The corpus drives VerifyIntegrity against this
 // (expecting ErrSubtypeIntegrity). newKind must differ from the row's current kind.
 func (db *DB) AdversarialRewriteDiscriminator(jid journal.JournalID, newKind journal.JournalKind) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	var current int = -1
-	if err := sqlitex.Execute(db.conn, "SELECT kind_id FROM journal WHERE journal_id = ?1", &sqlitex.ExecOptions{Args: []any{int64(jid)}, ResultFunc: func(stmt *zs.Stmt) error { current = stmt.ColumnInt(0); return nil }}); err != nil {
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
+	if err != nil {
+		return fmt.Errorf("AdversarialRewriteDiscriminator: lease connection: %w", err)
+	}
+	defer scope.release()
+	current := -1
+	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT kind_id FROM journal WHERE journal_id = ?1", int64(jid)).Scan(&current); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("AdversarialRewriteDiscriminator journal_id=%d: read current kind: %w", jid, err)
 	}
 	if current == -1 {
@@ -99,7 +112,7 @@ func (db *DB) AdversarialRewriteDiscriminator(jid journal.JournalID, newKind jou
 	if current == int(newKind) {
 		return fmt.Errorf("AdversarialRewriteDiscriminator journal_id=%d: new kind %s equals the current kind, which is no corruption", jid, newKind)
 	}
-	if err := sqlitex.Execute(db.conn, "UPDATE journal SET kind_id = ?1 WHERE journal_id = ?2", &sqlitex.ExecOptions{Args: []any{int(newKind), int64(jid)}}); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, "UPDATE journal SET kind_id = ?1 WHERE journal_id = ?2", int(newKind), int64(jid)); err != nil {
 		return fmt.Errorf("AdversarialRewriteDiscriminator journal_id=%d -> %s: %w", jid, newKind, err)
 	}
 	return nil
@@ -116,35 +129,43 @@ func (db *DB) AdversarialRewriteDiscriminator(jid journal.JournalID, newKind jou
 // toggled off so the anchor rows can be removed; the database is left in the
 // deliberately truncated state the corpus drives ReplayProjections against. n must
 // be positive and smaller than the journal length.
-func (db *DB) AdversarialTruncateTail(n int) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+func (db *DB) AdversarialTruncateTail(n int) (err error) {
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
+	if err != nil {
+		return fmt.Errorf("AdversarialTruncateTail: lease connection: %w", err)
+	}
+	defer scope.release()
 	if n <= 0 {
 		return fmt.Errorf("AdversarialTruncateTail: n must be positive, got %d", n)
 	}
 	var total int
-	if err := sqlitex.Execute(db.conn, "SELECT COUNT(*) FROM journal", &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error { total = stmt.ColumnInt(0); return nil }}); err != nil {
+	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT COUNT(*) FROM journal").Scan(&total); err != nil {
 		return fmt.Errorf("AdversarialTruncateTail: count journal: %w", err)
 	}
 	if n >= total {
 		return fmt.Errorf("AdversarialTruncateTail: n=%d must be smaller than the journal length %d (truncating the whole spine is a different case)", n, total)
 	}
-	if err := sqlitex.ExecuteTransient(db.conn, "PRAGMA foreign_keys=OFF", nil); err != nil {
-		return fmt.Errorf("AdversarialTruncateTail: disable FK: %w", err)
+	restoreFK, err := scope.pauseForeignKeys("AdversarialTruncateTail")
+	if err != nil {
+		return err
 	}
-	defer func() { _ = sqlitex.ExecuteTransient(db.conn, "PRAGMA foreign_keys=ON", nil) }()
+	defer func() { err = restoreFK(err) }()
 	// The n highest JournalIDs are the tail. Delete their subtype/detail rows first,
 	// then the supertype rows, so no dangling subtype row is left behind (the tail is
 	// removed cleanly — only the projection, not the spine's own integrity, diverges).
 	var tail []int64
-	if err := sqlitex.Execute(db.conn, "SELECT journal_id FROM journal ORDER BY journal_id DESC LIMIT ?1", &sqlitex.ExecOptions{Args: []any{n}, ResultFunc: func(stmt *zs.Stmt) error {
-		tail = append(tail, stmt.ColumnInt64(0))
+	if err := scope.queryRows("SELECT journal_id FROM journal ORDER BY journal_id DESC LIMIT ?1", []any{n}, func(rows *sql.Rows) error {
+		var jid int64
+		if err := rows.Scan(&jid); err != nil {
+			return err
+		}
+		tail = append(tail, jid)
 		return nil
-	}}); err != nil {
+	}); err != nil {
 		return fmt.Errorf("AdversarialTruncateTail: enumerate tail: %w", err)
 	}
 	for _, jid := range tail {
-		if err := db.deleteSpineRowCascadeLocked(jid); err != nil {
+		if err := scope.deleteSpineRowCascade(jid); err != nil {
 			return fmt.Errorf("AdversarialTruncateTail: delete tail row %d: %w", jid, err)
 		}
 	}
@@ -163,29 +184,31 @@ func (db *DB) AdversarialTruncateTail(n int) error {
 // caller-supplied. gap must be positive so the row lands beyond the current tail.
 // Returns the non-contiguous JournalID it wrote.
 func (db *DB) AdversarialInsertNonContiguousSupertype(actor journal.ActorID, gap int) (journal.JournalID, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
+	if err != nil {
+		return 0, fmt.Errorf("AdversarialInsertNonContiguousSupertype: lease connection: %w", err)
+	}
+	defer scope.release()
 	if gap <= 0 {
 		return 0, fmt.Errorf("AdversarialInsertNonContiguousSupertype: gap must be positive, got %d", gap)
 	}
 	var maxJID int64
-	if err := sqlitex.Execute(db.conn, "SELECT COALESCE(MAX(journal_id), ?1) FROM journal",
-		&sqlitex.ExecOptions{Args: []any{0}, ResultFunc: func(stmt *zs.Stmt) error { maxJID = stmt.ColumnInt64(0); return nil }}); err != nil {
+	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT COALESCE(MAX(journal_id), ?1) FROM journal", 0).Scan(&maxJID); err != nil {
 		return 0, fmt.Errorf("AdversarialInsertNonContiguousSupertype: read max journal_id: %w", err)
 	}
 	target := maxJID + int64(gap)
-	if err := sqlitex.Execute(db.conn, "INSERT INTO journal (journal_id, kind_id, actor_id, recorded_at, produced_by_operation_journal_id)\n\t\t VALUES (?1, ?2, ?3, ?4, ?5)", &sqlitex.ExecOptions{Args: []any{target, int(journal.JournalKindDecision), actor.String(), 0, nil}}); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO journal (journal_id, kind_id, actor_id, recorded_at, produced_by_operation_journal_id)\n\t\t VALUES (?1, ?2, ?3, ?4, ?5)", target, int(journal.JournalKindDecision), actor.String(), 0, nil); err != nil {
 		return 0, fmt.Errorf("AdversarialInsertNonContiguousSupertype journal_id=%d: %w", target, err)
 	}
 	return journal.JournalID(target), nil
 }
 
-// deleteSpineRowCascadeLocked removes one supertype journal row and every
+// deleteSpineRowCascade removes one supertype journal row and every
 // subtype/detail row that hangs off it, so a truncate/gap seam leaves no dangling
 // subtype row (which would instead trip the totality guard). It runs with FK
 // enforcement already disabled by the caller. It is deliberately exhaustive over the
 // class-table-inheritance and authority-detail tables the spine uses.
-func (db *DB) deleteSpineRowCascadeLocked(jid int64) error {
+func (scope *connScope) deleteSpineRowCascade(jid int64) error {
 	// Detail tables that reference the subtype rows (deepest first).
 	details := []string{
 		"DELETE FROM journal_operation_result_slots WHERE journal_id = ?1",
@@ -194,16 +217,18 @@ func (db *DB) deleteSpineRowCascadeLocked(jid int64) error {
 		"DELETE FROM journal_authorities WHERE journal_id = ?1",
 		"DELETE FROM journal_task_event_contexts WHERE event_journal_id = ?1",
 		"DELETE FROM journal_task_events WHERE journal_id = ?1",
+		"DELETE FROM journal_decision_contexts WHERE decision_journal_id = ?1",
+		"DELETE FROM journal_evidence_contexts WHERE evidence_journal_id = ?1",
 		"DELETE FROM journal_operations WHERE journal_id = ?1",
 		"DELETE FROM journal_decisions WHERE journal_id = ?1",
 		"DELETE FROM journal_evidence WHERE journal_id = ?1",
 	}
 	for _, stmt := range details {
-		if err := sqlitex.Execute(db.conn, stmt, &sqlitex.ExecOptions{Args: []any{jid}}); err != nil {
+		if _, err := scope.conn.ExecContext(scope.ctx, stmt, jid); err != nil {
 			return fmt.Errorf("cascade static subtype statement: %w", err)
 		}
 	}
-	if err := sqlitex.Execute(db.conn, "DELETE FROM journal WHERE journal_id = ?1", &sqlitex.ExecOptions{Args: []any{jid}}); err != nil {
+	if _, err := scope.conn.ExecContext(scope.ctx, "DELETE FROM journal WHERE journal_id = ?1", jid); err != nil {
 		return fmt.Errorf("delete supertype row %d: %w", jid, err)
 	}
 	return nil
@@ -213,15 +238,25 @@ func (db *DB) deleteSpineRowCascadeLocked(jid int64) error {
 // ascending JournalID order, so a corpus handler can pick a concrete interior or
 // tail row to corrupt without hardcoding an id. It writes nothing.
 func (db *DB) AdversarialJournalRows() ([]journal.JournalID, []journal.JournalKind, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
+	if err != nil {
+		return nil, nil, fmt.Errorf("AdversarialJournalRows: lease connection: %w", err)
+	}
+	defer scope.release()
 	var ids []journal.JournalID
 	var kinds []journal.JournalKind
-	if err := sqlitex.Execute(db.conn, "SELECT journal_id, kind_id FROM journal ORDER BY journal_id ASC", &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
-		ids = append(ids, journal.JournalID(stmt.ColumnInt64(0)))
-		kinds = append(kinds, journal.JournalKind(stmt.ColumnInt(1)))
+	if err := scope.queryRows("SELECT journal_id, kind_id FROM journal ORDER BY journal_id ASC", nil, func(rows *sql.Rows) error {
+		var (
+			id   int64
+			kind int
+		)
+		if err := rows.Scan(&id, &kind); err != nil {
+			return err
+		}
+		ids = append(ids, journal.JournalID(id))
+		kinds = append(kinds, journal.JournalKind(kind))
 		return nil
-	}}); err != nil {
+	}); err != nil {
 		return nil, nil, fmt.Errorf("AdversarialJournalRows: %w", err)
 	}
 	return ids, kinds, nil

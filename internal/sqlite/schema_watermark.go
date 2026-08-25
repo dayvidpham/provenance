@@ -1,30 +1,11 @@
 package sqlite
 
 import (
+	"context"
 	"fmt"
-
-	zs "zombiezen.com/go/sqlite"
-	"zombiezen.com/go/sqlite/sqlitex"
 )
 
-// schema_watermark.go owns the tasks.last_journal_id watermark schema and the
-// transforms between its two shapes (docs/journal-relational-contract.md §8.1, §13).
-//
-// A FRESH native database ships the tightened #5 shape: last_journal_id is NOT NULL,
-// so every task row reflects a journal position by construction — the only production
-// tasks-row INSERT is the reducer fold, which always carries the watermark. A LEGACY
-// database predates the tightening (the journal-base #4 shape had a NULLABLE watermark,
-// and an even older database may lack the column entirely); such a database is upgraded
-// by MigrateLegacyBaseline, which — if needed — adds the column first, anchors every
-// legacy row (populating each watermark), then RE-TIGHTENS the column back to NOT NULL
-// so a migrated database converges to the exact same schema-level enforcement a fresh
-// database ships (the enforcement is structural post-migration, not merely data-level).
-// The test seams simulate legacy databases by DOWNGRADING a fresh native schema to the
-// legacy nullable shape (a row can then be seeded with no watermark), exactly mirroring a
-// pre-tightening database on disk (§13 CORPUS/TEST PATH); post-migration the schema is
-// tight again, so a fresh downgrade seam is what a later test uses to model new legacy
-// state.
-
+// tasksWatermarkShape describes the three on-disk task watermark forms.
 type tasksWatermarkShape uint8
 
 const (
@@ -57,169 +38,139 @@ func (shape tasksWatermarkShape) copyQuery() string {
 	}
 }
 
-// tasksWatermarkColumnInfoLocked reports whether the tasks table has a last_journal_id
-// column and, if so, whether it is declared NOT NULL. Assumes db.mu is held.
-func (db *DB) tasksWatermarkColumnInfoLocked() (present bool, notNull bool, err error) {
-	if err := sqlitex.Execute(db.conn, "PRAGMA table_info(tasks)", &sqlitex.ExecOptions{ResultFunc: func(stmt *zs.Stmt) error {
-		if stmt.ColumnText(1) == "last_journal_id" {
-			present = true
-			notNull = stmt.ColumnInt(3) == 1 // column 3 of table_info is "notnull"
+func (scope *connScope) tasksWatermarkColumnInfo() (present bool, notNull bool, err error) {
+	rows, err := scope.conn.QueryContext(scope.ctx, "PRAGMA table_info(tasks)")
+	if err != nil {
+		return false, false, fmt.Errorf("tasksWatermarkColumnInfo: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNullValue, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNullValue, &defaultValue, &primaryKey); err != nil {
+			return false, false, fmt.Errorf("tasksWatermarkColumnInfo: scan table_info: %w", err)
 		}
-		return nil
-	}}); err != nil {
+		if name == "last_journal_id" {
+			present = true
+			notNull = notNullValue == 1
+		}
+	}
+	if err := rows.Err(); err != nil {
 		return false, false, fmt.Errorf("tasksWatermarkColumnInfo: %w", err)
 	}
 	return present, notNull, nil
 }
 
-// countUnanchoredTasksLocked reports how many tasks rows still carry a NULL watermark —
-// i.e. legacy rows not yet journal-anchored (§8.1, §13). Migration consults it to decide
-// whether the whole table can be re-tightened to NOT NULL: the rebuild is only safe (and
-// only meaningful) when zero un-anchored rows remain. A no-op when the column is absent
-// (the even-older column-less legacy shape) — a column-less table has no watermark to be
-// null, and migration adds the column before anchoring, so this runs after that add.
-// Assumes db.mu is held.
-func (db *DB) countUnanchoredTasksLocked() (int, error) {
-	present, _, err := db.tasksWatermarkColumnInfoLocked()
+func (scope *connScope) countUnanchoredTasks() (int, error) {
+	present, _, err := scope.tasksWatermarkColumnInfo()
 	if err != nil {
 		return 0, err
 	}
 	if !present {
-		return 0, fmt.Errorf(
-			"countUnanchoredTasks: tasks table has no last_journal_id column — where: migration " +
-				"re-tightening gate (§8.1, §13); when: after the column-add path should have run; impact: " +
-				"nothing re-tightened; fix: this indicates the column-add path was skipped, which is a bug")
+		return 0, fmt.Errorf("countUnanchoredTasks: tasks table has no last_journal_id column after migration column-add; fix: inspect the migration path")
 	}
-	var n int
-	if err := sqlitex.Execute(db.conn, "SELECT COUNT(*) FROM tasks WHERE last_journal_id IS ?1", &sqlitex.ExecOptions{Args: []any{nil}, ResultFunc: func(stmt *zs.Stmt) error { n = stmt.ColumnInt(0); return nil }}); err != nil {
+	var count int
+	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT COUNT(*) FROM tasks WHERE last_journal_id IS NULL").Scan(&count); err != nil {
 		return 0, fmt.Errorf("countUnanchoredTasks: %w", err)
 	}
-	return n, nil
+	return count, nil
 }
 
-// rebuildTasksWatermarkLocked runs the canonical SQLite table rebuild to change the
-// tasks table to the requested watermark shape (§13). It preserves every row, the child
-// foreign keys that reference tasks(id) (edges/labels/comments, which reference by name
-// across the drop+rename), and the tasks indexes. copyWatermark controls whether the
-// existing last_journal_id values are carried into the rebuilt table (false when the old
-// table has no such column). FK enforcement is toggled around an explicit transaction
-// exactly as completeJournalOperationFK does; a detected violation rolls the whole
-// rebuild back. Assumes db.mu is held.
-func (db *DB) rebuildTasksWatermarkLocked(shape tasksWatermarkShape) error {
-	if err := sqlitex.ExecuteTransient(db.conn, "PRAGMA foreign_keys=OFF", nil); err != nil {
-		return fmt.Errorf("rebuildTasksWatermark: disable FK enforcement: %w", err)
+// rebuildTasksWatermark performs the foreign-key-safe SQLite rebuild on this
+// exact connection. PRAGMA foreign_keys is connection-local and cannot change
+// inside a transaction, so it is toggled before the explicit BEGIN IMMEDIATE.
+func (scope *connScope) rebuildTasksWatermark(shape tasksWatermarkShape) (err error) {
+	restoreFK, err := scope.pauseForeignKeys("rebuildTasksWatermark")
+	if err != nil {
+		return err
 	}
-	defer func() { _ = sqlitex.ExecuteTransient(db.conn, "PRAGMA foreign_keys=ON", nil) }()
-
-	if err := sqlitex.ExecuteTransient(db.conn, "BEGIN IMMEDIATE", nil); err != nil {
-		return fmt.Errorf("rebuildTasksWatermark: begin: %w", err)
-	}
-	if err := sqlitex.ExecuteTransient(db.conn, shape.createRebuildQuery(), nil); err != nil {
-		_ = sqlitex.ExecuteTransient(db.conn, "ROLLBACK", nil)
-		return fmt.Errorf("rebuildTasksWatermark: create rebuild table: %w", err)
-	}
-	if err := sqlitex.Execute(db.conn, shape.copyQuery(), nil); err != nil {
-		_ = sqlitex.ExecuteTransient(db.conn, "ROLLBACK", nil)
-		return fmt.Errorf("rebuildTasksWatermark: copy rows: %w", err)
-	}
-	if err := sqlitex.ExecuteTransient(db.conn, "DROP TABLE tasks", nil); err != nil {
-		_ = sqlitex.ExecuteTransient(db.conn, "ROLLBACK", nil)
-		return fmt.Errorf("rebuildTasksWatermark: drop old table: %w", err)
-	}
-	if err := sqlitex.ExecuteTransient(db.conn, "ALTER TABLE tasks_watermark_rebuild RENAME TO tasks", nil); err != nil {
-		_ = sqlitex.ExecuteTransient(db.conn, "ROLLBACK", nil)
-		return fmt.Errorf("rebuildTasksWatermark: rename rebuilt table: %w", err)
-	}
-	// Recreate the indexes dropped with the old tasks table.
-	for _, ddl := range []string{
-		"CREATE INDEX IF NOT EXISTS idx_tasks_namespace ON tasks (namespace)",
-		"CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks (status_id)",
-		"CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks (priority_id)",
-		"CREATE INDEX IF NOT EXISTS idx_tasks_type ON tasks (type_id)",
-		"CREATE INDEX IF NOT EXISTS idx_tasks_phase ON tasks (phase_id)",
-		"CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks (owner_id)",
-	} {
-		if err := sqlitex.ExecuteTransient(db.conn, ddl, nil); err != nil {
-			_ = sqlitex.ExecuteTransient(db.conn, "ROLLBACK", nil)
-			return fmt.Errorf("rebuildTasksWatermark: recreate index: %w", err)
+	// The restore is reported even when the rebuild itself failed: losing
+	// enforcement is a distinct fault from the rebuild's, and dropping it on the
+	// already-failed path is how a connection silently stops enforcing.
+	defer func() { err = restoreFK(err) }()
+	return runImmediateTransaction(scope.ctx, scope.conn, func() error {
+		if _, err := scope.conn.ExecContext(scope.ctx, shape.createRebuildQuery()); err != nil {
+			return fmt.Errorf("rebuildTasksWatermark: create rebuild table: %w", err)
 		}
-	}
-	var violations int
-	if err := sqlitex.ExecuteTransient(db.conn, "PRAGMA foreign_key_check",
-		&sqlitex.ExecOptions{ResultFunc: func(*zs.Stmt) error { violations++; return nil }}); err != nil {
-		_ = sqlitex.ExecuteTransient(db.conn, "ROLLBACK", nil)
-		return fmt.Errorf("rebuildTasksWatermark: foreign_key_check: %w", err)
-	}
-	if violations > 0 {
-		_ = sqlitex.ExecuteTransient(db.conn, "ROLLBACK", nil)
-		return fmt.Errorf(
-			"rebuildTasksWatermark: rebuild left %d foreign-key violations, rolled back — where: tasks "+
-				"watermark rebuild; impact: the rebuild was reverted and the database left unchanged; fix: "+
-				"this indicates a child row (edge/label/comment) references a task id that does not exist",
-			violations)
-	}
-	if err := sqlitex.ExecuteTransient(db.conn, "COMMIT", nil); err != nil {
-		_ = sqlitex.ExecuteTransient(db.conn, "ROLLBACK", nil)
-		return fmt.Errorf("rebuildTasksWatermark: commit rebuild: %w", err)
-	}
-	return nil
+		if _, err := scope.conn.ExecContext(scope.ctx, shape.copyQuery()); err != nil {
+			return fmt.Errorf("rebuildTasksWatermark: copy rows: %w", err)
+		}
+		if _, err := scope.conn.ExecContext(scope.ctx, "DROP TABLE tasks"); err != nil {
+			return fmt.Errorf("rebuildTasksWatermark: drop old table: %w", err)
+		}
+		if _, err := scope.conn.ExecContext(scope.ctx, "ALTER TABLE tasks_watermark_rebuild RENAME TO tasks"); err != nil {
+			return fmt.Errorf("rebuildTasksWatermark: rename rebuilt table: %w", err)
+		}
+		for _, statement := range []string{
+			"CREATE INDEX IF NOT EXISTS idx_tasks_namespace ON tasks (namespace)",
+			"CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks (status_id)",
+			"CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks (priority_id)",
+			"CREATE INDEX IF NOT EXISTS idx_tasks_type ON tasks (type_id)",
+			"CREATE INDEX IF NOT EXISTS idx_tasks_phase ON tasks (phase_id)",
+			"CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks (owner_id)",
+		} {
+			if _, err := scope.conn.ExecContext(scope.ctx, statement); err != nil {
+				return fmt.Errorf("rebuildTasksWatermark: recreate index: %w", err)
+			}
+		}
+		rows, err := scope.conn.QueryContext(scope.ctx, "PRAGMA foreign_key_check")
+		if err != nil {
+			return fmt.Errorf("rebuildTasksWatermark: foreign_key_check: %w", err)
+		}
+		defer rows.Close()
+		violations := 0
+		for rows.Next() {
+			violations++
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("rebuildTasksWatermark: foreign_key_check: %w", err)
+		}
+		if violations != 0 {
+			return fmt.Errorf("rebuildTasksWatermark: rebuild left %d foreign-key violations; the transaction will roll back; fix: repair child rows before retrying", violations)
+		}
+		return nil
+	})
 }
 
-// downgradeTasksWatermarkToLegacyLocked relaxes the tasks table to the legacy (pre-#5)
-// nullable-watermark shape so a legacy row can be seeded with no watermark (§13). It is
-// the "old-schema downgrade" the test seeding seams perform: a no-op when the watermark
-// is already nullable or the column is already absent, a rebuild-to-nullable when the
-// live schema is the tightened NOT NULL shape. Existing rows (including any native rows
-// already carrying a watermark) are preserved. Assumes db.mu is held.
-func (db *DB) downgradeTasksWatermarkToLegacyLocked() error {
-	present, notNull, err := db.tasksWatermarkColumnInfoLocked()
+func (scope *connScope) downgradeTasksWatermarkToLegacy() error {
+	present, notNull, err := scope.tasksWatermarkColumnInfo()
 	if err != nil {
 		return err
 	}
 	if !present || !notNull {
-		return nil // already legacy-shaped (nullable, or the even-older column-less shape)
+		return nil
 	}
-	return db.rebuildTasksWatermarkLocked(tasksWatermarkNullable)
+	return scope.rebuildTasksWatermark(tasksWatermarkNullable)
 }
 
-// DowngradeTasksToColumnlessLegacy rebuilds the tasks table to the even-older legacy
-// shape that predates the last_journal_id column entirely (§13), so a test can drive
-// MigrateLegacyBaseline's column-add path against a genuinely column-less database. Like
-// SeedLegacyTask it is a narrow, test-only *DB seam that models a legacy database on
-// disk, never part of the JournalAPI surface. Existing base-column rows are preserved.
+// DowngradeTasksToColumnlessLegacy is a narrow test-only legacy fixture seam.
 func (db *DB) DowngradeTasksToColumnlessLegacy() error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	present, _, err := db.tasksWatermarkColumnInfoLocked()
+	scope, err := db.bindScope(context.Background(), projectionTargetLive)
+	if err != nil {
+		return fmt.Errorf("DowngradeTasksToColumnlessLegacy: lease connection: %w", err)
+	}
+	defer scope.release()
+	present, _, err := scope.tasksWatermarkColumnInfo()
 	if err != nil {
 		return err
 	}
 	if !present {
 		return nil
 	}
-	return db.rebuildTasksWatermarkLocked(tasksWatermarkColumnless)
+	return scope.rebuildTasksWatermark(tasksWatermarkColumnless)
 }
 
-// ensureTasksWatermarkColumnLocked is migration's column-add path (§13): a legacy
-// database that predates the last_journal_id column entirely gets it added (nullable,
-// with the journal FK) before any legacy row is anchored, so the anchoring projection
-// has a column to write the watermark into. Idempotent: a no-op when the column already
-// exists (the common case, where the legacy nullable column is present). Assumes db.mu
-// is held.
-func (db *DB) ensureTasksWatermarkColumnLocked() error {
-	present, _, err := db.tasksWatermarkColumnInfoLocked()
+func (scope *connScope) ensureTasksWatermarkColumn() error {
+	present, _, err := scope.tasksWatermarkColumnInfo()
 	if err != nil {
 		return err
 	}
 	if present {
 		return nil
 	}
-	if err := sqlitex.ExecuteTransient(db.conn,
-		"ALTER TABLE tasks ADD COLUMN last_journal_id INTEGER REFERENCES journal(journal_id)", nil); err != nil {
-		return fmt.Errorf(
-			"ensureTasksWatermarkColumn: add legacy last_journal_id column — where: migration column-add "+
-				"path (§13); when: before any legacy row is anchored; impact: nothing committed; fix: the "+
-				"legacy tasks table shape is not understood: %w", err)
+	if _, err := scope.conn.ExecContext(scope.ctx, "ALTER TABLE tasks ADD COLUMN last_journal_id INTEGER REFERENCES journal(journal_id)"); err != nil {
+		return fmt.Errorf("ensureTasksWatermarkColumn: add legacy last_journal_id column: %w", err)
 	}
 	return nil
 }

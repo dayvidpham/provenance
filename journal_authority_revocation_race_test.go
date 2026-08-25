@@ -180,10 +180,17 @@ func TestRevokeAndCitationBothOrderingsDeterministic(t *testing.T) {
 // the loser observes A already ended and is rejected with a typed ErrStaleEpisode,
 // writing nothing. The surviving state is single-valued and converges.
 func TestRevocationVsTransferCASSingleWinner(t *testing.T) {
-	t.Parallel()
-	const iterations = 40
+	// The compare-and-set admits one of two writers, so contention is its
+	// subject: on the single-connection memory pool the two Applies are queued
+	// rather than contending for the file, and only a file-backed pool puts them
+	// on separate connections where the loser can also lose on a lock.
+	forEachWritePool(t, "revocation-vs-transfer-cas", func(t *testing.T, r *raceTracker) {
+		revocationVsTransferCASSingleWinnerBody(t, r, 40)
+	})
+}
+
+func revocationVsTransferCASSingleWinnerBody(t *testing.T, r *raceTracker, iterations int) {
 	revokeWins, transferWins := 0, 0
-	r := newRaceTracker(t)
 
 	for i := 0; i < iterations; i++ {
 		suffix := fmt.Sprintf("-%d", i)

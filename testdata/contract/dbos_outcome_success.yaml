@@ -1,0 +1,16 @@
+cases:
+  - name: all-result-slots
+    classification: must-pass
+    provenance: {source: requirement, ref: "DBOS complete result-slot transport"}
+    mutation: {description: "One independent outcome carries every result-slot arm.", operator: all-result-slots}
+    input:
+      json: '{"schema":"provenance.dbos-step-outcome","operation_id":"fixture-operation","mutation_digest":"bQ==","success":{"anchor_journal_id":1,"emitted_events":[2],"result_slots":[{"slot":"activity","produced_journal_id":3,"kind":5,"activity_id":"fixture--018f0000-0000-7000-8000-000000000004"},{"slot":"authority","produced_journal_id":4,"kind":2},{"slot":"decision","produced_journal_id":5,"kind":3},{"slot":"evidence","produced_journal_id":6,"kind":4},{"slot":"task","produced_journal_id":7,"kind":1,"task_id":"fixture--018f0000-0000-7000-8000-000000000001"}]}}'
+    expected:
+      anchor: 1
+      emitted: [2]
+      slots:
+        - {slot: activity, producedID: 3, kind: 5, activityID: fixture--018f0000-0000-7000-8000-000000000004}
+        - {slot: authority, producedID: 4, kind: 2}
+        - {slot: decision, producedID: 5, kind: 3}
+        - {slot: evidence, producedID: 6, kind: 4}
+        - {slot: task, producedID: 7, kind: 1, taskID: fixture--018f0000-0000-7000-8000-000000000001}

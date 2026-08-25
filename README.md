@@ -87,9 +87,9 @@ nix develop             # enters devshell with Go, gopls, ast-grep, delve
 
 make fmt                # gofmt
 make lint               # go vet + ast-grep
-make test               # strict normal scheduler matrix + CGO1 race gate
-make test-local         # cached local iteration
-make build              # CGO_ENABLED=0 go build ./...
+make test               # authoritative CGO_ENABLED=1 race-only suite
+make test-local         # focused CGO_ENABLED=1 race-only iteration
+make build              # fmt + lint + race suite + CGO_ENABLED=0 build
 ```
 
 `make lint` also enforces that production code contains no `time.Sleep` calls.

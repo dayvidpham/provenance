@@ -36,7 +36,7 @@ type OperationID string
 
 // JournalKind is the closed discriminator selecting which typed subtype table
 // extends a journal row. Backed by the journal_kinds integer lookup, seeded
-// with exactly the five values below (§2.2).
+// with exactly the six values below (§2.2).
 type JournalKind int
 
 const (
@@ -45,6 +45,7 @@ const (
 	JournalKindAuthority                    // 2: journal_authorities
 	JournalKindDecision                     // 3: journal_decisions
 	JournalKindEvidence                     // 4: journal_evidence
+	JournalKindActivity                     // 5: journal_activity_creations
 )
 
 var journalKindStrings = [...]string{
@@ -53,6 +54,7 @@ var journalKindStrings = [...]string{
 	JournalKindAuthority: "authority",
 	JournalKindDecision:  "decision",
 	JournalKindEvidence:  "evidence",
+	JournalKindActivity:  "activity",
 }
 
 // JournalKinds returns the closed set in declaration/id order. Used both to
@@ -60,7 +62,7 @@ var journalKindStrings = [...]string{
 func JournalKinds() []JournalKind {
 	return []JournalKind{
 		JournalKindOperation, JournalKindTaskEvent, JournalKindAuthority,
-		JournalKindDecision, JournalKindEvidence,
+		JournalKindDecision, JournalKindEvidence, JournalKindActivity,
 	}
 }
 
@@ -71,9 +73,9 @@ func (k JournalKind) String() string {
 	return fmt.Sprintf("JournalKind(%d)", int(k))
 }
 
-// IsValid reports whether k is one of the five seeded kinds.
+// IsValid reports whether k is one of the six seeded kinds.
 func (k JournalKind) IsValid() bool {
-	return k >= JournalKindOperation && k <= JournalKindEvidence
+	return k >= JournalKindOperation && k <= JournalKindActivity
 }
 
 // ParseJournalKind maps a seeded lookup name to its typed JournalKind.
@@ -101,6 +103,8 @@ func (k JournalKind) SubtypeTable() (string, error) {
 		return "journal_decisions", nil
 	case JournalKindEvidence:
 		return "journal_evidence", nil
+	case JournalKindActivity:
+		return "journal_activity_creations", nil
 	default:
 		return "", fmt.Errorf("provenance: no subtype table for %s", k)
 	}
@@ -295,6 +299,9 @@ var (
 	// ErrSubtypeIntegrity is returned when a journal row violates class-table
 	// inheritance totality, exclusivity, or discriminator agreement (§10 rule 8).
 	ErrSubtypeIntegrity = errors.New("provenance: journal subtype integrity violated")
+	// ErrFactContextIntegrity is returned when a decision or evidence context row
+	// cannot be reconciled with its immutable subtype-owned fact parent.
+	ErrFactContextIntegrity = errors.New("provenance: fact context integrity violated")
 	// ErrActorPlacement is returned when a journal row violates the anchor-only
 	// actor-placement invariant (§2.1, §10 rule 5): a stored actor_id must be
 	// present iff the row is an anchor (produced_by_operation_journal_id IS NULL).

@@ -7,36 +7,22 @@ import (
 )
 
 // operations.go defines the mutation-time semantics types for the operations,
-// effects, results, and authority-lifecycle layer
-// (docs/journal-relational-contract.md §2, §3, §4, §9, §14). These are the
-// typed shapes the Apply write path and LookupCommitted read path consume; the
-// concrete SQLite reducer that folds them lives in internal/sqlite. The write
-// path validation is structured as reusable reducer steps so the Open/replay
-// reducer folds onto them rather than duplicating a second
-// switch (§9.2).
+// effects, results, and authority-lifecycle layer.
 
 // ---------------------------------------------------------------------------
 // Authority identity and closed lifecycle enums (§4)
 // ---------------------------------------------------------------------------
 
-// OperationAuthorityID is the opaque alternate key on journal_authorities,
-// carried as MutationContext.Authority (§4.2). Distinct from OperationID.
+// OperationAuthorityID is the opaque alternate key on journal_authorities.
 type OperationAuthorityID string
 
-// AssignmentID is the stable identity of one responsibility-occupancy episode
-// (§4.4). It is invariant across an episode's started/ended transitions; a
-// change of task/slot/actor is by definition a new episode (a transfer).
+// AssignmentID is the stable identity of one responsibility-occupancy episode.
 type AssignmentID string
 
-// ResultSlotID is the caller's local handle name for a thing an operation
-// allocated (e.g. "new-task-1"), persisted in journal_operation_result_slots
-// so LookupCommitted can reconstruct the slot→id mapping (§3.2).
+// ResultSlotID is the caller's local handle name for an operation-produced row.
 type ResultSlotID string
 
-// AuthorityKind is the closed discriminator on journal_authorities: a
-// bootstrap authority (the genesis/system root) or an assignment authority
-// (one responsibility episode's transition). Backed by the authority_kinds
-// integer lookup (§4.1).
+// AuthorityKind is the closed discriminator on journal_authorities.
 type AuthorityKind int
 
 const (
@@ -49,8 +35,7 @@ var authorityKindStrings = [...]string{
 	AuthorityKindAssignment: "assignment",
 }
 
-// AuthorityKinds returns the closed set in id order, seeding authority_kinds
-// and guarding corpus enum freshness.
+// AuthorityKinds returns the closed set in id order.
 func AuthorityKinds() []AuthorityKind {
 	return []AuthorityKind{AuthorityKindBootstrap, AuthorityKindAssignment}
 }
@@ -67,16 +52,13 @@ func (k AuthorityKind) IsValid() bool {
 	return k == AuthorityKindBootstrap || k == AuthorityKindAssignment
 }
 
-// AssignmentSlotID names a responsibility slot on a task (§4.4). Backed by the
-// assignment_slots lookup; extensible for future non-owner slots.
+// AssignmentSlotID names a responsibility slot on a task.
 type AssignmentSlotID string
 
-// SlotOwnerResponsibility is the one slot seeded today (§4.5).
+// SlotOwnerResponsibility is the one slot seeded today.
 const SlotOwnerResponsibility AssignmentSlotID = "owner-responsibility"
 
-// AssignmentTransition is the closed two-value lifecycle transition on an
-// episode (§4.4): started then, optionally, ended. Backed by the
-// assignment_transitions lookup.
+// AssignmentTransition is the closed two-value lifecycle transition on an episode.
 type AssignmentTransition int
 
 const (
@@ -89,8 +71,7 @@ var assignmentTransitionStrings = [...]string{
 	TransitionEnded:   "ended",
 }
 
-// AssignmentTransitions returns the closed set in id order, seeding the lookup
-// and guarding corpus enum freshness.
+// AssignmentTransitions returns the closed set in id order.
 func AssignmentTransitions() []AssignmentTransition {
 	return []AssignmentTransition{TransitionStarted, TransitionEnded}
 }
@@ -111,10 +92,7 @@ func (t AssignmentTransition) IsValid() bool {
 // Effects (§9.3) — the ordered list of journal rows one operation produces
 // ---------------------------------------------------------------------------
 
-// EffectSort is the closed set of effect shapes an operation can produce. It is
-// finer-grained than JournalKind because an authority effect splits into a
-// bootstrap-creation and the two assignment transitions, each of which folds
-// through a distinct per-effect authorization and projection step (§9.3).
+// EffectSort is the closed set of effect shapes an operation can produce.
 type EffectSort int
 
 const (
@@ -124,99 +102,54 @@ const (
 	EffectAssignmentEnd                        // JournalKindAuthority + AuthorityKindAssignment, ended
 	EffectDecision                             // JournalKindDecision
 	EffectEvidence                             // JournalKindEvidence
-	// EffectTaskCreate journals the birth of a task: it INSERTs the tasks row and
-	// emits a provenance.task.created task_event in one atomic fold, so a task's
-	// existence — like every later mutation — flows through the journal rather than a
-	// direct unjournaled write (§8.1, §9.3). Its produced journal row carries
-	// JournalKindTaskEvent (the created event), and the projection seeds status=Open.
-	// It must be ordered before any effect (or FK) that references the new task.
-	EffectTaskCreate // JournalKindTaskEvent (provenance.task.created), also inserts the tasks row
+	// EffectTaskCreate journals the birth of a task.
+	EffectTaskCreate // JournalKindTaskEvent (provenance.task.created), also inserts tasks row
 
-	// Journaled relationship / annotation mutation-family effect sorts (§6). Each
-	// produces one journal_task_events row carrying its fixed per-family
-	// EventKind (provenance.edge.added/removed, provenance.label.added/removed,
-	// provenance.comment.added) plus the operands in the payload; the shared reducer
-	// folds the row into the edges/labels/comments domain projection. They authorize
-	// against the operation's authority exactly like a task_event (§9.3), so who
-	// added/removed the relationship, under which authority, at which journal position is
-	// journal-derivable (who-provenance). An edge-add of a blocked_by edge is additionally
-	// cycle-checked in the fold before it commits.
-	EffectEdgeAdd     // JournalKindTaskEvent (provenance.edge.added), + edges INSERT projection
-	EffectEdgeRemove  // JournalKindTaskEvent (provenance.edge.removed), + edges DELETE projection
-	EffectLabelAdd    // JournalKindTaskEvent (provenance.label.added), + labels INSERT projection
-	EffectLabelRemove // JournalKindTaskEvent (provenance.label.removed), + labels DELETE projection
-	EffectCommentAdd  // JournalKindTaskEvent (provenance.comment.added), + comments INSERT projection
-	// EffectTaskCreateAllocated folds like EffectTaskCreate on first execution,
-	// but marks TaskID.UUID as a provisional Session allocation. On retry, Apply
-	// may replace only that UUID from this effect's committed result slot before
-	// canonical comparison. Namespace and every other operand remain fixed.
+	// Journaled relationship / annotation mutation-family effect sorts (§6).
+	EffectEdgeAdd     // JournalKindTaskEvent (provenance.edge.added)
+	EffectEdgeRemove  // JournalKindTaskEvent (provenance.edge.removed)
+	EffectLabelAdd    // JournalKindTaskEvent (provenance.label.added)
+	EffectLabelRemove // JournalKindTaskEvent (provenance.label.removed)
+	EffectCommentAdd  // JournalKindTaskEvent (provenance.comment.added)
+	// EffectTaskCreateAllocated folds like EffectTaskCreate on first execution
+	// but marks TaskID.UUID as a provisional Session allocation.
 	EffectTaskCreateAllocated
+
+	// EffectActivityCreate journals the immutable birth of one Activity row.
+	// ResultSlot is required: it is the proof-of-allocation handle callers use
+	// to recover the committed ActivityID via LookupCommitted. The SQLite fold
+	// (writing the row, collision detection, and result reconstruction) is
+	// implemented in .1.2; this vertical defines the canonical DTO and codec.
+	EffectActivityCreate
 )
 
 func (s EffectSort) String() string {
-	if tag, ok := mutationV1Codec.familyTag(s); ok {
+	if tag, ok := semanticEffectTag(s); ok {
 		return tag
 	}
 	return fmt.Sprintf("EffectSort(%d)", int(s))
 }
 
 // JournalKind maps an effect sort to the supertype discriminator its produced
-// journal row carries (§2.1). This is the single source of truth binding the
-// finer effect taxonomy to the closed JournalKind enum.
+// journal row carries (§2.1).
 func (s EffectSort) JournalKind() (JournalKind, error) {
-	switch s {
-	case EffectTaskEvent, EffectTaskCreate, EffectTaskCreateAllocated,
-		EffectEdgeAdd, EffectEdgeRemove, EffectLabelAdd, EffectLabelRemove, EffectCommentAdd:
-		// The relationship/annotation mutation families are journaled ON a
-		// journal_task_events row carrying their fixed per-family EventKind (§6 amendment).
-		return JournalKindTaskEvent, nil
-	case EffectBootstrapAuthority, EffectAssignmentStart, EffectAssignmentEnd:
-		return JournalKindAuthority, nil
-	case EffectDecision:
-		return JournalKindDecision, nil
-	case EffectEvidence:
-		return JournalKindEvidence, nil
-	default:
-		return 0, fmt.Errorf("provenance: no JournalKind for effect sort %s", s)
+	if kind, ok := semanticEffectJournalKind(s); ok {
+		return kind, nil
 	}
+	return 0, fmt.Errorf("provenance: no JournalKind for effect sort %s", s)
 }
 
-// Effect is one journal row an operation produces, in caller list order
-// (§9.3.1). It is a discriminated record keyed by Sort: exactly the fields for
-// that sort are read. A flat record (not an interface) keeps intra-operation
-// order an ordinal slice position, never a map iteration order (§9.3.1), and
-// keeps each effect statically inspectable by the reducer.
+// Effect is one journal row an operation produces, in caller list order (§9.3.1).
 type Effect struct {
 	Sort EffectSort
 
-	// ResultSlot, when non-empty, is the caller's local handle for this
-	// produced row, persisted in journal_operation_result_slots (§3.2).
+	// ResultSlot, when non-empty, is the caller's local handle for this produced row.
 	ResultSlot ResultSlotID
 
-	// ActorID must be left zero: a produced (subordinate) row carries no stored
-	// actor. The committing actor is recorded once on the operation anchor and
-	// derived for produced rows (§2.1, §8.5, §10 rule 5). Apply rejects any effect
-	// that sets it (anchor-only actor placement). The field is retained only so a
-	// caller attempting the retired per-row-actor pattern gets an actionable
-	// rejection rather than silently mis-shaped input.
+	// ActorID must be left zero; the committing actor comes from the operation anchor.
 	ActorID ActorID
 
-	// RecordedAtOverride, when non-nil, is a general-purpose per-effect audit/display
-	// RecordedAt stamped on this effect's journal row instead of the operation's
-	// single RecordedAt. Its scope is exactly §12's caller-trust doctrine for
-	// RecordedAt generally: it is audit/display only and NEVER establishes causality,
-	// order, or authority (JournalID still totally orders, §1, §12), so Apply applies
-	// it unconditionally with no honesty verification — a live caller setting it is
-	// exactly as trusted as the same caller supplying an unusual operation-level
-	// RecordedAt, which the system already permits by design. It is settable by any
-	// Apply caller, not migration-restricted. Honest legacy-baseline migration (§13)
-	// is its primary/motivating use (the marker/started rows carry the legacy
-	// updated_at and an ended row the legacy closed_at — two honest legacy timestamps
-	// within one operation), and migration adds its OWN self-consistency guard
-	// (assertHonestBaselineTimestamps) that runs ONLY on the migration path and only
-	// over values migration itself derived — that guard is not a general invariant on
-	// this field for non-migration callers (§13 regression g is enforced on the
-	// migration path alone).
+	// RecordedAtOverride, when non-nil, is a per-effect audit/display timestamp.
 	RecordedAtOverride *RecordedTime
 
 	// task_event (EffectTaskEvent)
@@ -225,38 +158,22 @@ type Effect struct {
 	Payload   json.RawMessage
 	Contexts  []EventContext
 
-	// task_create (EffectTaskCreate / EffectTaskCreateAllocated): the immutable birth metadata of the new task
-	// whose row this effect inserts (§8.1). TaskID (above) is the new task's id;
-	// the reducer forces EventKind to provenance.task.created, so the created event
-	// and its status=Open projection are canonical. Title and Description are free
-	// text; Type/Priority/Phase are the closed classification enums the tasks row
-	// stores.
+	// task_create (EffectTaskCreate / EffectTaskCreateAllocated)
 	Title       string
 	Description string
 	Type        TaskType
 	Priority    Priority
 	Phase       Phase
 
-	// task update/close materialization (EffectTaskEvent). These are complete journaled
-	// projections of the tasks row (§8.1), written directly in the fold and re-derived
-	// and compared during startup convergence. They let Session.Update carry the columns
-	// alongside the provenance.task.updated event, and CloseReason alongside the
-	// provenance.task.closed lifecycle event, within one journaled operation. Each is
-	// applied only when non-nil (or, for CloseReason, only on a close event), so a
-	// plain caller-domain task_event is unaffected.
-	CloseReason       string  // materialized when EventKind == provenance.task.closed
-	UpdateTitle       *string // materialized when non-nil (provenance.task.updated)
+	// task update/close materialization (EffectTaskEvent)
+	CloseReason       string
+	UpdateTitle       *string
 	UpdateDescription *string
 	UpdatePriority    *Priority
 	UpdatePhase       *Phase
 	UpdateNotes       *string
 
-	// Forced, on a TRANSITION lifecycle task_event (started/stopped/closed/reopened,
-	// §8.1), requests the FSM escape hatch: the reducer records a forced marker in the
-	// produced row's payload (EncodeForcedTransitionPayload) and SKIPS the static status
-	// FSM for that one row, so an out-of-FSM coercion is committed, journal-reproducible,
-	// and audit-visible. It never bypasses authorization (§9.3), only the FSM, and it has
-	// no effect on a non-transition kind.
+	// Forced on a TRANSITION lifecycle event requests the FSM escape hatch.
 	Forced bool
 
 	// bootstrap authority (EffectBootstrapAuthority)
@@ -266,30 +183,25 @@ type Effect struct {
 	// assignment start/end (EffectAssignmentStart / EffectAssignmentEnd)
 	AssignmentID AssignmentID
 	SlotID       AssignmentSlotID
-	Occupant     ActorID      // episode occupant (start); attributed actor (§8.2)
-	Predecessor  AssignmentID // optional predecessor episode on a transfer start
-	// Parent, on an EffectAssignmentStart, optionally cites the episode this one
-	// is deliberately rooted under for delegated governance (§14.5): the cited
-	// parent must be an episode that is ACTIVE at this start's own journal
-	// position, and the citation must not create a cycle. It is the deliberate
-	// ownership-citation edge and is DISTINCT from Predecessor — Predecessor is
-	// succession in time on one slot (a transfer), Parent is governance lineage
-	// across tasks. An episode may carry both, one, or neither.
-	Parent AssignmentID
+	Occupant     ActorID
+	Predecessor  AssignmentID
+	Parent       AssignmentID
 
 	// decision (EffectDecision) / evidence (EffectEvidence)
 	DecisionKind  DecisionKind
 	EvidenceKind  EvidenceKind
 	ContentDigest []byte
 
-	// Relationship / annotation mutation families (§6 amendment). TaskID (above) is the
-	// SOURCE task the mutation is authorized against (§9.3) and attributed to. The
-	// operands are journaled in the produced row's payload so the domain projection is
-	// reproducible solely from history (§15):
-	//   - EffectEdgeAdd / EffectEdgeRemove: EdgeTargetID (opaque target handle) + EdgeRelKind.
-	//   - EffectLabelAdd / EffectLabelRemove: Label.
-	//   - EffectCommentAdd: CommentIdentity + CommentAuthor + CommentBody (the comment id is
-	//     minted once by the caller and carried here so a replay reproduces the SAME id).
+	// activity_create (EffectActivityCreate): immutable birth of one Activity row.
+	// ResultSlot (above) is mandatory — it is the caller's proof-of-allocation handle.
+	// Fields match StartActivityWithID(id ActivityID, agentID AgentID, phase Phase, stage Stage, notes string).
+	ActivityID      ActivityID // stable identity of the new activity
+	ActivityAgentID AgentID    // agent responsible for this activity episode (alias for ActorID; same wire format)
+	ActivityPhase   Phase      // initial phase (e.g. PhaseWorkerSlices)
+	ActivityStage   Stage      // initial lifecycle stage (e.g. StageInProgress)
+	ActivityNotes   string     // free-text birth note (optional)
+
+	// Relationship / annotation mutation families (§6 amendment).
 	EdgeTargetID    string
 	EdgeRelKind     EdgeKind
 	Label           string
@@ -298,8 +210,7 @@ type Effect struct {
 	CommentBody     string
 }
 
-// DecisionKind / EvidenceKind are open, validated namespaced strings (§6),
-// recorded opaquely like EventKind.
+// DecisionKind / EvidenceKind are open, validated namespaced strings (§6).
 type (
 	DecisionKind string
 	EvidenceKind string
@@ -309,34 +220,25 @@ type (
 // Operation input and replay identity (§3.1, §9.4, §11)
 // ---------------------------------------------------------------------------
 
-// OperationInput is the validated request to commit one logical operation as an
-// atomic append plus domain mutation (§9.5). Its effects fold in slice order
-// (§9.3.1); each is authorized against state folded through all earlier effects
-// of the same operation (§9.3).
+// OperationInput is the validated request to commit one logical operation.
 type OperationInput struct {
 	OperationID OperationID
-	ActorID     ActorID // committing actor of the whole operation (§2.1)
-	// AuthorityJournalID is the authority this operation executes under. NULL
-	// only on a genesis operation whose sole effect is one bootstrap authority
-	// (§4.6, §10 rule 6).
+	ActorID     ActorID
+	// AuthorityJournalID is NULL only on a genesis operation.
 	AuthorityJournalID *JournalID
 	CommandDigest      []byte
-	// MutationDigest is retained for source compatibility and explicit legacy-row
-	// retries. New writes derive and persist this value from canonical Effects.
+	// MutationDigest is the SHA-256 digest of CanonicalBytes(). Canonicalize
+	// derives and sets this from the encoded canonical bytes; do not set it directly.
 	MutationDigest []byte
 	RecordedAt     RecordedTime // audit/display only (§12)
+	Conditions     []Condition
 	Effects        []Effect
 }
 
-// RecordedTime is the caller-supplied wall-clock stamp copied into
-// journal.RecordedAt for audit/display only (§12). Aliased so the operations
-// surface does not import time here; the sqlite layer converts to UnixNano.
+// RecordedTime is the caller-supplied wall-clock stamp (audit/display only §12).
 type RecordedTime = int64
 
-// StoredOperationIdentity contains the scalar replay identity. Canonical new rows
-// additionally compare their persisted canonical mutation bytes; MutationDigest is
-// derived from those bytes rather than trusted from the caller. Explicit legacy rows
-// retain their opaque digest comparison.
+// StoredOperationIdentity contains the scalar replay identity.
 type StoredOperationIdentity struct {
 	ActorID            ActorID
 	AuthorityJournalID *JournalID
@@ -352,13 +254,8 @@ type StoredOperationIdentity struct {
 type CommittedResultKind int
 
 const (
-	// CommittedAbsent: no journal_operations row exists for the OperationID
-	// (§9.4). LookupCommitted returns this with a nil error and no side effects.
 	CommittedAbsent CommittedResultKind = iota
-	// CommittedExact: a committed operation matching the requested identity.
 	CommittedExact
-	// CommittedConflict: an OperationID reused with a differing four-field
-	// identity (§11) — a typed conflict, never a re-execution.
 	CommittedConflict
 )
 
@@ -375,48 +272,26 @@ func (k CommittedResultKind) String() string {
 	}
 }
 
-// ResultSlotBinding is one reconstructed ResultSlotID→produced-row mapping
-// (§3.2), bucketed by the produced row's JournalKind. For a task_event slot the
-// produced row's TaskID is resolved for the caller.
+// ResultSlotBinding is one reconstructed ResultSlotID→produced-row mapping.
+// For task_event slots TaskID is resolved; for activity_create slots ActivityID is resolved.
 type ResultSlotBinding struct {
 	Slot              ResultSlotID
 	ProducedJournalID JournalID
 	Kind              JournalKind
-	TaskID            *TaskID
+	TaskID            *TaskID     // non-nil for JournalKindTaskEvent
+	ActivityID        *ActivityID // non-nil for JournalKindActivity
 }
 
-// CommittedResult is the closed result of Apply and LookupCommitted. For
-// CommittedExact it carries the operation's anchor, the flat EmittedEvents list
-// (the §2.1 ProducedByOperationJournalID closure over task_event rows in
-// JournalID order — no slot row needed, §3.2), and the slot-keyed ResultSlots.
+// CommittedResult is the closed result of Apply and LookupCommitted.
 type CommittedResult struct {
 	Kind            CommittedResultKind
 	AnchorJournalID JournalID
 	EmittedEvents   []JournalID // task_event closure, JournalID order (§2.1)
 	ResultSlots     []ResultSlotBinding
 	// ShortCircuited is true when a §9.4 idempotent-replay retry returned this
-	// already-committed result without folding effects (never re-executed).
+	// already-committed result without folding effects.
 	ShortCircuited bool
 	Conflict       *OperationConflict
-}
-
-// OperationConflict is the typed conflict returned when an OperationID is reused
-// with a differing four-field identity (§11), or when a concurrent racer loses
-// the OperationID insert with a non-matching identity (§9.6). It is the payload
-// of the CommittedConflict result variant.
-type OperationConflict struct {
-	OperationID OperationID
-	Field       string // the first identity field that differed
-}
-
-func (c OperationConflict) Error() string {
-	return fmt.Sprintf(
-		"provenance: OperationID %q reused with a different %s than the committed "+
-			"operation — where: Apply replay short-circuit (§9.4/§11); when: before "+
-			"any write; impact: nothing was committed; fix: retry with the identical "+
-			"actor, authority, command digest, and canonical effects, or issue a new "+
-			"OperationID for a genuinely different operation",
-		string(c.OperationID), c.Field)
 }
 
 // ---------------------------------------------------------------------------
@@ -424,42 +299,31 @@ func (c OperationConflict) Error() string {
 // ---------------------------------------------------------------------------
 
 var (
-	// ErrOperationConflict wraps a typed OperationID-reuse conflict (§11, §9.6).
+	// ErrOperationConflict classifies operation-identity admission conflicts. A
+	// committed OperationID-reuse conflict also carries *OperationConflict details
+	// (§11, §9.6); rejection of a reserved reducer-owned identity wraps this
+	// sentinel only because no conflicting committed identity is being compared.
 	ErrOperationConflict = errors.New("provenance: operation identity conflict")
-	// ErrGenesis is returned for genesis-discipline violations (§4.6, §10
-	// rules 6-7): a NULL authority off the first operation, a second genesis
-	// against a non-empty journal, or a genesis producing a non-bootstrap effect.
+	// ErrConditionFailed wraps a typed pre-condition failure (§9.5).
+	ErrConditionFailed = errors.New("provenance: journal condition failed")
+	// ErrActivityConflict wraps a typed ActivityID collision in an ActivityCreate fold.
+	ErrActivityConflict = errors.New("provenance: activity identity conflict")
+	// ErrGenesis is returned for genesis-discipline violations (§4.6).
 	ErrGenesis = errors.New("provenance: genesis authority discipline violated")
-	// ErrAuthorityScope is returned when an operation's authority does not reach
-	// (govern) the task an effect mutates (§9.3, §14.1).
+	// ErrAuthorityScope is returned when an authority does not govern the effect's task.
 	ErrAuthorityScope = errors.New("provenance: authority does not govern the effect's task")
-	// ErrAssignmentLifecycle is returned for assignment-transition lifecycle
-	// order violations (§14.4): ended-without-started, ended-before-started.
+	// ErrAssignmentLifecycle is returned for assignment-transition lifecycle order violations.
 	ErrAssignmentLifecycle = errors.New("provenance: assignment transition lifecycle order violated")
-	// ErrOrphanedEvidence is returned when a transfer names a predecessor that
-	// has not ended (§14.3), or one already consumed (§14.2).
+	// ErrOrphanedEvidence is returned for invalid predecessor evidence.
 	ErrOrphanedEvidence = errors.New("provenance: predecessor assignment evidence invalid")
-	// ErrStaleEpisode is returned to the losing racer of a concurrent transfer
-	// CAS whose precondition (the target episode still active) no longer holds
-	// (§9.6).
+	// ErrStaleEpisode is returned to the losing racer of a concurrent transfer CAS.
 	ErrStaleEpisode = errors.New("provenance: assignment episode is no longer active")
-	// ErrResultSlotIntegrity is returned when a result slot references a row
-	// produced by a different operation (§3.2, §10 rule 9).
+	// ErrResultSlotIntegrity is returned when a result slot references a foreign row.
 	ErrResultSlotIntegrity = errors.New("provenance: result slot references a foreign operation's produced row")
-	// ErrCloseWithoutEnding is returned when a task is closed while an active
-	// owner-responsibility episode is not ended in the same operation (§8.1,
-	// owner_responsibility.yaml regression c).
+	// ErrCloseWithoutEnding is returned when a task is closed without ending its episode.
 	ErrCloseWithoutEnding = errors.New("provenance: task closed without ending its active owner-responsibility episode")
-	// ErrParentCitation is returned when an assignment-start's ParentAssignmentID
-	// citation is invalid (§14.5): a cited parent that does not exist, is not
-	// active at the citation's journal position, or whose citation would create a
-	// cycle in the parent chain. Distinct from ErrOrphanedEvidence, which guards
-	// the predecessor (succession) edge.
+	// ErrParentCitation is returned for invalid assignment parent citations.
 	ErrParentCitation = errors.New("provenance: assignment parent citation invalid")
-	// ErrCorruptParentChain is returned when the governance walk over
-	// ParentAssignmentID citations detects a cycle in the STORED chain (§14.5) —
-	// a corruption reachable only by bypassing the start-effect citation guard
-	// (e.g. direct schema corruption). The bounded, visited-tracked walk fails
-	// closed with this typed error rather than looping.
+	// ErrCorruptParentChain is returned when a cyclic parent chain is detected in stored data.
 	ErrCorruptParentChain = errors.New("provenance: corrupt cyclic assignment parent-citation chain")
 )

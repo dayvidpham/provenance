@@ -7,16 +7,16 @@ optimization experiments live in [docs/test-performance.md](docs/test-performanc
 
 ## Authoritative gates
 
-Local iteration normally uses `go test ./...`, allowing Go's successful-result
-cache. Use `-run` for focused iteration and `-count=1` only to request one
-explicitly uncached execution.
-
-CI-readiness and landing gates use explicit resource, scheduling, freshness,
-order-independence, path, and timeout controls:
+All local, focused, CI-readiness, and landing test invocations use the race
+detector. The typical full-suite invocation is:
 
 ```bash
-go test -count=1 -shuffle=on -fullpath -timeout=10m ./...
-CGO_ENABLED=1 go test -race -count=1 -shuffle=on -fullpath -timeout=20m ./...
+CGO_ENABLED=1 go test -race -shuffle=on -fullpath -timeout=20m ./...
+```
+
+The remaining non-test gates are:
+
+```bash
 go vet ./...
 ast-grep scan --config sgconfig.yml --globs '!vendor/**' --globs '!worktree/**' .
 CGO_ENABLED=0 go build ./...
@@ -26,13 +26,24 @@ nix flake check --no-build
 `CGO_ENABLED=0` is a build-only compatibility gate. There is no CGO-disabled
 test mode and no CGO-disabled race mode: do not run focused, package, full, or
 race tests with `CGO_ENABLED=0`. Focused local iteration may narrow `-run` or
-the package list. A focused diagnostic does not replace either full CI/landing
-suite.
+the package list, but retains `CGO_ENABLED=1`, `-race`, `-shuffle=on`,
+`-fullpath`, and `-timeout=20m`. A focused diagnostic does not replace the full
+CI/landing suite.
 
 CI leaves `-cpu`, `-p`, and `-parallel` unset so Go uses the runner's available
-processors and default package/test concurrency. `-count=1` disables cached
-results without repeating tests. `-shuffle=on` reports a seed; reproduce an
-order failure with `-shuffle=<reported-seed>`.
+processors and default package/test concurrency. Do not specify `-count`.
+`-shuffle=on` reports a seed; reproduce an order failure with
+`-shuffle=<reported-seed>`.
+
+The private file-backed WAL pool benchmarks use the same race-only policy:
+
+```bash
+CGO_ENABLED=1 go test -race -fullpath -timeout=20m -run '^$' -bench '^BenchmarkPool' -benchmem ./internal/sqlite
+```
+
+They measure pooled reads, one `Apply` writer with readers, and contending
+`CurrentFact` writers. Their standard benchmark metrics and domain counters are
+performance observations only; ordinary tests remain the correctness proof.
 
 ## Test map
 
@@ -102,16 +113,22 @@ behavior under test:
    longer depends on `-wal`, `-shm`, or rollback-journal files.
 4. Capture the closed main-database bytes and digest as immutable source data.
 5. Write those bytes to a unique path under each case's `t.TempDir()`.
-6. Open each private copy with the narrow test-only raw zombiezen handle using
-   existing-file read-write flags without `OpenCreate`; mutate, checkpoint,
-   close, and prove sidecar absence and changed main-file bytes.
+6. Open each private copy with the narrow test-only raw handle in
+   `raw_sqlite_test.go`: `database/sql` on the same `modernc.org/sqlite` driver
+   as production, a `file:` DSN with `mode=rw` so an existing file is required
+   and none is created, `SetMaxOpenConns(1)` plus one pinned `*sql.Conn` for
+   connection affinity, and `busy_timeout=5000`. Mutate, checkpoint, close, and
+   prove sidecar absence and changed main-file bytes.
 7. Call production `OpenSQLite` once on the corrupt copy and retain nil-tracker,
    typed/topology error, diagnostic-token, and failed-open byte-equality guards.
 
 `canonical_startup_matrix_test.go` is the local example. It builds the full
 startup fixture once per top-level test pass, validates a copied reopen, then
 runs all 98 serial corruptions against private copies. The raw handle is test
-preparation only; production rejection remains the behavior under test.
+preparation only; production rejection remains the behavior under test. It is a
+fixture adapter, not a second SQLite implementation: it exposes small
+`ColumnInt`/`ColumnText`-style accessors over `database/sql` rows so corruption
+cases keep a compact call shape while staying on the production driver.
 
 Peasant's exact prior-art file is
 `/home/minttea/dev/peasant-labs/peasant/develop/internal/store/storetest/golden.go`.
@@ -161,27 +178,28 @@ Measure before and after on the same host and with `GOMAXPROCS` set to CI's core
 count. Use several runs and compare medians, not a single favorable result.
 
 ```bash
-time CGO_ENABLED=1 go test -race -cpu=2 -count=1 -timeout=20m -v . -run '^TestName$'
-CGO_ENABLED=1 go test -cpu=2 -count=1 -cpuprofile=cpu.prof .
+time CGO_ENABLED=1 go test -race -shuffle=on -fullpath -timeout=20m -v -run '^TestName$' .
+CGO_ENABLED=1 go test -race -shuffle=on -fullpath -timeout=20m -run '^TestName$' -cpuprofile=cpu.prof .
 go tool pprof -top -cum cpu.prof
 ```
 
 Sum the per-test durations from `-v` and compare them with wall time: similar
 values identify a serial critical path; a much larger sum indicates overlap.
-Record race and non-race results because the race detector changes CPU and
-memory cost. Capture `/proc/<pid>/status` `VmHWM` (or an equivalent process-tree
-peak-RSS measurement); Go heap profiles omit C allocations, SQLite, and race
-shadow memory. Report command, commit/worktree state, Go version, CPU, memory,
-`GOMAXPROCS`, wall/user/system time, package/test time, and before/after medians.
+All comparisons use the race-enabled command because that is the supported test
+configuration. Capture `/proc/<pid>/status` `VmHWM` (or an equivalent
+process-tree peak-RSS measurement); Go heap profiles omit C allocations,
+SQLite, and race shadow memory. Report command, commit/worktree state, Go
+version, CPU, memory, `GOMAXPROCS`, wall/user/system time, package/test time, and
+before/after medians.
 
 Use one diagnostic profile at a time to minimize instrumentation distortion:
 
 ```bash
-go test -count=1 -run '^TestName$' -cpuprofile=cpu.out .
-go test -count=1 -run '^TestName$' -memprofile=mem.out .
-go test -count=1 -run '^TestName$' -blockprofile=block.out .
-go test -count=1 -run '^TestName$' -mutexprofile=mutex.out .
-go test -count=1 -run '^TestName$' -trace=trace.out .
+CGO_ENABLED=1 go test -race -shuffle=on -fullpath -timeout=20m -run '^TestName$' -cpuprofile=cpu.out .
+CGO_ENABLED=1 go test -race -shuffle=on -fullpath -timeout=20m -run '^TestName$' -memprofile=mem.out .
+CGO_ENABLED=1 go test -race -shuffle=on -fullpath -timeout=20m -run '^TestName$' -blockprofile=block.out .
+CGO_ENABLED=1 go test -race -shuffle=on -fullpath -timeout=20m -run '^TestName$' -mutexprofile=mutex.out .
+CGO_ENABLED=1 go test -race -shuffle=on -fullpath -timeout=20m -run '^TestName$' -trace=trace.out .
 ```
 
 For debugging, add `-v` for human-readable events or `-json` for machine
@@ -199,3 +217,30 @@ Borrowed operations make one inner attempt and return escaped `BUSY`/`LOCKED`
 unchanged; DBOS step options own durable retry policy. Assert attempts,
 callbacks, durable state, typed outcomes, and replay behavior, not elapsed time
 or observed sleep intervals.
+
+### The one sanctioned exception: schema activation
+
+`internal/sqlite` schema activation is the single place that wraps a bounded
+outer retry around an operation. `activateSchemaWithRetry`, reached from `Open`
+and `OpenBorrowed`, retries the whole activation with backoff up to a 30s budget
+and then fails with an actionable error naming the file, the measured elapsed
+time, the budget, the likely concurrent migrator, that nothing was written, and
+how to clear it. Each attempt's wait is still SQLite's own `busy_timeout=5000`:
+the loop does not replace `busy_timeout`, it bounds how long an open keeps
+re-offering itself to it.
+
+Why the exception exists. Activation begins with `BEGIN IMMEDIATE`. It must: a
+deferred `BEGIN` established the read snapshot over the `CREATE TABLE IF NOT
+EXISTS` statements and then needed a read-to-write promotion on the first seed
+write, and SQLite never invokes the busy handler for a promotion, so contention
+failed instantly with `SQLITE_BUSY` and bypassed `busy_timeout` entirely. Taking
+the write lock at `BEGIN` fixes that, but it also means the lock is now held
+across `verifyIntegrity` and `replayProjections`, which are O(journal) per open.
+N concurrent openers therefore serialise, and the resulting queue can exceed a
+single 5s busy window even when nothing is wrong. The bounded outer budget is
+what keeps that queue from turning an ordinary concurrent open into a failure.
+
+The exception is deliberately narrow: bounded, non-durable, one operation, and
+the per-attempt wait remains SQLite's. Do not extend it to storage operations —
+those still make one inner attempt and return escaped `BUSY`/`LOCKED` unchanged,
+and DBOS step options own durable retry.

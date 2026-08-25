@@ -7,8 +7,8 @@ package provenance
 // OperationID alternate key and journal contract the reducer already enforces, and
 // post-checkpoint validation compares the journal-anchored committed operation.
 //
-// The adapter targets github.com/dbos-inc/dbos-transact-golang v0.16.0 (pinned),
-// authorized by the user at Impl-UAT C7a.
+// The adapter targets the repository-pinned DBOS library version, authorized by
+// the user at Impl-UAT C7a.
 //
 // Identity constants and retry-option types are defined in dbos_contract.go.
 
@@ -18,7 +18,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"strings"
 	"time"
 
@@ -68,9 +67,8 @@ func defaultApplyTestHooks() applyTestHooks {
 }
 
 // DBOSAdapter runs Provenance operations as durable DBOS workflows over a shared
-// journal contract. It owns one workflow for the single supported DBOS contract.
-// The adapter captures its contract snapshot once at construction; no paths
-// rebuild or mutate the identity after registration.
+// journal contract. The adapter captures its contract snapshot once at
+// construction; no paths rebuild or mutate the identity after registration.
 type DBOSAdapter struct {
 	root                  dbos.DBOSContext
 	tracker               Tracker
@@ -136,6 +134,7 @@ func NewDBOSAdapter(root dbos.DBOSContext, tracker Tracker, config DBOSAdapterCo
 		testHooks:             defaultApplyTestHooks(),
 	}
 	dbos.RegisterWorkflow(root, a.applyWorkflow)
+	dbos.RegisterWorkflow(root, a.transferWorkflow)
 	return a, nil
 }
 
@@ -162,6 +161,22 @@ func (a *DBOSAdapter) Apply(ctx context.Context, in journal.OperationInput) (Com
 	if err != nil {
 		return CommittedResult{}, fmt.Errorf("provenance.DBOSAdapter.Apply: canonicalize operation %q: %w", in.OperationID, err)
 	}
+	// Reserved syntax was valid before composed allocation existed, so durable
+	// workflow decoding remains syntactic. Classify it against durable ownership
+	// before any DBOS lookup/start: only an exact unmarked historical replay may
+	// continue; fresh or composition-owned identities fail without a checkpoint.
+	if journal.IsReservedInternalOperationID(normalized.OperationID) {
+		journalAPI := a.tracker.Journal()
+		var applyErr error
+		if contextual, ok := journalAPI.(ContextJournal); ok {
+			_, applyErr = contextual.ApplyContext(ctx, normalized)
+		} else {
+			_, applyErr = journalAPI.Apply(normalized)
+		}
+		if applyErr != nil {
+			return CommittedResult{}, fmt.Errorf("provenance.DBOSAdapter.Apply: classify reserved operation %q before workflow work: %w", normalized.OperationID, applyErr)
+		}
+	}
 
 	// Workflow identity is operation-scoped and available immediately after
 	// canonical validation. Inspect it before any journal access so terminal DBOS
@@ -184,7 +199,14 @@ func (a *DBOSAdapter) Apply(ctx context.Context, in journal.OperationInput) (Com
 		return CommittedResult{}, fmt.Errorf("provenance.DBOSAdapter.Apply: preflight LookupCommitted for operation %q: %w", normalized.OperationID, err)
 	}
 	if existing.Kind == journal.CommittedExact {
-		validated, applyErr := a.tracker.Journal().Apply(normalized)
+		journalAPI := a.tracker.Journal()
+		var validated CommittedResult
+		var applyErr error
+		if contextual, ok := journalAPI.(ContextJournal); ok {
+			validated, applyErr = contextual.ApplyContext(ctx, normalized)
+		} else {
+			validated, applyErr = journalAPI.Apply(normalized)
+		}
 		if applyErr != nil {
 			return CommittedResult{}, applyErr
 		}
@@ -210,7 +232,7 @@ func (a *DBOSAdapter) Apply(ctx context.Context, in journal.OperationInput) (Com
 	}
 	// Always retrieve before starting. Existing SUCCESS, ERROR, or in-flight state
 	// attaches read-only; only an explicit NonExistentWorkflowError may create a row.
-	// In particular, terminal ERROR replay must not call RunWorkflow because v0.16
+	// In particular, terminal ERROR replay must not call RunWorkflow because DBOS
 	// updates workflow_status.updated_at even when it executes zero callbacks.
 	var outcome DBOSStepOutcome
 	if exists {
@@ -364,6 +386,8 @@ func decodeListedWorkflowInput(input any) (DBOSApplyInput, error) {
 	var raw []byte
 	if encoded, ok := input.(string); ok {
 		raw = []byte(encoded)
+	} else if encoded, ok := input.([]byte); ok {
+		raw = append([]byte(nil), encoded...)
 	} else {
 		var err error
 		raw, err = json.Marshal(input)
@@ -371,92 +395,11 @@ func decodeListedWorkflowInput(input any) (DBOSApplyInput, error) {
 			return DBOSApplyInput{}, fmt.Errorf("encode DBOS listed workflow input: %w", err)
 		}
 	}
-	if err := validateUniqueJSONKeys(raw); err != nil {
-		return DBOSApplyInput{}, fmt.Errorf("validate DBOS listed workflow input: %w", err)
-	}
 	var decoded DBOSApplyInput
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&decoded); err != nil {
+	if err := decodeStrictDBOSJSON(raw, &decoded); err != nil {
 		return DBOSApplyInput{}, fmt.Errorf("decode DBOS listed workflow input: %w", err)
 	}
-	var trailing any
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return DBOSApplyInput{}, errors.New("decode DBOS listed workflow input: trailing JSON value")
-		}
-		return DBOSApplyInput{}, fmt.Errorf("decode DBOS listed workflow input trailing data: %w", err)
-	}
 	return decoded, nil
-}
-
-func validateUniqueJSONKeys(raw []byte) error {
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	if err := validateUniqueJSONValue(decoder); err != nil {
-		return err
-	}
-	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return errors.New("trailing JSON value")
-		}
-		return fmt.Errorf("read trailing JSON data: %w", err)
-	}
-	return nil
-}
-
-func validateUniqueJSONValue(decoder *json.Decoder) error {
-	token, err := decoder.Token()
-	if err != nil {
-		return fmt.Errorf("read JSON value: %w", err)
-	}
-	delim, ok := token.(json.Delim)
-	if !ok {
-		return nil
-	}
-	switch delim {
-	case '{':
-		keys := make(map[string]struct{})
-		for decoder.More() {
-			keyToken, err := decoder.Token()
-			if err != nil {
-				return fmt.Errorf("read JSON object key: %w", err)
-			}
-			key, ok := keyToken.(string)
-			if !ok {
-				return fmt.Errorf("JSON object key has type %T, want string", keyToken)
-			}
-			if _, exists := keys[key]; exists {
-				return fmt.Errorf("duplicate JSON object key %q", key)
-			}
-			keys[key] = struct{}{}
-			if err := validateUniqueJSONValue(decoder); err != nil {
-				return err
-			}
-		}
-		closing, err := decoder.Token()
-		if err != nil {
-			return fmt.Errorf("close JSON object: %w", err)
-		}
-		if closing != json.Delim('}') {
-			return fmt.Errorf("close JSON object with %q, want }", closing)
-		}
-	case '[':
-		for decoder.More() {
-			if err := validateUniqueJSONValue(decoder); err != nil {
-				return err
-			}
-		}
-		closing, err := decoder.Token()
-		if err != nil {
-			return fmt.Errorf("close JSON array: %w", err)
-		}
-		if closing != json.Delim(']') {
-			return fmt.Errorf("close JSON array with %q, want ]", closing)
-		}
-	default:
-		return fmt.Errorf("unexpected JSON delimiter %q", delim)
-	}
-	return nil
 }
 
 func reconcileDBOSAllocatedCreates(in journal.OperationInput, result journal.CommittedResult) (journal.OperationInput, error) {
@@ -488,20 +431,30 @@ func reconcileDBOSAllocatedCreates(in journal.OperationInput, result journal.Com
 // failures use the Go-error channel. The step name is derived from the adapter-
 // captured contract prefix plus the fingerprint.
 func (a *DBOSAdapter) applyWorkflow(wfCtx dbos.DBOSContext, input DBOSApplyInput) (DBOSStepOutcome, error) {
+	return a.runDomainWorkflow(wfCtx, input, "applyWorkflow", decodeApplyInput, a.foldDomainMutation)
+}
+
+func (a *DBOSAdapter) runDomainWorkflow(
+	wfCtx dbos.DBOSContext,
+	input DBOSApplyInput,
+	workflowName string,
+	decode func(dbosContractSnapshot, DBOSApplyInput) (journal.OperationInput, error),
+	fold func(journal.OperationInput) (CommittedResult, error),
+) (DBOSStepOutcome, error) {
 	a.testHooks.onWorkflowEntry()
-	in, err := decodeApplyInput(a.contract, input)
+	in, err := decode(a.contract, input)
 	if err != nil {
-		return DBOSStepOutcome{}, fmt.Errorf("provenance.applyWorkflow: %w", err)
+		return DBOSStepOutcome{}, fmt.Errorf("provenance.%s: %w", workflowName, err)
 	}
 	fp, err := fingerprint(a.contract, a.applicationVersion, input)
 	if err != nil {
-		return DBOSStepOutcome{}, fmt.Errorf("provenance.applyWorkflow: derive step identity: %w", err)
+		return DBOSStepOutcome{}, fmt.Errorf("provenance.%s: derive step identity: %w", workflowName, err)
 	}
 	// Step name is derived from the adapter-captured contract prefix.
 	stepName := a.contract.stepPrefix + fp
 	outcome, err := dbos.RunAsStep(wfCtx, func(stepCtx context.Context) (DBOSStepOutcome, error) {
 		a.testHooks.beforeDomainCommit()
-		result, applyErr := a.foldDomainMutation(in)
+		result, applyErr := fold(in)
 		outcome, checkpointErr := checkpointDomainApplyResult(a.contract, in, result, applyErr)
 		if checkpointErr != nil || applyErr != nil {
 			return outcome, checkpointErr
@@ -539,7 +492,7 @@ func checkpointDomainApplyResult(contract dbosContractSnapshot, in journal.Opera
 }
 
 // dbosStepOptions is the sole translation from resolved values to the pinned
-// opaque DBOS v0.16 functional options.
+// opaque DBOS functional options.
 func dbosStepOptions(stepName string, options resolvedDBOSStepOptions) []dbos.StepOption {
 	return []dbos.StepOption{
 		dbos.WithStepName(stepName),
@@ -586,9 +539,31 @@ func (a *DBOSAdapter) postValidate(in journal.OperationInput, outcome DBOSStepOu
 		}
 	}
 	success, decodeErr := decodeDBOSStepOutcome(a.contract, outcome)
+	if outcome.Failure != nil {
+		// A structurally valid failure is only authoritative after the journal
+		// confirms that no operation committed. Malformed failures still fail
+		// immediately at the outcome boundary and never consult journal state.
+		var diagnosticErr *DBOSDiagnosticError
+		if errors.As(decodeErr, &diagnosticErr) {
+			return CommittedResult{}, decodeErr
+		}
+		looked, lookupErr := a.tracker.Journal().LookupCommitted(in.OperationID)
+		if lookupErr != nil {
+			return CommittedResult{}, checkpointFailureDivergence(in.OperationID,
+				"the journal could not confirm absence for a checkpointed domain failure",
+				"repair journal availability and reconcile the checkpoint with the same durable operation before retrying", lookupErr)
+		}
+		if looked.Kind != journal.CommittedAbsent {
+			return CommittedResult{}, checkpointFailureDivergence(in.OperationID,
+				fmt.Sprintf("the journal reports %s for a checkpointed domain failure", looked.Kind),
+				"do not trust the failure checkpoint; reconcile the journal operation and DBOS workflow from the same durable backup", fmt.Errorf("failure checkpoint requires CommittedAbsent, got %s", looked.Kind))
+		}
+		return CommittedResult{}, decodeErr
+	}
 	if decodeErr != nil {
-		// A failure outcome surfaces its typed journal error here (matrix
-		// present-failure-outcome row); a malformed outcome fails closed.
+		// A malformed success outcome fails closed before any journal result is
+		// trusted. Valid success results continue through the journal authority
+		// comparison below.
 		return CommittedResult{}, decodeErr
 	}
 
@@ -602,8 +577,13 @@ func (a *DBOSAdapter) postValidate(in journal.OperationInput, outcome DBOSStepOu
 	case journal.CommittedExact:
 		got, encErr := encodeDBOSApplySuccess(a.contract, in.OperationID, in.MutationDigest, looked)
 		if encErr != nil {
-			return CommittedResult{}, fmt.Errorf(
-				"provenance.DBOSAdapter.Apply: re-encode looked-up result for operation %q: %w", in.OperationID, encErr)
+			return CommittedResult{}, &CheckpointDivergenceError{
+				Operation: in.OperationID,
+				Stage:     DBOSDiagStageCheckpointValidation,
+				Impact:    "the journal returned malformed result-slot metadata; the checkpoint is not trusted",
+				Fix:       "restore the operation and result-slot rows from the same committed backup",
+				Cause:     encErr,
+			}
 		}
 		if !canonicalResultsEqual(*got.Success, success) {
 			return CommittedResult{}, &CheckpointDivergenceError{
@@ -640,6 +620,16 @@ func (a *DBOSAdapter) postValidate(in journal.OperationInput, outcome DBOSStepOu
 			Fix:       "this indicates an unhandled CommittedResultKind; nothing is trusted",
 			Cause:     fmt.Errorf("unknown CommittedResultKind %d", int(looked.Kind)),
 		}
+	}
+}
+
+func checkpointFailureDivergence(operation OperationID, impact, fix string, cause error) error {
+	return &CheckpointDivergenceError{
+		Operation: operation,
+		Stage:     DBOSDiagStageCheckpointValidation,
+		Impact:    impact,
+		Fix:       fix,
+		Cause:     cause,
 	}
 }
 
@@ -697,7 +687,7 @@ func awaitWorkflowResult[T any](
 	return result, nil
 }
 
-// DBOS v0.16 persists workflow errors as text. Reconstruct its closed retry code
+// DBOS persists workflow errors as text. Reconstruct its closed retry code
 // on terminal retrieval so first delivery and later same-ID replay expose the same
 // errors.As-visible DBOSError contract instead of degrading to string matching.
 func terminalDBOSCause(err error, workflowID string) error {
@@ -719,6 +709,9 @@ func terminalDBOSCause(err error, workflowID string) error {
 // struct's own == -- never spuriously diverges a legitimate replay against its own
 // committed record.
 func canonicalResultsEqual(a, b CanonicalMutationResult) bool {
+	if validateCanonicalMutationResult(a.AnchorJournalID, a.EmittedEvents, a.ResultSlots) != nil || validateCanonicalMutationResult(b.AnchorJournalID, b.EmittedEvents, b.ResultSlots) != nil {
+		return false
+	}
 	if a.AnchorJournalID != b.AnchorJournalID {
 		return false
 	}
@@ -755,8 +748,8 @@ type ApplyWaitCanceledError struct {
 
 func (e *ApplyWaitCanceledError) Error() string {
 	return fmt.Sprintf(
-		"provenance: apply wait canceled for operation %q -- stage: %s; impact: %s; fix: %s; cause: %v",
-		e.Operation, e.Stage, e.Impact, e.Fix, e.Cause)
+		"provenance: apply wait canceled for operation %q -- stage: %s; impact: %s; fix: %s%s",
+		e.Operation, e.Stage, e.Impact, e.Fix, causeClause(e.Cause))
 }
 
 func (e *ApplyWaitCanceledError) Unwrap() error { return e.Cause }
@@ -774,8 +767,8 @@ type CheckpointDivergenceError struct {
 
 func (e *CheckpointDivergenceError) Error() string {
 	return fmt.Sprintf(
-		"provenance: checkpoint divergence for operation %q -- stage: %s; impact: %s; fix: %s; cause: %v",
-		e.Operation, e.Stage, e.Impact, e.Fix, e.Cause)
+		"provenance: checkpoint divergence for operation %q -- stage: %s; impact: %s; fix: %s%s",
+		e.Operation, e.Stage, e.Impact, e.Fix, causeClause(e.Cause))
 }
 
 func (e *CheckpointDivergenceError) Unwrap() error { return e.Cause }

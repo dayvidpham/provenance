@@ -10,6 +10,8 @@ package provenance
 // them together.
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 
 	intgraph "github.com/dayvidpham/provenance/internal/graph"
@@ -51,6 +53,26 @@ func openTracker(dbPath string, opts ...Option) (Tracker, error) {
 	}, nil
 }
 
+// openBorrowedTracker wires the canonical tracker to a caller-owned
+// database/sql pool. The internal store uses that exact pool and does not close
+// it when the Tracker is closed.
+func openBorrowedTracker(db *sql.DB, opts ...Option) (Tracker, error) {
+	o := defaultOptions()
+	for _, opt := range opts {
+		opt(&o)
+	}
+
+	store, err := dbsqlite.OpenBorrowed(db, o.registry.Models())
+	if err != nil {
+		return nil, fmt.Errorf("provenance.openBorrowedTracker: %w", err)
+	}
+	return &sqliteTracker{
+		db:       store,
+		graph:    intgraph.NewGraph(store),
+		registry: o.registry,
+	}, nil
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
@@ -60,6 +82,14 @@ func (t *sqliteTracker) Close() error {
 		return fmt.Errorf("provenance.Tracker.Close: %w", err)
 	}
 	return nil
+}
+
+func (t *sqliteTracker) InitializeGovernedRoot(ctx context.Context, request RootGenesisRequest) (OperationClosure, error) {
+	closure, err := t.db.InitializeGovernedRoot(ctx, request)
+	if err != nil {
+		return OperationClosure{}, fmt.Errorf("provenance.Tracker.InitializeGovernedRoot: %w", err)
+	}
+	return closure, nil
 }
 
 // ---------------------------------------------------------------------------

@@ -557,6 +557,39 @@ integer lookup at that point**, by that same criterion.
 
 **FD:** `{JournalID} → {EvidenceKind, TaskID, ContentDigest, Payload}`. **Candidate key / PK:** `{JournalID}`. **BCNF:** trivial.
 
+### 6.2.1 Subtype-owned fact contexts
+
+Decision and evidence facts carry immutable canonical context sets in exactly two
+relations. Contexts are owned by the fact subtype row, not by
+`journal_task_event_contexts`, and are written in the same operation transaction
+as their parent fact:
+
+**`journal_decision_contexts`**
+
+| Attribute | Domain | Nullable | Notes |
+|---|---|---|---|
+| `DecisionJournalID` | FK → `journal_decisions.JournalID` | no | part of PK; immutable decision parent |
+| `ContextKind` | `TEXT` | no | part of PK; same validated open context-kind domain as §5.2 |
+| `ContextIdentity` | `TEXT` | no | part of PK; encoded identity string |
+
+**`journal_evidence_contexts`** has the identical shape with
+`EvidenceJournalID` as an FK to `journal_evidence.JournalID`.
+
+Each relation is `STRICT, WITHOUT ROWID` with primary key
+`{ParentJournalID, ContextKind, ContextIdentity}`. The subtype FK statically
+prevents a decision context from being attached to an evidence row (and vice
+versa); no generic nullable-parent relation, discriminator, trigger, or
+`AttachedByJournalID` is used. Since a fact's parent `JournalID` fixes its
+snapshot visibility, fact contexts are not later attached and have no separate
+attachment position. Context sets are validate-then-sort-then-deduplicated by
+`(ContextKind, ContextIdentity)` as defined in §5.2.
+
+**FD / BCNF:** `{ParentJournalID, ContextKind, ContextIdentity} → {}`. The full
+triple is the only candidate key, so each relation is in BCNF. For a canonical
+operation, the stored set must equal the context set encoded in that operation's
+effect; missing, extra, malformed, cross-subtype, or opaque-legacy context rows
+are integrity violations and fail closed.
+
 ### 6.3 `immutable_tasks`
 
 `CreateImmutableTaskSnapshot` (the generic snapshot command from the
@@ -1062,7 +1095,7 @@ boundary, before returning to the caller.
    marker), so the only thing the `CHECK` rejects is the retired bare NULL-producer
    append; the base primitive's method shape is unchanged (the layering holds
    because only *which callers remain legal* changes under `#5`'s schema), and the
-   bare-append public path is retired from the operations-layer `JournalAPI`.
+   bare-append public path is retired from the operations-layer `Journal`.
    `VerifyIntegrity`'s §10 rule 8 subtype-integrity guard is orthogonal to rule 2.
 3. Common fields (`JournalKind`, `ActorID`, `RecordedAt`) are never
    duplicated on a subtype row; a subtype row's only own attributes are the

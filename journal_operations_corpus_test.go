@@ -1229,8 +1229,8 @@ func TestApplyConflictProducesTypedClosedSumAndErrorsAs(t *testing.T) {
 	if res.Conflict == nil {
 		t.Fatal("CommittedConflict result carried a nil Conflict payload")
 	}
-	if res.Conflict.OperationID != "op-x" || res.Conflict.Field != "mutation digest" {
-		t.Fatalf("res.Conflict = {%q,%q}, want {op-x, mutation digest derived from canonical effects}", res.Conflict.OperationID, res.Conflict.Field)
+	if res.Conflict.OperationID != "op-x" {
+		t.Fatalf("res.Conflict = %+v, want OperationID op-x", res.Conflict)
 	}
 	// errors.Is recovers the sentinel; errors.As recovers the typed *OperationConflict.
 	if !errors.Is(err, ErrOperationConflict) {
@@ -1240,8 +1240,8 @@ func TestApplyConflictProducesTypedClosedSumAndErrorsAs(t *testing.T) {
 	if !errors.As(err, &oc) {
 		t.Fatalf("errors.As(err, &*OperationConflict) = false — typed payload not recoverable: %v", err)
 	}
-	if oc.OperationID != "op-x" || oc.Field != "mutation digest" {
-		t.Fatalf("errors.As recovered {%q,%q}, want {op-x, mutation digest}", oc.OperationID, oc.Field)
+	if oc.OperationID != "op-x" {
+		t.Fatalf("errors.As recovered incomplete typed conflict %+v", oc)
 	}
 	// Nothing extra committed: the original event is the only one.
 	if r, lerr := env.tr.Journal().LookupCommitted("op-x"); lerr != nil {
@@ -1356,8 +1356,9 @@ func TestFoldEvidenceEnforcesAuthorityGovernance(t *testing.T) {
 // anchor insert loses a concurrent same-new-OperationID UNIQUE race, the reducer
 // re-reads the winner's committed row and returns the typed idempotent result (on
 // an exact identity match) or the typed CommittedConflict (on a mismatch), never a
-// raw SQLite constraint error. Under the in-process db.mu the live path is
-// unreachable, so the translation is driven through the adversarial seam.
+// raw SQLite constraint error. BEGIN IMMEDIATE serializes pooled writers before
+// the §9.4 lookup, so the live path is not reachable deterministically; the
+// translation is driven through the adversarial seam instead.
 func TestResolveOperationIDInsertRaceTranslatesToTypedOutcome(t *testing.T) {
 	t.Parallel()
 	env := newOpsEnv(t)

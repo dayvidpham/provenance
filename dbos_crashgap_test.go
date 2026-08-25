@@ -20,10 +20,12 @@ package provenance
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"os/exec"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -52,7 +54,7 @@ func TestCrashGapChild(t *testing.T) {
 	if gap == "" {
 		t.Skip("child entry point; runs only under PROV_CRASH_GAP")
 	}
-	runCrashChild(gap, os.Getenv("PROV_DBPATH"), os.Getenv("PROV_ACTOR"), os.Getenv("PROV_AUTH"), os.Getenv("PROV_TASK"))
+	runCrashChild(gap, os.Getenv("PROV_DBPATH"), os.Getenv("PROV_ACTOR"), os.Getenv("PROV_AUTH"), os.Getenv("PROV_TASK"), os.Getenv("PROV_MARKER"))
 	// If we reach here the crash hook did not fire.
 	os.Exit(crashExitFinished)
 }
@@ -93,7 +95,19 @@ func crashOp(actor ptypes.ActorID, auth journal.JournalID, taskID ptypes.TaskID)
 
 // runCrashChild builds the stack, arms the crash hook for gap, and drives one Apply
 // that must crash via os.Exit inside the step.
-func runCrashChild(gap, dbpath, actorStr, authStr, taskStr string) {
+func appendCrashMarker(path, marker string) {
+	if path == "" {
+		return
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return
+	}
+	_, _ = fmt.Fprintln(file, marker)
+	_ = file.Close()
+}
+
+func runCrashChild(gap, dbpath, actorStr, authStr, taskStr, marker string) {
 	db, err := openSharedSQL(dbpath)
 	if err != nil {
 		os.Exit(20)
@@ -112,13 +126,17 @@ func runCrashChild(gap, dbpath, actorStr, authStr, taskStr string) {
 	if err != nil {
 		os.Exit(23)
 	}
+	adapter.testHooks.onWorkflowEntry = func() { appendCrashMarker(marker, "workflow-entry") }
+	adapter.testHooks.beforeDomainCommit = func() { appendCrashMarker(marker, "domain-attempt") }
+	adapter.testHooks.afterDomainCommit = func() { appendCrashMarker(marker, "domain-commit") }
+	adapter.testHooks.afterStepCheckpoint = func() { appendCrashMarker(marker, "step-checkpoint") }
 	switch gap {
 	case "before":
-		adapter.testHooks.beforeDomainCommit = func() { os.Exit(crashExitBefore) }
+		adapter.testHooks.beforeDomainCommit = func() { appendCrashMarker(marker, "domain-attempt"); os.Exit(crashExitBefore) }
 	case "domain":
-		adapter.testHooks.afterDomainCommit = func() { os.Exit(crashExitDomain) }
+		adapter.testHooks.afterDomainCommit = func() { appendCrashMarker(marker, "domain-commit"); os.Exit(crashExitDomain) }
 	case "step":
-		adapter.testHooks.afterStepCheckpoint = func() { os.Exit(crashExitStep) }
+		adapter.testHooks.afterStepCheckpoint = func() { appendCrashMarker(marker, "step-checkpoint"); os.Exit(crashExitStep) }
 	default:
 		os.Exit(24)
 	}
@@ -144,6 +162,7 @@ func runCrashGap(t *testing.T, gap string, wantExit int) {
 	t.Helper()
 	dir := t.TempDir()
 	dbpath := dir + "/crash.db"
+	markerPath := dir + "/crash.markers"
 
 	// Parent establishes the genesis authority + committing actor (no DBOS needed),
 	// then releases the file before spawning the child.
@@ -158,6 +177,7 @@ func runCrashGap(t *testing.T, gap string, wantExit int) {
 		"PROV_ACTOR="+actor.String(),
 		"PROV_AUTH="+strconv.FormatInt(int64(auth), 10),
 		"PROV_TASK="+taskID.String(),
+		"PROV_MARKER="+markerPath,
 	)
 	out, err := cmd.CombinedOutput()
 	code := exitCode(err)
@@ -186,6 +206,10 @@ func runCrashGap(t *testing.T, gap string, wantExit int) {
 	if err != nil {
 		t.Fatalf("reopen NewDBOSAdapter: %v", err)
 	}
+	adapter.testHooks.onWorkflowEntry = func() { appendCrashMarker(markerPath, "workflow-entry") }
+	adapter.testHooks.beforeDomainCommit = func() { appendCrashMarker(markerPath, "domain-attempt") }
+	adapter.testHooks.afterDomainCommit = func() { appendCrashMarker(markerPath, "domain-commit") }
+	adapter.testHooks.afterStepCheckpoint = func() { appendCrashMarker(markerPath, "step-checkpoint") }
 	if err := dbos.Launch(root); err != nil {
 		t.Fatalf("reopen Launch: %v", err)
 	}
@@ -234,6 +258,36 @@ func runCrashGap(t *testing.T, gap string, wantExit int) {
 	// Recovery leaves the journal convergent (no double-fold, no orphan).
 	if _, err := tracker.Journal().ReplayProjections(); err != nil {
 		t.Errorf("ReplayProjections after recovery: %v", err)
+	}
+	markerBytes, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatalf("read crash marker: %v", err)
+	}
+	var domainAttempts []string
+	for _, marker := range strings.Split(strings.TrimSpace(string(markerBytes)), "\n") {
+		if marker == "domain-attempt" {
+			domainAttempts = append(domainAttempts, marker)
+		}
+	}
+	wantAttempts := 1
+	if gap != "step" {
+		wantAttempts = 2
+	}
+	if len(domainAttempts) != wantAttempts {
+		t.Fatalf("crash seam %s domain-attempt vector=%v, want %d attempts", gap, domainAttempts, wantAttempts)
+	}
+	var workflows, outputs, operations int
+	if err := db.QueryRow(`SELECT count(*) FROM workflow_status`).Scan(&workflows); err != nil {
+		t.Fatalf("count workflow_status: %v", err)
+	}
+	if err := db.QueryRow(`SELECT count(*) FROM operation_outputs`).Scan(&outputs); err != nil {
+		t.Fatalf("count operation_outputs: %v", err)
+	}
+	if err := db.QueryRow(`SELECT count(*) FROM journal_operations WHERE operation_id = ?`, "op-crash").Scan(&operations); err != nil {
+		t.Fatalf("count committed operation: %v", err)
+	}
+	if workflows != 1 || outputs != 1 || operations != 1 {
+		t.Fatalf("crash seam %s durable counts workflows=%d outputs=%d operations=%d, want 1/1/1", gap, workflows, outputs, operations)
 	}
 }
 

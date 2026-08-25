@@ -96,7 +96,7 @@ Before committing, ensure all gates pass:
 ```bash
 make fmt    # Reformat code
 make lint   # Check for errors
-make test   # Run repeated normal and CGO_ENABLED=1 race tests
+make test   # Run the authoritative CGO_ENABLED=1 race-only suite
 make build  # Build with CGO_ENABLED=0
 ```
 
@@ -268,18 +268,18 @@ func TestTrackerCreateTask(t *testing.T) {
 ### Running Tests
 
 ```bash
-# Run both authoritative uncached suites
-go test -count=1 -shuffle=on -fullpath -timeout=10m ./...
-CGO_ENABLED=1 go test -race -count=1 -shuffle=on -fullpath -timeout=20m ./...
+# The single authoritative suite. Never pass -count: repeated execution is not
+# evidence of correctness, and neither is looping a test to hunt flakes.
+CGO_ENABLED=1 go test -race -shuffle=on -fullpath -timeout=20m ./...
 
-# Cached local iteration
-go test ./... -run TestTrackerCreateTask
+# Narrow the scope during iteration
+CGO_ENABLED=1 go test -race -run TestTrackerCreateTask ./...
 
-# Run local race tests with verbose output
+# Verbose output
 CGO_ENABLED=1 go test -race -timeout=20m -v ./...
 
-# Run local tests with coverage
-go test -cover ./...
+# Coverage
+CGO_ENABLED=1 go test -race -cover ./...
 ```
 
 ## Build Targets
@@ -289,9 +289,9 @@ All build targets are defined in the `Makefile`:
 ```bash
 make fmt    # Format all Go files with gofmt
 make lint   # go vet ./... + ast-grep scan
-make test   # strict normal scheduler matrix + CGO1 race gate
-make test-local # cached local iteration
-make build  # CGO_ENABLED=0 go build ./...
+make test   # one authoritative CGO_ENABLED=1 race-only suite
+make test-local # focused CGO_ENABLED=1 race-only iteration
+make build  # fmt + lint + race suite + CGO_ENABLED=0 build
 make clean  # Remove bin/ directory
 ```
 
@@ -299,6 +299,13 @@ Each target can be run independently. All four quality gates (`fmt`, `lint`, `te
 Do not run full tests or race tests with `CGO_ENABLED=0`; that mode is reserved
 for `go build ./...`. The ast-grep lint gate rejects production `time.Sleep`, so
 SQLite `busy_timeout=5000` remains the sole local wait and DBOS owns retries.
+The single sanctioned exception is `internal/sqlite` schema activation: it bounds
+one operation in a 30s outer budget whose per-attempt wait is still
+`busy_timeout`, because `BEGIN IMMEDIATE` holds the write lock across the
+O(journal) integrity and replay probes and concurrent openers can therefore
+serialise past one 5s window. Do not extend this exception to storage
+operations; DBOS step options own durable retry. See TESTING.md, "Waiting and
+retries".
 
 ## Troubleshooting
 
@@ -308,18 +315,36 @@ This warning appears when go.mod has dependencies but no source files import the
 
 ### CGO_ENABLED=0 build fails
 
-Ensure you're not importing C libraries or cgo-dependent packages. Provenance dependencies must all be pure Go:
-- ✓ `zombiezen.com/go/sqlite` (pure Go)
+Ensure you're not importing C libraries or cgo-dependent packages. `CGO_ENABLED=0` applies to `go build ./...` only; the test and race gates run with `CGO_ENABLED=1` because `-race` requires it. Build dependencies must all be pure Go:
+- ✓ `modernc.org/sqlite` (pure Go — the C source is mechanically translated to Go)
 - ✗ `github.com/mattn/go-sqlite3` (CGo)
 
-### Why does `modernc.org/sqlite` appear in `go.mod`?
+### SQLite driver rules
 
-`modernc.org/sqlite` shows up as an **indirect** dependency even though we don't import it directly. It is pulled in transitively through:
+`internal/sqlite` uses the standard `database/sql` API with the
+`modernc.org/sqlite` driver, registered as `"sqlite"`. Two rules hold:
 
-- `zombiezen.com/go/sqlite` (our SQLite driver) — uses `modernc.org/sqlite/lib` for the embedded SQLite C-translated-to-Go runtime.
-- `github.com/dayvidpham/bestiary` — uses `modernc.org/sqlite` internally for its own catalog cache.
+- Never import `github.com/mattn/go-sqlite3` (CGo).
+- Never reintroduce `zombiezen.com/go/sqlite` into `internal/sqlite`,
+  `internal/allocation`, or `internal/fusedtx`. `sql_architecture_test.go` in
+  the repository root fails the suite if a non-test file in those packages
+  imports it (or a subpackage), or calls the retired driver-specific methods
+  `Execute`, `ExecuteTransient`, `LastInsertRowID`, or `Changes`; all production
+  SQL must end at `ExecContext`, `QueryContext`, or `QueryRowContext`.
 
-This is **expected and pure-Go**: `modernc.org/sqlite` is a CGo-free port of SQLite (the C source is mechanically translated to Go). Auditors who flag it should verify it ships under the same pure-Go guarantee — `CGO_ENABLED=0 go build ./...` continues to succeed.
+Pool, DSN, connection-scope, and `BEGIN IMMEDIATE` conventions live in
+[CLAUDE.md](CLAUDE.md), "SQLite pool, DSN, and transaction discipline".
+
+### Why does `zombiezen.com/go/sqlite` still appear in `go.mod`?
+
+`zombiezen.com/go/sqlite` remains an **indirect** dependency after the driver
+migration because `github.com/dayvidpham/bestiary` (our ML model catalog) still
+requires it. Provenance itself no longer imports it anywhere.
+
+This is **expected and pure-Go**: zombiezen builds on the same CGo-free
+`modernc.org` SQLite runtime, so `CGO_ENABLED=0 go build ./...` continues to
+succeed. Auditors who flag either module should verify that gate rather than the
+module list.
 
 ### Make targets not found
 

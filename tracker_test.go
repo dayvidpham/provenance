@@ -61,6 +61,38 @@ func TestOpenMemory(t *testing.T) {
 	}
 }
 
+func TestTrackerConcurrentCloseIsIdempotent(t *testing.T) {
+	tr, err := provenance.OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory() returned error: %v", err)
+	}
+
+	const callers = 16
+	start := make(chan struct{})
+	errs := make(chan error, callers)
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	for range callers {
+		go func() {
+			defer wg.Done()
+			<-start
+			errs <- tr.Close()
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	for closeErr := range errs {
+		if closeErr != nil {
+			t.Errorf("concurrent Tracker.Close() returned error: %v", closeErr)
+		}
+	}
+	if err := tr.Close(); err != nil {
+		t.Fatalf("repeated Tracker.Close() returned error: %v", err)
+	}
+}
+
 func TestCreateAndShow(t *testing.T) {
 	t.Parallel()
 	tr := openTestTracker(t)

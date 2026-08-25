@@ -39,12 +39,14 @@ package provenance
 // provisional UUIDs from the committed result and return the original task.
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
+	"github.com/dayvidpham/provenance/internal/allocation"
 	"github.com/google/uuid"
 )
 
@@ -77,6 +79,75 @@ func (s *Session) checkGate(op string) error {
 		return nil
 	}
 	return s.gate("Session." + op)
+}
+
+// AllocateGoverned creates a governed child batch under this Session's exact
+// bound assignment authority. The request repeats ActorID deliberately so its
+// canonical operation identity is self-contained; it must match the Session
+// actor before the transaction begins.
+func (s *Session) AllocateGoverned(ctx context.Context, request GovernedAllocationRequest) (OperationClosure, error) {
+	if err := s.checkGate("AllocateGoverned"); err != nil {
+		return OperationClosure{}, err
+	}
+	if request.ActorID != s.actor {
+		return OperationClosure{}, allocation.NewError(
+			allocation.ErrorAuthority, request.OperationID, "Session.AllocateGoverned",
+			"the request ActorID differs from the actor bound to this Session",
+			"nothing was written; actor attribution cannot be silently substituted",
+			"construct the request with the Session actor or bind a Session for the request actor", nil)
+	}
+	closure, err := s.tr.db.AllocateGovernedForAuthority(ctx, request, s.authority)
+	if err != nil {
+		return OperationClosure{}, fmt.Errorf("provenance.Session.AllocateGoverned: %w", err)
+	}
+	return closure, nil
+}
+
+// AllocateGovernedComposed is the one-child entry point over
+// AllocateGovernedComposedBatch, which takes the same request type with
+// 1..MaxGovernedAllocationChildren ordered children.
+//
+// The liveness gate runs before the child-count check so that every Session
+// verb reports the same failure on a store whose handle has been closed. The
+// other order would answer a dead store with a validation complaint about the
+// request, sending the caller to fix an argument that was never the problem.
+func (s *Session) AllocateGovernedComposed(ctx context.Context, request GovernedAllocationComposedRequest) (GovernedAllocationComposedResult, error) {
+	if err := s.checkGate("AllocateGovernedComposed"); err != nil {
+		return GovernedAllocationComposedResult{}, err
+	}
+	if len(request.Allocation.Children) != 1 {
+		return GovernedAllocationComposedResult{}, allocation.NewError(allocation.ErrorValidation, request.Allocation.OperationID, "Session.AllocateGovernedComposed", "the one-child composed allocation entry point requires exactly one child", "nothing was written", "use AllocateGovernedComposedBatch for 1..128 ordered children", nil)
+	}
+	return s.AllocateGovernedComposedBatch(ctx, request)
+}
+
+// AllocateGovernedComposedBatch creates 1..128 ordered governed children and
+// reduces the shared ordered supplemental closure in the same SQLite
+// transaction. Supplements are authenticated against the complete child list.
+func (s *Session) AllocateGovernedComposedBatch(ctx context.Context, request GovernedAllocationComposedRequest) (GovernedAllocationComposedResult, error) {
+	if err := s.checkGate("AllocateGovernedComposedBatch"); err != nil {
+		return GovernedAllocationComposedResult{}, err
+	}
+	canonical, _, err := allocation.CanonicalizeComposed(request)
+	if err != nil {
+		return GovernedAllocationComposedResult{}, fmt.Errorf("provenance.Session.AllocateGovernedComposedBatch: %w", err)
+	}
+	request, err = allocation.DecodeComposedRequest(canonical)
+	if err != nil {
+		return GovernedAllocationComposedResult{}, fmt.Errorf("provenance.Session.AllocateGovernedComposedBatch: copy canonical request: %w", err)
+	}
+	if request.Allocation.ActorID != s.actor {
+		return GovernedAllocationComposedResult{}, allocation.NewError(
+			allocation.ErrorAuthority, request.Allocation.OperationID, "Session.AllocateGovernedComposedBatch",
+			"the request ActorID differs from the actor bound to this Session",
+			"nothing was written; actor attribution cannot be silently substituted",
+			"construct the request with the Session actor or bind a Session for the request actor", nil)
+	}
+	result, err := s.tr.db.AllocateGovernedComposedForAuthority(ctx, request, s.authority)
+	if err != nil {
+		return GovernedAllocationComposedResult{}, fmt.Errorf("provenance.Session.AllocateGovernedComposedBatch: %w", err)
+	}
+	return result, nil
 }
 
 // ErrGenesisRequired is returned by a journaled Session verb invoked against a journal

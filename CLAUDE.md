@@ -41,7 +41,7 @@ provenance/
 │       └── namespace_test.go
 │
 ├── internal/
-│   ├── sqlite/             # SQL persistence (zombiezen). No graph logic.
+│   ├── sqlite/             # SQL persistence (database/sql + modernc.org/sqlite). No graph logic.
 │   │   ├── db.go           # Open/Close, WAL config, schema migration, ml_models seeding
 │   │   ├── tasks.go        # Task CRUD
 │   │   ├── edges.go        # Edge insert/delete/query
@@ -88,9 +88,9 @@ provenance/
 | Package | Role |
 |---------|------|
 | `provenance` (root) | **Public API surface**. Consumers (e.g., pasture) import only this package. Holds the `Tracker` interface, constructors (`OpenSQLite`, `OpenMemory`), the `sqliteTracker` implementation, and the bestiary adapter. Re-exports every `pkg/ptypes` and `pkg/namespace` symbol via type aliases (`reexports.go`) so consumers see `provenance.TaskID` rather than `ptypes.TaskID`. |
-| `pkg/ptypes` | **Public type definitions and bestiary delegation**. Holds every public type, enum, and sentinel error. Imports bestiary for `Provider.IsValid()` catalog validation; does not import SQLite or zombiezen. This is what allows `internal/sqlite` to import the types without creating an import cycle through the root package. Consumers should not import this directly — use the root re-exports. |
+| `pkg/ptypes` | **Public type definitions and bestiary delegation**. Holds every public type, enum, and sentinel error. Imports bestiary for `Provider.IsValid()` catalog validation; does not import `database/sql` or any SQLite driver. This is what allows `internal/sqlite` to import the types without creating an import cycle through the root package. Consumers should not import this directly — use the root re-exports. |
 | `pkg/namespace` | Namespace URI derivation (git remote → canonical HTTPS, working dir → `file://`). Used to scope IDs. Re-exported by root. |
-| `internal/sqlite` | **All SQL operations**. Encapsulates the zombiezen SQLite driver. No graph logic — pure relational CRUD including agent table-per-type operations and ml_models seeding from the registry. |
+| `internal/sqlite` | **All SQL operations**. Owns the `database/sql` pool over the `modernc.org/sqlite` driver, plus connection leasing, transactions, journal reduction, projection reads, replay, and migration. No graph logic — pure relational CRUD including agent table-per-type operations and ml_models seeding from the registry. |
 | `internal/graph` | Implements `dominikbraun/graph.Store[string, Task]` backed by `internal/sqlite`. Bridges graph library and persistence. |
 | `internal/helpers` | Graph traversal utilities (Ancestors, Descendants) composed from dominikbraun/graph primitives (DFS + PredecessorMap). |
 | `internal/testutil` | Shared test fixtures (e.g., known-model lists for seeding test databases). |
@@ -112,16 +112,107 @@ Direct dependencies pinned in `go.mod`:
 | `github.com/dominikbraun/graph` | Directed graph operations, topological sort, cycle detection | v0.23.0 |
 | `github.com/google/uuid` | UUIDv7 generation for IDs | v1.6.0 |
 | `gopkg.in/yaml.v3` | YAML parsing (used by namespace and frontmatter helpers) | v3.0.1 |
-| `zombiezen.com/go/sqlite` | Pure-Go SQLite (audit trail, local state) | v1.4.2 |
+| `modernc.org/sqlite` | Pure-Go SQLite driver, used through `database/sql` (journal, projections, local state) | v1.52.0 |
+| `github.com/dbos-inc/dbos-transact-golang` | Durable-execution runtime for the DBOS adapter and borrowed-pool integration | v0.20.0 |
 
-No other direct external dependencies may be added without supervisor approval. Indirect (transitive) dependencies are tracked in `go.mod`'s `indirect` block — see `CONTRIBUTING.md` for why `modernc.org/sqlite` appears there.
+No other direct external dependencies may be added without supervisor approval. Indirect (transitive) dependencies are tracked in `go.mod`'s `indirect` block — see `CONTRIBUTING.md` for why `zombiezen.com/go/sqlite` still appears there.
 
 ## Go Conventions
 
-### No CGo
-Production builds run with `CGO_ENABLED=0`. All direct SQLite usage MUST go through `zombiezen.com/go/sqlite` (pure Go). Never import `github.com/mattn/go-sqlite3` (CGo) and never import `modernc.org/sqlite` directly — even though `modernc.org/sqlite` is pure Go, we standardise on the zombiezen API at the source level.
+### SQLite driver: `database/sql` over `modernc.org/sqlite`
 
-`modernc.org/sqlite` *does* appear as an indirect dependency in `go.mod` because zombiezen and bestiary use it transitively. That's expected and CGo-free; see `CONTRIBUTING.md` for the rationale.
+`go build ./...` runs with `CGO_ENABLED=0`, so every dependency must be pure Go.
+The tests are the exception: the authoritative suite is race-only and therefore
+runs with `CGO_ENABLED=1` (see `CONTRIBUTING.md` and `TESTING.md`).
+
+All SQLite access goes through the standard `database/sql` API with the
+`modernc.org/sqlite` driver, registered under the driver name `"sqlite"`
+(`internal/sqlite/db.go`, `sqliteDriverName`). Rules:
+
+- Never import `github.com/mattn/go-sqlite3` (CGo).
+- Do not reintroduce `zombiezen.com/go/sqlite`. `internal/sqlite` migrated off it;
+  `sql_architecture_test.go` in the repository root fails if any non-test file in
+  `internal/sqlite`, `internal/allocation`, or `internal/fusedtx` imports
+  `zombiezen.com/go/sqlite` (or a subpackage), or calls the retired driver-specific
+  methods `Execute`, `ExecuteTransient`, `LastInsertRowID`, or `Changes`. All
+  production SQL must end at `ExecContext`, `QueryContext`, or `QueryRowContext`.
+- `zombiezen.com/go/sqlite` *does* remain an indirect dependency in `go.mod`,
+  because `github.com/dayvidpham/bestiary` still uses it. That is expected and
+  CGo-free; see `CONTRIBUTING.md`.
+
+### SQLite pool, DSN, and transaction discipline
+
+`internal/sqlite` owns the persistence stack: it is the only package that opens a
+pool holding Provenance's *journal* schema, and the conventions below are
+enforced by the code in `internal/sqlite/db.go` — match them rather than
+inventing a second pattern.
+
+It is not the only package in the module that opens a `*sql.DB`.
+`internal/fusedtx.OpenSystem` opens the DBOS *system* database from a
+caller-supplied DSN it does not validate, with its own limits (16 open / 8 idle),
+and none of the DSN discipline below applies to it: whatever `busy_timeout`,
+`journal_mode`, and `foreign_keys` that DSN carries is what DBOS gets. Supplying
+a WAL, non-zero-`busy_timeout` DSN there is the caller's obligation. This is
+deliberate rather than an oversight — a post-connect probe would sample one
+connection of a lazily grown pool and prove nothing about the rest (the same
+reasoning recorded on `armForeignKeys`) — but it means "the module runs on WAL
+with `busy_timeout=5000`" is a statement about `Open`, not about every handle in
+the process.
+
+**Pools and DSNs.** `Open` resolves one `openTarget` that carries the runtime,
+activation, and read-only DSNs for a path. Connection settings are carried in
+the DSN as `_pragma` values rather than applied ad hoc after connect: the
+runtime DSN sets `busy_timeout(5000)`, `foreign_keys(1)`, `synchronous(NORMAL)`,
+and — for file-backed databases — `journal_mode(WAL)`. A file-backed runtime pool
+is bounded at 4 connections (`runtimePoolSize`, enough for the Apply-plus-reader
+workload without unbounded fan-out); `:memory:` is rewritten to a process-unique
+`file:provenance-memdb-N?mode=memory&cache=shared` URI with a pool of 1
+(`memoryPoolSize`) so parallel opens stay isolated and the memory database stays
+alive. `withSQLiteQuery` preserves caller-supplied URI fields, so extend a DSN
+through it instead of string-concatenating query parameters.
+
+**Connection ownership.** `database/sql` hands out arbitrary connections, so any
+operation that needs connection-local state — a TEMP table, a connection-local
+PRAGMA, or an explicit transaction — must pin one connection through
+`DB.bindScope`, which returns a `connScope` and registers it for lifecycle
+tracking. Release each scope exactly once (`release`); use `discard` only on
+transaction-cleanup paths where the connection's transaction or PRAGMA state is
+unknown. `borrowConnScope` wraps a connection whose lifetime belongs to
+activation or preflight; releasing it is deliberately a no-op. `DB.Close` first
+refuses new leases, then cancels and drains registered scopes, and only then
+closes a pool it owns.
+
+**Owned vs borrowed pools.** `Open` creates and owns its pool (`ownsPool: true`).
+`OpenBorrowed` (public entry point `provenance.OpenBorrowedSQLite`) activates the
+schema on a caller-owned `database/sql` pool and then uses that exact pool: it
+never closes it, never validates or mutates its limits, and `DB.Close`
+invalidates only the Provenance instance. Its DSN pragmas are the caller's too —
+`busy_timeout`, `journal_mode`, and `synchronous` are never set on a borrowed
+pool — with one exception this package does own: `foreign_keys` is forced ON for
+the span of every lease and restored to the caller's captured value on release,
+verified by read-back, retiring the connection when the restore cannot be proven
+(SQLite ignores the pragma inside a transaction, so an unverified restore is a
+silent leak of Provenance's state into the caller's pool). There is no second connection and no
+cross-driver bridge — one pool, one physical database.
+
+**Transactions.** Use `runImmediateTransaction` (`BEGIN IMMEDIATE`) wherever a
+transaction reads before it writes. A deferred `BEGIN` takes the read lock first
+and then needs a read-to-write promotion, on which SQLite never invokes the busy
+handler, so contention would fail instantly and bypass `busy_timeout` entirely.
+`runScopedTransaction` owns the rollback guarantees: it caps the connection's
+`busy_timeout` at the caller's deadline, and rolls back on every non-commit path
+using a fresh bounded context so a canceled caller cannot leave the connection
+write-locked.
+
+**Waiting.** On pools `Open` owns, SQLite's `busy_timeout=5000` is the only local
+contention wait (a borrowed pool waits for whatever its owner's DSN configured,
+and the DBOS system handle for whatever the caller passed to `OpenSystem`);
+production code adds no sleep or private retry loop (the ast-grep lint gate
+rejects production `time.Sleep`). The single sanctioned exception is schema
+activation, which wraps a bounded 30s outer budget around
+`activateSchemaWithRetry` whose per-attempt wait is still `busy_timeout`. Do not
+extend it to storage operations — see `TESTING.md`, "Waiting and retries", and
+`CONTRIBUTING.md`.
 
 ### Strongly-Typed Enums
 Prefer named types with explicit constants over bare strings or integers. All enums must implement `String()`, `MarshalText()`, `UnmarshalText()`, and `IsValid()`.
@@ -202,18 +293,22 @@ func (id TaskID) Hash() string {
 
 ### Mandatory flags
 ```bash
-# Cached local iteration
-go test ./...
+# The single authoritative suite — local, focused, CI readiness, and landing
+CGO_ENABLED=1 go test -race -shuffle=on -fullpath -timeout=20m ./...
 
-# CI readiness / landing evidence
-go test -count=1 -shuffle=on -fullpath -timeout=10m ./...
-CGO_ENABLED=1 go test -race -count=1 -shuffle=on -fullpath -timeout=20m ./...
+# Narrow the scope during iteration
+CGO_ENABLED=1 go test -race -run TestName ./internal/sqlite
 ```
-Both suites are mandatory for CI readiness and landing. `-count=1` requests one
-uncached execution; it does not select CPUs. `-cpu`, `-p`, and `-parallel`
-control scheduler, package, and `t.Parallel` concurrency respectively; CI leaves
-them unset to use the runner's available processors. The race gate uses
-`CGO_ENABLED=1` and `-race` to detect concurrent access issues.
+There is one suite, and it always uses the race detector under
+`CGO_ENABLED=1`. There is no separate non-race wave.
+
+**Never pass `-count`.** Repeated execution is not evidence of correctness:
+determinism must be argued from synchronization structure, not sampled by
+re-running. The same applies to wrapping a test in a shell loop to hunt flakes.
+
+`-cpu`, `-p`, and `-parallel` control scheduler, package, and `t.Parallel`
+concurrency respectively; CI leaves them unset to use the runner's available
+processors.
 Production builds use `CGO_ENABLED=0`; do not run tests with `CGO_ENABLED=0`.
 
 ### Test file conventions
@@ -226,7 +321,7 @@ Production builds use `CGO_ENABLED=0`; do not run tests with `CGO_ENABLED=0`.
 ```bash
 make fmt    # gofmt — fails if any file needs formatting
 make lint   # go vet ./... + ast-grep scan
-make test   # strict normal scheduler matrix, then CGO_ENABLED=1 race gate
+make test   # one authoritative CGO_ENABLED=1 race-only suite
 make build  # CGO_ENABLED=0 go build ./...
 ```
 
@@ -235,12 +330,13 @@ make build  # CGO_ENABLED=0 go build ./...
 ```bash
 make fmt            # gofmt -w .
 make lint           # go vet ./... + ast-grep scan
-make test           # repeated normal and CGO_ENABLED=1 race suites
+make test           # one authoritative CGO_ENABLED=1 race-only suite
 make build          # runs fmt + lint + test, then CGO_ENABLED=0 go build ./...
 make clean          # rm -rf bin/
 ```
 
-`make build` is the full quality gate — it depends on `fmt`, `lint`, and `test` before invoking `go build`.
+`make build` is the full quality gate — it depends on `fmt`, `lint`, and the
+single race-only `test` target before invoking `go build`.
 
 Cross-compilation:
 ```bash

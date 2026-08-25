@@ -9,6 +9,7 @@ package provenance_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"testing"
 
@@ -16,13 +17,13 @@ import (
 	"github.com/google/uuid"
 )
 
-// fakeJournal wraps a real JournalAPI, counting fold ATTEMPTS (every Apply call,
+// fakeJournal wraps a real Journal, counting fold ATTEMPTS (every Apply call,
 // which the step skips entirely on a §9.4/DBOS replay) and successful COMMITS (the
 // "execute once" oracle, tolerant of DBOS retry attempts that do not commit),
 // and optionally transforming LookupCommitted to inject a matrix
 // divergence.
 type fakeJournal struct {
-	provenance.JournalAPI
+	provenance.Journal
 	attempts *int
 	commits  *int
 	lookup   func(real provenance.CommittedResult, realErr error) (provenance.CommittedResult, error)
@@ -32,7 +33,7 @@ func (f *fakeJournal) Apply(in provenance.OperationInput) (provenance.CommittedR
 	if f.attempts != nil {
 		*f.attempts++
 	}
-	res, err := f.JournalAPI.Apply(in)
+	res, err := f.Journal.Apply(in)
 	if err == nil && f.commits != nil {
 		*f.commits++
 	}
@@ -40,7 +41,7 @@ func (f *fakeJournal) Apply(in provenance.OperationInput) (provenance.CommittedR
 }
 
 func (f *fakeJournal) LookupCommitted(op provenance.OperationID) (provenance.CommittedResult, error) {
-	real, err := f.JournalAPI.LookupCommitted(op)
+	real, err := f.Journal.LookupCommitted(op)
 	if f.lookup != nil {
 		return f.lookup(real, err)
 	}
@@ -53,7 +54,7 @@ type wrappedTracker struct {
 	journal *fakeJournal
 }
 
-func (w *wrappedTracker) Journal() provenance.JournalAPI { return w.journal }
+func (w *wrappedTracker) Journal() provenance.Journal { return w.journal }
 
 // counters holds the attempt/commit counters a matrix test asserts against.
 type counters struct {
@@ -73,7 +74,7 @@ func stackWithJournal(t *testing.T, c *counters, lookup func(provenance.Committe
 func stackWithJournalUnlaunched(t *testing.T, c *counters, lookup func(provenance.CommittedResult, error) (provenance.CommittedResult, error)) *dbosStack {
 	t.Helper()
 	return newDBOSStackUnlaunched(t, func(real provenance.Tracker) provenance.Tracker {
-		fj := &fakeJournal{JournalAPI: real.Journal(), lookup: lookup}
+		fj := &fakeJournal{Journal: real.Journal(), lookup: lookup}
 		if c != nil {
 			fj.attempts = &c.attempts
 			fj.commits = &c.commits
@@ -153,6 +154,9 @@ func TestMatrix_AbsentConflict_TypedConflict(t *testing.T) {
 	if !errors.As(err, &oc) {
 		t.Errorf("conflict not errors.As-discoverable: %v", err)
 	}
+	if oc.Axis != provenance.ConflictCommand || oc.Index != -1 {
+		t.Fatalf("conflict metadata=%#v, want ConflictCommand/-1", oc)
+	}
 }
 
 // Row 4: present-success (DBOS) | exact equal canonical mutation → the read-only
@@ -225,6 +229,62 @@ func TestMatrix_PresentSuccessChangedCanonicalOperand_ConflictsBeforeWorkflow(t 
 	}
 	if len(tasksAfter) != len(tasksBefore) || looked.AnchorJournalID != first.AnchorJournalID || len(looked.EmittedEvents) != len(first.EmittedEvents) || len(looked.ResultSlots) != len(first.ResultSlots) {
 		t.Fatalf("conflicting retry changed durable state: tasks %d->%d, first=%+v looked=%+v", len(tasksBefore), len(tasksAfter), first, looked)
+	}
+}
+
+func TestMatrix_SuccessCheckpointRejectsResultSlotDivergence(t *testing.T) {
+
+	tests := map[string]func(*provenance.CommittedResult){
+		"over-limit": func(result *provenance.CommittedResult) {
+			result.ResultSlots = make([]provenance.ResultSlotBinding, provenance.MaxCanonicalResultSlots+1)
+			for i := range result.ResultSlots {
+				result.ResultSlots[i] = provenance.ResultSlotBinding{Slot: provenance.ResultSlotID(fmt.Sprintf("slot-%03d", i)), ProducedJournalID: provenance.JournalID(i + 1), Kind: provenance.JournalKindAuthority}
+			}
+		},
+		// Activity slots reserved for later vertical; test non-entity wrong-arm instead.
+		"wrong-arm-decision": func(result *provenance.CommittedResult) {
+			result.ResultSlots[0].Kind = provenance.JournalKindDecision
+			result.ResultSlots[0].TaskID = nil
+		},
+		"missing": func(result *provenance.CommittedResult) {
+			result.ResultSlots = nil
+		},
+		"extra": func(result *provenance.CommittedResult) {
+			result.ResultSlots = append(result.ResultSlots, provenance.ResultSlotBinding{
+				Slot: "zz-extra", ProducedJournalID: result.AnchorJournalID, Kind: provenance.JournalKindAuthority,
+			})
+		},
+		"duplicate": func(result *provenance.CommittedResult) {
+			result.ResultSlots = append(result.ResultSlots, result.ResultSlots[0])
+		},
+		"wrong-kind": func(result *provenance.CommittedResult) {
+			result.ResultSlots[0].Kind = provenance.JournalKindAuthority
+			result.ResultSlots[0].TaskID = nil
+		},
+		"wrong-arm": func(result *provenance.CommittedResult) {
+			result.ResultSlots[0].Kind = provenance.JournalKindEvidence
+			result.ResultSlots[0].TaskID = nil
+		},
+		"foreign-row": func(result *provenance.CommittedResult) {
+			result.ResultSlots[0].ProducedJournalID++
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			lookup := func(result provenance.CommittedResult, err error) (provenance.CommittedResult, error) {
+				if err == nil && result.Kind == provenance.CommittedExact {
+					result.ResultSlots = append([]provenance.ResultSlotBinding(nil), result.ResultSlots...)
+					mutate(&result)
+				}
+				return result, err
+			}
+			s := stackWithJournal(t, nil, lookup)
+			_, err := s.adapter.Apply(context.Background(), s.createTaskOp("slot-divergence-"+name, "matrix", name))
+			var divergence *provenance.CheckpointDivergenceError
+			if !errors.As(err, &divergence) || divergence.Stage == "" || divergence.Impact == "" || divergence.Fix == "" || divergence.Cause == nil {
+				t.Fatalf("slot divergence err=%v, want actionable CheckpointDivergenceError", err)
+			}
+		})
 	}
 }
 
@@ -400,6 +460,47 @@ func TestMatrix_PresentFailureOutcome_TypedFailurePermanent(t *testing.T) {
 	}
 	if c.attempts != attemptsAfterFirst {
 		t.Errorf("fold attempted again on re-Apply (%d→%d): failure not permanent", attemptsAfterFirst, c.attempts)
+	}
+}
+
+func TestMatrix_FailureCheckpointRejectsCommittedJournal(t *testing.T) {
+	t.Parallel()
+	variants := map[string]func() (provenance.CommittedResult, error){
+		"exact": func() (provenance.CommittedResult, error) {
+			return provenance.CommittedResult{Kind: provenance.CommittedExact, AnchorJournalID: 99}, nil
+		},
+		"conflict": func() (provenance.CommittedResult, error) {
+			return provenance.CommittedResult{Kind: provenance.CommittedConflict}, nil
+		},
+		"unknown": func() (provenance.CommittedResult, error) {
+			return provenance.CommittedResult{Kind: provenance.CommittedResultKind(99)}, nil
+		},
+		"unavailable": func() (provenance.CommittedResult, error) {
+			return provenance.CommittedResult{}, errors.New("journal unavailable during checkpoint reconciliation")
+		},
+	}
+	for name, terminal := range variants {
+		t.Run(name, func(t *testing.T) {
+			var lookups int
+			lookup := func(real provenance.CommittedResult, realErr error) (provenance.CommittedResult, error) {
+				lookups++
+				if lookups == 1 {
+					return provenance.CommittedResult{Kind: provenance.CommittedAbsent}, nil
+				}
+				return terminal()
+			}
+			s := stackWithJournal(t, nil, lookup)
+			op := s.createTaskOp("failure-checkpoint-"+name, "aura", name)
+			op.Conditions = []provenance.Condition{{Kind: provenance.ConditionExactFact, Selector: provenance.FactSelector{Kind: provenance.FactDecision, Filter: provenance.FactFilter{TaskScope: provenance.FactTaskScope{Kind: provenance.FactTaskAny}}, DecisionKind: "fixture.missing"}, AssertedJournalID: 1}}
+			_, err := s.adapter.Apply(context.Background(), op)
+			var divergence *provenance.CheckpointDivergenceError
+			if !errors.As(err, &divergence) || divergence.Operation != op.OperationID || divergence.Stage == "" || divergence.Impact == "" || divergence.Fix == "" || divergence.Cause == nil {
+				t.Fatalf("failure checkpoint variant %s err=%v divergence=%+v", name, err, divergence)
+			}
+			if errors.Is(err, provenance.ErrConditionFailed) {
+				t.Fatalf("failure checkpoint variant %s surfaced typed domain failure despite journal divergence: %v", name, err)
+			}
+		})
 	}
 }
 

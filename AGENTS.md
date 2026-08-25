@@ -10,16 +10,24 @@ Before changing test fixtures, scheduling, or CI flags, read the measured
 
 ## Quality Gates
 
-- During local iteration, use `go test ./...` so successful package results may
-  use Go's test cache. Use `-run` to narrow the scope and `-count=1` only when an
-  explicitly uncached run is needed.
-- For CI readiness and landing evidence, run
-  `go test -count=1 -shuffle=on -fullpath -timeout=10m ./...`.
-- Run the race gate with
-  `CGO_ENABLED=1 go test -race -count=1 -shuffle=on -fullpath -timeout=20m ./...`.
+- Every test invocation — local, focused, CI-readiness, and landing — uses the
+  race detector under `CGO_ENABLED=1`. There is no separate non-race wave.
+- The authoritative full-suite gate is
+  `CGO_ENABLED=1 go test -race -shuffle=on -fullpath -timeout=20m ./...`.
+- Use `-run` to narrow scope during iteration; the flags above are otherwise
+  unchanged.
+- Synchronization primitives are permitted. Each new production primitive must
+  justify the invariant it protects, why explicit pool ownership, a SQLite
+  transaction, a channel, an atomic, or another primitive is insufficient, and
+  any hot-path performance claim must have evidence and race-detector coverage.
+  Process-local synchronization must not replace SQLite transaction ownership
+  for persistent invariants.
+- Never pass `-count`. Repeated execution is not evidence of correctness:
+  determinism must be argued from synchronization structure, not sampled by
+  re-running. Equivalently, never wrap a test in a shell loop to hunt flakes.
 - `-cpu` selects `GOMAXPROCS` values and reruns once per listed value; `-p`
   limits concurrently built/tested packages; `-parallel` limits tests that call
-  `t.Parallel`; `-count` repeats tests and does not allocate CPUs.
+  `t.Parallel`.
 - CI intentionally leaves `-cpu`, `-p`, and `-parallel` unset so Go uses the
   runner's available processors and default concurrency.
 - Verify pure-Go/static compatibility with `CGO_ENABLED=0 go build ./...`.
@@ -29,6 +37,12 @@ Before changing test fixtures, scheduling, or CI flags, read the measured
 - Run `go vet ./...` and `ast-grep scan --config sgconfig.yml --globs '!vendor/**' --globs '!worktree/**' .`; the latter
   rejects production `time.Sleep`, keeping local contention waits in SQLite's
   `busy_timeout=5000` and durable retries in DBOS.
+  The single sanctioned exception is `internal/sqlite` schema activation, which
+  bounds one operation in a 30s outer budget whose per-attempt wait is still
+  `busy_timeout` (it must, because `BEGIN IMMEDIATE` now holds the write lock
+  across the O(journal) integrity and replay probes, so concurrent openers
+  serialise past one 5s window). Do not extend it to storage operations; DBOS
+  step options own durable retry. See TESTING.md, "Waiting and retries".
 - Run `nix flake check --no-build` for the Nix evaluation gate.
 - There is no supported CGO-disabled test or race mode. Do not interpret the
   CGO-disabled build gate as permission to run a package, focused, full, or

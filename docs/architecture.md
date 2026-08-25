@@ -4,7 +4,10 @@ This document describes Provenance's runtime layers, persistence model, and the
 boundaries between its domain API, global journal, SQLite projections, and DBOS
 durable execution. For domain terminology and PROV-O correspondence, see
 [`CONCEPTS.md`](../CONCEPTS.md). The normative relational details are in
-[`journal-relational-contract.md`](journal-relational-contract.md).
+[`journal-relational-contract.md`](journal-relational-contract.md). For the
+motivation-to-invariant chain behind actor attribution, assignment authority,
+delegation, and governed task allocation, see
+[`attribution-authorization-design.md`](attribution-authorization-design.md).
 
 ## Design Goals
 
@@ -38,7 +41,7 @@ provenance.Tracker -------------------- ModelRegistry
   |                    +-----------------+-----------------+
   |                    |                                   |
   |                    v                                   v
-  |             JournalAPI.Apply                    DBOSAdapter.Apply
+  |             Journal.Apply                      DBOSAdapter.Apply
   |                    |                                   |
   |                    +-----------------+-----------------+
   |                                      v
@@ -107,7 +110,7 @@ an ambiguous response must pin and reuse a stable `OperationID`. Session methods
 that accept `ApplyOption` support `WithOperationID` directly. The edge, label,
 and comment convenience methods do not accept options; retry-safe callers use
 `Session.Atomic` with `WithOperationID`, or construct a direct
-`JournalAPI.Apply`. An exact retry returns the committed result; reuse with
+`Journal.Apply`. An exact retry returns the committed result; reuse with
 changed canonical input returns a typed conflict.
 
 ## Global Journal And Projections
@@ -138,20 +141,47 @@ edges or current wall-clock time.
 ## SQLite Storage
 
 `internal/sqlite` owns schema management, SQL, transactions, journal reduction,
-projection reads, replay, and migration. SQL uses the pure-Go zombiezen driver.
-Stable data values are bound as parameters; typed selectors choose among the few
-legitimate query shapes where SQL identifiers cannot be bound.
+projection reads, replay, and migration. SQL uses the standard `database/sql` API
+with the pure-Go `modernc.org/sqlite` driver. Stable data values are bound as
+parameters; typed selectors choose among the few legitimate query shapes where
+SQL identifiers cannot be bound.
 
-The database runs in WAL mode. A process-local write lock serializes operations
-that must observe and update journal state atomically, while SQLite provides
-cross-connection transaction isolation. Collections and wire fields are bounded,
-and external or persisted input is validated before it reaches mutation logic.
+A file-backed database that Provenance opens itself runs in WAL mode with
+`busy_timeout=5000`, `foreign_keys=ON`, and `synchronous=NORMAL`, all carried as
+`_pragma` values on the runtime DSN so every pooled connection is configured
+identically. These are properties of `Open`, not module-wide invariants: on a
+borrowed pool (`OpenBorrowedSQLite`) and on the DBOS system handle
+(`internal/fusedtx.OpenSystem`, which takes the caller's DSN unvalidated), the
+caller's DSN decides them, and supplying WAL and a non-zero `busy_timeout` for a
+shared file is the caller's obligation. The one pragma Provenance does govern on
+a borrowed pool is `foreign_keys`, forced ON per lease and restored to the
+caller's value on release with a read-back that retires the connection rather
+than return it in an unproven state. The runtime pool is bounded at four
+connections; an in-memory database is rewritten to a
+process-unique shared-cache URI with a single connection so parallel opens stay
+isolated.
 
-`OpenBorrowedSQLite` supports a DBOS-owned, file-backed `database/sql` handle. A
-separate zombiezen connection opens the same file and WAL because the two drivers
-cannot share a connection object. DBOS retains lifecycle ownership; Provenance
-uses the borrowed handle as a liveness sentinel, closes only its bridge
-connection, and rejects pathless or in-memory borrowed databases.
+Serialization is SQLite's, not the process's. There is no Go write lock: WAL
+already admits one writer at a time, and an operation that must observe and
+update journal state atomically holds an explicit `BEGIN IMMEDIATE` transaction
+on one pinned connection for the duration. Because `database/sql` hands out
+arbitrary connections, every operation that needs connection-local state — a TEMP
+table, a connection-local PRAGMA, or an explicit transaction — leases a
+connection scope that pins exactly one connection until release. The only
+process-local mutex guards scope registration so that `Close` can refuse new
+leases and drain outstanding ones before closing a pool it owns. Collections and
+wire fields are bounded, and external or persisted input is validated before it
+reaches mutation logic.
+
+`OpenBorrowedSQLite` supports a DBOS-owned, file-backed `database/sql` handle.
+There is no second connection and no cross-driver bridge: Provenance activates
+its schema on the caller's pool and then persists through that exact pool, which
+both sides already share because both use `modernc.org/sqlite`. DBOS retains
+lifecycle ownership. Provenance uses a `Ping` on the borrowed pool as the
+liveness sentinel that makes post-shutdown reads and writes return
+`StoreUnavailableError`, never closes that pool, and rejects pathless, temporary,
+or in-memory borrowed databases.
+
 Provenance accepts the caller-owned `database/sql` pool exactly as supplied and
 does not validate or mutate its limits. Applications should size that pool for
 their own DBOS readers and durable background work; the integration harnesses
@@ -160,8 +190,13 @@ Smaller deliberate pools remain supported. WAL remains single-writer regardless
 of pool size.
 Every borrowed public write checks that lifecycle sentinel and then executes its
 inner operation exactly once. SQLite's `busy_timeout=5000` is the sole local
-contention wait; Provenance adds no Go sleep or retry loop. Direct writes return
-an escaped `BUSY` or `LOCKED` error unchanged after SQLite's wait.
+contention wait for storage operations; Provenance adds no Go sleep or retry loop
+around them. Direct writes return an escaped `BUSY` or `LOCKED` error unchanged
+after SQLite's wait. The single sanctioned exception is startup schema
+activation, which retries the whole activation under a bounded 30s budget whose
+per-attempt wait is still `busy_timeout`, because `BEGIN IMMEDIATE` holds the
+write lock across the integrity and replay probes; see
+[TESTING.md](../TESTING.md), "Waiting and retries".
 
 ## Dependency Graph
 
@@ -205,7 +240,7 @@ packages.
 
 ## DBOS Durable Execution
 
-DBOS is optional. Standalone trackers commit through `JournalAPI.Apply`; callers
+DBOS is optional. Standalone trackers commit through `Journal.Apply`; callers
 that need crash-resumable execution use `DBOSAdapter.Apply`. Both paths converge
 on the same journal reducer and SQLite projections.
 

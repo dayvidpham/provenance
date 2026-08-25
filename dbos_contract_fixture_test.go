@@ -17,7 +17,7 @@ import (
 	"github.com/dayvidpham/provenance/internal/testcorpus"
 )
 
-func TestDBOSCorpusInventoryHasExactlyFourAuthorities(t *testing.T) {
+func TestDBOSCorpusInventoryHasExactlyFiveAuthorities(t *testing.T) {
 	entries, err := os.ReadDir("testdata/contract")
 	if err != nil {
 		t.Fatal(err)
@@ -29,7 +29,7 @@ func TestDBOSCorpusInventoryHasExactlyFourAuthorities(t *testing.T) {
 		}
 	}
 	slices.Sort(got)
-	want := []string{"dbos_outcome_failure.yaml", "dbos_retry_baseline.yaml", "dbos_wire_negative.yaml", "dbos_wire_positive.yaml"}
+	want := []string{"dbos_outcome_failure.yaml", "dbos_outcome_success.yaml", "dbos_retry_baseline.yaml", "dbos_wire_negative.yaml", "dbos_wire_positive.yaml"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("DBOS corpus authority inventory=%v want exactly %v", got, want)
 	}
@@ -41,17 +41,30 @@ var dbosWireYAML []byte
 //go:embed testdata/contract/dbos_wire_negative.yaml
 var dbosWireInvalidYAML []byte
 
+//go:embed testdata/contract/dbos_outcome_success.yaml
+var dbosOutcomeSuccessYAML []byte
+
 type dbosWireInput struct {
 	ContextHex string `yaml:"contextHex"`
 	Mutation   string `yaml:"mutation"`
 }
 
 type dbosWireExpected struct {
-	Sort        string              `yaml:"sort"`
-	DigestHex   string              `yaml:"digestHex"`
-	Fingerprint string              `yaml:"fingerprint"`
-	Context     dbosExpectedContext `yaml:"context"`
-	Effect      dbosExpectedEffect  `yaml:"effect"`
+	Sort        string                  `yaml:"sort"`
+	DigestHex   string                  `yaml:"digestHex"`
+	Fingerprint string                  `yaml:"fingerprint"`
+	Context     dbosExpectedContext     `yaml:"context"`
+	Conditions  []dbosExpectedCondition `yaml:"conditions"`
+	Effect      dbosExpectedEffect      `yaml:"effect"`
+}
+
+type dbosExpectedCondition struct {
+	Kind              string `yaml:"kind"`
+	FactKind          string `yaml:"factKind"`
+	TaskScope         string `yaml:"taskScope"`
+	DecisionKind      string `yaml:"decisionKind"`
+	EvidenceKind      string `yaml:"evidenceKind"`
+	AssertedJournalID int64  `yaml:"assertedJournalID"`
 }
 
 type dbosExpectedContext struct {
@@ -103,6 +116,11 @@ type dbosExpectedEffect struct {
 	CommentID          string                     `yaml:"commentID"`
 	CommentAuthor      string                     `yaml:"commentAuthor"`
 	CommentBody        string                     `yaml:"commentBody"`
+	ActivityID         string                     `yaml:"activityID"`
+	ActivityAgentID    string                     `yaml:"activityAgentID"`
+	ActivityPhase      string                     `yaml:"activityPhase"`
+	ActivityStage      string                     `yaml:"activityStage"`
+	ActivityNotes      string                     `yaml:"activityNotes"`
 }
 
 type dbosInvalidInput struct {
@@ -116,6 +134,24 @@ type dbosInvalidExpected struct {
 	Field      DBOSDiagnosticField `yaml:"field"`
 }
 
+type dbosSuccessInput struct {
+	JSON string `yaml:"json"`
+}
+
+type dbosSuccessExpected struct {
+	Anchor  int64             `yaml:"anchor"`
+	Emitted []int64           `yaml:"emitted"`
+	Slots   []dbosSuccessSlot `yaml:"slots"`
+}
+
+type dbosSuccessSlot struct {
+	Slot       string `yaml:"slot"`
+	ProducedID int64  `yaml:"producedID"`
+	Kind       int    `yaml:"kind"`
+	TaskID     string `yaml:"taskID"`
+	ActivityID string `yaml:"activityID"`
+}
+
 func loadDBOSWireCorpus(t *testing.T) testcorpus.Corpus[dbosWireInput, dbosWireExpected] {
 	t.Helper()
 	corpus, err := testcorpus.LoadCorpus[dbosWireInput, dbosWireExpected](dbosWireYAML)
@@ -125,7 +161,7 @@ func loadDBOSWireCorpus(t *testing.T) testcorpus.Corpus[dbosWireInput, dbosWireE
 	if err := corpus.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if err := corpus.CheckExact(14); err != nil {
+	if err := corpus.CheckExact(15); err != nil {
 		t.Fatal(err)
 	}
 	expected := map[string]string{
@@ -134,7 +170,7 @@ func loadDBOSWireCorpus(t *testing.T) testcorpus.Corpus[dbosWireInput, dbosWireE
 		"assignment-end": "assignment_end", "decision": "decision", "evidence": "evidence",
 		"task-create": "task_create", "task-create-allocated": "task_create_allocated",
 		"edge-add": "edge_add", "edge-remove": "edge_remove", "label-add": "label_add",
-		"label-remove": "label_remove", "comment-add": "comment_add",
+		"label-remove": "label_remove", "comment-add": "comment_add", "activity-create": "activity_create",
 	}
 	seen := make(map[string]struct{}, len(corpus.Cases))
 	for _, c := range corpus.Cases {
@@ -177,6 +213,16 @@ func expectedDBOSOperation(t *testing.T, expected dbosWireExpected) journal.Oper
 	if len(e.Contexts) > 0 {
 		contexts = make([]EventContext, len(e.Contexts))
 	}
+	var conditions []Condition
+	if len(expected.Conditions) > 0 {
+		conditions = make([]Condition, len(expected.Conditions))
+	}
+	for i, source := range expected.Conditions {
+		kind := map[string]ConditionKind{"exact_fact": ConditionExactFact, "current_fact": ConditionCurrentFact}[source.Kind]
+		factKind := map[string]FactKind{"decision": FactDecision, "evidence": FactEvidence}[source.FactKind]
+		taskScope := map[string]FactTaskScopeKind{"any": FactTaskAny, "unscoped": FactTaskUnscoped, "exact": FactTaskExact}[source.TaskScope]
+		conditions[i] = Condition{Kind: kind, Selector: FactSelector{Kind: factKind, Filter: FactFilter{TaskScope: FactTaskScope{Kind: taskScope}}, DecisionKind: DecisionKind(source.DecisionKind), EvidenceKind: EvidenceKind(source.EvidenceKind)}, AssertedJournalID: JournalID(source.AssertedJournalID)}
+	}
 	for i, source := range e.Contexts {
 		if source.Kind != "task" {
 			t.Fatalf("unknown expected context kind %q", source.Kind)
@@ -201,7 +247,7 @@ func expectedDBOSOperation(t *testing.T, expected dbosWireExpected) journal.Oper
 		phase = &value
 	}
 	effect := Effect{
-		Sort:       map[string]EffectSort{"task_event": EffectTaskEvent, "bootstrap_authority": EffectBootstrapAuthority, "assignment_start": EffectAssignmentStart, "assignment_end": EffectAssignmentEnd, "decision": EffectDecision, "evidence": EffectEvidence, "task_create": EffectTaskCreate, "task_create_allocated": EffectTaskCreateAllocated, "edge_add": EffectEdgeAdd, "edge_remove": EffectEdgeRemove, "label_add": EffectLabelAdd, "label_remove": EffectLabelRemove, "comment_add": EffectCommentAdd}[e.Sort],
+		Sort:       map[string]EffectSort{"task_event": EffectTaskEvent, "bootstrap_authority": EffectBootstrapAuthority, "assignment_start": EffectAssignmentStart, "assignment_end": EffectAssignmentEnd, "decision": EffectDecision, "evidence": EffectEvidence, "task_create": EffectTaskCreate, "task_create_allocated": EffectTaskCreateAllocated, "edge_add": EffectEdgeAdd, "edge_remove": EffectEdgeRemove, "label_add": EffectLabelAdd, "label_remove": EffectLabelRemove, "comment_add": EffectCommentAdd, "activity_create": EffectActivityCreate}[e.Sort],
 		ResultSlot: ResultSlotID(e.ResultSlot), RecordedAtOverride: e.RecordedAtOverride,
 		TaskID: task, EventKind: EventKind(e.EventKind), Contexts: contexts,
 		Title: e.Title, Description: e.Description,
@@ -212,6 +258,21 @@ func expectedDBOSOperation(t *testing.T, expected dbosWireExpected) journal.Oper
 		DecisionKind: DecisionKind(e.DecisionKind), EvidenceKind: EvidenceKind(e.EvidenceKind), EdgeTargetID: e.EdgeTarget, EdgeRelKind: map[string]EdgeKind{"derived_from": EdgeDerivedFrom}[e.EdgeKind], Label: e.Label,
 		CommentIdentity: comment, CommentAuthor: func() ActorID { value, _ := ParseActorID(e.CommentAuthor); return value }(), CommentBody: e.CommentBody,
 	}
+	if e.ActivityID != "" {
+		effect.ActivityID, err = ParseActivityID(e.ActivityID)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if e.ActivityAgentID != "" {
+		effect.ActivityAgentID, err = ParseAgentID(e.ActivityAgentID)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	effect.ActivityPhase = map[string]Phase{"worker_slices": PhaseWorkerSlices}[e.ActivityPhase]
+	effect.ActivityStage = map[string]Stage{"in_progress": StageInProgress}[e.ActivityStage]
+	effect.ActivityNotes = e.ActivityNotes
 	if e.Payload != "" {
 		effect.Payload = json.RawMessage(e.Payload)
 	}
@@ -225,7 +286,7 @@ func expectedDBOSOperation(t *testing.T, expected dbosWireExpected) journal.Oper
 	if err != nil {
 		t.Fatal(err)
 	}
-	return OperationInput{OperationID: OperationID(expected.Context.OperationID), ActorID: actor, AuthorityJournalID: &authority, CommandDigest: []byte(expected.Context.Command), MutationDigest: digest, RecordedAt: expected.Context.RecordedAt, Effects: []Effect{effect}}
+	return OperationInput{OperationID: OperationID(expected.Context.OperationID), ActorID: actor, AuthorityJournalID: &authority, CommandDigest: []byte(expected.Context.Command), MutationDigest: digest, RecordedAt: expected.Context.RecordedAt, Conditions: conditions, Effects: []Effect{effect}}
 }
 
 func TestDBOSIndependentImmutableWireFixturesEveryFamily(t *testing.T) {
@@ -266,8 +327,8 @@ func TestDBOSIndependentImmutableWireFixturesEveryFamily(t *testing.T) {
 			}
 		})
 	}
-	if len(closedSorts) != 13 {
-		t.Fatalf("wire corpus covers %d EffectSort values, want closed set of 13", len(closedSorts))
+	if len(closedSorts) != 14 {
+		t.Fatalf("wire corpus covers %d EffectSort values, want closed set of 14", len(closedSorts))
 	}
 }
 
@@ -367,5 +428,51 @@ func TestDBOSIndependentStrictNegativeFixturesAndBounds(t *testing.T) {
 	oversized := DBOSApplyInput{Schema: contract.applyInputSchema, Context: contextBytes, Mutation: bytes.Repeat([]byte{'x'}, MaxCanonicalMutationBytes+1)}
 	if _, err := decodeApplyInput(contract, oversized); err == nil {
 		t.Fatal("mutation over bound accepted")
+	}
+}
+
+func TestDBOSOutcomeSuccessWireCorpus(t *testing.T) {
+	corpus, err := testcorpus.LoadCorpus[dbosSuccessInput, dbosSuccessExpected](dbosOutcomeSuccessYAML)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := corpus.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := corpus.CheckExact(1); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range corpus.Cases {
+		if c.Classification != testcorpus.MustPass || c.Input.JSON == "" || len(c.Expected.Slots) != 5 {
+			t.Fatalf("success outcome fixture %q is outside the closed all-slot membership", c.Name)
+		}
+		var outcome DBOSStepOutcome
+		if err := json.Unmarshal([]byte(c.Input.JSON), &outcome); err != nil {
+			t.Fatalf("strict success fixture unmarshal: %v", err)
+		}
+		contract := newDBOSContractSnapshot()
+		result, err := decodeDBOSStepOutcome(contract, outcome)
+		if err != nil {
+			t.Fatalf("production success outcome decode: %v", err)
+		}
+		if result.AnchorJournalID != c.Expected.Anchor || !slices.Equal(result.EmittedEvents, c.Expected.Emitted) || len(result.ResultSlots) != len(c.Expected.Slots) {
+			t.Fatalf("success result header=%#v, want anchor=%d emitted=%v slots=%d", result, c.Expected.Anchor, c.Expected.Emitted, len(c.Expected.Slots))
+		}
+		for i, want := range c.Expected.Slots {
+			got := result.ResultSlots[i]
+			if string(got.Slot) != want.Slot || int64(got.ProducedJournalID) != want.ProducedID || int(got.Kind) != want.Kind {
+				t.Fatalf("slot %d=%#v want %#v", i, got, want)
+			}
+			if want.TaskID != "" && got.TaskID != want.TaskID {
+				t.Fatalf("slot %d TaskID=%v want %q", i, got.TaskID, want.TaskID)
+			}
+			if want.ActivityID != "" && got.ActivityID != want.ActivityID {
+				t.Fatalf("slot %d ActivityID=%v want %q", i, got.ActivityID, want.ActivityID)
+			}
+		}
+		raw, err := json.Marshal(outcome)
+		if err != nil || string(raw) != c.Input.JSON {
+			t.Fatalf("success fixture re-encode drift: got %s err=%v want %s", raw, err, c.Input.JSON)
+		}
 	}
 }
