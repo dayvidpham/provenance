@@ -100,17 +100,20 @@ All notable changes to this project will be documented in this file.
 #### Dependencies
 
 - `github.com/dbos-inc/dbos-transact-golang` v0.16.0 → v0.20.0.
-- The DBOS durable-contract fingerprint now derives from the library version the
-  module actually depends on. The pinned-library string fed into fingerprint
-  derivation still read `v0.16.0` after the dependency moved to `v0.20.0`, so
-  every fingerprint encoded a version claim that was false. Correcting it changes
-  every derived fingerprint, which would normally be a durable-state break — but
-  this release already declares pre-v0.0.4 durable state non-replayable, so the
-  correction costs nothing here and is made now rather than pinning the false
-  version into the contract permanently. The canonical wire encoding is
-  unaffected: every mutation digest in the independently pinned wire corpus is
-  byte-identical, and only the 15 fingerprint values in
-  `testdata/contract/dbos_wire_positive.yaml` were re-pinned.
+- **The DBOS durable fingerprint and workflow identity are re-keyed.** The
+  pinned-library string that salts fingerprint derivation still read `v0.16.0`
+  after the dependency moved to `v0.20.0`. That string is not documentation: it
+  is hashed into every durable workflow ID and step name, so correcting it to
+  `v0.20.0` re-keys the entire durable namespace. Every workflow ID this build
+  derives differs from the one an earlier build derived for the same operation.
+  This is a durable-state break, and it is taken under the same ratified window
+  as the rest of this release: pre-v0.0.4 durable state is already declared
+  non-replayable, so there is no reachable workflow for it to strand. The
+  constant is frozen from here on — it does not track `go.mod`, and a future DBOS
+  upgrade must leave it alone unless a drain-and-cut is decided deliberately.
+  The canonical wire encoding is unaffected: every mutation digest in the
+  independently pinned wire corpus is byte-identical, and only the 15 fingerprint
+  values in `testdata/contract/dbos_wire_positive.yaml` were re-pinned.
 - SQLite persistence moved from `zombiezen.com/go/sqlite` to
   `modernc.org/sqlite` (`database/sql`). `zombiezen.com/go/sqlite` remains only
   as an indirect dependency. Callers that shared a handle with Provenance through
