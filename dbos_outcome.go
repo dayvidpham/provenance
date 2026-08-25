@@ -730,6 +730,8 @@ func workflowIdentityForKind(contract dbosContractSnapshot, applicationVersion s
 		[]byte(contract.applyInputSchema), []byte(contract.contextSchema),
 		[]byte(contract.outcomeSchema), []byte(contract.workflowSchema),
 		[]byte(contract.workflowPrefix), []byte(contract.stepPrefix),
+		// pinnedLibrary is a frozen salt, not a live version claim: see
+		// dbosPinnedLibraryConst. Its value keys this whole durable namespace.
 		[]byte(contract.pinnedLibrary),
 		[]byte(applicationVersion), []byte(operation),
 	}

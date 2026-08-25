@@ -158,7 +158,22 @@ const (
 	dbosWorkflowPrefixConst = "provenance.apply/"
 	// dbosStepPrefixConst is the prefix for durable step names within one workflow.
 	dbosStepPrefixConst = "provenance.apply-step/"
-	// dbosPinnedLibraryConst is the exact library/version string included in fingerprint derivation.
+	// dbosPinnedLibraryConst is a FROZEN FINGERPRINT SALT, not a live version pin.
+	//
+	// It is hashed into workflowIdentityForKind and into the step fingerprint, so
+	// its value keys every durable workflow ID and step name this module has ever
+	// written. Changing the string does not describe a different library: it
+	// re-keys the durable namespace, and every in-flight workflow becomes
+	// unreachable under its new identity while its old rows keep the old one.
+	//
+	// It therefore deliberately DOES NOT track go.mod. Upgrading the DBOS
+	// dependency must leave this constant alone -- the pending v1.2 upgrade
+	// explicitly included. Changing it is a durable-state break that needs an
+	// operational decision first: drain every in-flight workflow, then cut.
+	//
+	// It reads v0.20.0 because the string was corrected from a stale v0.16.0 in
+	// the same release whose ratified breaking change already declared pre-v0.0.4
+	// durable state non-replayable. That was the free window, and it has closed.
 	dbosPinnedLibraryConst = "github.com/dbos-inc/dbos-transact-golang v0.20.0"
 )
 

@@ -243,6 +243,15 @@ func TestFingerprint_StableAndSensitive(t *testing.T) {
 	if workflowIdentity(changedContract, "v1", in.OperationID) == workflow {
 		t.Error("workflow identity is insensitive to the captured contract")
 	}
+	// The pinned-library string is a fingerprint salt: it keys the durable
+	// workflow namespace. This assertion is why dbosPinnedLibraryConst may not be
+	// updated alongside a dependency bump -- changing it re-keys every workflow
+	// ID rather than describing the new library.
+	saltedContract := contract
+	saltedContract.pinnedLibrary += "-other"
+	if workflowIdentity(saltedContract, "v1", in.OperationID) == workflow {
+		t.Error("workflow identity is insensitive to the pinned-library salt; changing that constant would silently NOT re-key durable workflows, contradicting its documented contract")
+	}
 	changedRecordedAt := in
 	changedRecordedAt.RecordedAt++
 	inputChangedRecordedAt, _, err := encodeApplyInput(contract, changedRecordedAt)
