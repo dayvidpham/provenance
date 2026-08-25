@@ -1,5 +1,13 @@
 # PROPOSAL-1: Providence Architecture and Implementation Plan
 
+> **Historical record — not current guidance.** This proposal is superseded and
+> kept for the audit trail; its text is deliberately not rewritten. In
+> particular, its SQLite driver decision (`zombiezen.com/go/sqlite`) no longer
+> holds: persistence now uses `database/sql` over `modernc.org/sqlite`, and
+> `internal/sqlite/sql_architecture_test.go` fails if zombiezen is reintroduced
+> there. See `CLAUDE.md` and `docs/architecture.md` for the current rules.
+
+
 **Beads ID:** aura-plugins-z24dr
 **References:**
 - REQUEST: aura-plugins-oviik

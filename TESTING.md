@@ -113,16 +113,22 @@ behavior under test:
    longer depends on `-wal`, `-shm`, or rollback-journal files.
 4. Capture the closed main-database bytes and digest as immutable source data.
 5. Write those bytes to a unique path under each case's `t.TempDir()`.
-6. Open each private copy with the narrow test-only raw zombiezen handle using
-   existing-file read-write flags without `OpenCreate`; mutate, checkpoint,
-   close, and prove sidecar absence and changed main-file bytes.
+6. Open each private copy with the narrow test-only raw handle in
+   `raw_sqlite_test.go`: `database/sql` on the same `modernc.org/sqlite` driver
+   as production, a `file:` DSN with `mode=rw` so an existing file is required
+   and none is created, `SetMaxOpenConns(1)` plus one pinned `*sql.Conn` for
+   connection affinity, and `busy_timeout=5000`. Mutate, checkpoint, close, and
+   prove sidecar absence and changed main-file bytes.
 7. Call production `OpenSQLite` once on the corrupt copy and retain nil-tracker,
    typed/topology error, diagnostic-token, and failed-open byte-equality guards.
 
 `canonical_startup_matrix_test.go` is the local example. It builds the full
 startup fixture once per top-level test pass, validates a copied reopen, then
 runs all 98 serial corruptions against private copies. The raw handle is test
-preparation only; production rejection remains the behavior under test.
+preparation only; production rejection remains the behavior under test. It is a
+fixture adapter, not a second SQLite implementation: it exposes small
+`ColumnInt`/`ColumnText`-style accessors over `database/sql` rows so corruption
+cases keep a compact call shape while staying on the production driver.
 
 Peasant's exact prior-art file is
 `/home/minttea/dev/peasant-labs/peasant/develop/internal/store/storetest/golden.go`.

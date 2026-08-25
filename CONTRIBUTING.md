@@ -315,18 +315,35 @@ This warning appears when go.mod has dependencies but no source files import the
 
 ### CGO_ENABLED=0 build fails
 
-Ensure you're not importing C libraries or cgo-dependent packages. Provenance dependencies must all be pure Go:
-- ✓ `zombiezen.com/go/sqlite` (pure Go)
+Ensure you're not importing C libraries or cgo-dependent packages. `CGO_ENABLED=0` applies to `go build ./...` only; the test and race gates run with `CGO_ENABLED=1` because `-race` requires it. Build dependencies must all be pure Go:
+- ✓ `modernc.org/sqlite` (pure Go — the C source is mechanically translated to Go)
 - ✗ `github.com/mattn/go-sqlite3` (CGo)
 
-### Why does `modernc.org/sqlite` appear in `go.mod`?
+### SQLite driver rules
 
-`modernc.org/sqlite` shows up as an **indirect** dependency even though we don't import it directly. It is pulled in transitively through:
+`internal/sqlite` uses the standard `database/sql` API with the
+`modernc.org/sqlite` driver, registered as `"sqlite"`. Two rules hold:
 
-- `zombiezen.com/go/sqlite` (our SQLite driver) — uses `modernc.org/sqlite/lib` for the embedded SQLite C-translated-to-Go runtime.
-- `github.com/dayvidpham/bestiary` — uses `modernc.org/sqlite` internally for its own catalog cache.
+- Never import `github.com/mattn/go-sqlite3` (CGo).
+- Never reintroduce `zombiezen.com/go/sqlite` into `internal/sqlite`.
+  `internal/sqlite/sql_architecture_test.go` fails the suite if a non-test file
+  in that package imports it, or calls the retired driver-specific methods
+  `Execute`, `ExecuteTransient`, `LastInsertRowID`, or `Changes`; all production
+  SQL must end at `ExecContext`, `QueryContext`, or `QueryRowContext`.
 
-This is **expected and pure-Go**: `modernc.org/sqlite` is a CGo-free port of SQLite (the C source is mechanically translated to Go). Auditors who flag it should verify it ships under the same pure-Go guarantee — `CGO_ENABLED=0 go build ./...` continues to succeed.
+Pool, DSN, connection-scope, and `BEGIN IMMEDIATE` conventions live in
+[CLAUDE.md](CLAUDE.md), "SQLite pool, DSN, and transaction discipline".
+
+### Why does `zombiezen.com/go/sqlite` still appear in `go.mod`?
+
+`zombiezen.com/go/sqlite` remains an **indirect** dependency after the driver
+migration because `github.com/dayvidpham/bestiary` (our ML model catalog) still
+requires it. Provenance itself no longer imports it anywhere.
+
+This is **expected and pure-Go**: zombiezen builds on the same CGo-free
+`modernc.org` SQLite runtime, so `CGO_ENABLED=0 go build ./...` continues to
+succeed. Auditors who flag either module should verify that gate rather than the
+module list.
 
 ### Make targets not found
 

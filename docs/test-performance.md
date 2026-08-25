@@ -83,12 +83,22 @@ coverage; neither compromise was accepted.
 
 ### Raw per-case corruption preparation: 2026-07-22
 
-The startup matrix now uses a narrow test-only zombiezen connection to mutate
-each private baseline copy instead of successfully calling production
-`OpenSQLite` before corruption. The raw connection uses
-`OpenReadWrite|OpenURI` without `OpenCreate`, applies only the foreign-key and
-check-constraint test PRAGMAs, proves every DML changes exactly one row, and
-proves the canonical trigger exists before and is absent after DDL. It then
+Driver note (later than this measurement, and not a re-measurement): the raw
+fixture was written against `zombiezen.com/go/sqlite`, whose flags were
+`OpenReadWrite|OpenURI` without `OpenCreate`. The SQLite driver has since moved
+to `database/sql` over `modernc.org/sqlite`, and the fixture moved with it:
+`raw_sqlite_test.go` now opens a `file:` DSN with `mode=rw` (existing file
+required, none created), pins a single connection, and sets
+`busy_timeout=5000`. The preparation steps and assertions described below are
+unchanged; the timings below were measured on the earlier driver and are not
+restated as current.
+
+The startup matrix now uses a narrow test-only raw connection to mutate each
+private baseline copy instead of successfully calling production `OpenSQLite`
+before corruption. The raw connection opens the existing file read-write without
+creating one, applies only the foreign-key and check-constraint test PRAGMAs,
+proves every DML changes exactly one row, and proves the canonical trigger exists
+before and is absent after DDL. It then
 truncates WAL, closes, proves no SQLite sidecars remain, and proves the main
 bytes differ from the pristine baseline before the one unchanged production
 failed-open assertion.
