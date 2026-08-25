@@ -17,6 +17,9 @@ rule:
     - pattern: Provider("google")
     - pattern: Provider("openai")
     - pattern: Provider("local")
-ignore:
+ignores:
   - "**/vendor/**"
   - "**/*_test.go"
+  - "*_test.go"
+  - "**/testdata/astgrep/**"
+  - "testdata/astgrep/**"

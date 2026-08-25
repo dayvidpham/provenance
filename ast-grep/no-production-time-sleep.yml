@@ -5,8 +5,17 @@ message: >
   Production code must not call time.Sleep. SQLite busy_timeout is the sole
   local contention wait, and DBOS owns durable retries. Use synchronization or
   an injected clock in tests rather than adding a hidden production retry loop.
+# The bare pattern `time.Sleep($DURATION)` parses as a Go type conversion, not
+# a call, so it never matched. Parsing the pattern inside a function body and
+# selecting the call expression makes it match the call it was written for; the
+# fixture under testdata/astgrep proves it still does.
 rule:
-  pattern: time.Sleep($DURATION)
-ignore:
+  pattern:
+    context: "func sleeps() { time.Sleep($DURATION) }"
+    selector: call_expression
+ignores:
   - "**/*_test.go"
+  - "*_test.go"
   - "**/vendor/**"
+  - "**/testdata/astgrep/**"
+  - "testdata/astgrep/**"
