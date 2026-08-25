@@ -1401,15 +1401,37 @@ func (scope *connScope) seedReferenceData(models []ptypes.ModelEntry) error {
 		{seedPhases, []string{"request", "elicit", "propose", "review", "plan_uat", "ratify", "handoff", "impl_plan", "worker_slices", "code_review", "impl_uat", "landing", "unscoped"}},
 		{seedStages, []string{"not_started", "in_progress", "blocked", "complete"}},
 	}
+	// Each lookup's statement is prepared once and reused across its rows, for
+	// the same reason as the model registry below: the rows are few but the
+	// parse is not, and this seeds nine lookups on every activation.
 	for _, seed := range seeds {
-		for id, name := range seed.names {
-			if _, err := scope.conn.ExecContext(scope.ctx, seed.kind.query(), id, name); err != nil {
-				return fmt.Errorf("seedReferenceData: kind %d id %d: %w", seed.kind, id, err)
-			}
+		if err := scope.seedReferenceKind(seed.kind, seed.names); err != nil {
+			return err
 		}
 	}
 	if err := scope.seedMLModels(models); err != nil {
 		return fmt.Errorf("seedReferenceData: %w", err)
+	}
+	return nil
+}
+
+// seedReferenceKind inserts one closed lookup's rows through a single prepared
+// statement. The ids are the enum values the Go side uses, so the SQL lookup and
+// the Go enum cannot drift.
+func (scope *connScope) seedReferenceKind(kind referenceSeedKind, names []string) (err error) {
+	insert, err := scope.conn.PrepareContext(scope.ctx, kind.query())
+	if err != nil {
+		return fmt.Errorf("seedReferenceData: prepare kind %d: %w", kind, err)
+	}
+	defer func() {
+		if closeErr := insert.Close(); closeErr != nil && err == nil {
+			err = fmt.Errorf("seedReferenceData: close prepared insert for kind %d: %w", kind, closeErr)
+		}
+	}()
+	for id, name := range names {
+		if _, err := insert.ExecContext(scope.ctx, id, name); err != nil {
+			return fmt.Errorf("seedReferenceData: kind %d id %d: %w", kind, id, err)
+		}
 	}
 	return nil
 }
@@ -1453,7 +1475,20 @@ func (kind referenceSeedKind) query() string {
 	}
 }
 
-func (scope *connScope) seedMLModels(models []ptypes.ModelEntry) error {
+// insertMLModelSQL seeds one model row, resolving its provider by name so the
+// caller never supplies a provider surrogate key.
+const insertMLModelSQL = "INSERT OR IGNORE INTO ml_models (provider_id, name) VALUES (?1, ?2)"
+
+// seedMLModels writes the caller's model registry.
+//
+// The statement is prepared once and reused for every row. The default registry
+// carries several thousand models, and executing the statement text per row made
+// SQLite parse the same INSERT — and compile its provider subselect — once per
+// model. Parsing was the dominant cost of opening a tracker on the default
+// registry; the rows written, their order, and their idempotence are unchanged,
+// because this reuses one compiled form of the same statement rather than
+// changing what is executed.
+func (scope *connScope) seedMLModels(models []ptypes.ModelEntry) (err error) {
 	var existing int
 	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT COUNT(*) FROM ml_models").Scan(&existing); err != nil {
 		return fmt.Errorf("seedMLModels: count existing models: %w", err)
@@ -1461,12 +1496,47 @@ func (scope *connScope) seedMLModels(models []ptypes.ModelEntry) error {
 	if existing >= len(models) {
 		return nil
 	}
+	providers, err := scope.providerIDsByName()
+	if err != nil {
+		return err
+	}
+	insert, err := scope.conn.PrepareContext(scope.ctx, insertMLModelSQL)
+	if err != nil {
+		return fmt.Errorf("seedMLModels: prepare model insert: %w", err)
+	}
+	// A leaked prepared statement holds a compiled SQLite statement on the
+	// activation connection, so the close is reported rather than dropped.
+	defer func() {
+		if closeErr := insert.Close(); closeErr != nil && err == nil {
+			err = fmt.Errorf("seedMLModels: close prepared model insert: %w", closeErr)
+		}
+	}()
 	for _, model := range models {
-		if _, err := scope.conn.ExecContext(scope.ctx, "INSERT OR IGNORE INTO ml_models (provider_id, name) VALUES ((SELECT id FROM providers WHERE name = ?1), ?2)", string(model.Provider), string(model.Name)); err != nil {
+		providerID, known := providers[string(model.Provider)]
+		if !known {
+			continue
+		}
+		if _, err := insert.ExecContext(scope.ctx, providerID, string(model.Name)); err != nil {
 			return fmt.Errorf("seedMLModels: insert (%s, %q): %w", model.Provider.String(), model.Name, err)
 		}
 	}
 	return nil
+}
+
+func (scope *connScope) providerIDsByName() (map[string]int64, error) {
+	providers := map[string]int64{}
+	if err := scope.queryRows("SELECT id, name FROM providers", nil, func(rows *sql.Rows) error {
+		var id int64
+		var name string
+		if err := rows.Scan(&id, &name); err != nil {
+			return err
+		}
+		providers[name] = id
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("seedMLModels: read provider lookup: %w", err)
+	}
+	return providers, nil
 }
 
 // Scan helpers ---------------------------------------------------------------
