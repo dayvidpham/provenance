@@ -68,7 +68,7 @@ func (a *HostBoundGovernedAllocator) RunInitializeRoot(ctx context.Context, work
 
 func (a *HostBoundGovernedAllocator) RunAllocateComposed(ctx context.Context, workflowID string, authority JournalID, request GovernedAllocationComposedRequest) (GovernedAllocationComposedResult, error) {
 	if len(request.Allocation.Children) != 1 {
-		return GovernedAllocationComposedResult{}, allocation.NewError(allocation.ErrorValidation, request.Allocation.OperationID, "HostBoundGovernedAllocator.RunAllocateComposed", "the legacy wrapper requires exactly one child", "no DBOS workflow was started", "use RunAllocateComposedBatch for 1..128 ordered children", nil)
+		return GovernedAllocationComposedResult{}, allocation.NewError(allocation.ErrorValidation, request.Allocation.OperationID, "HostBoundGovernedAllocator.RunAllocateComposed", "the one-child composed allocation entry point requires exactly one child", "no DBOS workflow was started", "use RunAllocateComposedBatch for 1..128 ordered children", nil)
 	}
 	return a.RunAllocateComposedBatch(ctx, workflowID, authority, request)
 }
@@ -85,17 +85,6 @@ func (a *HostBoundGovernedAllocator) RunAllocateComposedBatch(ctx context.Contex
 // capability to create or execute reserved operations, bind DBOS, or access SQL.
 func GovernedAllocationSupplementOperationID(external OperationID) OperationID {
 	return allocation.GovernedAllocationSupplementOperationID(external)
-}
-
-// BindGovernedAllocator is retained for source compatibility, but fails closed.
-// DBOS v0.20 exposes no public way to prove that systemDB is the pointer stored
-// inside root; accepting this pair would therefore make same-file distinct
-// handles look certified when DBOS would use split durability. New integrations
-// must use OpenBoundGovernedAllocator or OpenFusedGovernedAllocator, which create
-// the DBOS root and its SqliteSystemDB from one handle by construction.
-// Deprecated: use OpenBoundGovernedAllocator.
-func BindGovernedAllocator(root dbos.DBOSContext, systemDB *sql.DB, participant GovernedAllocationParticipant) (bound *BoundGovernedAllocator, err error) {
-	return nil, fmt.Errorf("provenance.BindGovernedAllocator: uncertified raw DBOS root/*sql.DB binding is disabled -- where: host-bound allocator construction; when: before workflow registration; why: DBOS v0.20 cannot publicly prove that the supplied handle is root's SqliteSystemDB; impact: no workflow was registered and no writes occurred; fix: migrate to OpenBoundGovernedAllocator (or OpenFusedGovernedAllocator), which establishes one exact handle by construction")
 }
 
 // OpenBoundGovernedAllocator constructs the host-facing, task-level capability
@@ -144,10 +133,12 @@ func (a *BoundGovernedAllocator) RunInitializeRoot(ctx context.Context, workflow
 	return a.allocator.RunInitializeRoot(ctx, workflowID, request)
 }
 
-// RunAllocateComposed is the source-compatible one-child wrapper.
+// RunAllocateComposed executes a composed allocation that must carry exactly
+// one child. It is the narrow entry point; RunAllocateComposedBatch accepts the
+// same request type with 1..128 ordered children.
 func (a *BoundGovernedAllocator) RunAllocateComposed(ctx context.Context, workflowID string, authority JournalID, request GovernedAllocationComposedRequest) (GovernedAllocationComposedResult, error) {
 	if len(request.Allocation.Children) != 1 {
-		return GovernedAllocationComposedResult{}, allocation.NewError(allocation.ErrorValidation, request.Allocation.OperationID, "BoundGovernedAllocator.RunAllocateComposed", "the legacy composed allocation wrapper requires exactly one child", "no DBOS workflow was started", "use RunAllocateComposedBatch for 1..128 ordered children", nil)
+		return GovernedAllocationComposedResult{}, allocation.NewError(allocation.ErrorValidation, request.Allocation.OperationID, "BoundGovernedAllocator.RunAllocateComposed", "the one-child composed allocation entry point requires exactly one child", "no DBOS workflow was started", "use RunAllocateComposedBatch for 1..128 ordered children", nil)
 	}
 	return a.RunAllocateComposedBatch(ctx, workflowID, authority, request)
 }
@@ -221,7 +212,8 @@ func registerFusedGovernedAllocatorWorkflows(root dbos.DBOSContext, allocator *F
 	dbos.RegisterWorkflow(root, allocator.allocateComposedWorkflow, dbos.WithInstance(allocator))
 }
 
-// ConfigName makes the allocator's two registered DBOS method workflows stable
+// ConfigName makes the allocator's three registered DBOS method workflows
+// (initializeRootWorkflow, allocateWorkflow, allocateComposedWorkflow) stable
 // within its owned root. A root owns exactly one allocator capability.
 func (a *FusedGovernedAllocator) ConfigName() string { return "governed-allocation" }
 
@@ -297,7 +289,7 @@ func (a *FusedGovernedAllocator) RunAllocate(ctx context.Context, workflowID str
 // to a changed effect order, payload, or result-slot binding.
 func (a *FusedGovernedAllocator) RunAllocateComposed(ctx context.Context, workflowID string, authority JournalID, request GovernedAllocationComposedRequest) (GovernedAllocationComposedResult, error) {
 	if len(request.Allocation.Children) != 1 {
-		return GovernedAllocationComposedResult{}, allocation.NewError(allocation.ErrorValidation, request.Allocation.OperationID, "FusedGovernedAllocator.RunAllocateComposed", "the legacy composed allocation wrapper requires exactly one child", "no DBOS workflow was started", "use RunAllocateComposedBatch for 1..128 ordered children", nil)
+		return GovernedAllocationComposedResult{}, allocation.NewError(allocation.ErrorValidation, request.Allocation.OperationID, "FusedGovernedAllocator.RunAllocateComposed", "the one-child composed allocation entry point requires exactly one child", "no DBOS workflow was started", "use RunAllocateComposedBatch for 1..128 ordered children", nil)
 	}
 	return a.RunAllocateComposedBatch(ctx, workflowID, authority, request)
 }

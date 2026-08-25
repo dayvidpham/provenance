@@ -67,6 +67,19 @@ All notable changes to this project will be documented in this file.
   pool itself. The signature is unchanged, but the borrowed pool now carries all
   Provenance traffic, so its size, lifetime, and pragmas govern Provenance's
   behaviour.
+- `BindGovernedAllocator` is removed. It could not succeed: every call returned
+  an error because the pinned DBOS release exposes no way to prove that a
+  supplied `*sql.DB` is the handle stored inside the supplied root. Use
+  `OpenBoundGovernedAllocator` (owns its root) or `NewHostBoundGovernedAllocator`
+  (borrows the host's root and system handle at the one construction site).
+- `GovernedAllocationDepth` is removed. No code path ever produced that error
+  kind: governed allocation bounds breadth (`MaxGovernedAllocationChildren`), not
+  ancestry depth, so the classification could never be observed by `errors.As` on
+  a `GovernedAllocationError`.
+- `GovernedAllocationSupplementPolicy` and `GovernedAllocationSupplementPolicyV1`
+  are removed. The supplemental policy is fixed by the canonical encoder and is
+  never accepted from or returned to a caller, so the re-exports named a value
+  callers could not supply or observe.
 
 #### Dependencies
 

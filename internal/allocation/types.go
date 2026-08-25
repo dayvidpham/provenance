@@ -47,7 +47,6 @@ const (
 	ErrorConflict
 	ErrorAuthority
 	ErrorRevoked
-	ErrorDepth
 	ErrorCollision
 	ErrorGenesis
 	ErrorCorruption
@@ -63,8 +62,6 @@ func (kind ErrorKind) String() string {
 		return "authority"
 	case ErrorRevoked:
 		return "revoked"
-	case ErrorDepth:
-		return "depth"
 	case ErrorCollision:
 		return "collision"
 	case ErrorGenesis:

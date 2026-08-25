@@ -69,16 +69,20 @@ type (
 
 	// Governed allocation is the closed first-class primitive for creating a
 	// caller-identified child task and assignment under one exact parent.
-	GovernedAllocationRequest         = allocation.GovernedAllocationRequest
+	GovernedAllocationRequest = allocation.GovernedAllocationRequest
+	// GovernedAllocationComposedRequest carries 1..MaxGovernedAllocationChildren
+	// ordered children. SupplementalEffects apply to the complete ordered
+	// allocation closure, not to one child independently.
 	GovernedAllocationComposedRequest = allocation.ComposedRequest
 	GovernedAllocationComposedResult  = allocation.ComposedResult
-	// GovernedAllocationComposedBatchRequest is the additive multi-child
-	// composition contract. SupplementalEffects apply to the complete ordered
-	// allocation closure, rather than to one child independently.
+	// GovernedAllocationComposedBatchRequest and
+	// GovernedAllocationComposedBatchResult are the same types as
+	// GovernedAllocationComposedRequest and GovernedAllocationComposedResult;
+	// they exist only as the spelling used at the RunAllocateComposedBatch call
+	// site. There is no separate batch contract.
 	GovernedAllocationComposedBatchRequest = allocation.ComposedRequest
 	GovernedAllocationComposedBatchResult  = allocation.ComposedResult
 	GovernedAllocationCompositionVersion   = allocation.CompositionVersion
-	GovernedAllocationSupplementPolicy     = allocation.SupplementPolicy
 	GovernedAllocationReferenceScope       = allocation.ReferenceScope
 	GovernedAllocationReferenceScopeKind   = allocation.ReferenceScopeKind
 	RootGenesisRequest                     = allocation.RootGenesisRequest
@@ -183,7 +187,6 @@ const (
 const (
 	MaxGovernedAllocationChildren          = allocation.MaxChildren
 	GovernedAllocationCompositionV1        = allocation.CompositionV1
-	GovernedAllocationSupplementPolicyV1   = allocation.SupplementPolicyV1
 	GovernedAllocationReferenceDescendants = allocation.ReferenceScopeDescendants
 
 	GovernedRequestGenesis    = allocation.RequestKindGenesis
@@ -193,7 +196,6 @@ const (
 	GovernedAllocationConflict   = allocation.ErrorConflict
 	GovernedAllocationAuthority  = allocation.ErrorAuthority
 	GovernedAllocationRevoked    = allocation.ErrorRevoked
-	GovernedAllocationDepth      = allocation.ErrorDepth
 	GovernedAllocationCollision  = allocation.ErrorCollision
 	GovernedAllocationGenesis    = allocation.ErrorGenesis
 	GovernedAllocationCorruption = allocation.ErrorCorruption
