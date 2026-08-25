@@ -806,44 +806,71 @@ func activateSchema(scope *connScope, models []ptypes.ModelEntry, policy activat
 // still waiting under a longer busy_timeout; capping the connection-local value
 // lets BEGIN finish with a definite SQLite error before that deadline and avoids
 // leaving an invisible pending write transaction on the pinned connection.
-func limitTransactionBusyTimeout(ctx context.Context, conn sqlQueryer) (func() error, error) {
+// It returns a rearm closure and a restore closure. The rearm closure caps the
+// connection's busy_timeout at the deadline remaining AT CALL TIME — the retry
+// loop in runScopedTransaction calls it before every attempt, because arming
+// only once would let an attempt started near the deadline block a further full
+// initial budget past it. The restore closure puts the original value back and
+// runs exactly once, however many times rearm lowered the value in between.
+func limitTransactionBusyTimeout(ctx context.Context, conn sqlQueryer) (func() error, func() error, error) {
+	noop := func() error { return nil }
 	deadline, hasDeadline := ctx.Deadline()
 	if !hasDeadline {
-		return func() error { return nil }, nil
+		return noop, noop, nil
 	}
-	remaining := time.Until(deadline)
-	if remaining <= 0 {
-		return nil, ctx.Err()
-	}
-	limitMS := int(remaining.Milliseconds())
-	if limitMS < 1 {
-		limitMS = 1
+	if time.Until(deadline) <= 0 {
+		return nil, nil, ctx.Err()
 	}
 
 	controlCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	var previousMS int
 	if err := conn.QueryRowContext(controlCtx, "PRAGMA busy_timeout").Scan(&previousMS); err != nil {
-		return nil, fmt.Errorf("read SQLite busy timeout before transaction: %w", err)
+		return nil, nil, fmt.Errorf("read SQLite busy timeout before transaction: %w", err)
 	}
-	if previousMS <= limitMS {
-		return func() error { return nil }, nil
+	armedMS := previousMS
+	rearm := func() error {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return ctx.Err()
+		}
+		limitMS := int(remaining.Milliseconds())
+		if limitMS < 1 {
+			limitMS = 1
+		}
+		// Only ever lower the budget: the remaining deadline shrinks
+		// monotonically, and a standing value already below it needs no cap.
+		if limitMS >= armedMS {
+			return nil
+		}
+		armCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if _, err := conn.ExecContext(armCtx, fmt.Sprintf("PRAGMA busy_timeout=%d", limitMS)); err != nil {
+			return fmt.Errorf("limit SQLite busy timeout to caller deadline: %w", err)
+		}
+		armedMS = limitMS
+		return nil
 	}
-	if _, err := conn.ExecContext(controlCtx, fmt.Sprintf("PRAGMA busy_timeout=%d", limitMS)); err != nil {
-		return nil, fmt.Errorf("limit SQLite busy timeout to caller deadline: %w", err)
-	}
-	return func() error {
+	restore := func() error {
+		if armedMS == previousMS {
+			return nil
+		}
 		restoreCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
 		if _, err := conn.ExecContext(restoreCtx, fmt.Sprintf("PRAGMA busy_timeout=%d", previousMS)); err != nil {
 			return fmt.Errorf("restore SQLite busy timeout to %dms: %w", previousMS, err)
 		}
+		armedMS = previousMS
 		return nil
-	}, nil
+	}
+	if err := rearm(); err != nil {
+		return nil, nil, err
+	}
+	return rearm, restore, nil
 }
 
 func runScopedTransaction(ctx context.Context, conn sqlQueryer, begin string, operation func() error) (err error) {
-	restoreBusyTimeout, err := limitTransactionBusyTimeout(ctx, conn)
+	rearmBusyTimeout, restoreBusyTimeout, err := limitTransactionBusyTimeout(ctx, conn)
 	if err != nil {
 		return err
 	}
@@ -856,6 +883,7 @@ func runScopedTransaction(ctx context.Context, conn sqlQueryer, begin string, op
 			}
 		}
 	}()
+	backoff := 2 * time.Millisecond
 	for {
 		_, err = conn.ExecContext(ctx, begin)
 		if err == nil {
@@ -871,6 +899,12 @@ func runScopedTransaction(ctx context.Context, conn sqlQueryer, begin string, op
 		if !isBusyError(err) {
 			return err
 		}
+		// Callers without a deadline keep the pre-existing contract: one attempt
+		// under the standing busy_timeout, busy surfaced as-is — even when their
+		// context is already cancelled.
+		if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+			return err
+		}
 		// A caller deadline is the authoritative contention bound, and the busy
 		// handler is only an implementation detail of waiting under it: modernc
 		// can give up before its armed busy budget elapses, so a single BEGIN
@@ -882,13 +916,26 @@ func runScopedTransaction(ctx context.Context, conn sqlQueryer, begin string, op
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return errors.Join(ctxErr, err)
 		}
-		if _, hasDeadline := ctx.Deadline(); !hasDeadline {
-			return err
-		}
+		// Capped exponential backoff: a connection whose standing busy_timeout is
+		// zero returns busy without the handler waiting at all, and a fixed short
+		// cadence would turn this loop into a write-lock probe storm against the
+		// very owner it is waiting for.
 		select {
 		case <-ctx.Done():
 			return errors.Join(ctx.Err(), err)
-		case <-time.After(2 * time.Millisecond):
+		case <-time.After(backoff):
+		}
+		if backoff < 25*time.Millisecond {
+			backoff *= 2
+			if backoff > 25*time.Millisecond {
+				backoff = 25 * time.Millisecond
+			}
+		}
+		// Re-arm to the deadline remaining NOW: an attempt armed with the
+		// initial budget could otherwise block a full extra budget past the
+		// deadline (~2x the promised bound).
+		if rearmErr := rearmBusyTimeout(); rearmErr != nil {
+			return errors.Join(rearmErr, err)
 		}
 	}
 	committed := false

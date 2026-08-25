@@ -506,6 +506,9 @@ func (db *DB) applyPreparedOperation(ctx context.Context, in journal.OperationIn
 		res, foldErr = scope.foldPreparedOperation(in, prepared, callerMutationDigest, options)
 		return foldErr
 	}); transactionErr != nil {
+		// Deadline authority for the BEGIN leg lives in runScopedTransaction's
+		// retry loop; this heuristic remains for the fold and COMMIT legs, where
+		// a deadline can expire mid-transaction without a typed context error.
 		if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= 10*time.Millisecond {
 			transactionErr = fmt.Errorf("caller deadline expired while acquiring SQLite write ownership; transaction was rolled back and nothing was committed; retry with a longer context or reduce writer contention: %w", errors.Join(context.DeadlineExceeded, transactionErr))
 		}
