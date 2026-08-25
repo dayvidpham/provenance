@@ -146,10 +146,18 @@ with the pure-Go `modernc.org/sqlite` driver. Stable data values are bound as
 parameters; typed selectors choose among the few legitimate query shapes where
 SQL identifiers cannot be bound.
 
-A file-backed database runs in WAL mode with `busy_timeout=5000`,
-`foreign_keys=ON`, and `synchronous=NORMAL`, all carried as `_pragma` values on
-the runtime DSN so every pooled connection is configured identically. The runtime
-pool is bounded at four connections; an in-memory database is rewritten to a
+A file-backed database that Provenance opens itself runs in WAL mode with
+`busy_timeout=5000`, `foreign_keys=ON`, and `synchronous=NORMAL`, all carried as
+`_pragma` values on the runtime DSN so every pooled connection is configured
+identically. These are properties of `Open`, not module-wide invariants: on a
+borrowed pool (`OpenBorrowedSQLite`) and on the DBOS system handle
+(`internal/fusedtx.OpenSystem`, which takes the caller's DSN unvalidated), the
+caller's DSN decides them, and supplying WAL and a non-zero `busy_timeout` for a
+shared file is the caller's obligation. The one pragma Provenance does govern on
+a borrowed pool is `foreign_keys`, forced ON per lease and restored to the
+caller's value on release with a read-back that retires the connection rather
+than return it in an unproven state. The runtime pool is bounded at four
+connections; an in-memory database is rewritten to a
 process-unique shared-cache URI with a single connection so parallel opens stay
 isolated.
 

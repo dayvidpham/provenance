@@ -142,9 +142,22 @@ All SQLite access goes through the standard `database/sql` API with the
 
 ### SQLite pool, DSN, and transaction discipline
 
-`internal/sqlite` owns the persistence stack; no other production package opens
-a Provenance-owned SQLite pool. The conventions below are enforced by the code in
-`internal/sqlite/db.go` — match them rather than inventing a second pattern.
+`internal/sqlite` owns the persistence stack: it is the only package that opens a
+pool holding Provenance's *journal* schema, and the conventions below are
+enforced by the code in `internal/sqlite/db.go` — match them rather than
+inventing a second pattern.
+
+It is not the only package in the module that opens a `*sql.DB`.
+`internal/fusedtx.OpenSystem` opens the DBOS *system* database from a
+caller-supplied DSN it does not validate, with its own limits (16 open / 8 idle),
+and none of the DSN discipline below applies to it: whatever `busy_timeout`,
+`journal_mode`, and `foreign_keys` that DSN carries is what DBOS gets. Supplying
+a WAL, non-zero-`busy_timeout` DSN there is the caller's obligation. This is
+deliberate rather than an oversight — a post-connect probe would sample one
+connection of a lazily grown pool and prove nothing about the rest (the same
+reasoning recorded on `armForeignKeys`) — but it means "the module runs on WAL
+with `busy_timeout=5000`" is a statement about `Open`, not about every handle in
+the process.
 
 **Pools and DSNs.** `Open` resolves one `openTarget` that carries the runtime,
 activation, and read-only DSNs for a path. Connection settings are carried in
@@ -173,7 +186,13 @@ closes a pool it owns.
 `OpenBorrowed` (public entry point `provenance.OpenBorrowedSQLite`) activates the
 schema on a caller-owned `database/sql` pool and then uses that exact pool: it
 never closes it, never validates or mutates its limits, and `DB.Close`
-invalidates only the Provenance instance. There is no second connection and no
+invalidates only the Provenance instance. Its DSN pragmas are the caller's too —
+`busy_timeout`, `journal_mode`, and `synchronous` are never set on a borrowed
+pool — with one exception this package does own: `foreign_keys` is forced ON for
+the span of every lease and restored to the caller's captured value on release,
+verified by read-back, retiring the connection when the restore cannot be proven
+(SQLite ignores the pragma inside a transaction, so an unverified restore is a
+silent leak of Provenance's state into the caller's pool). There is no second connection and no
 cross-driver bridge — one pool, one physical database.
 
 **Transactions.** Use `runImmediateTransaction` (`BEGIN IMMEDIATE`) wherever a
@@ -185,7 +204,9 @@ handler, so contention would fail instantly and bypass `busy_timeout` entirely.
 using a fresh bounded context so a canceled caller cannot leave the connection
 write-locked.
 
-**Waiting.** SQLite's `busy_timeout=5000` is the only local contention wait;
+**Waiting.** On pools `Open` owns, SQLite's `busy_timeout=5000` is the only local
+contention wait (a borrowed pool waits for whatever its owner's DSN configured,
+and the DBOS system handle for whatever the caller passed to `OpenSystem`);
 production code adds no sleep or private retry loop (the ast-grep lint gate
 rejects production `time.Sleep`). The single sanctioned exception is schema
 activation, which wraps a bounded 30s outer budget around
