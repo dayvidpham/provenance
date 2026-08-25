@@ -51,8 +51,13 @@ var sqlSinkMethods = map[string]struct{}{
 	"Prepare": {}, "PrepareContext": {},
 }
 
-// retiredSQLMethods belong to the zombiezen/sqlitex driver this module no
-// longer uses. Their reappearance means a partial driver migration.
+// retiredSQLDriverModule is the driver this module migrated away from. An
+// import of it means a partial driver migration: two drivers on one file, each
+// with its own connection state and locking behaviour.
+const retiredSQLDriverModule = "zombiezen.com/go/sqlite"
+
+// retiredSQLMethods belong to that driver. They can reappear without the import
+// (through a local wrapper), so both the import and the method names are banned.
 var retiredSQLMethods = map[string]struct{}{
 	"Execute": {}, "ExecuteTransient": {}, "LastInsertRowID": {}, "Changes": {},
 }
@@ -159,6 +164,23 @@ var _ = context.Background
 				t.Errorf("seeded %q violation was accepted; the guard no longer detects that class", name)
 			}
 		})
+	}
+}
+
+// TestSQLGuardRejectsRetiredDriverImport covers the import half of the ban. It
+// parses rather than type-checks its fixture because the retired driver is not
+// a build dependency of this module — which is the very property being kept.
+func TestSQLGuardRejectsRetiredDriverImport(t *testing.T) {
+	source := "package guarded\n\nimport (\n\tsqlite \"" + retiredSQLDriverModule + "\"\n\t\"" + retiredSQLDriverModule + "/sqlitex\"\n)\n\nvar _ *sqlite.Conn\nvar _ = sqlitex.Execute\n"
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "retired-import.go", source, 0)
+	if err != nil {
+		t.Fatalf("parse retired-driver fixture: %v", err)
+	}
+	program := &sqlProgram{fset: fset, files: []*ast.File{file}}
+	program.inspectRetiredDriverImports(file)
+	if len(program.findings) != 2 {
+		t.Fatalf("retired-driver import fixture produced %d findings, want one per import: %+v", len(program.findings), program.findings)
 	}
 }
 
@@ -374,6 +396,7 @@ func (program *sqlProgram) report(node ast.Node, format string, args ...any) {
 
 func (program *sqlProgram) inspect() []sqlFinding {
 	for _, file := range program.files {
+		program.inspectRetiredDriverImports(file)
 		ast.Inspect(file, func(node ast.Node) bool {
 			switch node := node.(type) {
 			case *ast.SelectorExpr:
@@ -394,6 +417,18 @@ func (program *sqlProgram) inspect() []sqlFinding {
 		return program.findings[i].position < program.findings[j].position
 	})
 	return program.findings
+}
+
+// inspectRetiredDriverImports keeps the driver migration total. Running the
+// retired driver alongside database/sql would put two independent connection
+// pools, with two independent lock views, on one database file.
+func (program *sqlProgram) inspectRetiredDriverImports(file *ast.File) {
+	for _, imported := range file.Imports {
+		path := strings.Trim(imported.Path.Value, `"`)
+		if path == retiredSQLDriverModule || strings.HasPrefix(path, retiredSQLDriverModule+"/") {
+			program.report(imported, "imports the retired driver %q; this module reaches SQLite through database/sql only, and a second driver on the same file would hold its own connections and locks", path)
+		}
+	}
 }
 
 func (program *sqlProgram) inspectCall(call *ast.CallExpr) {
