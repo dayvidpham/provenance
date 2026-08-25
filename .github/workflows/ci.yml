@@ -56,11 +56,20 @@ jobs:
           CGO_ENABLED: "0"
         run: go build ./...
 
+      - name: Set up Node (for ast-grep CLI)
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: "26"
+      - name: Install ast-grep
+        # The ast-grep rule meta-gate (a Go test) execs the ast-grep binary,
+        # so the test jobs need it on PATH, pinned to the same version the
+        # nix dev shell resolves.
+        run: npm install -g @ast-grep/cli@0.41.1
       - name: Test
         # Non-race pass. The race-instrumented pass runs separately in the
         # "Race Tests" job so a race failure and a plain logic failure are
         # never conflated in the same job's output.
-        run: go test -count=1 -shuffle=on ./...
+        run: go test -count=1 -shuffle=on -timeout=15m ./...
 
   race:
     name: Race Tests
@@ -68,7 +77,7 @@ jobs:
     # The full race suite is CPU-heavy (SQLite + DBOS durable-execution
     # journal tests) and takes on the order of 10 minutes on ubuntu-latest
     # runners; this ceiling only guards against a genuine hang.
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -82,6 +91,15 @@ jobs:
       - name: Verify dependencies
         run: go mod verify
 
+      - name: Set up Node (for ast-grep CLI)
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: "26"
+      - name: Install ast-grep
+        # The ast-grep rule meta-gate (a Go test) execs the ast-grep binary,
+        # so the test jobs need it on PATH, pinned to the same version the
+        # nix dev shell resolves.
+        run: npm install -g @ast-grep/cli@0.41.1
       - name: Race detector
         # KNOWN FLAKES (documented, load-sensitive under CI contention — do
         # NOT retry or skip; a red run here should be triaged against these
@@ -91,7 +109,10 @@ jobs:
         #   - tampering test (journal_spine_corruption_test.go family)
         env:
           CGO_ENABLED: "1"
-        run: go test -race -count=1 -shuffle=on ./...
+        # -timeout matches the Makefile race target's discipline: Go's default
+        # 10m test timeout is shorter than the full race suite on a two-core
+        # runner (the root package alone runs ~6-7 min on a fast machine).
+        run: go test -race -count=1 -shuffle=on -timeout=25m ./...
 
   lint:
     name: Lint
