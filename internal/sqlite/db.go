@@ -856,7 +856,11 @@ func runScopedTransaction(ctx context.Context, conn sqlQueryer, begin string, op
 			}
 		}
 	}()
-	if _, err = conn.ExecContext(ctx, begin); err != nil {
+	for {
+		_, err = conn.ExecContext(ctx, begin)
+		if err == nil {
+			break
+		}
 		// database/sql may report a context deadline while a driver is completing
 		// BEGIN on the pinned connection. Clear that possible transaction with an
 		// independent bounded context so a timed-out contender cannot retain a
@@ -864,7 +868,28 @@ func runScopedTransaction(ctx context.Context, conn sqlQueryer, begin string, op
 		rollbackCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 		_, _ = conn.ExecContext(rollbackCtx, "ROLLBACK")
 		cancel()
-		return err
+		if !isBusyError(err) {
+			return err
+		}
+		// A caller deadline is the authoritative contention bound, and the busy
+		// handler is only an implementation detail of waiting under it: modernc
+		// can give up before its armed busy budget elapses, so a single BEGIN
+		// attempt would surface SQLITE_BUSY while the caller's budget still has
+		// tens of milliseconds left. Retry until the deadline actually expires;
+		// once it has, the deadline is the cause and the busy result is just how
+		// the loss was reported, so return the typed context error joined with
+		// the SQLite error to keep the contention detail inspectable.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return errors.Join(ctxErr, err)
+		}
+		if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return errors.Join(ctx.Err(), err)
+		case <-time.After(2 * time.Millisecond):
+		}
 	}
 	committed := false
 	defer func() {
