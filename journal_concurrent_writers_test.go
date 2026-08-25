@@ -28,6 +28,28 @@ type raceTracker struct {
 	actorB ActorID
 }
 
+// forEachWritePool runs one contention body against both write-pool shapes.
+//
+// OpenMemory pins the pool to a single connection, so no two scopes can hold
+// SQLite file locks at the same time: every "concurrent" writer in a memory
+// fixture is really queued behind one connection, and a defect that only
+// appears when two connections contend for the file is invisible there. That is
+// how the deferred-BEGIN migration regression shipped green. A file-backed
+// tracker has a bounded multi-connection pool and does contend, so a test whose
+// subject IS the contention runs on both.
+func forEachWritePool(t *testing.T, name string, body func(*testing.T, *raceTracker)) {
+	t.Helper()
+	t.Run("memory-pool-1", func(t *testing.T) {
+		t.Parallel()
+		body(t, newRaceTracker(t))
+	})
+	t.Run("file-pool-multi", func(t *testing.T) {
+		t.Parallel()
+		tracker, _ := newFileRaceTracker(t, name)
+		body(t, tracker)
+	})
+}
+
 func newRaceTracker(t *testing.T) *raceTracker {
 	t.Helper()
 	tr, err := OpenMemory(WithModelRegistry(NewRegistry(nil)))
@@ -121,8 +143,10 @@ func (r *raceTracker) assertConverged(t *testing.T) {
 // every other Apply short-circuits (§9.4) to that same committed anchor. No second
 // anchor, caller-digest conflict, or duplicate task_event is ever produced.
 func TestConcurrentSameOperationIDSingleWinner(t *testing.T) {
-	t.Parallel()
-	r := newRaceTracker(t)
+	forEachWritePool(t, "same-operation-single-winner", testConcurrentSameOperationIDSingleWinnerBody)
+}
+
+func testConcurrentSameOperationIDSingleWinnerBody(t *testing.T, r *raceTracker) {
 	task := r.createTask(t, "single-winner")
 
 	const goroutines = 8
@@ -189,8 +213,10 @@ func TestConcurrentSameOperationIDSingleWinner(t *testing.T) {
 // ErrOperationConflict with the closed CommittedConflict variant, and nothing extra is
 // committed.
 func TestConcurrentSameOperationIDConflictingIdentityLoserGetsTypedConflict(t *testing.T) {
-	t.Parallel()
-	r := newRaceTracker(t)
+	forEachWritePool(t, "same-operation-conflicting-identity", testConcurrentSameOperationIDConflictingIdentityLoserGetsTypedConflictBody)
+}
+
+func testConcurrentSameOperationIDConflictingIdentityLoserGetsTypedConflictBody(t *testing.T, r *raceTracker) {
 	task := r.createTask(t, "conflict")
 
 	base := OperationInput{
@@ -245,8 +271,10 @@ func TestConcurrentSameOperationIDConflictingIdentityLoserGetsTypedConflict(t *t
 // path, §9.5), no interleaving loses or duplicates a fold, and the post-race database
 // converges under the production reducer.
 func TestConcurrentTwoSessionsDistinctOpsConverge(t *testing.T) {
-	t.Parallel()
-	r := newRaceTracker(t)
+	forEachWritePool(t, "two-sessions-distinct-ops", testConcurrentTwoSessionsDistinctOpsConvergeBody)
+}
+
+func testConcurrentTwoSessionsDistinctOpsConvergeBody(t *testing.T, r *raceTracker) {
 	task := r.createTask(t, "distinct-ops")
 	sessionA := r.tr.As(r.actorA, r.boot)
 	sessionB := r.tr.As(r.actorB, r.boot)
@@ -307,8 +335,10 @@ func TestConcurrentTwoSessionsDistinctOpsConverge(t *testing.T) {
 // the same assignment CAS-A), and general fold-loop atomicity-under-fault is covered by
 // the sequential AdversarialApplyWithFault corpus cases (§8.1).
 func TestConcurrentAtomicOpsNoPartialFold(t *testing.T) {
-	t.Parallel()
-	r := newRaceTracker(t)
+	forEachWritePool(t, "atomic-ops-no-partial-fold", testConcurrentAtomicOpsNoPartialFoldBody)
+}
+
+func testConcurrentAtomicOpsNoPartialFoldBody(t *testing.T, r *raceTracker) {
 	taskA := r.createTask(t, "atomic-a")
 	taskB := r.createTask(t, "atomic-b")
 	occ := r.actorB

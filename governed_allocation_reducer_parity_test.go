@@ -8,17 +8,16 @@ import (
 	provenance "github.com/dayvidpham/provenance"
 )
 
-// The production composed-contract corpus supplies all four V1 families with
-// result slots and verifies ordered emitted events, contexts, projections and
-// exact reconstruction. Running both transaction owners here keeps that corpus a
-// focused parity gate rather than introducing a second fixture framework.
+// TestGovernedAllocationV1ReducerParity proves the Session admission path
+// rejects a request exactly as the DBOS-owned path does, for the same reason
+// and with the same absence of writes.
+//
+// It used to also re-run TestFusedGovernedAllocationComposedPersistsAllowedSupplementsAndReplays
+// and TestSessionAllocateGovernedComposedUsesSameReducer as subtests. Both are
+// ordinary top-level tests in this package, so the suite already runs them; the
+// second invocation proved nothing new and duplicated roughly three seconds of
+// race-detector time on every run.
 func TestGovernedAllocationV1ReducerParity(t *testing.T) {
-	t.Run("DBOS composed and replay", TestFusedGovernedAllocationComposedPersistsAllowedSupplementsAndReplays)
-	t.Run("pinned SQLite composed", TestSessionAllocateGovernedComposedUsesSameReducer)
-	t.Run("Session admission and replay", testSessionAllocationReducerParity)
-}
-
-func testSessionAllocationReducerParity(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("zero authority", func(t *testing.T) {

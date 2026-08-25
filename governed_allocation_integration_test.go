@@ -1243,14 +1243,24 @@ func TestGovernedAllocationComposedRejectsUnsupportedAndUnrelatedReferencesBefor
 		t.Fatalf("launch fused allocator: %v", err)
 	}
 	root := initializeFusedRoot(t, fused, actor, "composed-reject-root")
+	// Each case pins the exact rejection it proves: the typed kind, the boundary
+	// that rejected it, and the reason. "some error was returned" would pass just
+	// as happily if a request were rejected for the wrong reason, at the wrong
+	// boundary, or by an unrelated fixture bug.
 	for _, test := range []struct {
 		name       string
 		beforeDBOS bool
+		wantKind   provenance.GovernedAllocationErrorKind
+		wantWhere  string
+		wantWhy    string
 		mutate     func(*provenance.GovernedAllocationComposedRequest)
 	}{
 		{
 			name:       "task creation effect",
 			beforeDBOS: true,
+			wantKind:   provenance.GovernedAllocationValidation,
+			wantWhere:  `canonical request validation: SupplementalEffects[0].Sort`,
+			wantWhy:    `effect sort task_create is not permitted by static`,
 			mutate: func(value *provenance.GovernedAllocationComposedRequest) {
 				value.SupplementalEffects = []provenance.Effect{{Sort: provenance.EffectTaskCreate, TaskID: value.Allocation.Children[0].TaskID, Title: "forbidden", Type: provenance.TaskTypeTask, Priority: provenance.PriorityMedium, Phase: provenance.PhaseWorkerSlices}}
 			},
@@ -1258,6 +1268,9 @@ func TestGovernedAllocationComposedRejectsUnsupportedAndUnrelatedReferencesBefor
 		{
 			name:       "allocated task creation effect",
 			beforeDBOS: true,
+			wantKind:   provenance.GovernedAllocationValidation,
+			wantWhere:  `canonical request validation: SupplementalEffects[0].Sort`,
+			wantWhy:    `effect sort task_create_allocated is not permitted by static`,
 			mutate: func(value *provenance.GovernedAllocationComposedRequest) {
 				value.SupplementalEffects = []provenance.Effect{{Sort: provenance.EffectTaskCreateAllocated, TaskID: value.Allocation.Children[0].TaskID, Title: "forbidden", Type: provenance.TaskTypeTask, Priority: provenance.PriorityMedium, Phase: provenance.PhaseWorkerSlices, ResultSlot: "forbidden-task"}}
 			},
@@ -1265,6 +1278,9 @@ func TestGovernedAllocationComposedRejectsUnsupportedAndUnrelatedReferencesBefor
 		{
 			name:       "assignment effect",
 			beforeDBOS: true,
+			wantKind:   provenance.GovernedAllocationValidation,
+			wantWhere:  `canonical request validation: SupplementalEffects[0].Sort`,
+			wantWhy:    `effect sort assignment_start is not permitted by static`,
 			mutate: func(value *provenance.GovernedAllocationComposedRequest) {
 				value.SupplementalEffects = []provenance.Effect{{Sort: provenance.EffectAssignmentStart, TaskID: value.Allocation.Children[0].TaskID, AssignmentID: value.Allocation.Children[0].AssignmentID, SlotID: provenance.SlotOwnerResponsibility, Occupant: actor}}
 			},
@@ -1272,6 +1288,9 @@ func TestGovernedAllocationComposedRejectsUnsupportedAndUnrelatedReferencesBefor
 		{
 			name:       "assignment end effect",
 			beforeDBOS: true,
+			wantKind:   provenance.GovernedAllocationValidation,
+			wantWhere:  `canonical request validation: SupplementalEffects[0].Sort`,
+			wantWhy:    `effect sort assignment_end is not permitted by static`,
 			mutate: func(value *provenance.GovernedAllocationComposedRequest) {
 				value.SupplementalEffects = []provenance.Effect{{Sort: provenance.EffectAssignmentEnd, TaskID: value.Allocation.Children[0].TaskID, AssignmentID: value.Allocation.Children[0].AssignmentID, SlotID: provenance.SlotOwnerResponsibility}}
 			},
@@ -1279,6 +1298,9 @@ func TestGovernedAllocationComposedRejectsUnsupportedAndUnrelatedReferencesBefor
 		{
 			name:       "unsupported decision effect",
 			beforeDBOS: true,
+			wantKind:   provenance.GovernedAllocationValidation,
+			wantWhere:  `canonical request validation: SupplementalEffects[0].Sort`,
+			wantWhy:    `effect sort decision is not permitted by static`,
 			mutate: func(value *provenance.GovernedAllocationComposedRequest) {
 				value.SupplementalEffects = []provenance.Effect{{Sort: provenance.EffectDecision, TaskID: value.Allocation.Children[0].TaskID, DecisionKind: "provenance.unsupported"}}
 			},
@@ -1286,6 +1308,9 @@ func TestGovernedAllocationComposedRejectsUnsupportedAndUnrelatedReferencesBefor
 		{
 			name:       "unrelated task event",
 			beforeDBOS: true,
+			wantKind:   provenance.GovernedAllocationAuthority,
+			wantWhere:  `composed supplemental reference validation`,
+			wantWhy:    `supplemental effect 0 references unrelated task`,
 			mutate: func(value *provenance.GovernedAllocationComposedRequest) {
 				value.SupplementalEffects = []provenance.Effect{{Sort: provenance.EffectTaskEvent, TaskID: provenance.TaskID{Namespace: "governed", UUID: uuid.NewSHA1(uuid.NameSpaceURL, []byte("unrelated"))}, EventKind: "provenance.unrelated"}}
 			},
@@ -1293,6 +1318,9 @@ func TestGovernedAllocationComposedRejectsUnsupportedAndUnrelatedReferencesBefor
 		{
 			name:       "unrelated task context",
 			beforeDBOS: true,
+			wantKind:   provenance.GovernedAllocationAuthority,
+			wantWhere:  `composed supplemental reference validation`,
+			wantWhy:    `supplemental effect 2 references unrelated task`,
 			mutate: func(value *provenance.GovernedAllocationComposedRequest) {
 				unrelated := provenance.TaskID{Namespace: "governed", UUID: uuid.NewSHA1(uuid.NameSpaceURL, []byte("unrelated-context"))}
 				context, err := provenance.TaskContext(unrelated)
@@ -1305,6 +1333,9 @@ func TestGovernedAllocationComposedRejectsUnsupportedAndUnrelatedReferencesBefor
 		{
 			name:       "mutation-family task event",
 			beforeDBOS: true,
+			wantKind:   provenance.GovernedAllocationValidation,
+			wantWhere:  `canonical request validation: SupplementalEffects[0].EventKind`,
+			wantWhy:    `is reducer-derived and cannot be supplied as a generic supplemental task event`,
 			mutate: func(value *provenance.GovernedAllocationComposedRequest) {
 				value.SupplementalEffects = []provenance.Effect{{
 					Sort: provenance.EffectTaskEvent, TaskID: value.Allocation.Children[0].TaskID,
@@ -1315,6 +1346,9 @@ func TestGovernedAllocationComposedRejectsUnsupportedAndUnrelatedReferencesBefor
 		{
 			name:       "task-created pseudo event",
 			beforeDBOS: true,
+			wantKind:   provenance.GovernedAllocationValidation,
+			wantWhere:  `canonical request validation: SupplementalEffects[0].EventKind`,
+			wantWhy:    `is reducer-derived and cannot be supplied as a generic supplemental task event`,
 			mutate: func(value *provenance.GovernedAllocationComposedRequest) {
 				value.SupplementalEffects = []provenance.Effect{{
 					Sort: provenance.EffectTaskEvent, TaskID: value.Allocation.Children[0].TaskID,
@@ -1328,8 +1362,22 @@ func TestGovernedAllocationComposedRejectsUnsupportedAndUnrelatedReferencesBefor
 			test.mutate(&request)
 			before := snapshotGovernedTables(t, db)
 			beforeParticipants := participantCalls
-			if _, err := fused.RunAllocateComposed(ctx, "composed-reject-workflow-"+strings.ReplaceAll(test.name, " ", "-"), root.AssignmentRow.JournalID, request); err == nil {
+			_, err := fused.RunAllocateComposed(ctx, "composed-reject-workflow-"+strings.ReplaceAll(test.name, " ", "-"), root.AssignmentRow.JournalID, request)
+			if err == nil {
 				t.Fatal("invalid composition was accepted")
+			}
+			var governed *provenance.GovernedAllocationError
+			if !errors.As(err, &governed) {
+				t.Fatalf("rejection is not a typed governed-allocation error: %v", err)
+			}
+			if governed.Kind != test.wantKind {
+				t.Errorf("rejection kind = %s, want %s: %v", governed.Kind, test.wantKind, err)
+			}
+			if governed.Where != test.wantWhere {
+				t.Errorf("rejection boundary = %q, want %q", governed.Where, test.wantWhere)
+			}
+			if !strings.Contains(governed.Why, test.wantWhy) {
+				t.Errorf("rejection reason = %q, want it to contain %q", governed.Why, test.wantWhy)
 			}
 			assertNoGovernedWrites(t, before, db)
 			if participantCalls != beforeParticipants {

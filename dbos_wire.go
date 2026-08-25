@@ -80,8 +80,9 @@ type DBOSApplyInput struct {
 }
 
 // UnmarshalJSON keeps DBOS's callback boundary closed as well as the explicit
-// decodeApplyInput boundary. DBOS v0.16 otherwise ignores unknown fields and
-// accepts duplicate JSON object keys before invoking a registered callback.
+// decodeApplyInput boundary. The pinned DBOS release otherwise ignores unknown
+// fields and accepts duplicate JSON object keys before invoking a registered
+// callback.
 func (in *DBOSApplyInput) UnmarshalJSON(raw []byte) error {
 	type wire DBOSApplyInput
 	var decoded wire

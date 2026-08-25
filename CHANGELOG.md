@@ -67,10 +67,50 @@ All notable changes to this project will be documented in this file.
   pool itself. The signature is unchanged, but the borrowed pool now carries all
   Provenance traffic, so its size, lifetime, and pragmas govern Provenance's
   behaviour.
+- `BindGovernedAllocator` is removed. It could not succeed: every call returned
+  an error because the pinned DBOS release exposes no way to prove that a
+  supplied `*sql.DB` is the handle stored inside the supplied root. Use
+  `OpenBoundGovernedAllocator` (owns its root) or `NewHostBoundGovernedAllocator`
+  (borrows the host's root and system handle at the one construction site).
+- `GovernedAllocationDepth` is removed. No code path ever produced that error
+  kind: governed allocation bounds breadth (`MaxGovernedAllocationChildren`), not
+  ancestry depth, so the classification could never be observed by `errors.As` on
+  a `GovernedAllocationError`.
+- `GovernedAllocationSupplementPolicy` and `GovernedAllocationSupplementPolicyV1`
+  are removed. The supplemental policy is fixed by the canonical encoder and is
+  never accepted from or returned to a caller, so the re-exports named a value
+  callers could not supply or observe.
+- `GovernedAllocationComposedBatchRequest` and
+  `GovernedAllocationComposedBatchResult` are removed. They were transparent
+  aliases of `GovernedAllocationComposedRequest` and
+  `GovernedAllocationComposedResult` — the same types, not a second contract —
+  and having two names for one composed-allocation request implied a batch
+  contract that has never existed: both the one-child and the multi-child entry
+  points take the surviving type, which carries
+  1..`MaxGovernedAllocationChildren` ordered children. Migration: rename
+  `GovernedAllocationComposedBatchRequest` to
+  `GovernedAllocationComposedRequest` and
+  `GovernedAllocationComposedBatchResult` to
+  `GovernedAllocationComposedResult`. The method names are unchanged, so
+  `RunAllocateComposedBatch` and `AllocateGovernedComposedBatch` still name the
+  multi-child entry points. The one known consumer (pasture) is updated in
+  lockstep with its next dependency bump, so the rename never lands
+  un-atomically.
 
 #### Dependencies
 
 - `github.com/dbos-inc/dbos-transact-golang` v0.16.0 → v0.20.0.
+- The DBOS durable-contract fingerprint now derives from the library version the
+  module actually depends on. The pinned-library string fed into fingerprint
+  derivation still read `v0.16.0` after the dependency moved to `v0.20.0`, so
+  every fingerprint encoded a version claim that was false. Correcting it changes
+  every derived fingerprint, which would normally be a durable-state break — but
+  this release already declares pre-v0.0.4 durable state non-replayable, so the
+  correction costs nothing here and is made now rather than pinning the false
+  version into the contract permanently. The canonical wire encoding is
+  unaffected: every mutation digest in the independently pinned wire corpus is
+  byte-identical, and only the 15 fingerprint values in
+  `testdata/contract/dbos_wire_positive.yaml` were re-pinned.
 - SQLite persistence moved from `zombiezen.com/go/sqlite` to
   `modernc.org/sqlite` (`database/sql`). `zombiezen.com/go/sqlite` remains only
   as an indirect dependency. Callers that shared a handle with Provenance through

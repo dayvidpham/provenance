@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"strconv"
 
@@ -220,18 +219,6 @@ func forEachFactContextRow(scope *connScope, query string, args []any, visit fun
 		}
 	}
 	return rows.Err()
-}
-
-func factContextExists(scope *connScope, query string, args ...any) (bool, error) {
-	var present int
-	err := scope.conn.QueryRowContext(scope.ctx, query, args...).Scan(&present)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return true, nil
 }
 
 // classifyFactContextSchema is deliberately read-only. Open calls it before

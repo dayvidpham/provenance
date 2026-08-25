@@ -34,8 +34,8 @@ type StoreUnavailableError struct {
 
 func (e *StoreUnavailableError) Error() string {
 	return fmt.Sprintf(
-		"provenance: store unavailable during %s — store: %s; stage: %s; impact: %s; fix: %s; cause: %v",
-		e.Operation, e.Store, e.Stage, e.Impact, e.Fix, e.Cause)
+		"provenance: store unavailable during %s — store: %s; stage: %s; impact: %s; fix: %s%s",
+		e.Operation, e.Store, e.Stage, e.Impact, e.Fix, causeClause(e.Cause))
 }
 
 func (e *StoreUnavailableError) Unwrap() error { return e.Cause }

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -327,34 +326,5 @@ func TestBoundGovernedAllocatorReopenReplaySuppressesParticipant(t *testing.T) {
 	}
 	if !replay.Replayed() || !committed.Closure().Equal(replay.Closure()) || calls != 1 || children != 3 {
 		t.Fatalf("reopen replay reran or changed participant closure: replay=%v calls=%d children=%d", replay.Replayed(), calls, children)
-	}
-}
-
-func TestBindGovernedAllocatorRejectsUnverifiableSameFileDistinctHandle(t *testing.T) {
-	ctx := context.Background()
-	dsn := "file:" + filepath.Join(t.TempDir(), "uncertified.db")
-	systemDB, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = systemDB.Close() })
-	root, err := dbos.NewDBOSContext(ctx, dbos.Config{AppName: "uncertified", ApplicationVersion: "test-v1", SqliteSystemDB: systemDB})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { dbos.Shutdown(root, 30*time.Second) })
-	distinct, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = distinct.Close() })
-	bound, err := provenance.BindGovernedAllocator(root, distinct, nil)
-	if err == nil || bound != nil {
-		t.Fatalf("uncertified same-file distinct handle was accepted: bound=%v err=%v", bound, err)
-	}
-	for _, evidence := range []string{"DBOS v0.20", "no workflow was registered", "OpenBoundGovernedAllocator"} {
-		if !strings.Contains(err.Error(), evidence) {
-			t.Fatalf("rejection lacks %q: %v", evidence, err)
-		}
 	}
 }

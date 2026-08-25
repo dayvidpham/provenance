@@ -52,19 +52,19 @@ func TestFusedGovernedAllocationComposedBatchCommitsOrderedCompleteClosureAndRep
 	beforeJournal := countFusedGovernedRows(t, db, `SELECT COUNT(*) FROM journal`)
 	beforeOutputs := countFusedGovernedRows(t, db, `SELECT COUNT(*) FROM operation_outputs`)
 
-	for _, mutate := range []func(*provenance.GovernedAllocationComposedBatchRequest){
-		func(changed *provenance.GovernedAllocationComposedBatchRequest) {
+	for _, mutate := range []func(*provenance.GovernedAllocationComposedRequest){
+		func(changed *provenance.GovernedAllocationComposedRequest) {
 			// Supplements intentionally retain the old child reference. Existing
 			// workflow identity must win over this now-stale reference preflight.
 			changed.Allocation.Children[0].TaskID = governedChild("composed-batch-stale-reference", changed.Allocation.Children[0].Occupant).TaskID
 		},
-		func(changed *provenance.GovernedAllocationComposedBatchRequest) {
+		func(changed *provenance.GovernedAllocationComposedRequest) {
 			changed.Allocation.Children[0], changed.Allocation.Children[1] = changed.Allocation.Children[1], changed.Allocation.Children[0]
 		},
-		func(changed *provenance.GovernedAllocationComposedBatchRequest) {
+		func(changed *provenance.GovernedAllocationComposedRequest) {
 			changed.SupplementalEffects[0].Payload = []byte(`{"changed":true}`)
 		},
-		func(changed *provenance.GovernedAllocationComposedBatchRequest) {
+		func(changed *provenance.GovernedAllocationComposedRequest) {
 			changed.Allocation.Children[1].Title += " changed metadata"
 		},
 	} {
@@ -264,20 +264,20 @@ func TestFusedGovernedAllocationComposedBatchInvalidSecondChildWritesNothing(t *
 	}
 }
 
-func TestGovernedAllocationComposedLegacyWrapperIsOneChildBatch(t *testing.T) {
+func TestGovernedAllocationComposedRejectsMoreThanOneChild(t *testing.T) {
 	ctx := context.Background()
-	fused, _ := openFusedAllocatorWithDatabase(t, "composed-legacy-wrapper")
-	actor := registerGovernedActor(t, fused.Tracker(), "composed-legacy-wrapper")
+	fused, _ := openFusedAllocatorWithDatabase(t, "composed-one-child-entry")
+	actor := registerGovernedActor(t, fused.Tracker(), "composed-one-child-entry")
 	if err := fused.Launch(); err != nil {
 		t.Fatalf("launch fused allocator: %v", err)
 	}
-	root := initializeFusedRoot(t, fused, actor, "composed-legacy-wrapper")
-	legacy := composedGovernedRequest("composed-legacy-one", actor, root, 1)
-	result, err := fused.RunAllocateComposed(ctx, "composed-legacy-one-workflow", root.AssignmentRow.JournalID, legacy)
+	root := initializeFusedRoot(t, fused, actor, "composed-one-child-entry")
+	single := composedGovernedRequest("composed-one-child", actor, root, 1)
+	result, err := fused.RunAllocateComposed(ctx, "composed-one-child-workflow", root.AssignmentRow.JournalID, single)
 	if err != nil || len(result.Closure().Children()) != 1 {
-		t.Fatalf("legacy one-child wrapper failed: result=%+v err=%v", result, err)
+		t.Fatalf("one-child composed entry point failed: result=%+v err=%v", result, err)
 	}
-	multi := composedGovernedRequest("composed-legacy-multi", actor, root, 2)
-	_, err = fused.RunAllocateComposed(ctx, "composed-legacy-multi-workflow", root.AssignmentRow.JournalID, multi)
+	multi := composedGovernedRequest("composed-two-child", actor, root, 2)
+	_, err = fused.RunAllocateComposed(ctx, "composed-two-child-workflow", root.AssignmentRow.JournalID, multi)
 	mustGovernedError(t, err, provenance.GovernedAllocationValidation)
 }

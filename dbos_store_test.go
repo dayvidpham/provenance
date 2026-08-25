@@ -11,6 +11,7 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -230,41 +231,86 @@ func TestBorrowed_PostShutdown_SessionGated(t *testing.T) {
 
 	tid := provenance.TaskID{} // the liveness gate fires before the id is ever used
 	agentID := provenance.AgentID{}
+	ctx := context.Background()
+
+	gated := map[string]bool{}
+	mustGate := func(verb string, err error) {
+		t.Helper()
+		gated[verb] = true
+		mustStoreUnavailable(t, err, "Session."+verb)
+	}
 
 	_, createErr := sess.Create("aura", "t", "", provenance.TaskTypeTask, provenance.PriorityMedium, provenance.PhaseUnscoped)
-	mustStoreUnavailable(t, createErr, "Session.Create")
+	mustGate("Create", createErr)
 
 	_, updateErr := sess.Update(tid, provenance.UpdateFields{})
-	mustStoreUnavailable(t, updateErr, "Session.Update")
+	mustGate("Update", updateErr)
 
 	_, startErr := sess.Start(tid)
-	mustStoreUnavailable(t, startErr, "Session.Start")
+	mustGate("Start", startErr)
 
 	_, stopErr := sess.Stop(tid)
-	mustStoreUnavailable(t, stopErr, "Session.Stop")
+	mustGate("Stop", stopErr)
 
 	_, reopenErr := sess.Reopen(tid)
-	mustStoreUnavailable(t, reopenErr, "Session.Reopen")
+	mustGate("Reopen", reopenErr)
 
 	_, closeErr := sess.CloseTask(tid, "done")
-	mustStoreUnavailable(t, closeErr, "Session.CloseTask")
+	mustGate("CloseTask", closeErr)
 
 	_, atomicErr := sess.Atomic(func(op *provenance.Operation) {
 		op.CreateTask(tid, "t", "", provenance.TaskTypeTask, provenance.PriorityMedium, provenance.PhaseUnscoped)
 	})
-	mustStoreUnavailable(t, atomicErr, "Session.Atomic")
+	mustGate("Atomic", atomicErr)
 
-	mustStoreUnavailable(t, sess.AddEdge(tid, "aura--x", provenance.EdgeBlockedBy), "Session.AddEdge")
-	mustStoreUnavailable(t, sess.RemoveEdge(tid, "aura--x", provenance.EdgeBlockedBy), "Session.RemoveEdge")
-	mustStoreUnavailable(t, sess.AddLabel(tid, "label"), "Session.AddLabel")
-	mustStoreUnavailable(t, sess.RemoveLabel(tid, "label"), "Session.RemoveLabel")
+	mustGate("AddEdge", sess.AddEdge(tid, "aura--x", provenance.EdgeBlockedBy))
+	mustGate("RemoveEdge", sess.RemoveEdge(tid, "aura--x", provenance.EdgeBlockedBy))
+	mustGate("AddLabel", sess.AddLabel(tid, "label"))
+	mustGate("RemoveLabel", sess.RemoveLabel(tid, "label"))
 
 	_, commentErr := sess.AddComment(tid, agentID, "body")
-	mustStoreUnavailable(t, commentErr, "Session.AddComment")
+	mustGate("AddComment", commentErr)
+
+	// The governed-allocation verbs are gated on the same boundary. Each is
+	// called with a request the store would reject on its own merits, so a
+	// StoreUnavailableError proves the gate ran first rather than the request
+	// validation answering for it.
+	_, allocErr := sess.AllocateGoverned(ctx, provenance.GovernedAllocationRequest{})
+	mustGate("AllocateGoverned", allocErr)
+
+	_, composedErr := sess.AllocateGovernedComposed(ctx, provenance.GovernedAllocationComposedRequest{})
+	mustGate("AllocateGovernedComposed", composedErr)
+
+	_, batchErr := sess.AllocateGovernedComposedBatch(ctx, provenance.GovernedAllocationComposedRequest{})
+	mustGate("AllocateGovernedComposedBatch", batchErr)
+
+	_, transferErr := sess.TransferAssignment(provenance.AssignmentTransferRequest{})
+	mustGate("TransferAssignment", transferErr)
+
+	assertEverySessionVerbIsGated(t, sess, gated)
 
 	// Cleanup after shutdown is safe (closes only the bridge).
 	if err := tr.Close(); err != nil {
 		t.Errorf("Close after shutdown: %v", err)
+	}
+}
+
+// assertEverySessionVerbIsGated is the completeness half of the liveness gate.
+// The list of verbs above is written by hand, and a hand-written list is exactly
+// what a newly added verb slips past: the new verb would reach a closed handle
+// and report whatever the driver says, while this test still passed. Reflection
+// over the Session method set makes the omission fail here instead.
+func assertEverySessionVerbIsGated(t *testing.T, session *provenance.Session, gated map[string]bool) {
+	t.Helper()
+	sessionType := reflect.TypeOf(session)
+	if sessionType.NumMethod() == 0 {
+		t.Fatal("Session exposes no methods -- where: assertEverySessionVerbIsGated; why: reflection found an empty method set, so the completeness check cannot see a new verb; impact: an ungated verb would pass unnoticed; fix: confirm the Session type passed here is the pointer type the API returns")
+	}
+	for i := 0; i < sessionType.NumMethod(); i++ {
+		verb := sessionType.Method(i).Name
+		if !gated[verb] {
+			t.Errorf("Session.%s is not covered by the post-shutdown liveness assertions; every public verb must fail with *StoreUnavailableError once the borrowed handle is closed. Add a call for it above (or gate it in session.go if it does not call checkGate).", verb)
+		}
 	}
 }
 

@@ -47,7 +47,6 @@ const (
 	ErrorConflict
 	ErrorAuthority
 	ErrorRevoked
-	ErrorDepth
 	ErrorCollision
 	ErrorGenesis
 	ErrorCorruption
@@ -63,8 +62,6 @@ func (kind ErrorKind) String() string {
 		return "authority"
 	case ErrorRevoked:
 		return "revoked"
-	case ErrorDepth:
-		return "depth"
 	case ErrorCollision:
 		return "collision"
 	case ErrorGenesis:
@@ -91,8 +88,19 @@ type Error struct {
 
 func (e *Error) Error() string {
 	return fmt.Sprintf(
-		"provenance: governed allocation %s for operation %q -- where: %s; why: %s; impact: %s; fix: %s; cause: %v",
-		e.Kind, e.Operation, e.Where, e.Why, e.Impact, e.Fix, e.Cause)
+		"provenance: governed allocation %s for operation %q -- where: %s; why: %s; impact: %s; fix: %s%s",
+		e.Kind, e.Operation, e.Where, e.Why, e.Impact, e.Fix, causeClause(e.Cause))
+}
+
+// causeClause renders the wrapped cause, or nothing at all when there is none.
+// Half of the governed-allocation failures are diagnosed by the reducer itself
+// and have no underlying error; printing "cause: <nil>" told the reader that a
+// real cause had been lost.
+func causeClause(cause error) string {
+	if cause == nil {
+		return ""
+	}
+	return "; cause: " + cause.Error()
 }
 
 func (e *Error) Unwrap() error { return e.Cause }

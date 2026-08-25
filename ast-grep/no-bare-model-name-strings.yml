@@ -13,5 +13,7 @@ rule:
   any:
     - pattern: RegisterMLAgent($A, $B, $C, "$M")
     - pattern: mustRegisterMLAgent($T, $TR, $A, $B, $C, "$M")
-ignore:
+ignores:
   - "**/vendor/**"
+  - "**/testdata/astgrep/**"
+  - "testdata/astgrep/**"
