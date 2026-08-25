@@ -238,7 +238,14 @@ func (scope *connScope) migrateWithFault(in journal.MigrationInput, faultHook fu
 
 func (scope *connScope) anchorLegacyBaselines(in journal.MigrationInput, ordered []journal.LegacyTaskRow, resolved []*journal.ActorID, faultHook func(taskIndex int) error) (result journal.MigrationResult, err error) {
 	result.TasksMigrated = len(ordered)
-	err = runScopedTransaction(scope.ctx, scope.conn, "BEGIN", func() error {
+	// BEGIN IMMEDIATE, not BEGIN, for the same reason activation takes the write
+	// lock at BEGIN: the fold path reads before it writes, so a deferred
+	// transaction would take the read lock first and then need a read-to-write
+	// promotion on the first baseline INSERT — and SQLite never invokes the busy
+	// handler for a promotion. A migration contending with any other writer would
+	// fail instantly with SQLITE_BUSY, bypassing busy_timeout, and roll back every
+	// baseline in the all-or-nothing batch.
+	err = runImmediateTransaction(scope.ctx, scope.conn, func() error {
 		for i, legacy := range ordered {
 			op := baselineOperation(in, legacy, resolved[i])
 			if err := validateApplyInput(op); err != nil {

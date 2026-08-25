@@ -34,6 +34,16 @@ func newRaceTracker(t *testing.T) *raceTracker {
 	if err != nil {
 		t.Fatalf("OpenMemory: %v", err)
 	}
+	return newRaceTrackerOn(t, tr)
+}
+
+// newRaceTrackerOn is the backend-independent half of newRaceTracker: it takes
+// ownership of an already-open Tracker and establishes the same genesis
+// authority and two committing actors. The file-backed contention families
+// (journal_migration_contention_test.go) reuse it so that a pool-size-4 file
+// database races exactly the fixture the pool-size-1 memory families race.
+func newRaceTrackerOn(t *testing.T, tr Tracker) *raceTracker {
+	t.Helper()
 	t.Cleanup(func() { _ = tr.Close() })
 	reg := func(name string) ActorID {
 		a, err := tr.RegisterSoftwareAgent("provenance-test", name, "0", "test")
