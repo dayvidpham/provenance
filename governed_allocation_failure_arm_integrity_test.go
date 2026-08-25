@@ -13,7 +13,7 @@ import (
 	provenance "github.com/dayvidpham/provenance"
 )
 
-func TestReviewEvidenceCommittedSuccessCannotBeReplacedByValidFailure(t *testing.T) {
+func TestGovernedAllocationCommittedSuccessCannotBeReplacedByValidFailureArm(t *testing.T) {
 	for _, composed := range []bool{false, true} {
 		name := "simple"
 		if composed {
@@ -22,18 +22,18 @@ func TestReviewEvidenceCommittedSuccessCannotBeReplacedByValidFailure(t *testing
 		t.Run(name, func(t *testing.T) {
 			ctx := context.Background()
 			calls := 0
-			path := filepath.Join(t.TempDir(), "review-failure-arm-"+name+".db")
+			path := filepath.Join(t.TempDir(), "committed-success-arm-"+name+".db")
 			participant := func(context.Context, provenance.GovernedAllocationTransaction, provenance.GovernedAllocationRequest, provenance.OperationClosure) error {
 				calls++
 				return nil
 			}
-			fused, db := openFusedReceiptProof(t, path, "review-failure-arm-"+name, participant)
-			actor := registerGovernedActor(t, fused.Tracker(), "review-failure-arm-"+name)
-			root := initializeFusedRoot(t, fused, actor, "review-failure-arm-root-"+name)
-			workflow := "review-success-" + name
-			request := governedRequest("review-failure-arm-"+name, actor, root.AssignmentID, 1)
+			fused, db := openFusedReceiptProof(t, path, "committed-success-arm-"+name, participant)
+			actor := registerGovernedActor(t, fused.Tracker(), "committed-success-arm-"+name)
+			root := initializeFusedRoot(t, fused, actor, "committed-success-arm-root-"+name)
+			workflow := "committed-success-workflow-" + name
+			request := governedRequest("committed-success-arm-"+name, actor, root.AssignmentID, 1)
 			if composed {
-				_, err := fused.RunAllocateComposed(ctx, workflow, root.AssignmentRow.JournalID, composedGovernedRequest("review-failure-arm-"+name, actor, root, 1))
+				_, err := fused.RunAllocateComposed(ctx, workflow, root.AssignmentRow.JournalID, composedGovernedRequest("committed-success-arm-"+name, actor, root, 1))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -44,12 +44,12 @@ func TestReviewEvidenceCommittedSuccessCannotBeReplacedByValidFailure(t *testing
 			// Obtain a structurally valid Failure arm from the same production workflow,
 			// rather than manufacturing malformed JSON.
 			badAuthority := provenance.JournalID(0)
-			failureWorkflow := "review-valid-failure-" + name
+			failureWorkflow := "valid-failure-workflow-" + name
 			if composed {
 				// A committed OperationID is now classified before fresh authority
 				// admission, so obtain the independent valid failure arm under a
 				// fresh identity rather than trying to overwrite the success identity.
-				_, _ = fused.RunAllocateComposed(ctx, failureWorkflow, badAuthority, composedGovernedRequest("review-valid-failure-arm-"+name, actor, root, 1))
+				_, _ = fused.RunAllocateComposed(ctx, failureWorkflow, badAuthority, composedGovernedRequest("valid-failure-arm-"+name, actor, root, 1))
 			} else {
 				_, _ = fused.RunAllocate(ctx, failureWorkflow, badAuthority, request)
 			}
@@ -72,11 +72,11 @@ func TestReviewEvidenceCommittedSuccessCannotBeReplacedByValidFailure(t *testing
 				t.Fatal(err)
 			}
 			// Reopen through the same real DBOS/SQLite constructor.
-			fused, db = openFusedReceiptProof(t, path, "review-failure-arm-"+name, participant)
+			fused, db = openFusedReceiptProof(t, path, "committed-success-arm-"+name, participant)
 			var err error
 			if composed {
 				var got provenance.GovernedAllocationComposedResult
-				got, err = fused.RunAllocateComposed(ctx, workflow, root.AssignmentRow.JournalID, composedGovernedRequest("review-failure-arm-"+name, actor, root, 1))
+				got, err = fused.RunAllocateComposed(ctx, workflow, root.AssignmentRow.JournalID, composedGovernedRequest("committed-success-arm-"+name, actor, root, 1))
 				if !reflect.DeepEqual(got, provenance.GovernedAllocationComposedResult{}) {
 					t.Fatalf("forged failure returned receipt: %+v", got)
 				}
@@ -97,9 +97,9 @@ func TestReviewEvidenceCommittedSuccessCannotBeReplacedByValidFailure(t *testing
 	}
 }
 
-func TestReviewEvidenceComposedParticipantFailureUsesCompleteRollbackOracle(t *testing.T) {
+func TestComposedParticipantFailureRollsBackEveryGovernedTable(t *testing.T) {
 	ctx := context.Background()
-	fused, db := openFusedAllocatorWithParticipantAndDatabase(t, "review-complete-rollback", func(ctx context.Context, tx provenance.GovernedAllocationTransaction, request provenance.GovernedAllocationRequest, closure provenance.OperationClosure) error {
+	fused, db := openFusedAllocatorWithParticipantAndDatabase(t, "participant-failure-rollback", func(ctx context.Context, tx provenance.GovernedAllocationTransaction, request provenance.GovernedAllocationRequest, closure provenance.OperationClosure) error {
 		_, err := tx.Exec(ctx, `INSERT INTO fused_governed_participant_audit(operation_id,anchor_journal_id,child_task_id) VALUES(?1,?2,?3)`, request.OperationID, closure.AnchorJournalID(), closure.Children()[0].TaskID.String())
 		if err != nil {
 			return err
@@ -107,18 +107,18 @@ func TestReviewEvidenceComposedParticipantFailureUsesCompleteRollbackOracle(t *t
 		return errors.New("participant rejected commit")
 	})
 	createFusedGovernedParticipantAuditTable(t, db)
-	actor := registerGovernedActor(t, fused.Tracker(), "review-complete-rollback")
+	actor := registerGovernedActor(t, fused.Tracker(), "participant-failure-rollback")
 	if err := fused.Launch(); err != nil {
 		t.Fatal(err)
 	}
-	root := initializeFusedRoot(t, fused, actor, "review-complete-rollback-root")
-	request := composedGovernedRequest("review-complete-rollback", actor, root, 1)
-	workflow := "review-complete-rollback-workflow"
-	before := reviewRollbackCounts(t, db)
+	root := initializeFusedRoot(t, fused, actor, "participant-failure-rollback-root")
+	request := composedGovernedRequest("participant-failure-rollback", actor, root, 1)
+	workflow := "participant-failure-rollback-workflow"
+	before := governedDomainRowCounts(t, db)
 	if _, err := fused.RunAllocateComposed(ctx, workflow, root.AssignmentRow.JournalID, request); err == nil {
 		t.Fatal("participant failure succeeded")
 	}
-	after := reviewRollbackCounts(t, db)
+	after := governedDomainRowCounts(t, db)
 	if !reflect.DeepEqual(after, before) {
 		t.Fatalf("operation-scoped rollback oracle changed:\nbefore=%v\nafter=%v", before, after)
 	}
@@ -130,7 +130,7 @@ func TestReviewEvidenceComposedParticipantFailureUsesCompleteRollbackOracle(t *t
 	}
 }
 
-func reviewRollbackCounts(t *testing.T, db *sql.DB) []int {
+func governedDomainRowCounts(t *testing.T, db *sql.DB) []int {
 	t.Helper()
 	queries := []string{
 		`SELECT COUNT(*) FROM governed_allocation_operations`, `SELECT COUNT(*) FROM governed_operation_effect_rows`, `SELECT COUNT(*) FROM governed_composed_supplement_owners`,
@@ -147,18 +147,18 @@ func reviewRollbackCounts(t *testing.T, db *sql.DB) []int {
 	return result
 }
 
-func TestReviewEvidenceForeignProducerMutationTargetsCanonicalRowAndExtraRowSeparately(t *testing.T) {
+func TestComposedReceiptDetectsForeignProducerMutationOnCanonicalAndExtraRows(t *testing.T) {
 	for _, extra := range []bool{false, true} {
 		t.Run(map[bool]string{false: "canonical", true: "extra"}[extra], func(t *testing.T) {
 			ctx := context.Background()
-			fused, db := openFusedAllocatorWithDatabase(t, "review-foreign-producer")
-			actor := registerGovernedActor(t, fused.Tracker(), "review-foreign-producer")
+			fused, db := openFusedAllocatorWithDatabase(t, "foreign-producer-mutation")
+			actor := registerGovernedActor(t, fused.Tracker(), "foreign-producer-mutation")
 			if err := fused.Launch(); err != nil {
 				t.Fatal(err)
 			}
-			root := initializeFusedRoot(t, fused, actor, "review-foreign-producer-root")
-			request := composedGovernedRequest("review-foreign-producer", actor, root, 1)
-			if _, err := fused.RunAllocateComposed(ctx, "review-foreign-producer-original", root.AssignmentRow.JournalID, request); err != nil {
+			root := initializeFusedRoot(t, fused, actor, "foreign-producer-mutation-root")
+			request := composedGovernedRequest("foreign-producer-mutation", actor, root, 1)
+			if _, err := fused.RunAllocateComposed(ctx, "foreign-producer-mutation-original", root.AssignmentRow.JournalID, request); err != nil {
 				t.Fatal(err)
 			}
 			if extra {
@@ -174,7 +174,7 @@ func TestReviewEvidenceForeignProducerMutationTargetsCanonicalRowAndExtraRowSepa
 			} else {
 				mustMutateComposedReceipt(t, db, `UPDATE journal SET produced_by_operation_journal_id=(SELECT MIN(journal_id) FROM journal_operations) WHERE journal_id=(SELECT produced_journal_id FROM journal_operation_result_slots WHERE result_slot_id='slice-event')`)
 			}
-			got, err := fused.RunAllocateComposed(ctx, "review-foreign-producer-retry", root.AssignmentRow.JournalID, request)
+			got, err := fused.RunAllocateComposed(ctx, "foreign-producer-mutation-retry", root.AssignmentRow.JournalID, request)
 			mustGovernedError(t, err, provenance.GovernedAllocationCorruption)
 			if !reflect.DeepEqual(got, provenance.GovernedAllocationComposedResult{}) {
 				t.Fatalf("tamper returned receipt: %+v", got)
@@ -183,28 +183,28 @@ func TestReviewEvidenceForeignProducerMutationTargetsCanonicalRowAndExtraRowSepa
 	}
 }
 
-func TestReviewEvidenceFreshWorkflowRejectsWrongParentAuthorityBeforeWrites(t *testing.T) {
+func TestFreshWorkflowRejectsWrongParentAuthorityBeforeWrites(t *testing.T) {
 	ctx := context.Background()
 	calls := 0
-	fused, db := openFusedAllocatorWithParticipantAndDatabase(t, "review-wrong-parent", func(context.Context, provenance.GovernedAllocationTransaction, provenance.GovernedAllocationRequest, provenance.OperationClosure) error {
+	fused, db := openFusedAllocatorWithParticipantAndDatabase(t, "wrong-parent-authority", func(context.Context, provenance.GovernedAllocationTransaction, provenance.GovernedAllocationRequest, provenance.OperationClosure) error {
 		calls++
 		return nil
 	})
-	actor := registerGovernedActor(t, fused.Tracker(), "review-wrong-parent")
+	actor := registerGovernedActor(t, fused.Tracker(), "wrong-parent-authority")
 	if err := fused.Launch(); err != nil {
 		t.Fatal(err)
 	}
-	root := initializeFusedRoot(t, fused, actor, "review-wrong-parent-root")
-	foreign := governedRequest("review-foreign-authority", actor, root.AssignmentID, 1)
-	foreignResult, err := fused.RunAllocate(ctx, "review-foreign-authority-workflow", root.AssignmentRow.JournalID, foreign)
+	root := initializeFusedRoot(t, fused, actor, "wrong-parent-authority-root")
+	foreign := governedRequest("foreign-authority", actor, root.AssignmentID, 1)
+	foreignResult, err := fused.RunAllocate(ctx, "foreign-authority-workflow", root.AssignmentRow.JournalID, foreign)
 	if err != nil {
 		t.Fatal(err)
 	}
 	wrong := foreignResult.Children()[0].AssignmentRow.JournalID
-	request := governedRequest("review-wrong-parent", actor, root.AssignmentID, 1)
+	request := governedRequest("wrong-parent-authority", actor, root.AssignmentID, 1)
 	before := snapshotGovernedTables(t, db)
 	beforeCalls := calls
-	result, err := fused.RunAllocate(ctx, "review-wrong-parent-fresh-workflow", wrong, request)
+	result, err := fused.RunAllocate(ctx, "wrong-parent-authority-fresh-workflow", wrong, request)
 	mustGovernedError(t, err, provenance.GovernedAllocationAuthority)
 	assertEmptyClosure(t, result)
 	if calls != beforeCalls {
@@ -213,21 +213,21 @@ func TestReviewEvidenceFreshWorkflowRejectsWrongParentAuthorityBeforeWrites(t *t
 	assertNoGovernedWrites(t, before, db)
 }
 
-func TestReviewEvidenceJoinedParticipantAndCleanupFailureCannotAuthenticateDomainRejection(t *testing.T) {
+func TestJoinedParticipantAndCleanupFailureCannotAuthenticateDomainRejection(t *testing.T) {
 	ctx := context.Background()
 	domainLike := &provenance.GovernedAllocationError{Kind: provenance.GovernedAllocationAuthority, Operation: "forged-domain", Why: "participant supplied", Impact: "none", Fix: "none"}
-	fused, db := openFusedAllocatorWithParticipantAndDatabase(t, "review-joined-failure", func(context.Context, provenance.GovernedAllocationTransaction, provenance.GovernedAllocationRequest, provenance.OperationClosure) error {
+	fused, db := openFusedAllocatorWithParticipantAndDatabase(t, "joined-participant-failure", func(context.Context, provenance.GovernedAllocationTransaction, provenance.GovernedAllocationRequest, provenance.OperationClosure) error {
 		return errors.Join(domainLike, errors.New("injected rollback cleanup failure"))
 	})
 	createFusedGovernedParticipantAuditTable(t, db)
-	actor := registerGovernedActor(t, fused.Tracker(), "review-joined-failure")
+	actor := registerGovernedActor(t, fused.Tracker(), "joined-participant-failure")
 	if err := fused.Launch(); err != nil {
 		t.Fatal(err)
 	}
-	root := initializeFusedRoot(t, fused, actor, "review-joined-failure-root")
-	request := composedGovernedRequest("review-joined-failure", actor, root, 1)
-	before := reviewRollbackCounts(t, db)
-	result, err := fused.RunAllocateComposed(ctx, "review-joined-failure-workflow", root.AssignmentRow.JournalID, request)
+	root := initializeFusedRoot(t, fused, actor, "joined-participant-failure-root")
+	request := composedGovernedRequest("joined-participant-failure", actor, root, 1)
+	before := governedDomainRowCounts(t, db)
+	result, err := fused.RunAllocateComposed(ctx, "joined-participant-failure-workflow", root.AssignmentRow.JournalID, request)
 	if err == nil {
 		t.Fatal("joined participant/cleanup failure succeeded")
 	}
@@ -238,7 +238,7 @@ func TestReviewEvidenceJoinedParticipantAndCleanupFailureCannotAuthenticateDomai
 	if !reflect.DeepEqual(result, provenance.GovernedAllocationComposedResult{}) {
 		t.Fatalf("joined failure returned receipt: %+v", result)
 	}
-	if after := reviewRollbackCounts(t, db); !reflect.DeepEqual(after, before) {
+	if after := governedDomainRowCounts(t, db); !reflect.DeepEqual(after, before) {
 		t.Fatalf("joined failure left domain writes: before=%v after=%v", before, after)
 	}
 }

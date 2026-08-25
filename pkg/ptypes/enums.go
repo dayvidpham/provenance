@@ -4,8 +4,9 @@
 //
 // This package imports bestiary to support Provider.IsValid() catalog
 // membership checks. It is NOT zero-dependency — bestiary is a direct
-// dependency. This reverses the FIX-4 architectural decision from the
-// prior wave (UAT-2), which had imposed a zero-dep constraint on pkg/ptypes.
+// dependency, deliberately: an earlier zero-dependency constraint on this
+// package was dropped because provider validity has to be checked against the
+// one catalog rather than a second, drifting copy of it.
 //
 // Consumers of the library should continue to use the root
 // "github.com/dayvidpham/provenance" package, which re-exports everything
