@@ -325,9 +325,10 @@ Ensure you're not importing C libraries or cgo-dependent packages. `CGO_ENABLED=
 `modernc.org/sqlite` driver, registered as `"sqlite"`. Two rules hold:
 
 - Never import `github.com/mattn/go-sqlite3` (CGo).
-- Never reintroduce `zombiezen.com/go/sqlite` into `internal/sqlite`.
-  `internal/sqlite/sql_architecture_test.go` fails the suite if a non-test file
-  in that package imports it, or calls the retired driver-specific methods
+- Never reintroduce `zombiezen.com/go/sqlite` into `internal/sqlite`,
+  `internal/allocation`, or `internal/fusedtx`. `sql_architecture_test.go` in
+  the repository root fails the suite if a non-test file in those packages
+  imports it (or a subpackage), or calls the retired driver-specific methods
   `Execute`, `ExecuteTransient`, `LastInsertRowID`, or `Changes`; all production
   SQL must end at `ExecContext`, `QueryContext`, or `QueryRowContext`.
 

@@ -131,8 +131,9 @@ All SQLite access goes through the standard `database/sql` API with the
 
 - Never import `github.com/mattn/go-sqlite3` (CGo).
 - Do not reintroduce `zombiezen.com/go/sqlite`. `internal/sqlite` migrated off it;
-  `internal/sqlite/sql_architecture_test.go` fails if any non-test file in that
-  package imports `zombiezen.com/go/sqlite`, or calls the retired driver-specific
+  `sql_architecture_test.go` in the repository root fails if any non-test file in
+  `internal/sqlite`, `internal/allocation`, or `internal/fusedtx` imports
+  `zombiezen.com/go/sqlite` (or a subpackage), or calls the retired driver-specific
   methods `Execute`, `ExecuteTransient`, `LastInsertRowID`, or `Changes`. All
   production SQL must end at `ExecContext`, `QueryContext`, or `QueryRowContext`.
 - `zombiezen.com/go/sqlite` *does* remain an indirect dependency in `go.mod`,
