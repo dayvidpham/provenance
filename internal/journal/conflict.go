@@ -9,10 +9,10 @@ type ConflictAxis uint8
 
 const (
 	ConflictActor     ConflictAxis = iota + 1 // nonzero: committing actor differs
-	ConflictAuthority                          // authority JournalID differs
-	ConflictCommand                            // command digest differs
-	ConflictCondition                          // condition list length or element differs
-	ConflictEffect                             // effect list length or element differs
+	ConflictAuthority                         // authority JournalID differs
+	ConflictCommand                           // command digest differs
+	ConflictCondition                         // condition list length or element differs
+	ConflictEffect                            // effect list length or element differs
 )
 
 var conflictAxisNames = [...]string{0: "<invalid>", 1: "Actor", 2: "Authority", 3: "Command", 4: "Condition", 5: "Effect"}

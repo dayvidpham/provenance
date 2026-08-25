@@ -254,7 +254,7 @@ type StoredOperationIdentity struct {
 type CommittedResultKind int
 
 const (
-	CommittedAbsent   CommittedResultKind = iota
+	CommittedAbsent CommittedResultKind = iota
 	CommittedExact
 	CommittedConflict
 )
