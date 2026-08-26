@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.0.6 - 2026-08-26
+
+### Fixed
+
+- A deadline-expired contended write always carries its SQLite contention
+  evidence in the error chain. The driver's context watcher can interrupt a
+  `BEGIN` while SQLite is still waiting for the writer lock, so a genuinely
+  contended wait could previously end with a bare context error and be
+  misclassified downstream as plain deadline expiry. The retry loop now joins
+  the busy error observed by any earlier attempt into the deadline return,
+  and when no attempt ever surfaced one, a post-expiry probe re-attempts the
+  same `BEGIN` with a zero busy budget: an instant refusal proves the lock is
+  still held and is joined as evidence; an instant success is rolled back and
+  the bare deadline stands. Evidence attachment is gated on the error being
+  the context's own, so a hard SQLite fault (FULL, IOERR, CORRUPT) landing at
+  deadline expiry surfaces as that fault and is never dressed up as
+  contention. A probe rollback failure is surfaced to the caller instead of
+  silently returning a write-locked connection to the pool.
+
 ## v0.0.5 - 2026-08-25
 
 ### Fixed
