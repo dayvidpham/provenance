@@ -2,6 +2,53 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.0.5 - 2026-08-25
+
+### Fixed
+
+- A caller deadline is now a real bound on contended writes. The SQLite
+  driver's busy handler can give up before its armed budget elapses, so a
+  single `BEGIN` attempt could surface `SQLITE_BUSY` with time still left on
+  the caller's context deadline. The transaction path now retries a busy
+  `BEGIN` until the deadline actually expires, re-arming the connection's
+  `busy_timeout` before every attempt with the deadline remaining at that
+  moment (capped exponential backoff between attempts), and then returns the
+  typed context error joined with the SQLite error so the contention detail
+  stays inspectable. Callers without a deadline keep the single-attempt
+  contract. Measured worst-case return latency over 50 contended runs:
+  300.8ms against a 300ms deadline (previously up to 552ms, and up to a full
+  extra busy budget for deadlines longer than the standing 5s value).
+- The lowered busy budget is recorded before the pragma applies, so the
+  restore path always puts the original `busy_timeout` back even if the
+  lowering statement's result is lost.
+
+### Performance
+
+- Reference data and the model catalogue are seeded through prepared
+  statements, with the provider key resolved once instead of via a correlated
+  subselect per row. A fresh database open no longer re-parses one INSERT
+  statement per catalogue model.
+- A fresh database creates the operation journal relation in its completed
+  shape directly, instead of creating the historical shape and immediately
+  rebuilding it through the drop-copy-rename migration. Only databases that
+  genuinely predate the completed shape pay the rebuild.
+- The test suite runs its isolated tests in parallel across the
+  governed-allocation family, `internal/sqlite`, and the DBOS matrix, each
+  backed by a recorded isolation proof; wall-clock-sensitive tests remain
+  deliberately serial with their reasons stated. Suite wall clock on an idle
+  host: `go test ./...` 78s -> 21s, `go test -race ./...` 418s -> 107s.
+
+### Documentation
+
+- `fusedtx.OpenSystem` documents both halves of the embedded DBOS queue
+  behaviour accurately: the reserved internal queue's polling never dequeues
+  work (nothing is enqueued), and its once-a-second reconcile tick executes an
+  UPDATE against the system database — which in fusedtx is the application's
+  own SQLite file — so it periodically takes the single-writer lock.
+- The measured test-suite baseline, its inventories, and the null result of
+  the queue-polling investigation are recorded under `docs/perf/` and
+  `docs/test-performance.md`.
+
 ## v0.0.4 - 2026-08-25
 
 ### Breaking Changes
