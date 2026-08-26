@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -94,7 +95,7 @@ func TestDeadlineJoinsBusyEvidenceFromEarlierAttempt(t *testing.T) {
 		t.Fatalf("harvested error = %v, want SQLITE_BUSY", busyErr)
 	}
 	_, _ = scope.conn.ExecContext(harvestCtx, "ROLLBACK")
-	if _, err := scope.conn.ExecContext(harvestCtx, "PRAGMA busy_timeout=5000"); err != nil {
+	if _, err := scope.conn.ExecContext(harvestCtx, fmt.Sprintf("PRAGMA busy_timeout=%d", busyTimeoutMS)); err != nil {
 		t.Fatalf("restore the harvest busy budget: %v", err)
 	}
 
