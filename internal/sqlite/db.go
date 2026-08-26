@@ -812,21 +812,31 @@ func activateSchema(scope *connScope, models []ptypes.ModelEntry, policy activat
 // only once would let an attempt started near the deadline block a further full
 // initial budget past it. The restore closure puts the original value back and
 // runs exactly once, however many times rearm lowered the value in between.
-func limitTransactionBusyTimeout(ctx context.Context, conn sqlQueryer) (func() error, func() error, error) {
+// The third closure is a contention probe for the moment AFTER the caller's
+// deadline has expired without SQLITE_BUSY ever surfacing: the driver's context
+// watcher can interrupt a BEGIN while SQLite is still waiting for the writer
+// lock, so the interrupted attempt reports only the context error even though
+// the wait was genuinely contended. The probe re-attempts the BEGIN with a zero
+// busy budget on an independent bounded context — an instant refusal proves the
+// lock is (still) held and returns that SQLite error as evidence; an instant
+// success is rolled back and returns nil. Consumers classify contention from
+// the error chain, so the evidence must be present whenever contention was
+// real.
+func limitTransactionBusyTimeout(ctx context.Context, conn sqlQueryer) (func() error, func() error, func(string) error, error) {
 	noop := func() error { return nil }
 	deadline, hasDeadline := ctx.Deadline()
 	if !hasDeadline {
-		return noop, noop, nil
+		return noop, noop, nil, nil
 	}
 	if time.Until(deadline) <= 0 {
-		return nil, nil, ctx.Err()
+		return nil, nil, nil, ctx.Err()
 	}
 
 	controlCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	var previousMS int
 	if err := conn.QueryRowContext(controlCtx, "PRAGMA busy_timeout").Scan(&previousMS); err != nil {
-		return nil, nil, fmt.Errorf("read SQLite busy timeout before transaction: %w", err)
+		return nil, nil, nil, fmt.Errorf("read SQLite busy timeout before transaction: %w", err)
 	}
 	armedMS := previousMS
 	rearm := func() error {
@@ -867,14 +877,33 @@ func limitTransactionBusyTimeout(ctx context.Context, conn sqlQueryer) (func() e
 		armedMS = previousMS
 		return nil
 	}
-	if err := rearm(); err != nil {
-		return nil, nil, err
+	probeContention := func(begin string) error {
+		probeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		// armedMS is recorded before the Exec for the same reason rearm does
+		// it: restore must run even if the lowering statement's result is lost.
+		armedMS = 0
+		if _, err := conn.ExecContext(probeCtx, "PRAGMA busy_timeout=0"); err != nil {
+			return nil
+		}
+		_, beginErr := conn.ExecContext(probeCtx, begin)
+		if beginErr == nil {
+			_, _ = conn.ExecContext(probeCtx, "ROLLBACK")
+			return nil
+		}
+		if isBusyError(beginErr) {
+			return beginErr
+		}
+		return nil
 	}
-	return rearm, restore, nil
+	if err := rearm(); err != nil {
+		return nil, nil, nil, err
+	}
+	return rearm, restore, probeContention, nil
 }
 
 func runScopedTransaction(ctx context.Context, conn sqlQueryer, begin string, operation func() error) (err error) {
-	rearmBusyTimeout, restoreBusyTimeout, err := limitTransactionBusyTimeout(ctx, conn)
+	rearmBusyTimeout, restoreBusyTimeout, probeContention, err := limitTransactionBusyTimeout(ctx, conn)
 	if err != nil {
 		return err
 	}
@@ -888,6 +917,7 @@ func runScopedTransaction(ctx context.Context, conn sqlQueryer, begin string, op
 		}
 	}()
 	backoff := 2 * time.Millisecond
+	var lastBusy error
 	for {
 		_, err = conn.ExecContext(ctx, begin)
 		if err == nil {
@@ -901,8 +931,25 @@ func runScopedTransaction(ctx context.Context, conn sqlQueryer, begin string, op
 		_, _ = conn.ExecContext(rollbackCtx, "ROLLBACK")
 		cancel()
 		if !isBusyError(err) {
+			// The deadline can interrupt an attempt while SQLite is still
+			// waiting for the writer lock, so a contended wait can end with
+			// only the context error. Consumers classify contention from the
+			// error chain, so attach the evidence: the busy error an earlier
+			// attempt observed, or failing that, an instant zero-budget probe
+			// of the same BEGIN that proves the lock is still held.
+			if ctx.Err() != nil {
+				if lastBusy != nil {
+					return errors.Join(err, lastBusy)
+				}
+				if probeContention != nil {
+					if evidence := probeContention(begin); evidence != nil {
+						return errors.Join(err, evidence)
+					}
+				}
+			}
 			return err
 		}
+		lastBusy = err
 		// Callers without a deadline keep the pre-existing contract: one attempt
 		// under the standing busy_timeout, busy surfaced as-is — even when their
 		// context is already cancelled.
