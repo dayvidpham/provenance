@@ -10,6 +10,7 @@ import (
 	"github.com/dayvidpham/provenance/internal/journal"
 	"github.com/dayvidpham/provenance/pkg/ptypes"
 	"github.com/google/uuid"
+	"modernc.org/sqlite"
 )
 
 func TestApplyContextBoundsContendedWriterByCallerDeadline(t *testing.T) {
@@ -57,6 +58,14 @@ func TestApplyContextBoundsContendedWriterByCallerDeadline(t *testing.T) {
 	cancel()
 	if !errors.Is(applyErr, context.DeadlineExceeded) {
 		t.Fatalf("deadline-aware contended Apply error = %v, want typed context deadline", applyErr)
+	}
+	// Consumers classify contention from the error chain, so a wait that was
+	// genuinely contended must always carry SQLite's busy evidence — whether an
+	// attempt surfaced it directly, an earlier attempt's evidence was joined,
+	// or the post-expiry probe proved the lock still held.
+	var busyEvidence *sqlite.Error
+	if !errors.As(applyErr, &busyEvidence) || !isBusyResultCode(busyEvidence.Code()) {
+		t.Fatalf("deadline-aware contended Apply error carries no SQLite contention evidence: %v", applyErr)
 	}
 	if deadlineElapsed >= 2*time.Second || deadlineElapsed >= time.Duration(busyTimeoutMS)*time.Millisecond/2 {
 		t.Fatalf("deadline-aware contended Apply took %v, want well below 2s and the %dms busy timeout", deadlineElapsed, busyTimeoutMS)
