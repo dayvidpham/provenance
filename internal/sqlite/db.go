@@ -822,7 +822,7 @@ func activateSchema(scope *connScope, models []ptypes.ModelEntry, policy activat
 // success is rolled back and returns nil. Consumers classify contention from
 // the error chain, so the evidence must be present whenever contention was
 // real.
-func limitTransactionBusyTimeout(ctx context.Context, conn sqlQueryer) (func() error, func() error, func(string) error, error) {
+func limitTransactionBusyTimeout(ctx context.Context, conn sqlQueryer) (func() error, func() error, func(string) (error, error), error) {
 	noop := func() error { return nil }
 	deadline, hasDeadline := ctx.Deadline()
 	if !hasDeadline {
@@ -877,24 +877,33 @@ func limitTransactionBusyTimeout(ctx context.Context, conn sqlQueryer) (func() e
 		armedMS = previousMS
 		return nil
 	}
-	probeContention := func(begin string) error {
+	// probeContention must be TERMINAL: it zeroes armedMS, and rearm only ever
+	// lowers, so no later attempt could restore a usable busy budget. Every
+	// caller returns immediately after probing. It reports (evidence, fault):
+	// evidence is a SQLite busy error proving the lock is held right now;
+	// fault is a probe failure the caller must surface — above all a ROLLBACK
+	// failure after a successful probe BEGIN, which would otherwise return a
+	// write-locked connection to the pool and starve every other writer.
+	probeContention := func(begin string) (error, error) {
 		probeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
 		// armedMS is recorded before the Exec for the same reason rearm does
 		// it: restore must run even if the lowering statement's result is lost.
 		armedMS = 0
 		if _, err := conn.ExecContext(probeCtx, "PRAGMA busy_timeout=0"); err != nil {
-			return nil
+			return nil, nil
 		}
 		_, beginErr := conn.ExecContext(probeCtx, begin)
 		if beginErr == nil {
-			_, _ = conn.ExecContext(probeCtx, "ROLLBACK")
-			return nil
+			if _, rollbackErr := conn.ExecContext(probeCtx, "ROLLBACK"); rollbackErr != nil {
+				return nil, fmt.Errorf("roll back the post-deadline contention probe's transaction: %w", rollbackErr)
+			}
+			return nil, nil
 		}
 		if isBusyError(beginErr) {
-			return beginErr
+			return beginErr, nil
 		}
-		return nil
+		return nil, nil
 	}
 	if err := rearm(); err != nil {
 		return nil, nil, nil, err
@@ -936,13 +945,20 @@ func runScopedTransaction(ctx context.Context, conn sqlQueryer, begin string, op
 			// only the context error. Consumers classify contention from the
 			// error chain, so attach the evidence: the busy error an earlier
 			// attempt observed, or failing that, an instant zero-budget probe
-			// of the same BEGIN that proves the lock is still held.
-			if ctx.Err() != nil {
+			// of the same BEGIN that proves the lock is still held. Gated on
+			// the error itself being the context's — a hard SQLite fault
+			// (FULL, IOERR, CORRUPT) that lands as the deadline expires must
+			// surface as that fault, never dressed up as contention.
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 				if lastBusy != nil {
 					return errors.Join(err, lastBusy)
 				}
 				if probeContention != nil {
-					if evidence := probeContention(begin); evidence != nil {
+					evidence, probeFault := probeContention(begin)
+					if probeFault != nil {
+						return errors.Join(err, probeFault)
+					}
+					if evidence != nil {
 						return errors.Join(err, evidence)
 					}
 				}
