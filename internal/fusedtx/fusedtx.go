@@ -49,6 +49,14 @@ type System struct {
 // database, creates or launches a DBOS root, or assumes shutdown ownership.
 // Hosts must call it before launching root so workflows can be registered on
 // the same application boundary.
+//
+// BindSystem deliberately runs NO system-schema preflight. The host already
+// created the root, and the DBOS runtime migrates the system schema while it
+// builds that context, so the only moment at which a superseded database can
+// still be refused has passed. A host that opens its own handle owns that
+// refusal: call provenance.RequireSupportedDBOSSystemSchema on the exact
+// *sql.DB before dbos.NewContext. The host must also blank-import the DBOS
+// SQLite driver package, for the reason given on this file's import block.
 func BindSystem(root dbos.Context, systemDB *sql.DB) (*System, error) {
 	if root == nil {
 		return nil, fmt.Errorf("fusedtx.BindSystem: DBOS root is nil -- where: host-bound fused system construction; impact: no composed workflow can be registered; fix: pass the exact context returned by dbos.NewContext before launch")
