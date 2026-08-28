@@ -106,10 +106,27 @@ func OpenSystem(ctx context.Context, config SystemConfig) (*System, error) {
 	// Constructing the context also creates DBOS's reserved internal queue. It is
 	// the one queue that stays in process rather than in the queues table, so a
 	// same-named RegisterQueue is rejected and its polling cadence stays at the
-	// package default; dbos.Config exposes no field for it. Provenance neither
-	// registers a queue nor enqueues a workflow, so the polling never dequeues
-	// work and is not on any workflow-latency path. It is NOT free of side
-	// effects, though: the queue supervisor's fixed once-a-second reconcile tick
+	// package default; dbos.Config exposes no field for it.
+	//
+	// That queue is NOT idle for Provenance. Launch re-enqueues every PENDING
+	// workflow it recovers onto it, so crash recovery runs on this queue's
+	// worker, not on a caller's goroutine: after a crash, recovery costs one
+	// poll of that worker. The worker starts at the 1s base interval and only
+	// grows it -- doubling toward a 120s ceiling -- when a dequeue pass hits a
+	// contention error; an ordinary empty poll scales the interval back down by
+	// 0.9 toward the base. So the interval an operator sees on a recovering
+	// database is about one second unless the database is already contended.
+	// A first delivery still runs on the caller's own goroutine through
+	// dbos.RunWorkflow: Provenance registers no queue and enqueues nothing
+	// itself, so the queue is on the recovery path only.
+	// Source: dbos/dbos.go:825 (Launch recovers before it starts the queue
+	// runner), dbos/recovery.go:9-21, dbos/queue.go:749-757 and
+	// dbos/queue.go:786-790 (only a contention error backs the interval off),
+	// dbos/internal/models/queue.go:12 and dbos/queue.go:16 (1s base, 120s
+	// ceiling).
+	//
+	// The construction is NOT free of side effects either: the queue
+	// supervisor's fixed once-a-second reconcile tick
 	// executes an UPDATE on workflow_status against the system database, and in
 	// fusedtx that database IS the application's SQLite file — so the tick
 	// periodically takes the single-writer lock and can surface as SQLITE_BUSY

@@ -370,6 +370,13 @@ func listedWorkflowDiagnostic(workflows []dbos.WorkflowStatus, contract dbosCont
 func knownWorkflowStatus(status dbos.WorkflowStatusType) bool {
 	switch status {
 	case dbos.WorkflowStatusPending,
+		// ENQUEUED is load-bearing even though Provenance enqueues nothing of
+		// its own: Launch moves every PENDING workflow it recovers to the
+		// runtime's reserved internal queue and leaves it ENQUEUED until that
+		// queue's worker picks it up. A replay that arrives inside that window
+		// must recognise the status instead of treating it as unknown.
+		// Source: dbos/recovery.go:9-21 and
+		// dbos/internal/sysdb/system_database.go:4963 (ReenqueueForRecovery).
 		dbos.WorkflowStatusEnqueued,
 		dbos.WorkflowStatusDelayed,
 		dbos.WorkflowStatusSuccess,

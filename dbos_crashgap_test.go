@@ -356,6 +356,142 @@ func asExitError(err error, target **exec.ExitError) bool {
 	return false
 }
 
+// recoveryQueueName is the reserved queue the runtime re-enqueues recovered
+// workflows onto. It is an internal constant of the library, so this test names
+// it as durable data read back out of workflow_status rather than importing it.
+// Source: dbos/internal/models/queue.go:9, InternalQueueName.
+const recoveryQueueName = "_dbos_internal_queue"
+
+// The supported runtime no longer recovers a crashed workflow on the recovering
+// caller's goroutine: Launch re-enqueues every PENDING workflow it finds onto
+// the reserved internal queue, and that queue's worker runs it. Prove it with no
+// second caller at all -- the reopening process only builds the stack and
+// launches -- and prove where it ran by reading the queue the row was placed on.
+// Source: dbos/dbos.go:825 and dbos/recovery.go:9-21.
+func TestRecoveredWorkflowFinishesOnTheInternalQueueWithoutASecondCaller(t *testing.T) {
+	t.Parallel()
+	if testing.Short() {
+		t.Skip("subprocess crash-recovery test")
+	}
+	dir := t.TempDir()
+	dbpath := dir + "/recovery-on-launch.db"
+	markerPath := dir + "/recovery-on-launch.markers"
+
+	actor, auth := seedCrashGenesis(t, dbpath)
+	taskID := ptypes.TaskID{Namespace: "aura", UUID: uuid.Must(uuid.NewV7())}
+
+	// The child crashes before the domain commit, so nothing of the operation is
+	// durable yet except the PENDING workflow row.
+	cmd := exec.Command(os.Args[0], "-test.run=^TestCrashGapChild$", "-test.v")
+	cmd.Env = append(os.Environ(),
+		"PROV_CRASH_GAP=before",
+		"PROV_DBPATH="+dbpath,
+		"PROV_ACTOR="+actor.String(),
+		"PROV_AUTH="+strconv.FormatInt(int64(auth), 10),
+		"PROV_TASK="+taskID.String(),
+		"PROV_MARKER="+markerPath,
+	)
+	out, err := cmd.CombinedOutput()
+	if code := exitCode(err); code != crashExitBefore {
+		t.Fatalf("child exit code = %d, want %d (crash before the domain commit)\n%s", code, crashExitBefore, out)
+	}
+
+	db, err := openSharedSQL(dbpath)
+	if err != nil {
+		t.Fatalf("reopen the crashed database: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	root, err := dbos.NewContext(context.Background(), dbos.Config{
+		AppName: crashAppName, SQLiteSystemDB: db, ApplicationVersion: crashAppVersion,
+	})
+	if err != nil {
+		t.Fatalf("reopen dbos.NewContext: %v", err)
+	}
+	tracker, err := OpenBorrowedSQLite(db)
+	if err != nil {
+		t.Fatalf("reopen OpenBorrowedSQLite: %v", err)
+	}
+	adapter, err := NewDBOSAdapter(root, tracker, DBOSAdapterConfig{})
+	if err != nil {
+		t.Fatalf("reopen NewDBOSAdapter: %v", err)
+	}
+	workflowID := adapter.contract.workflowPrefix + workflowIdentity(adapter.contract, adapter.applicationVersion, "op-crash")
+	if err := dbos.Launch(root); err != nil {
+		t.Fatalf("reopen Launch: %v", err)
+	}
+	defer func() { shutdownDBOSRoot(t, root, 10*time.Second); _ = tracker.Close() }()
+
+	// Wait on the workflow's own terminal condition, with a bounded ceiling. The
+	// handle blocks until the recovered workflow reaches a terminal state; the
+	// timeout is a failure ceiling, never a scheduling assumption.
+	type completion struct {
+		outcome DBOSStepOutcome
+		err     error
+	}
+	finished := make(chan completion, 1)
+	go func() {
+		handle, retrieveErr := dbos.RetrieveWorkflow[DBOSStepOutcome](root, workflowID)
+		if retrieveErr != nil {
+			finished <- completion{err: retrieveErr}
+			return
+		}
+		outcome, resultErr := handle.GetResult()
+		finished <- completion{outcome: outcome, err: resultErr}
+	}()
+	select {
+	case done := <-finished:
+		if done.err != nil {
+			t.Fatalf("the recovered workflow did not complete on its own: %v", done.err)
+		}
+	case <-time.After(120 * time.Second):
+		t.Fatal("the recovered workflow never reached a terminal state, with no second caller driving it: " +
+			"recovery no longer completes through the runtime's internal queue")
+	}
+
+	// The domain effect is durable exactly once, and the journal agrees.
+	looked, err := tracker.Journal().LookupCommitted("op-crash")
+	if err != nil {
+		t.Fatalf("LookupCommitted after unattended recovery: %v", err)
+	}
+	if looked.Kind != journal.CommittedExact {
+		t.Fatalf("LookupCommitted Kind = %v, want CommittedExact", looked.Kind)
+	}
+	if _, err := tracker.Show(taskID); err != nil {
+		t.Fatalf("Show the recovered task: %v", err)
+	}
+
+	// The row records WHERE it ran: recovery placed it on the reserved internal
+	// queue, which is the behaviour this test exists to pin.
+	var queueName string
+	var status string
+	if err := db.QueryRow(`SELECT COALESCE(queue_name, ''), status FROM workflow_status WHERE workflow_uuid = ?`, workflowID).
+		Scan(&queueName, &status); err != nil {
+		t.Fatalf("read the recovered workflow row: %v", err)
+	}
+	if queueName != recoveryQueueName {
+		t.Errorf("recovered workflow queue_name = %q, want %q: recovery did not run through the internal queue",
+			queueName, recoveryQueueName)
+	}
+	if status != string(dbos.WorkflowStatusSuccess) {
+		t.Errorf("recovered workflow status = %q, want %q", status, dbos.WorkflowStatusSuccess)
+	}
+
+	var workflows, outputs, operations int
+	if err := db.QueryRow(`SELECT count(*) FROM workflow_status`).Scan(&workflows); err != nil {
+		t.Fatalf("count workflow_status: %v", err)
+	}
+	if err := db.QueryRow(`SELECT count(*) FROM operation_outputs`).Scan(&outputs); err != nil {
+		t.Fatalf("count operation_outputs: %v", err)
+	}
+	if err := db.QueryRow(`SELECT count(*) FROM journal_operations WHERE operation_id = ?`, "op-crash").Scan(&operations); err != nil {
+		t.Fatalf("count the committed operation: %v", err)
+	}
+	if workflows != 1 || outputs != 1 || operations != 1 {
+		t.Fatalf("unattended recovery durable counts workflows=%d outputs=%d operations=%d, want 1/1/1",
+			workflows, outputs, operations)
+	}
+}
+
 func TestCrashGap1_DomainCommitBeforeCheckpoint(t *testing.T) {
 	t.Parallel()
 	if testing.Short() {
