@@ -390,7 +390,7 @@ func assertTerminalPrecedenceReplay(t *testing.T, s *retryTerminalStack, op Oper
 	assertTerminalDiagnostic(t, replayErr, op.OperationID)
 	var firstDBOS, replayDBOS *dbos.Error
 	if !errors.As(firstErr, &firstDBOS) || !errors.As(replayErr, &replayDBOS) || firstDBOS.Code != replayDBOS.Code || firstDBOS.Message != replayDBOS.Message || firstDBOS.WorkflowID != replayDBOS.WorkflowID {
-		t.Fatalf("terminal DBOSError drift: first=%#v replay=%#v", firstDBOS, replayDBOS)
+		t.Fatalf("terminal runtime error drift: first=%#v replay=%#v", firstDBOS, replayDBOS)
 	}
 	if s.journal.attempts.Load() != attempts || s.callbacks.Load() != callbacks || s.journal.writes.Load() != writes {
 		t.Fatalf("terminal precedence executed dependency: attempts=%d/%d callbacks=%d/%d writes=%d/%d", attempts, s.journal.attempts.Load(), callbacks, s.callbacks.Load(), writes, s.journal.writes.Load())

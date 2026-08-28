@@ -443,7 +443,7 @@ func TestRecoveredWorkflowFinishesOnTheInternalQueueWithoutASecondCaller(t *test
 		if done.err != nil {
 			t.Fatalf("the recovered workflow did not complete on its own: %v", done.err)
 		}
-	case <-time.After(120 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("the recovered workflow never reached a terminal state, with no second caller driving it: " +
 			"recovery no longer completes through the runtime's internal queue")
 	}

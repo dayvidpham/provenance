@@ -225,6 +225,12 @@ func RequireSupportedSchema(ctx context.Context, db *sql.DB, origin string) erro
 	if state != SchemaStateSuperseded {
 		return nil
 	}
+	// Derive the real file once; both descriptions below read it, and this path
+	// is terminal, so a second PRAGMA round-trip would only add noise.
+	path, pathErr := MainDatabaseFile(ctx, db)
+	if pathErr != nil {
+		path = ""
+	}
 	return fmt.Errorf(
 		"dbossys.RequireSupportedSchema: %s records DBOS system schema version %d, below the supported floor %d "+
 			"-- where: DBOS system-schema preflight, before any DBOS context is created; "+
@@ -233,15 +239,14 @@ func RequireSupportedSchema(ctx context.Context, db *sql.DB, origin string) erro
 			"caution: a first launch that is still creating this database records a below-floor version until its "+
 			"migrations finish, so confirm that no other process is opening the same file before you delete anything; "+
 			"fix: drain or abandon the old workflows, %s, then let this build create a fresh one: %w",
-		describeDatabase(ctx, db, origin), version, FirstSupportedMigrationVersion,
-		describeDeletion(ctx, db, origin), ErrSupersededSystemSchema)
+		describeDatabase(path, origin), version, FirstSupportedMigrationVersion,
+		describeDeletion(path, origin), ErrSupersededSystemSchema)
 }
 
-// describeDatabase names the database for a human: its real file when the handle
-// can report one, with the caller's origin as secondary context.
-func describeDatabase(ctx context.Context, db *sql.DB, origin string) string {
-	path, err := MainDatabaseFile(ctx, db)
-	if err != nil || path == "" {
+// describeDatabase names the database for a human: its real file when one was
+// derived, with the caller's origin as secondary context.
+func describeDatabase(path, origin string) string {
+	if path == "" {
 		return origin
 	}
 	if path == origin {
@@ -253,9 +258,8 @@ func describeDatabase(ctx context.Context, db *sql.DB, origin string) string {
 // describeDeletion spells out the exact deletion an operator must perform. It
 // names the plain file path and its two SQLite siblings, never the DSN, because
 // this clause is the one a reader copies into a shell.
-func describeDeletion(ctx context.Context, db *sql.DB, origin string) string {
-	path, err := MainDatabaseFile(ctx, db)
-	if err != nil || path == "" {
+func describeDeletion(path, origin string) string {
+	if path == "" {
 		return fmt.Sprintf("delete the database file that %s names, together with its -wal and -shm siblings", origin)
 	}
 	return fmt.Sprintf("delete the database file %s and its two siblings %s-wal and %s-shm", path, path, path)
