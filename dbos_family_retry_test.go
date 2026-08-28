@@ -32,7 +32,7 @@ type dbosFamilyBaseline struct {
 
 type dbosFamilyEnv struct {
 	db              *sql.DB
-	root            dbos.DBOSContext
+	root            dbos.Context
 	tracker         Tracker
 	adapter         *DBOSAdapter
 	actor           ActorID
@@ -213,7 +213,7 @@ func newDBOSFamilyEnv(t *testing.T, name string, withGenesis bool) *dbosFamilyEn
 	if err != nil {
 		t.Fatal(err)
 	}
-	root, err := dbos.NewDBOSContext(context.Background(), dbos.Config{AppName: name, SqliteSystemDB: db, ApplicationVersion: "family-current"})
+	root, err := dbos.NewContext(context.Background(), dbos.Config{AppName: name, SQLiteSystemDB: db, ApplicationVersion: "family-current"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,7 +243,7 @@ func newDBOSFamilyEnv(t *testing.T, name string, withGenesis bool) *dbosFamilyEn
 	}
 	env := &dbosFamilyEnv{db: db, root: root, tracker: tracker, adapter: adapter, actor: actor.ID, other: other.ID, authority: authority}
 	adapter.testHooks.onWorkflowEntry = func() { env.workflowEntries++ }
-	t.Cleanup(func() { root.Shutdown(5 * time.Second); _ = tracker.Close(); _ = db.Close() })
+	t.Cleanup(func() { shutdownDBOSRoot(t, root, 5*time.Second); _ = tracker.Close(); _ = db.Close() })
 	return env
 }
 

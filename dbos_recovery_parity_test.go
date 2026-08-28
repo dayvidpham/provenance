@@ -17,7 +17,7 @@ import (
 
 type recoveryParityStack struct {
 	db      *sql.DB
-	root    dbos.DBOSContext
+	root    dbos.Context
 	tracker Tracker
 	adapter *DBOSAdapter
 	entries atomic.Int64
@@ -29,14 +29,14 @@ func openRecoveryParityStack(t *testing.T, path string, register bool, actor Act
 	if err != nil {
 		t.Fatal(err)
 	}
-	root, err := dbos.NewDBOSContext(context.Background(), dbos.Config{AppName: appName, SqliteSystemDB: db, ApplicationVersion: "recovery-parity"})
+	root, err := dbos.NewContext(context.Background(), dbos.Config{AppName: appName, SQLiteSystemDB: db, ApplicationVersion: "recovery-parity"})
 	if err != nil {
 		_ = db.Close()
 		t.Fatal(err)
 	}
 	tracker, err := OpenBorrowedSQLite(db)
 	if err != nil {
-		root.Shutdown(5 * time.Second)
+		_ = dbos.Shutdown(root, 5*time.Second)
 		_ = db.Close()
 		t.Fatal(err)
 	}
@@ -58,15 +58,15 @@ func openRecoveryParityStack(t *testing.T, path string, register bool, actor Act
 	stack := &recoveryParityStack{db: db, root: root, tracker: tracker, adapter: adapter}
 	adapter.testHooks.onWorkflowEntry = func() { stack.entries.Add(1) }
 	if err := dbos.Launch(root); err != nil {
-		stack.close()
+		stack.close(t)
 		t.Fatal(err)
 	}
 	return stack
 }
 
-func (s *recoveryParityStack) close() {
+func (s *recoveryParityStack) close(t *testing.T) {
 	if s.root != nil {
-		s.root.Shutdown(5 * time.Second)
+		shutdownDBOSRoot(t, s.root, 5*time.Second)
 		s.root = nil
 	}
 	if s.tracker != nil {
@@ -116,7 +116,7 @@ func TestDBOSRecoveredConditionAndActivityParity(t *testing.T) {
 	_ = seedDB.Close()
 
 	first := openRecoveryParityStack(t, path, false, actor, appName)
-	defer first.close()
+	defer first.close(t)
 	auth := authority
 	taskID := TaskID{Namespace: "recovery", UUID: uuid.Must(uuid.NewV7())}
 	task, err := first.tracker.Journal().Apply(OperationInput{OperationID: "recovery-parity-task", ActorID: actor, AuthorityJournalID: &auth, CommandDigest: []byte("task"), Effects: []Effect{{Sort: EffectTaskCreate, ResultSlot: "task", TaskID: taskID, Title: "recovery", Type: TaskTypeTask, Priority: PriorityMedium, Phase: PhaseWorkerSlices}}})
@@ -169,10 +169,10 @@ func TestDBOSRecoveredConditionAndActivityParity(t *testing.T) {
 	if first.entries.Load() != 3 {
 		t.Fatalf("first callback entries=%d, want one per first delivery", first.entries.Load())
 	}
-	first.close()
+	first.close(t)
 
 	reopened := openRecoveryParityStack(t, path, false, actor, appName)
-	defer reopened.close()
+	defer reopened.close(t)
 	recoveredSuccess, err := reopened.adapter.Apply(context.Background(), conditionSuccess)
 	if err != nil || !reflect.DeepEqual(recoveredSuccess, firstSuccess) {
 		t.Fatalf("recovered conditioned ActivityCreate=%#v err=%v want %#v", recoveredSuccess, err, firstSuccess)

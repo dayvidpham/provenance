@@ -2,6 +2,112 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Breaking Changes
+
+#### Public API: DBOS runtime types were renamed by the runtime
+
+The DBOS runtime renamed its central interface, so every Provenance signature
+that names a DBOS type changed with it. There are no aliases to the old names:
+this package has no external consumers other than its one host, and a
+compatibility shim would keep a dead name alive in the durable-execution seam
+that most needs one exact shape.
+
+- `NewHostBoundGovernedAllocator(ctx, root dbos.DBOSContext, systemDB, participant)`
+  now takes `root dbos.Context`.
+- `NewDBOSAdapter(root dbos.DBOSContext, tracker, config)` now takes
+  `root dbos.Context`.
+- Every exported workflow signature that named `dbos.DBOSContext` now names
+  `dbos.Context`.
+- Callers that named `dbos.DBOSError` or `dbos.DBOSErrorCode` in an `errors.As`
+  probe must name `*dbos.Error` and `dbos.ErrorCode`.
+- The DBOS `Config` field that carries a caller-owned SQLite handle is now
+  `SQLiteSystemDB`, not `SqliteSystemDB`.
+- A host that creates its own DBOS context must now blank-import
+  `github.com/dbos-inc/dbos-transact-golang/dbos/driver/sqlite`. Without that
+  import every construction over a SQLite handle fails at run time, and the
+  runtime loses the error-code extractor it needs to tell a busy or locked
+  database apart from a permanent failure. Provenance links the driver in its own
+  factory-owned open path.
+- Dependencies the runtime upgrade moved, through minimal version selection.
+  `modernc.org/sqlite` v1.52.0 -> v1.54.0 is the one that matters and the one
+  named in the approved-dependency table: it is the SQLite driver, the substrate
+  of the contended-write fixes in v0.0.5 and v0.0.6, so the bump is called out
+  rather than left to `go.mod`. The transitive set moved with it:
+  `modernc.org/libc` v1.73.0 -> v1.74.3, `golang.org/x/sync` v0.21.0 -> v0.22.0,
+  `golang.org/x/sys` v0.46.0 -> v0.47.0, `golang.org/x/text` v0.38.0 -> v0.40.0,
+  and `github.com/mattn/go-isatty` v0.0.22 -> v0.0.23.
+
+#### Stored databases: a system database from the superseded DBOS runtime is refused
+
+- **A DBOS system database created by the superseded runtime is out of scope and
+  is not carried forward.** The upgrade is a clean cut: there is no in-place
+  upgrade path, none is tested, and none will be added. Drain or abandon the old
+  workflows, delete the database file (and its `-wal` and `-shm` siblings), and
+  let this build create a fresh one.
+- `fusedtx.OpenSystem` now refuses such a database before it creates any DBOS
+  context, because the runtime would otherwise migrate it in place during
+  construction. The refusal reads only: the file is unchanged, and nothing is
+  opened, launched, or migrated.
+- New exported gate for hosts that build their own DBOS context:
+  `provenance.RequireSupportedDBOSSystemSchema(ctx, systemDB, origin)` and the
+  sentinel `provenance.ErrSupersededDBOSSystemSchema`. Call the gate on the exact
+  `*sql.DB` you are about to pass as `dbos.Config.SQLiteSystemDB`, before you
+  create the context. `dbos.NewClient` is the same moment under another name: it
+  builds a context of its own from `ClientConfig.SQLiteSystemDB` and migrates in
+  place too, so gate that call as well. A database with no DBOS system schema is
+  fresh and is accepted.
+- The refusal names the real file to delete, derived from the handle with
+  `PRAGMA database_list`, together with its `-wal` and `-shm` siblings. A caller
+  normally passes a DSN, which carries a `file:` scheme and a pragma query string
+  and is therefore not a name any shell accepts; the DSN stays in the message as
+  secondary context only. The refusal also warns that a concurrent first launch
+  records a below-floor version until its migrations finish, so nobody deletes a
+  database that another process is still creating.
+- Rationale: the durable state this refusal protects has one host and no live
+  installation worth migrating, and an untested in-place migration of a durable
+  execution store is a worse risk than a required recreate.
+
+#### Shutdown outcomes are reported instead of dropped
+
+- The runtime's shutdown now reports a timeout that left resources running.
+  `FusedGovernedAllocator.Close` and `BoundGovernedAllocator.Close` already
+  returned an error; that error now also carries an incomplete shutdown, joined
+  with any tracker-close error. A non-nil result means DBOS resources are still
+  running on the shared SQLite handle, so no caller may close or reuse that
+  handle.
+
+### Fixed
+
+- The step-retry-exhaustion marker used when a persisted workflow error is read
+  back as plain text is derived from the runtime's own error-code constant. The
+  previous literal spelled the code as a number, which the runtime has never
+  printed, so that half of the check could never match.
+
+### Unchanged, deliberately
+
+- The durable fingerprint salt is frozen and was NOT touched by this upgrade. It
+  keys every durable workflow ID and step name ever written, so it describes no
+  library version. Golden digests now pin the identities it keys, so a later edit
+  cannot move the durable namespace quietly.
+
+### Durable identity: read this if you leave `ApplicationVersion` empty
+
+The application version is hashed into every durable workflow ID alongside the
+frozen salt. The runtime changed how it *derives* a default one: the superseded
+runtime used the binary hash, and the supported runtime uses
+`sha256(binaryHash || appName)`. A host that leaves `Config.ApplicationVersion`
+empty therefore gets a different version string from the same binary, and the
+same frozen salt then yields different durable workflow IDs.
+
+This is not a durable break here. The upgrade is a clean cut, so no durable state
+is carried across it, and the old default was already rebuild-sensitive: any
+rebuild of the binary moved it. A host that wants durable identity to survive a
+rebuild must set `Config.ApplicationVersion` explicitly; that has always been
+true, and it is now the only way to be unaffected by the derivation change.
+
+
 ## v0.0.6 - 2026-08-26
 
 ### Fixed

@@ -70,7 +70,7 @@ func defaultApplyTestHooks() applyTestHooks {
 // journal contract. The adapter captures its contract snapshot once at
 // construction; no paths rebuild or mutate the identity after registration.
 type DBOSAdapter struct {
-	root                  dbos.DBOSContext
+	root                  dbos.Context
 	tracker               Tracker
 	applicationVersion    string
 	contract              dbosContractSnapshot
@@ -86,12 +86,12 @@ type DBOSAdapter struct {
 // the workflow on the not-yet-launched root.
 //
 // All validation occurs before registration so partial registration is impossible.
-func NewDBOSAdapter(root dbos.DBOSContext, tracker Tracker, config DBOSAdapterConfig) (*DBOSAdapter, error) {
+func NewDBOSAdapter(root dbos.Context, tracker Tracker, config DBOSAdapterConfig) (*DBOSAdapter, error) {
 	if root == nil {
 		return nil, fmt.Errorf(
 			"provenance.NewDBOSAdapter: the DBOS root context is nil -- where: adapter construction; " +
 				"impact: no durable workflow can be registered or run; fix: pass the DBOS root created with " +
-				"NewDBOSContext(SqliteSystemDB=...) before calling Launch")
+				"NewContext(SQLiteSystemDB=...) before calling Launch")
 	}
 	if tracker == nil {
 		return nil, fmt.Errorf(
@@ -270,7 +270,7 @@ func (a *DBOSAdapter) Apply(ctx context.Context, in journal.OperationInput) (Com
 	return a.postValidate(normalized, outcome)
 }
 
-func existingWorkflowDiagnostic(root dbos.DBOSContext, contract dbosContractSnapshot, applicationVersion, workflowID, requestedFingerprint string, operation OperationID) (bool, error) {
+func existingWorkflowDiagnostic(root dbos.Context, contract dbosContractSnapshot, applicationVersion, workflowID, requestedFingerprint string, operation OperationID) (bool, error) {
 	workflows, err := lookupExistingWorkflows(root, workflowID, operation)
 	if err != nil {
 		return false, err
@@ -278,8 +278,8 @@ func existingWorkflowDiagnostic(root dbos.DBOSContext, contract dbosContractSnap
 	return listedWorkflowDiagnostic(workflows, contract, applicationVersion, workflowID, requestedFingerprint, operation)
 }
 
-func lookupExistingWorkflows(root dbos.DBOSContext, workflowID string, operation OperationID) ([]dbos.WorkflowStatus, error) {
-	workflows, err := dbos.ListWorkflows(root, dbos.WithWorkflowIDs([]string{workflowID}), dbos.WithLimit(2), dbos.WithLoadInput(true), dbos.WithLoadOutput(true))
+func lookupExistingWorkflows(root dbos.Context, workflowID string, operation OperationID) ([]dbos.WorkflowStatus, error) {
+	workflows, err := dbos.ListWorkflows(root, dbos.WithFilterWorkflowIDs(workflowID), dbos.WithFilterLimit(2), dbos.WithFilterLoadInput(true), dbos.WithFilterLoadOutput(true))
 	if err != nil {
 		return nil, diagnostic(DBOSDiagClassTerminalRetrieval, DBOSDiagFieldWorkflow,
 			DBOSDiagStageWorkflowTerminalLookup, operation, workflowID,
@@ -370,6 +370,13 @@ func listedWorkflowDiagnostic(workflows []dbos.WorkflowStatus, contract dbosCont
 func knownWorkflowStatus(status dbos.WorkflowStatusType) bool {
 	switch status {
 	case dbos.WorkflowStatusPending,
+		// ENQUEUED is load-bearing even though Provenance enqueues nothing of
+		// its own: Launch moves every PENDING workflow it recovers to the
+		// runtime's reserved internal queue and leaves it ENQUEUED until that
+		// queue's worker picks it up. A replay that arrives inside that window
+		// must recognise the status instead of treating it as unknown.
+		// Source: dbos/recovery.go:9-21 and
+		// dbos/internal/sysdb/system_database.go:4963 (ReenqueueForRecovery).
 		dbos.WorkflowStatusEnqueued,
 		dbos.WorkflowStatusDelayed,
 		dbos.WorkflowStatusSuccess,
@@ -430,12 +437,12 @@ func reconcileDBOSAllocatedCreates(in journal.OperationInput, result journal.Com
 // checkpointed as a closed outcome (nil Go error); only DBOS infrastructure
 // failures use the Go-error channel. The step name is derived from the adapter-
 // captured contract prefix plus the fingerprint.
-func (a *DBOSAdapter) applyWorkflow(wfCtx dbos.DBOSContext, input DBOSApplyInput) (DBOSStepOutcome, error) {
+func (a *DBOSAdapter) applyWorkflow(wfCtx dbos.Context, input DBOSApplyInput) (DBOSStepOutcome, error) {
 	return a.runDomainWorkflow(wfCtx, input, "applyWorkflow", decodeApplyInput, a.foldDomainMutation)
 }
 
 func (a *DBOSAdapter) runDomainWorkflow(
-	wfCtx dbos.DBOSContext,
+	wfCtx dbos.Context,
 	input DBOSApplyInput,
 	workflowName string,
 	decode func(dbosContractSnapshot, DBOSApplyInput) (journal.OperationInput, error),
@@ -497,8 +504,8 @@ func dbosStepOptions(stepName string, options resolvedDBOSStepOptions) []dbos.St
 	return []dbos.StepOption{
 		dbos.WithStepName(stepName),
 		dbos.WithStepMaxRetries(options.maxRetries),
-		dbos.WithBaseInterval(options.baseInterval),
-		dbos.WithBackoffFactor(options.backoffFactor),
+		dbos.WithStepBaseInterval(options.baseInterval),
+		dbos.WithStepBackoffFactor(options.backoffFactor),
 	}
 }
 
@@ -639,7 +646,7 @@ func checkpointFailureDivergence(operation OperationID, impact, fix string, caus
 // ApplyWaitCanceledError while durable work continues. It leaks no waiter.
 func awaitWorkflowResult[T any](
 	caller context.Context,
-	root dbos.DBOSContext,
+	root dbos.Context,
 	workflowID string,
 	operation OperationID,
 	pollingInterval time.Duration,
@@ -687,16 +694,24 @@ func awaitWorkflowResult[T any](
 	return result, nil
 }
 
+// terminalMaxStepRetriesMarker is the prefix the DBOS runtime writes when it
+// formats a step-retry-exhaustion error. The runtime prints the code by NAME,
+// not by number, so the marker is derived from the code constant instead of
+// being spelled out: a rename in the library then moves this marker with it
+// rather than leaving a branch that can never match.
+// Source: dbos/internal/models/errors.go, (*Error).Error.
+var terminalMaxStepRetriesMarker = "DBOS Error " + dbos.ErrorCodeMaxStepRetriesExceeded.String() + ":"
+
 // DBOS persists workflow errors as text. Reconstruct its closed retry code
 // on terminal retrieval so first delivery and later same-ID replay expose the same
-// errors.As-visible DBOSError contract instead of degrading to string matching.
+// errors.As-visible runtime error contract instead of degrading to string matching.
 func terminalDBOSCause(err error, workflowID string) error {
-	var typed *dbos.DBOSError
+	var typed *dbos.Error
 	if errors.As(err, &typed) {
 		return err
 	}
-	if strings.Contains(err.Error(), "DBOS Error 13:") || strings.Contains(err.Error(), "exceeded its maximum") {
-		return &dbos.DBOSError{Message: err.Error(), Code: dbos.MaxStepRetriesExceeded, WorkflowID: workflowID}
+	if strings.Contains(err.Error(), terminalMaxStepRetriesMarker) || strings.Contains(err.Error(), "exceeded its maximum") {
+		return &dbos.Error{Message: err.Error(), Code: dbos.ErrorCodeMaxStepRetriesExceeded, WorkflowID: workflowID}
 	}
 	return err
 }

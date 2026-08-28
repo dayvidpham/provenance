@@ -35,11 +35,26 @@ type HostBoundGovernedAllocator struct {
 
 // NewHostBoundGovernedAllocator borrows the two exact local variables used by a
 // host while constructing its engine root: root and the *sql.DB assigned to
-// dbos.Config.SqliteSystemDB. DBOS v0.20 provides no supported pointer inspector,
+// dbos.Config.SQLiteSystemDB. The DBOS runtime provides no supported pointer inspector,
 // so this constructor does not claim to certify independently assembled pairs;
 // callers must pass the same variables at the one engine construction site.
 // Registration must occur before the host launches root.
-func NewHostBoundGovernedAllocator(ctx context.Context, root dbos.DBOSContext, systemDB *sql.DB, participant GovernedAllocationParticipant) (*HostBoundGovernedAllocator, error) {
+//
+// The host owns two obligations that this constructor cannot discharge for it,
+// because both happen before the root exists:
+//
+//  1. Blank-import "github.com/dbos-inc/dbos-transact-golang/dbos/driver/sqlite"
+//     in the binary. The DBOS runtime keeps no SQLite driver of its own and uses
+//     whichever driver that import registers, even for a caller-supplied handle.
+//     Without it every context construction over SQLite fails at run time, and
+//     the runtime loses the error-code extractor it needs to tell a busy or
+//     locked database apart from a permanent failure.
+//  2. Call RequireSupportedDBOSSystemSchema on the exact *sql.DB, BEFORE the
+//     call that builds the root -- dbos.NewContext, or dbos.NewClient, which
+//     builds a context of its own. Either call migrates a superseded system
+//     database in place while it constructs, and this build supports no such
+//     upgrade, so the preflight has no later moment to run in.
+func NewHostBoundGovernedAllocator(ctx context.Context, root dbos.Context, systemDB *sql.DB, participant GovernedAllocationParticipant) (*HostBoundGovernedAllocator, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -52,7 +67,7 @@ func NewHostBoundGovernedAllocator(ctx context.Context, root dbos.DBOSContext, s
 	}
 	tracker, err := OpenBorrowedSQLite(systemDB)
 	if err != nil {
-		return nil, fmt.Errorf("provenance.NewHostBoundGovernedAllocator: activate Provenance on the caller-owned SqliteSystemDB before workflow registration -- impact: no DBOS lifecycle action occurred; fix: pass a live pre-launch engine database with Provenance-compatible schema: %w", err)
+		return nil, fmt.Errorf("provenance.NewHostBoundGovernedAllocator: activate Provenance on the caller-owned SQLiteSystemDB before workflow registration -- impact: no DBOS lifecycle action occurred; fix: pass a live pre-launch engine database with Provenance-compatible schema: %w", err)
 	}
 	allocator := &FusedGovernedAllocator{system: system, tracker: tracker, participant: participant}
 	registerFusedGovernedAllocatorWorkflows(root, allocator)
@@ -196,8 +211,8 @@ func OpenFusedGovernedAllocator(ctx context.Context, config FusedGovernedAllocat
 	}
 	tracker, err := OpenBorrowedSQLite(system.DB())
 	if err != nil {
-		system.Close(30 * time.Second)
-		return nil, fmt.Errorf("provenance.OpenFusedGovernedAllocator: activate Provenance schema on the owned DBOS system handle: %w", err)
+		return nil, fmt.Errorf("provenance.OpenFusedGovernedAllocator: activate Provenance schema on the owned DBOS system handle: %w",
+			errors.Join(err, system.Close(30*time.Second)))
 	}
 	allocator := &FusedGovernedAllocator{system: system, tracker: tracker, participant: config.Participant, ownsRoot: true}
 	// Registration occurs before Launch and uses the allocator instance as the
@@ -206,7 +221,7 @@ func OpenFusedGovernedAllocator(ctx context.Context, config FusedGovernedAllocat
 	return allocator, nil
 }
 
-func registerFusedGovernedAllocatorWorkflows(root dbos.DBOSContext, allocator *FusedGovernedAllocator) {
+func registerFusedGovernedAllocatorWorkflows(root dbos.Context, allocator *FusedGovernedAllocator) {
 	dbos.RegisterWorkflow(root, allocator.initializeRootWorkflow, dbos.WithInstance(allocator))
 	dbos.RegisterWorkflow(root, allocator.allocateWorkflow, dbos.WithInstance(allocator))
 	dbos.RegisterWorkflow(root, allocator.allocateComposedWorkflow, dbos.WithInstance(allocator))
@@ -245,12 +260,19 @@ func (a *FusedGovernedAllocator) Close(timeout time.Duration) error {
 		return nil
 	}
 	a.closeOnce.Do(func() {
+		var trackerErr error
 		if a.tracker != nil {
-			a.closeErr = a.tracker.Close()
+			trackerErr = a.tracker.Close()
 		}
+		var shutdownErr error
 		if a.system != nil && a.ownsRoot {
-			a.system.Close(timeout)
+			// A shutdown that times out leaves DBOS resources running on the
+			// shared SQLite handle. Report it instead of dropping it: a caller
+			// that treats an incomplete shutdown as complete may then close or
+			// reuse a database that DBOS is still writing to.
+			shutdownErr = a.system.Close(timeout)
 		}
+		a.closeErr = errors.Join(trackerErr, shutdownErr)
 	})
 	return a.closeErr
 }
@@ -427,7 +449,7 @@ func newFusedWorkflowInput(authority JournalID, canonical []byte) fusedWorkflowI
 }
 
 // encoded is the exact JSON payload DBOS persists when using its default
-// v0.20 serializer. ListWorkflows returns that decoded JSON string through its
+// runtime serializer. ListWorkflows returns that decoded JSON string through its
 // public API, allowing byte-level replay identity verification without touching
 // DBOS implementation tables.
 func (input fusedWorkflowInput) encoded() ([]byte, error) {
@@ -755,7 +777,7 @@ func equalComposedBindings(left, right GovernedAllocationComposedResult) bool {
 	return true
 }
 
-// verifyWorkflowInput loads input through DBOS v0.20's public ListWorkflows
+// verifyWorkflowInput loads input through the DBOS runtime's public ListWorkflows
 // API. The owned fused capability uses DBOS's default JSON serializer, whose
 // public status input is the original JSON payload string. Comparing those
 // bytes (rather than decoded maps or semantic fields) prevents a caller ID
@@ -765,10 +787,10 @@ func (a *FusedGovernedAllocator) verifyWorkflowInput(workflowID string, operatio
 		return false, nil
 	}
 	workflows, err := dbos.ListWorkflows(a.system.Root(),
-		dbos.WithWorkflowIDs([]string{workflowID}),
-		dbos.WithLimit(2),
-		dbos.WithLoadInput(true),
-		dbos.WithLoadOutput(false),
+		dbos.WithFilterWorkflowIDs(workflowID),
+		dbos.WithFilterLimit(2),
+		dbos.WithFilterLoadInput(true),
+		dbos.WithFilterLoadOutput(false),
 	)
 	if err != nil {
 		return false, fmt.Errorf("provenance.FusedGovernedAllocator: load persisted DBOS workflow input %q: %w", workflowID, err)
@@ -869,7 +891,7 @@ func composedResultFrom(result GovernedAllocationComposedResult, err error) (fus
 	}}, nil
 }
 
-func (a *FusedGovernedAllocator) initializeRootWorkflow(ctx dbos.DBOSContext, input fusedWorkflowInput) (fusedOperationResult, error) {
+func (a *FusedGovernedAllocator) initializeRootWorkflow(ctx dbos.Context, input fusedWorkflowInput) (fusedOperationResult, error) {
 	request, err := input.genesisRequest()
 	if err != nil {
 		return resultFrom(OperationClosure{}, err)
@@ -880,7 +902,7 @@ func (a *FusedGovernedAllocator) initializeRootWorkflow(ctx dbos.DBOSContext, in
 	return resultFrom(closure, err)
 }
 
-func (a *FusedGovernedAllocator) allocateComposedWorkflow(ctx dbos.DBOSContext, input fusedWorkflowInput) (fusedComposedOperationResult, error) {
+func (a *FusedGovernedAllocator) allocateComposedWorkflow(ctx dbos.Context, input fusedWorkflowInput) (fusedComposedOperationResult, error) {
 	request, err := input.composedAllocationRequest()
 	if err != nil {
 		return composedResultFrom(GovernedAllocationComposedResult{}, err)
@@ -910,7 +932,7 @@ func (a *FusedGovernedAllocator) allocateComposedWorkflow(ctx dbos.DBOSContext, 
 // participant behavior on a distinct workflow replay. Composition has its own
 // explicit workflow and receipt type because supplemental effects change the
 // public operation identity.
-func (a *FusedGovernedAllocator) allocateWorkflow(ctx dbos.DBOSContext, input fusedWorkflowInput) (fusedOperationResult, error) {
+func (a *FusedGovernedAllocator) allocateWorkflow(ctx dbos.Context, input fusedWorkflowInput) (fusedOperationResult, error) {
 	request, err := input.allocationRequest()
 	if err != nil {
 		return resultFrom(OperationClosure{}, err)

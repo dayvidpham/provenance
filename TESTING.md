@@ -145,6 +145,52 @@ not use a golden for fresh database creation, migration/upgrade, crash recovery,
 or DBOS borrowed/shared-WAL tests. Those tests must exercise their real
 lifecycle from scratch.
 
+## The superseded DBOS system-database fixture
+
+`testdata/dbos/dbos_system_v020.db` is a real system database written by the
+superseded DBOS runtime (`github.com/dbos-inc/dbos-transact-golang` v0.20.0). It
+records `dbos_migrations.version = 41`, which is the exact durable shape the
+clean-cut policy refuses. Every refusal test depends on it, so its bytes are
+pinned: `internal/dbosfixture` verifies `DBOSSystemV020SHA256` against the source
+file BEFORE it writes each private mutable copy, and every consumer takes its
+copies from that one helper. A fixture that changed without its digest fails
+loudly instead of quietly proving the wrong thing.
+
+`testdata/dbos/gen_dbos_system_v020.go` reproduces the fixture. It cannot run in
+this module: this module pins the supported runtime, and Go builds one version of
+a dependency per module graph. Run it from a scratch module pinned to the
+superseded runtime:
+
+```bash
+repo=$(pwd)
+scratch=$(mktemp -d)
+cd "$scratch"
+cp "$repo/testdata/dbos/gen_dbos_system_v020.go" main.go
+go mod init dbosfixture
+go get github.com/dbos-inc/dbos-transact-golang@v0.20.0
+go get modernc.org/sqlite@v1.52.0
+go run main.go -out ./dbos_system_v020.db   # the file, not the package: it is build-ignored
+sha256sum dbos_system_v020.db
+```
+
+The driver pin matters: the committed fixture was written with
+`modernc.org/sqlite` v1.52.0, the version this module pinned when the superseded
+runtime was current. The generator fails unless the recorded version is 41,
+checkpoints the write-ahead log back into the main file, and proves no `-wal` or
+`-shm` sidecar survives, so the result is one self-contained immutable file. It
+stays in WAL mode, which is what the committed fixture records; the committed
+file is 176128 bytes with a 4096-byte page size.
+
+The recipe is verified, not assumed: run offline against the module cache it
+produces a 176128-byte WAL-mode file at system schema version 41 with no
+sidecar, the same shape as the committed fixture.
+
+The rebuilt file is not byte-identical to the committed one: it carries a fresh
+executor identity, so its digest differs on every run. Only the shape reproduces.
+Replacing the committed fixture therefore means updating
+`DBOSSystemV020SHA256` in `internal/dbosfixture/dbosfixture.go` in the same
+change.
+
 ## Isolation and parallelism
 
 Inject database, state, and output paths through existing production seams and

@@ -1,7 +1,7 @@
 package provenance_test
 
 // dbos_harness_test.go builds the real DBOS + borrowed-tracker stack every adapter
-// test drives, in the issue's startup order (open *sql.DB → NewDBOSContext →
+// test drives, in the issue's startup order (open *sql.DB → dbos.NewContext →
 // OpenBorrowedSQLite → NewDBOSAdapter → Launch). It uses the pinned
 // modernc.org/sqlite driver DBOS itself uses, on a shared temp file, so the DBOS
 // checkpoints and the Provenance domain rows are co-located in one database.
@@ -30,7 +30,7 @@ func uuidV7() string { return uuid.Must(uuid.NewV7()).String() }
 
 // dbosStack is one fully-wired adapter over a shared SQLite file.
 type dbosStack struct {
-	root    dbos.DBOSContext
+	root    dbos.Context
 	db      *sql.DB
 	tracker provenance.Tracker
 	adapter *provenance.DBOSAdapter
@@ -65,13 +65,13 @@ func newDBOSStackUnlaunched(t *testing.T, wrap func(provenance.Tracker) provenan
 		t.Fatalf("ping shared db: %v", err)
 	}
 
-	root, err := dbos.NewDBOSContext(context.Background(), dbos.Config{
+	root, err := dbos.NewContext(context.Background(), dbos.Config{
 		AppName:            "provenance-dbos-test",
-		SqliteSystemDB:     db,
+		SQLiteSystemDB:     db,
 		ApplicationVersion: "test-v1",
 	})
 	if err != nil {
-		t.Fatalf("NewDBOSContext: %v", err)
+		t.Fatalf("dbos.NewContext: %v", err)
 	}
 
 	borrowed, err := provenance.OpenBorrowedSQLite(db)
@@ -98,7 +98,7 @@ func newDBOSStackUnlaunched(t *testing.T, wrap func(provenance.Tracker) provenan
 	boot := establishGenesisBorrowed(t, borrowed, sys.ID)
 
 	t.Cleanup(func() {
-		root.Shutdown(5 * time.Second)
+		shutdownDBOSRoot(t, root, 5*time.Second)
 		_ = borrowed.Close()
 	})
 
@@ -152,7 +152,7 @@ func launchDBOSStack(t *testing.T, stack *dbosStack) {
 
 // newUnlaunchedRoot wires a DBOS root + borrowed tracker WITHOUT launching or
 // registering an adapter, for construction-time assertions (e.g. version checks).
-func newUnlaunchedRoot(t *testing.T, appVersion string) (dbos.DBOSContext, provenance.Tracker) {
+func newUnlaunchedRoot(t *testing.T, appVersion string) (dbos.Context, provenance.Tracker) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "unlaunched.db")
 	db, err := sql.Open("sqlite", "file:"+path+"?_txlock=immediate&_pragma=busy_timeout(5000)")
@@ -164,18 +164,18 @@ func newUnlaunchedRoot(t *testing.T, appVersion string) (dbos.DBOSContext, prove
 	if err := db.Ping(); err != nil {
 		t.Fatalf("ping: %v", err)
 	}
-	root, err := dbos.NewDBOSContext(context.Background(), dbos.Config{
-		AppName: "provenance-unlaunched-test", SqliteSystemDB: db, ApplicationVersion: appVersion,
+	root, err := dbos.NewContext(context.Background(), dbos.Config{
+		AppName: "provenance-unlaunched-test", SQLiteSystemDB: db, ApplicationVersion: appVersion,
 	})
 	if err != nil {
-		t.Fatalf("NewDBOSContext: %v", err)
+		t.Fatalf("dbos.NewContext: %v", err)
 	}
 	borrowed, err := provenance.OpenBorrowedSQLite(db)
 	if err != nil {
 		t.Fatalf("OpenBorrowedSQLite: %v", err)
 	}
 	t.Cleanup(func() {
-		root.Shutdown(3 * time.Second)
+		shutdownDBOSRoot(t, root, 3*time.Second)
 		_ = borrowed.Close()
 	})
 	return root, borrowed
@@ -273,5 +273,19 @@ func mustStoreUnavailable(t *testing.T, err error, op string) {
 	}
 	if su.Operation == "" || su.Store == "" || su.Stage == "" || su.Impact == "" || su.Fix == "" || su.Cause == nil {
 		t.Errorf("%s: StoreUnavailableError has empty actionable fields: %+v", op, su)
+	}
+}
+
+// shutdownDBOSRoot stops a DBOS root and reports a shutdown that did not
+// finish. The runtime returns an error when the timeout expires with resources
+// still running; a test that ignored it could then close a shared SQLite handle
+// the runtime is still writing to.
+func shutdownDBOSRoot(t *testing.T, root dbos.Context, timeout time.Duration) {
+	t.Helper()
+	if root == nil {
+		return
+	}
+	if err := dbos.Shutdown(root, timeout); err != nil {
+		t.Errorf("DBOS shutdown did not finish within %s: %v", timeout, err)
 	}
 }

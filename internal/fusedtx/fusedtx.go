@@ -9,7 +9,16 @@ import (
 	"time"
 
 	dbos "github.com/dbos-inc/dbos-transact-golang/dbos"
+	// The DBOS runtime keeps no SQLite driver of its own: it uses whichever
+	// driver this blank import registers, even when the caller supplies the
+	// *sql.DB handle. Without the import every construction fails at run time,
+	// and the runtime loses the error-code extractor it needs to tell a busy or
+	// locked database apart from a permanent failure.
+	// Source: dbos/internal/sysdb/sqlite_driver.go and dbos/driver/sqlite.
+	_ "github.com/dbos-inc/dbos-transact-golang/dbos/driver/sqlite"
 	_ "modernc.org/sqlite"
+
+	"github.com/dayvidpham/provenance/internal/dbossys"
 )
 
 // SystemConfig is the closed construction contract for an owned DBOS SQLite
@@ -28,10 +37,11 @@ type SystemConfig struct {
 // ensure application code cannot pair an unrelated DBOS context with another
 // same-file SQLite handle.
 type System struct {
-	root       dbos.DBOSContext
+	root       dbos.Context
 	systemDB   *sql.DB
 	dataSource *dbos.DataSource
 	closeOnce  sync.Once
+	closeErr   error
 }
 
 // BindSystem borrows a host-created DBOS root and its exact SQLite system
@@ -39,16 +49,24 @@ type System struct {
 // database, creates or launches a DBOS root, or assumes shutdown ownership.
 // Hosts must call it before launching root so workflows can be registered on
 // the same application boundary.
-func BindSystem(root dbos.DBOSContext, systemDB *sql.DB) (*System, error) {
+//
+// BindSystem deliberately runs NO system-schema preflight. The host already
+// created the root, and the DBOS runtime migrates the system schema while it
+// builds that context, so the only moment at which a superseded database can
+// still be refused has passed. A host that opens its own handle owns that
+// refusal: call provenance.RequireSupportedDBOSSystemSchema on the exact
+// *sql.DB before dbos.NewContext. The host must also blank-import the DBOS
+// SQLite driver package, for the reason given on this file's import block.
+func BindSystem(root dbos.Context, systemDB *sql.DB) (*System, error) {
 	if root == nil {
-		return nil, fmt.Errorf("fusedtx.BindSystem: DBOS root is nil -- where: host-bound fused system construction; impact: no composed workflow can be registered; fix: pass the exact context returned by dbos.NewDBOSContext before launch")
+		return nil, fmt.Errorf("fusedtx.BindSystem: DBOS root is nil -- where: host-bound fused system construction; impact: no composed workflow can be registered; fix: pass the exact context returned by dbos.NewContext before launch")
 	}
 	if systemDB == nil {
-		return nil, fmt.Errorf("fusedtx.BindSystem: system database is nil -- where: host-bound fused system construction; impact: DBOS and Provenance cannot share one transaction source; fix: pass the exact *sql.DB used as DBOS Config.SqliteSystemDB")
+		return nil, fmt.Errorf("fusedtx.BindSystem: system database is nil -- where: host-bound fused system construction; impact: DBOS and Provenance cannot share one transaction source; fix: pass the exact *sql.DB used as DBOS Config.SQLiteSystemDB")
 	}
 	dataSource, err := dbos.NewDataSource(root, systemDB)
 	if err != nil {
-		return nil, fmt.Errorf("fusedtx.BindSystem: bind DBOS data source to the host system database -- where: host-bound fused system construction; impact: the composed workflow was not registered; fix: pass the exact pre-launch DBOS root and its SqliteSystemDB handle: %w", err)
+		return nil, fmt.Errorf("fusedtx.BindSystem: bind DBOS data source to the host system database -- where: host-bound fused system construction; impact: the composed workflow was not registered; fix: pass the exact pre-launch DBOS root and its SQLiteSystemDB handle: %w", err)
 	}
 	return &System{root: root, systemDB: systemDB, dataSource: dataSource}, nil
 }
@@ -77,35 +95,66 @@ func OpenSystem(ctx context.Context, config SystemConfig) (*System, error) {
 		return nil, fmt.Errorf("fusedtx.OpenSystem: ping owned SQLite system handle: %w", err)
 	}
 
-	// Constructing the context also creates DBOS's reserved internal queue, whose
-	// worker and supervisor each poll once a second for the life of the system.
-	// That cadence is not configurable: v0.20.0 registers the queue in memory
-	// with the package default, exposes no polling field on dbos.Config, and
-	// refuses both a same-named RegisterQueue and a SetPollingInterval on a queue
-	// that is not database-backed. Provenance neither registers a queue nor
-	// enqueues a workflow, so the polling never dequeues work and is not on any
-	// workflow-latency path. It is NOT free of side effects, though: the queue
-	// supervisor's once-a-second reconcile tick executes an UPDATE against the
-	// system database, and in fusedtx that database IS the application's SQLite
-	// file — so the tick periodically takes the single-writer lock and can
-	// surface as SQLITE_BUSY under concurrent application writes. See
+	// Refuse a system database that a superseded DBOS runtime wrote, BEFORE any
+	// DBOS context exists. The runtime would otherwise migrate it in place on
+	// construction, and this build supports no such upgrade.
+	if err := dbossys.RequireSupportedSchema(ctx, systemDB, config.SQLiteDSN); err != nil {
+		_ = systemDB.Close()
+		return nil, fmt.Errorf("fusedtx.OpenSystem: %w", err)
+	}
+
+	// Constructing the context also creates DBOS's reserved internal queue. It is
+	// the one queue that stays in process rather than in the queues table, so a
+	// same-named RegisterQueue is rejected and its polling cadence stays at the
+	// package default; dbos.Config exposes no field for it.
+	//
+	// That queue is NOT idle for Provenance. Launch re-enqueues every PENDING
+	// workflow it recovers onto it, so crash recovery runs on this queue's
+	// worker, not on a caller's goroutine: after a crash, recovery costs one
+	// poll of that worker. The worker starts at the 1s base interval and only
+	// grows it -- doubling toward a 120s ceiling -- when a dequeue pass hits a
+	// contention error; an ordinary empty poll scales the interval back down by
+	// 0.9 toward the base. So the interval an operator sees on a recovering
+	// database is about one second unless the database is already contended.
+	// A first delivery still runs on the caller's own goroutine through
+	// dbos.RunWorkflow: Provenance registers no queue and enqueues nothing
+	// itself, so the queue is on the recovery path only.
+	// Source: dbos/dbos.go:825 (Launch recovers before it starts the queue
+	// runner), dbos/recovery.go:9-21, dbos/queue.go:749-757 and
+	// dbos/queue.go:786-790 (only a contention error backs the interval off),
+	// dbos/internal/models/queue.go:12 and dbos/queue.go:16 (1s base, 120s
+	// ceiling).
+	//
+	// The construction is NOT free of side effects either: the queue
+	// supervisor's fixed once-a-second reconcile tick
+	// executes an UPDATE on workflow_status against the system database, and in
+	// fusedtx that database IS the application's SQLite file — so the tick
+	// periodically takes the single-writer lock and can surface as SQLITE_BUSY
+	// under concurrent application writes. The supported runtime narrows that
+	// UPDATE to rows owned by Config.AppName, which this constructor always
+	// sets, but it does not remove the write. See
 	// docs/perf/parallel-governed-allocation-family.md for the measured
 	// contention and docs/test-performance.md for the upstream ask.
-	root, err := dbos.NewDBOSContext(ctx, dbos.Config{
+	// Source: dbos/queue.go, queueRunner.run, and
+	// dbos/internal/sysdb/system_database.go, SysDB.TransitionDelayedWorkflows.
+	root, err := dbos.NewContext(ctx, dbos.Config{
 		AppName:            config.AppName,
 		ApplicationVersion: config.ApplicationVersion,
 		Logger:             config.Logger,
-		SqliteSystemDB:     systemDB,
+		SQLiteSystemDB:     systemDB,
 	})
 	if err != nil {
 		_ = systemDB.Close()
-		return nil, fmt.Errorf("fusedtx.OpenSystem: create DBOS root over owned system handle: %w", err)
+		return nil, fmt.Errorf("fusedtx.OpenSystem: create DBOS root over owned system handle: %w",
+			dbossys.DescribeOpenFailure(dbossys.ClassifyOpenFailure(err), config.SQLiteDSN, err))
 	}
 	dataSource, err := dbos.NewDataSource(root, systemDB)
 	if err != nil {
-		dbos.Shutdown(root, 30*time.Second)
+		// The root is torn down, so the handle must not be closed here as well:
+		// the DBOS runtime owns closing the pool it was given.
+		_ = dbos.Shutdown(root, 30*time.Second)
 		return nil, fmt.Errorf(
-			"fusedtx.OpenSystem: create DBOS v0.20 data source with the owned system handle: %w; "+
+			"fusedtx.OpenSystem: create the DBOS data source with the owned system handle: %w; "+
 				"where: fused transaction construction; impact: application SQL is not available through DBOS; "+
 				"fix: repair the SQLite system database and recreate the fused capability",
 			err)
@@ -116,26 +165,40 @@ func OpenSystem(ctx context.Context, config SystemConfig) (*System, error) {
 // Root exposes the DBOS root only to packages inside this module's internal
 // boundary. The root package wraps System in a public capability without
 // exposing this method or the exact SQLite handle to ordinary callers.
-func (s *System) Root() dbos.DBOSContext { return s.root }
+func (s *System) Root() dbos.Context { return s.root }
 
 // DB exposes the factory-owned handle only within the Go internal boundary so
 // the root wrapper can activate the matching Provenance schema. It must not be
 // closed directly; System.Close owns the DBOS lifecycle.
 func (s *System) DB() *sql.DB { return s.systemDB }
 
-// Close shuts down the DBOS root exactly once. DBOS owns the factory-created
-// system pool's close operation, so System deliberately does not close it again.
-func (s *System) Close(timeoutDuration time.Duration) {
+// Close shuts down the DBOS root exactly once and reports the outcome. A
+// non-nil error means the timeout expired while DBOS resources were still
+// running: the shared SQLite handle is then still in use, so no caller may
+// close it. DBOS owns the factory-created system pool's close operation, so
+// System deliberately does not close it either way.
+//
+// Close is idempotent and repeats the first outcome on every later call.
+func (s *System) Close(timeoutDuration time.Duration) error {
 	if s == nil || s.root == nil {
-		return
+		return nil
 	}
-	s.closeOnce.Do(func() { dbos.Shutdown(s.root, timeoutDuration) })
+	s.closeOnce.Do(func() {
+		if err := dbos.Shutdown(s.root, timeoutDuration); err != nil {
+			s.closeErr = fmt.Errorf(
+				"fusedtx.System.Close: DBOS shutdown did not finish within %s -- where: fused system teardown; "+
+					"impact: DBOS resources are still running on the shared SQLite handle, so that handle must NOT be closed; "+
+					"fix: allow a longer timeout, or stop the workflows that are still running, then close again: %w",
+				timeoutDuration, err)
+		}
+	})
+	return s.closeErr
 }
 
 // Run invokes callback through DBOS's public RunAsTransaction API. DBOS owns
 // transaction begin, commit, rollback, retries, and operation_outputs
 // checkpointing; callback receives only the local application SQL surface.
-func Run[R any](ctx dbos.DBOSContext, system *System, callback Callback[R]) (R, error) {
+func Run[R any](ctx dbos.Context, system *System, callback Callback[R]) (R, error) {
 	if ctx == nil {
 		return *new(R), fmt.Errorf(
 			"fusedtx.Run: workflow context is nil -- where: fused transaction execution; " +

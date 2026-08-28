@@ -154,7 +154,7 @@ func TestHostBoundGovernedAllocatorBorrowsEngineLifecycle(t *testing.T) {
 	if _, err := db.Exec(`CREATE TABLE engine_owned_participant(operation_id TEXT PRIMARY KEY, child_count INTEGER NOT NULL) STRICT`); err != nil {
 		t.Fatal(err)
 	}
-	root, err := dbos.NewDBOSContext(ctx, dbos.Config{AppName: "engine-owned", ApplicationVersion: "test-v1", SqliteSystemDB: db, Logger: slog.Default()})
+	root, err := dbos.NewContext(ctx, dbos.Config{AppName: "engine-owned", ApplicationVersion: "test-v1", SQLiteSystemDB: db, Logger: slog.Default()})
 	if err != nil {
 		t.Fatal(err)
 	}

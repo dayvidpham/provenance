@@ -64,6 +64,21 @@ polling interval for the internal queue on `dbos.Config`, or to let
 internal queue value and rejects the reserved name explicitly
 (`dbos/queue.go:512`, `dbos/queue.go:324`).
 
+#### Re-read at the runtime upgrade: 2026-08-28
+
+The reading above was re-checked line by line when the module moved onto
+`dbos-transact-golang v1.2.0`, and it stands. Two details are now more precise:
+
+| Fact | Location |
+|---|---|
+| The internal queue is still the one queue that lives in process rather than in the `queues` table, still with the one-second package default | `dbos/queue.go:512` |
+| `RegisterQueue` still rejects the reserved name, now with an `ErrInvalidOption`-matching error | `dbos/queue.go:322` |
+| The supervisor's reconcile tick is still a hard-coded one second, and it still executes an `UPDATE` on `workflow_status` each tick | `dbos/queue.go:543`, `dbos/internal/sysdb/system_database.go:4544` |
+| That per-tick `UPDATE` is now scoped by `application_name` when the context sets `AppName`, which Provenance always does | `dbos/internal/sysdb/system_database.go:4548-4556` |
+| Per-queue workers gained adaptive polling. The interval doubles ONLY when a dequeue pass hit a contention error, never on an empty poll: the worker sets `hasBackoffError` from `IsContentionError` and otherwise scales the interval DOWN by 0.9 toward the 1s base. The ceiling on the doubling side is 120s. This applies to queue workers, NOT to the supervisor tick | `dbos/queue.go:749-757` (the two branches), `dbos/queue.go:786-790` (only contention sets the flag), `dbos/queue.go:508-510` (factors 2.0 and 0.9), `dbos/queue.go:16` (120s ceiling), `dbos/internal/models/queue.go:12` (1s base) |
+| Launch re-enqueues every PENDING workflow it recovers onto the reserved internal queue, so crash recovery now runs on that queue's worker. Recovery latency is therefore bounded by that worker's interval, which starts at the 1s base and only grows under contention | `dbos/dbos.go:825` (Launch recovers, then starts the queue runner), `dbos/recovery.go:9-21`, `dbos/internal/sysdb/system_database.go:4963` (`ReenqueueForRecovery`) |
+| `RetrieveQueue` on an absent queue now returns an error matching `dbos.ErrQueueNotFound` instead of `(nil, nil)` | `dbos/queue.go:398` |
+
 Separately, a Provenance-level polling knob would have had nothing to configure
 even if the library allowed it: Provenance registers no queue and enqueues no
 workflow. Every workflow runs through `dbos.RunWorkflow` on the owning context,
@@ -95,7 +110,7 @@ One `OpenBoundGovernedAllocator` + `Launch` + genesis + composed allocation +
 | Phase | Normal | Race |
 |---|---:|---:|
 | `sql.Open` + ping | `26-55ms` | `28-47ms` |
-| `dbos.NewDBOSContext` (system-database migration) | `342-695ms` | `492-589ms` |
+| `dbos.NewContext` (system-database migration) | `342-695ms` | `492-589ms` |
 | `OpenBorrowedSQLite` (Provenance schema activation) | `39-44ms` | `990ms-1.019s` |
 | Launch | `~9ms` | `12-37ms` |
 | Genesis workflow | `29-42ms` | `65-94ms` |

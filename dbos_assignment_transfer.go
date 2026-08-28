@@ -143,7 +143,7 @@ func assignmentTransferResult(request AssignmentTransferRequest, replayed bool) 
 	}
 }
 
-func (a *DBOSAdapter) transferWorkflow(wfCtx dbos.DBOSContext, input DBOSApplyInput) (DBOSStepOutcome, error) {
+func (a *DBOSAdapter) transferWorkflow(wfCtx dbos.Context, input DBOSApplyInput) (DBOSStepOutcome, error) {
 	return a.runDomainWorkflow(wfCtx, input, "transferWorkflow", decodeAssignmentTransferInput, a.foldDomainAssignmentTransfer)
 }
 

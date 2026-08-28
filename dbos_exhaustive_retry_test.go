@@ -320,7 +320,7 @@ func TestDBOSCompletedRetryEveryCanonicalOperandHasZeroCallbackAndWrites(t *test
 		t.Fatal(err)
 	}
 	defer func() { _ = db.Close() }()
-	root, err := dbos.NewDBOSContext(context.Background(), dbos.Config{AppName: "dbos-exhaustive", SqliteSystemDB: db, ApplicationVersion: "exhaustive-current"})
+	root, err := dbos.NewContext(context.Background(), dbos.Config{AppName: "dbos-exhaustive", SQLiteSystemDB: db, ApplicationVersion: "exhaustive-current"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -365,7 +365,7 @@ func TestDBOSCompletedRetryEveryCanonicalOperandHasZeroCallbackAndWrites(t *test
 	if err := dbos.Launch(root); err != nil {
 		t.Fatal(err)
 	}
-	defer func() { root.Shutdown(5 * time.Second); _ = tracker.Close() }()
+	defer func() { shutdownDBOSRoot(t, root, 5*time.Second); _ = tracker.Close() }()
 	want, err := adapter.Apply(context.Background(), fixture.input)
 	if err != nil {
 		t.Fatalf("initial exhaustive Apply: %v", err)
