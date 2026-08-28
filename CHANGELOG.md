@@ -2,6 +2,80 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Breaking Changes
+
+#### Public API: DBOS runtime types were renamed by the runtime
+
+The DBOS runtime renamed its central interface, so every Provenance signature
+that names a DBOS type changed with it. There are no aliases to the old names:
+this package has no external consumers other than its one host, and a
+compatibility shim would keep a dead name alive in the durable-execution seam
+that most needs one exact shape.
+
+- `NewHostBoundGovernedAllocator(ctx, root dbos.DBOSContext, systemDB, participant)`
+  now takes `root dbos.Context`.
+- `NewDBOSAdapter(root dbos.DBOSContext, tracker, config)` now takes
+  `root dbos.Context`.
+- Every exported workflow signature that named `dbos.DBOSContext` now names
+  `dbos.Context`.
+- Callers that named `dbos.DBOSError` or `dbos.DBOSErrorCode` in an `errors.As`
+  probe must name `*dbos.Error` and `dbos.ErrorCode`.
+- The DBOS `Config` field that carries a caller-owned SQLite handle is now
+  `SQLiteSystemDB`, not `SqliteSystemDB`.
+- A host that creates its own DBOS context must now blank-import
+  `github.com/dbos-inc/dbos-transact-golang/dbos/driver/sqlite`. Without that
+  import every construction over a SQLite handle fails at run time, and the
+  runtime loses the error-code extractor it needs to tell a busy or locked
+  database apart from a permanent failure. Provenance links the driver in its own
+  factory-owned open path.
+
+#### Stored databases: a system database from the superseded DBOS runtime is refused
+
+- **A DBOS system database created by the superseded runtime is out of scope and
+  is not carried forward.** The upgrade is a clean cut: there is no in-place
+  upgrade path, none is tested, and none will be added. Drain or abandon the old
+  workflows, delete the database file (and its `-wal` and `-shm` siblings), and
+  let this build create a fresh one.
+- `fusedtx.OpenSystem` now refuses such a database before it creates any DBOS
+  context, because the runtime would otherwise migrate it in place during
+  construction. The refusal reads only: the file is unchanged, and nothing is
+  opened, launched, or migrated.
+- New exported gate for hosts that build their own DBOS context:
+  `provenance.RequireSupportedDBOSSystemSchema(ctx, systemDB, origin)` and the
+  sentinel `provenance.ErrSupersededDBOSSystemSchema`. Call the gate on the exact
+  `*sql.DB` you are about to pass as `dbos.Config.SQLiteSystemDB`, before you
+  create the context. A database with no DBOS system schema is fresh and is
+  accepted.
+- Rationale: the durable state this refusal protects has one host and no live
+  installation worth migrating, and an untested in-place migration of a durable
+  execution store is a worse risk than a required recreate.
+
+#### Shutdown outcomes are reported instead of dropped
+
+- The runtime's shutdown now reports a timeout that left resources running.
+  `FusedGovernedAllocator.Close` and `BoundGovernedAllocator.Close` already
+  returned an error; that error now also carries an incomplete shutdown, joined
+  with any tracker-close error. A non-nil result means DBOS resources are still
+  running on the shared SQLite handle, so no caller may close or reuse that
+  handle.
+
+### Fixed
+
+- The step-retry-exhaustion marker used when a persisted workflow error is read
+  back as plain text is derived from the runtime's own error-code constant. The
+  previous literal spelled the code as a number, which the runtime has never
+  printed, so that half of the check could never match.
+
+### Unchanged, deliberately
+
+- The durable fingerprint salt is frozen and was NOT touched by this upgrade. It
+  keys every durable workflow ID and step name ever written, so it describes no
+  library version. Golden digests now pin the identities it keys, so a later edit
+  cannot move the durable namespace quietly.
+
+
 ## v0.0.6 - 2026-08-26
 
 ### Fixed

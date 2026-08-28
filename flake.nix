@@ -39,7 +39,7 @@
       # Vendor hash for buildGoModule. No vendor/ dir, so Nix
       # downloads deps and verifies against this hash.
       # Run `nix build` once with lib.fakeHash to get the real hash.
-      vendorHash = "sha256-ORk/i5aXrq/BWeK/tUCdep3nyuh5dVVVLueg0jZjra0=";
+      vendorHash = "sha256-fse4XkSYMAEQ5O4ltMZ0uHO4DyS7nabQZSVtU61zbe8=";
 
       # CLI tools available in the dev shell
       devTools = pkgs: with pkgs; [
