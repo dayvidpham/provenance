@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dayvidpham/provenance/internal/dbosfixture"
 	"github.com/dayvidpham/provenance/internal/dbossys"
 	"github.com/dayvidpham/provenance/internal/fusedtx"
 )
@@ -33,22 +34,6 @@ func TestOpenSystemSourceLinksTheDBOSSQLiteDriver(t *testing.T) {
 	}
 }
 
-// copyImmutableFixture writes a testdata database's bytes to a private mutable
-// path and returns the path and the source digest.
-func copyImmutableFixture(t *testing.T, name string) (string, string) {
-	t.Helper()
-	data, err := os.ReadFile(filepath.Join("..", "..", "testdata", "dbos", name))
-	if err != nil {
-		t.Fatalf("read immutable fixture %s: %v", name, err)
-	}
-	target := filepath.Join(t.TempDir(), name)
-	if err := os.WriteFile(target, data, 0o600); err != nil {
-		t.Fatalf("write private fixture copy: %v", err)
-	}
-	sum := sha256.Sum256(data)
-	return target, hex.EncodeToString(sum[:])
-}
-
 func fileDigest(t *testing.T, path string) string {
 	t.Helper()
 	data, err := os.ReadFile(path)
@@ -64,7 +49,7 @@ func fileDigest(t *testing.T, path string) string {
 // refuse before it creates any DBOS context, and must leave the file untouched.
 func TestOpenSystemRefusesSupersededSystemDatabase(t *testing.T) {
 	t.Parallel()
-	path, wantDigest := copyImmutableFixture(t, "dbos_system_v020.db")
+	path, wantDigest := dbosfixture.PrivateDBOSSystemV020Copy(t, filepath.Join("..", "..", "testdata", "dbos"))
 	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&mode=rw"
 
 	system, err := fusedtx.OpenSystem(context.Background(), fusedtx.SystemConfig{
@@ -113,6 +98,47 @@ func TestOpenSystemCreatesSupportedSystemSchema(t *testing.T) {
 	}
 	if version < dbossys.FirstSupportedMigrationVersion {
 		t.Errorf("version=%d want at least the supported floor %d", version, dbossys.FirstSupportedMigrationVersion)
+	}
+}
+
+// The refusal must not be able to fire on this build's own database. A file this
+// build created, closed, and re-opened is accepted, at the exact end of the
+// supported runtime's migration history.
+func TestOpenSystemReopensADatabaseItCreated(t *testing.T) {
+	t.Parallel()
+	first, dsn := newSystem(t)
+	launch(t, first.Root())
+	if err := first.Close(30 * time.Second); err != nil {
+		t.Fatalf("close the first fused system: %v", err)
+	}
+
+	second, err := fusedtx.OpenSystem(context.Background(), fusedtx.SystemConfig{
+		SQLiteDSN:          dsn,
+		AppName:            "provenance-fusedtx-reopen-test",
+		ApplicationVersion: "fusedtx-test-v1",
+		Logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("re-open a database this build created: %v", err)
+	}
+	t.Cleanup(func() {
+		if closeErr := second.Close(30 * time.Second); closeErr != nil {
+			t.Errorf("close the re-opened fused system: %v", closeErr)
+		}
+	})
+	// The re-open is not launched. The schema state is settled by construction,
+	// and a second launched context would add a supervisor ticking once a second
+	// on this package's shared machine for no extra assertion.
+	state, version, err := dbossys.InspectSchema(context.Background(), second.DB())
+	if err != nil {
+		t.Fatalf("InspectSchema after the re-open: %v", err)
+	}
+	if state != dbossys.SchemaStateSupported {
+		t.Errorf("state=%s want %s", state, dbossys.SchemaStateSupported)
+	}
+	if version != dbosfixture.SupportedSystemSchemaVersion {
+		t.Errorf("version=%d want %d, the end of the supported runtime's migration history",
+			version, dbosfixture.SupportedSystemSchemaVersion)
 	}
 }
 
