@@ -64,6 +64,20 @@ polling interval for the internal queue on `dbos.Config`, or to let
 internal queue value and rejects the reserved name explicitly
 (`dbos/queue.go:512`, `dbos/queue.go:324`).
 
+#### Re-read at the runtime upgrade: 2026-08-28
+
+The reading above was re-checked line by line when the module moved onto
+`dbos-transact-golang v1.2.0`, and it stands. Two details are now more precise:
+
+| Fact | Location |
+|---|---|
+| The internal queue is still the one queue that lives in process rather than in the `queues` table, still with the one-second package default | `dbos/queue.go:512` |
+| `RegisterQueue` still rejects the reserved name, now with an `ErrInvalidOption`-matching error | `dbos/queue.go:322` |
+| The supervisor's reconcile tick is still a hard-coded one second, and it still executes an `UPDATE` on `workflow_status` each tick | `dbos/queue.go:543`, `dbos/internal/sysdb/system_database.go:4544` |
+| That per-tick `UPDATE` is now scoped by `application_name` when the context sets `AppName`, which Provenance always does | `dbos/internal/sysdb/system_database.go:4548-4556` |
+| Per-queue workers gained adaptive polling: the interval doubles on an empty poll up to a 120s ceiling. This applies to queue workers, NOT to the supervisor tick | `dbos/queue.go:508-509`, `dbos/queue.go:750-755` |
+| `RetrieveQueue` on an absent queue now returns an error matching `dbos.ErrQueueNotFound` instead of `(nil, nil)` | `dbos/queue.go:398` |
+
 Separately, a Provenance-level polling knob would have had nothing to configure
 even if the library allowed it: Provenance registers no queue and enqueues no
 workflow. Every workflow runs through `dbos.RunWorkflow` on the owning context,

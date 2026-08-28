@@ -48,7 +48,7 @@ type SQLTx interface {
 type Callback[R any] func(context.Context, SQLTx) (R, error)
 
 // IsNoRows normalizes the two narrow SQL adapters used by the allocation
-// reducers. Standalone Modernc returns database/sql.ErrNoRows; the DBOS v0.20
+// reducers. Standalone Modernc returns database/sql.ErrNoRows; the DBOS
 // adapter maps it to dbos.ErrNoRows. Keeping this distinction here prevents
 // reducer code from depending on DBOS driver types.
 func IsNoRows(err error) bool {

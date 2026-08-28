@@ -84,7 +84,7 @@ type scriptedRetryTracker struct {
 func (t *scriptedRetryTracker) Journal() Journal { return t.journal }
 
 type retryTerminalStack struct {
-	root      dbos.DBOSContext
+	root      dbos.Context
 	db        *sql.DB
 	borrowed  Tracker
 	adapter   *DBOSAdapter
@@ -101,7 +101,7 @@ func newRetryTerminalStack(t *testing.T, name string, options DBOSStepOptions) *
 	if err != nil {
 		t.Fatal(err)
 	}
-	root, err := dbos.NewDBOSContext(context.Background(), dbos.Config{AppName: name, SqliteSystemDB: db, ApplicationVersion: "retry-terminal"})
+	root, err := dbos.NewContext(context.Background(), dbos.Config{AppName: name, SQLiteSystemDB: db, ApplicationVersion: "retry-terminal"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +129,7 @@ func newRetryTerminalStack(t *testing.T, name string, options DBOSStepOptions) *
 	if err := dbos.Launch(root); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { root.Shutdown(5 * time.Second); _ = borrowed.Close(); _ = db.Close() })
+	t.Cleanup(func() { shutdownDBOSRoot(t, root, 5*time.Second); _ = borrowed.Close(); _ = db.Close() })
 	return stack
 }
 
@@ -388,7 +388,7 @@ func assertTerminalPrecedenceReplay(t *testing.T, s *retryTerminalStack, op Oper
 	attempts, callbacks, writes := s.journal.attempts.Load(), s.callbacks.Load(), s.journal.writes.Load()
 	_, replayErr := s.adapter.Apply(context.Background(), op)
 	assertTerminalDiagnostic(t, replayErr, op.OperationID)
-	var firstDBOS, replayDBOS *dbos.DBOSError
+	var firstDBOS, replayDBOS *dbos.Error
 	if !errors.As(firstErr, &firstDBOS) || !errors.As(replayErr, &replayDBOS) || firstDBOS.Code != replayDBOS.Code || firstDBOS.Message != replayDBOS.Message || firstDBOS.WorkflowID != replayDBOS.WorkflowID {
 		t.Fatalf("terminal DBOSError drift: first=%#v replay=%#v", firstDBOS, replayDBOS)
 	}
@@ -404,7 +404,7 @@ func assertTerminalPrecedenceReplay(t *testing.T, s *retryTerminalStack, op Oper
 func assertTerminalDiagnostic(t *testing.T, err error, operation OperationID) {
 	t.Helper()
 	var diagnostic *DBOSDiagnosticError
-	var dbosErr *dbos.DBOSError
+	var dbosErr *dbos.Error
 	if !errors.As(err, &diagnostic) || diagnostic.Class != DBOSDiagClassTerminalRetrieval || diagnostic.Field != DBOSDiagFieldWorkflow || diagnostic.Stage != DBOSDiagStageWorkflowTerminalLookup || diagnostic.Operation != operation || diagnostic.Workflow == "" || diagnostic.Impact == "" || diagnostic.Fix == "" || diagnostic.Cause == nil {
 		t.Fatalf("terminal error lacks typed actionable diagnostic: %#v (%v)", diagnostic, err)
 	}

@@ -102,7 +102,7 @@ func TestFusedLegacyRunAllocateReopensBaselineWorkflowWithoutParticipant(t *test
 		_ = firstAllocator.Close(30 * time.Second)
 		t.Fatalf("participant calls after baseline allocation=%d, want 1", participantCalls)
 	}
-	workflows, err := dbos.ListWorkflows(firstAllocator.system.Root(), dbos.WithWorkflowIDs([]string{"legacy-replay-allocation-workflow"}), dbos.WithLimit(2), dbos.WithLoadInput(true), dbos.WithLoadOutput(false))
+	workflows, err := dbos.ListWorkflows(firstAllocator.system.Root(), dbos.WithFilterWorkflowIDs("legacy-replay-allocation-workflow"), dbos.WithFilterLimit(2), dbos.WithFilterLoadInput(true), dbos.WithFilterLoadOutput(false))
 	if err != nil {
 		_ = firstAllocator.Close(30 * time.Second)
 		t.Fatalf("load persisted legacy workflow input: %v", err)

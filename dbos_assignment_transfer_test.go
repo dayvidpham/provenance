@@ -16,7 +16,7 @@ import (
 
 type dbosAssignmentTransferStack struct {
 	db      *sql.DB
-	root    dbos.DBOSContext
+	root    dbos.Context
 	tracker Tracker
 	adapter *DBOSAdapter
 	entries atomic.Int64
@@ -28,8 +28,8 @@ func openDBOSAssignmentTransferStack(t *testing.T, path, appName, version string
 	if err != nil {
 		t.Fatal(err)
 	}
-	root, err := dbos.NewDBOSContext(context.Background(), dbos.Config{
-		AppName: appName, SqliteSystemDB: db, ApplicationVersion: version,
+	root, err := dbos.NewContext(context.Background(), dbos.Config{
+		AppName: appName, SQLiteSystemDB: db, ApplicationVersion: version,
 	})
 	if err != nil {
 		_ = db.Close()
@@ -37,29 +37,29 @@ func openDBOSAssignmentTransferStack(t *testing.T, path, appName, version string
 	}
 	tracker, err := OpenBorrowedSQLite(db)
 	if err != nil {
-		root.Shutdown(5 * time.Second)
+		_ = dbos.Shutdown(root, 5*time.Second)
 		_ = db.Close()
 		t.Fatal(err)
 	}
 	adapter, err := NewDBOSAdapter(root, tracker, DBOSAdapterConfig{})
 	if err != nil {
 		_ = tracker.Close()
-		root.Shutdown(5 * time.Second)
+		_ = dbos.Shutdown(root, 5*time.Second)
 		_ = db.Close()
 		t.Fatal(err)
 	}
 	stack := &dbosAssignmentTransferStack{db: db, root: root, tracker: tracker, adapter: adapter}
 	adapter.testHooks.onWorkflowEntry = func() { stack.entries.Add(1) }
 	if err := dbos.Launch(root); err != nil {
-		stack.close()
+		stack.close(t)
 		t.Fatal(err)
 	}
 	return stack
 }
 
-func (s *dbosAssignmentTransferStack) close() {
+func (s *dbosAssignmentTransferStack) close(t *testing.T) {
 	if s.root != nil {
-		s.root.Shutdown(5 * time.Second)
+		shutdownDBOSRoot(t, s.root, 5*time.Second)
 		s.root = nil
 	}
 	if s.tracker != nil {
@@ -178,7 +178,7 @@ func TestDBOSAdapterTransferAssignmentSuccessAndReplayAcrossWorkflows(t *testing
 		t.Fatalf("same-workflow replay = %+v entries=%d, want %+v and one entry", sameWorkflow, firstStack.entries.Load(), want)
 	}
 	assertDBOSAssignmentTransferOwner(t, firstStack.tracker, task, &actorB)
-	firstStack.close()
+	firstStack.close(t)
 
 	// Same application version recovers and attaches to the original workflow
 	// without executing another callback.
@@ -190,7 +190,7 @@ func TestDBOSAdapterTransferAssignmentSuccessAndReplayAcrossWorkflows(t *testing
 	if reopened != want || sameVersion.entries.Load() != 0 {
 		t.Fatalf("reopened same-workflow replay = %+v entries=%d, want %+v and zero entries", reopened, sameVersion.entries.Load(), want)
 	}
-	sameVersion.close()
+	sameVersion.close(t)
 
 	// A different application version has a distinct DBOS workflow identity, but
 	// the existing core operation still wins admission and returns its semantic
@@ -204,14 +204,14 @@ func TestDBOSAdapterTransferAssignmentSuccessAndReplayAcrossWorkflows(t *testing
 		t.Fatalf("distinct-workflow replay = %+v entries=%d, want %+v and one core replay callback", distinct, distinctVersion.entries.Load(), want)
 	}
 	assertDBOSAssignmentTransferOwner(t, distinctVersion.tracker, task, &actorB)
-	distinctVersion.close()
+	distinctVersion.close(t)
 }
 
 func TestDBOSAdapterTransferAssignmentChangedInputConflicts(t *testing.T) {
 	t.Parallel()
 
 	stack := openDBOSAssignmentTransferStack(t, t.TempDir()+"/transfer.db", "dbos-transfer-conflict", "transfer-v1")
-	defer stack.close()
+	defer stack.close(t)
 	actorA, actorB, _, task, authority := establishDBOSAssignmentTransferFixture(t, stack, "conflict")
 	operation := OperationID("dbos-transfer-conflict")
 	if _, err := stack.adapter.TransferAssignment(context.Background(), stack.tracker.As(actorA, authority), transferRequest(task, "DBOS-TRANSFER-PREVIOUS-conflict", "DBOS-TRANSFER-NEXT-B-conflict", actorB), WithOperationID(operation)); err != nil {
@@ -232,7 +232,7 @@ func TestDBOSAdapterTransferAssignmentRevocationRaceParity(t *testing.T) {
 	t.Parallel()
 
 	stack := openDBOSAssignmentTransferStack(t, t.TempDir()+"/transfer.db", "dbos-transfer-race", "transfer-v1")
-	defer stack.close()
+	defer stack.close(t)
 	actorA, actorB, boot, _, _ := establishDBOSAssignmentTransferFixture(t, stack, "race-seed")
 
 	const iterations = 12

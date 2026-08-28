@@ -32,8 +32,8 @@ import (
 // These options map internally and exclusively to the pinned DBOS options:
 //
 //   - MaxRetries   → dbos.WithStepMaxRetries
-//   - BaseInterval → dbos.WithBaseInterval
-//   - BackoffFactor → dbos.WithBackoffFactor
+//   - BaseInterval → dbos.WithStepBaseInterval
+//   - BackoffFactor → dbos.WithStepBackoffFactor
 //
 // StepName is contract-owned and cannot be overridden by callers.
 type DBOSStepOptions struct {
@@ -166,14 +166,17 @@ const (
 	// re-keys the durable namespace, and every in-flight workflow becomes
 	// unreachable under its new identity while its old rows keep the old one.
 	//
-	// It therefore deliberately DOES NOT track go.mod. Upgrading the DBOS
-	// dependency must leave this constant alone -- the pending v1.2 upgrade
-	// explicitly included. Changing it is a durable-state break that needs an
-	// operational decision first: drain every in-flight workflow, then cut.
+	// It therefore deliberately DOES NOT track go.mod, and it no longer names the
+	// library version this module builds against. Upgrading the DBOS dependency
+	// must leave this constant alone. Changing it is a durable-state break that
+	// needs an operational decision first: drain every in-flight workflow, then
+	// cut.
 	//
 	// It reads v0.20.0 because the string was corrected from a stale v0.16.0 in
 	// the same release whose ratified breaking change already declared pre-v0.0.4
-	// durable state non-replayable. That was the free window, and it has closed.
+	// durable state non-replayable. That was the free window, and it has closed:
+	// the later move to a newer DBOS runtime kept this value frozen, and
+	// dbos_fingerprint_salt_test.go pins the digests it keys.
 	dbosPinnedLibraryConst = "github.com/dbos-inc/dbos-transact-golang v0.20.0"
 )
 

@@ -25,7 +25,7 @@ func TestExactSystemHandleCommitsApplicationAndCheckpoint(t *testing.T) {
 	systemDB := system.DB()
 	createSentinelTable(t, systemDB)
 
-	workflow := func(workflowCtx dbos.DBOSContext, value string) (string, error) {
+	workflow := func(workflowCtx dbos.Context, value string) (string, error) {
 		return fusedtx.Run(workflowCtx, system, func(ctx context.Context, tx fusedtx.SQLTx) (string, error) {
 			if _, err := tx.Exec(ctx, `INSERT INTO fused_sentinel (value) VALUES (?)`, value); err != nil {
 				return "", err
@@ -66,7 +66,7 @@ func TestCallbackFailureRollsBackSentinelWithoutSuccessfulCheckpoint(t *testing.
 	systemDB := system.DB()
 	createSentinelTable(t, systemDB)
 
-	workflow := func(workflowCtx dbos.DBOSContext, _ string) (string, error) {
+	workflow := func(workflowCtx dbos.Context, _ string) (string, error) {
 		return fusedtx.Run(workflowCtx, system, func(ctx context.Context, tx fusedtx.SQLTx) (string, error) {
 			if _, err := tx.Exec(ctx, `INSERT INTO fused_sentinel (value) VALUES (?)`, "rolled-back"); err != nil {
 				return "", err
@@ -115,7 +115,7 @@ func TestSecondHandleCannotBecomeFusedDataSource(t *testing.T) {
 
 	createSentinelTable(t, systemDB)
 
-	workflow := func(workflowCtx dbos.DBOSContext, value string) (string, error) {
+	workflow := func(workflowCtx dbos.Context, value string) (string, error) {
 		return fusedtx.Run(workflowCtx, system, func(ctx context.Context, tx fusedtx.SQLTx) (string, error) {
 			if _, err := tx.Exec(ctx, `INSERT INTO fused_sentinel (value) VALUES (?)`, value); err != nil {
 				return "", err
@@ -159,7 +159,9 @@ func newSystem(t *testing.T) (*fusedtx.System, string) {
 		t.Fatalf("create owned fused system: %v", err)
 	}
 	t.Cleanup(func() {
-		system.Close(30 * time.Second)
+		if err := system.Close(30 * time.Second); err != nil {
+			t.Errorf("close owned fused system: %v", err)
+		}
 	})
 	return system, dsn
 }
@@ -169,7 +171,7 @@ func systemDSN(t *testing.T) string {
 	return "file:" + filepath.Join(t.TempDir(), "fusedtx.db") + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
 }
 
-func launch(t *testing.T, root dbos.DBOSContext) {
+func launch(t *testing.T, root dbos.Context) {
 	t.Helper()
 	if err := dbos.Launch(root); err != nil {
 		t.Fatalf("launch DBOS context: %v", err)

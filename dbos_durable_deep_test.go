@@ -24,12 +24,12 @@ func (duplicateLookupInput) MarshalJSON() ([]byte, error) {
 
 func (*duplicateLookupInput) UnmarshalJSON([]byte) error { return nil }
 
-func duplicateLookupWorkflow(dbos.DBOSContext, duplicateLookupInput) (string, error) {
+func duplicateLookupWorkflow(dbos.Context, duplicateLookupInput) (string, error) {
 	return "seeded", nil
 }
 
 type internalDBOSStack struct {
-	root            dbos.DBOSContext
+	root            dbos.Context
 	dbPath          string
 	tracker         Tracker
 	adapter         *DBOSAdapter
@@ -45,7 +45,7 @@ func newInternalDBOSStack(t *testing.T, name string) *internalDBOSStack {
 	if err != nil {
 		t.Fatal(err)
 	}
-	root, err := dbos.NewDBOSContext(context.Background(), dbos.Config{AppName: name, SqliteSystemDB: db, ApplicationVersion: "durable-current"})
+	root, err := dbos.NewContext(context.Background(), dbos.Config{AppName: name, SQLiteSystemDB: db, ApplicationVersion: "durable-current"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +71,7 @@ func newInternalDBOSStack(t *testing.T, name string) *internalDBOSStack {
 	if err := dbos.Launch(root); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { root.Shutdown(5 * time.Second); _ = tracker.Close(); _ = db.Close() })
+	t.Cleanup(func() { shutdownDBOSRoot(t, root, 5*time.Second); _ = tracker.Close(); _ = db.Close() })
 	return s
 }
 
@@ -120,7 +120,7 @@ func TestDBOSApplyRejectsDuplicateStoredInputBeforeCallbacksOrWrites(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	root, err := dbos.NewDBOSContext(context.Background(), dbos.Config{AppName: "lookup-boundary", SqliteSystemDB: db, ApplicationVersion: "lookup-boundary"})
+	root, err := dbos.NewContext(context.Background(), dbos.Config{AppName: "lookup-boundary", SQLiteSystemDB: db, ApplicationVersion: "lookup-boundary"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +147,7 @@ func TestDBOSApplyRejectsDuplicateStoredInputBeforeCallbacksOrWrites(t *testing.
 	if err := dbos.Launch(root); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { root.Shutdown(5 * time.Second); _ = tracker.Close(); _ = db.Close() })
+	t.Cleanup(func() { shutdownDBOSRoot(t, root, 5*time.Second); _ = tracker.Close(); _ = db.Close() })
 
 	op := OperationInput{OperationID: "lookup-boundary-operation", ActorID: agent.ID, AuthorityJournalID: &authority, CommandDigest: []byte("command"), Effects: []Effect{{Sort: EffectTaskCreate, ResultSlot: "task", TaskID: ptypes.TaskID{Namespace: "lookup", UUID: uuid.Must(uuid.NewV7())}, Title: "must-not-write", Type: TaskTypeTask, Priority: PriorityMedium, Phase: PhaseWorkerSlices}}}
 	_, normalized, err := encodeApplyInput(adapter.contract, op)

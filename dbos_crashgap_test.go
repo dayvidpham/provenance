@@ -112,8 +112,8 @@ func runCrashChild(gap, dbpath, actorStr, authStr, taskStr, marker string) {
 	if err != nil {
 		os.Exit(20)
 	}
-	root, err := dbos.NewDBOSContext(context.Background(), dbos.Config{
-		AppName: crashAppName, SqliteSystemDB: db, ApplicationVersion: crashAppVersion,
+	root, err := dbos.NewContext(context.Background(), dbos.Config{
+		AppName: crashAppName, SQLiteSystemDB: db, ApplicationVersion: crashAppVersion,
 	})
 	if err != nil {
 		os.Exit(21)
@@ -192,11 +192,11 @@ func runCrashGap(t *testing.T, gap string, wantExit int) {
 		t.Fatalf("reopen: %v", err)
 	}
 	defer func() { _ = db.Close() }()
-	root, err := dbos.NewDBOSContext(context.Background(), dbos.Config{
-		AppName: crashAppName, SqliteSystemDB: db, ApplicationVersion: crashAppVersion,
+	root, err := dbos.NewContext(context.Background(), dbos.Config{
+		AppName: crashAppName, SQLiteSystemDB: db, ApplicationVersion: crashAppVersion,
 	})
 	if err != nil {
-		t.Fatalf("reopen NewDBOSContext: %v", err)
+		t.Fatalf("reopen dbos.NewContext: %v", err)
 	}
 	tracker, err := OpenBorrowedSQLite(db)
 	if err != nil {
@@ -213,7 +213,7 @@ func runCrashGap(t *testing.T, gap string, wantExit int) {
 	if err := dbos.Launch(root); err != nil {
 		t.Fatalf("reopen Launch: %v", err)
 	}
-	defer func() { root.Shutdown(5 * time.Second); _ = tracker.Close() }()
+	defer func() { shutdownDBOSRoot(t, root, 5*time.Second); _ = tracker.Close() }()
 
 	// Drive the same operation to completion: it attaches to the recovered workflow.
 	res, err := adapter.Apply(context.Background(), crashOp(actor, auth, taskID))

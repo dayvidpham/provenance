@@ -108,7 +108,7 @@ func TestNewDBOSAdapterRejectsInvalidConfigBeforeRegistration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	root, err := dbos.NewDBOSContext(context.Background(), dbos.Config{AppName: "config-integration", SqliteSystemDB: db, ApplicationVersion: "config-integration"})
+	root, err := dbos.NewContext(context.Background(), dbos.Config{AppName: "config-integration", SQLiteSystemDB: db, ApplicationVersion: "config-integration"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +116,7 @@ func TestNewDBOSAdapterRejectsInvalidConfigBeforeRegistration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { root.Shutdown(time.Second); _ = tracker.Close(); _ = db.Close() })
+	t.Cleanup(func() { shutdownDBOSRoot(t, root, time.Second); _ = tracker.Close(); _ = db.Close() })
 
 	_, err = NewDBOSAdapter(root, tracker, DBOSAdapterConfig{StepOptions: DBOSStepOptions{MaxRetries: 13}})
 	var cfgErr *DBOSConfigError
