@@ -30,6 +30,9 @@ that most needs one exact shape.
   runtime loses the error-code extractor it needs to tell a busy or locked
   database apart from a permanent failure. Provenance links the driver in its own
   factory-owned open path.
+- The SQLite driver moved from `modernc.org/sqlite` v1.52.0 to v1.54.0, forced by
+  the runtime upgrade. That driver is the substrate of the contended-write fixes
+  in v0.0.5 and v0.0.6, so the bump is called out rather than left to `go.mod`.
 
 #### Stored databases: a system database from the superseded DBOS runtime is refused
 
@@ -46,8 +49,17 @@ that most needs one exact shape.
   `provenance.RequireSupportedDBOSSystemSchema(ctx, systemDB, origin)` and the
   sentinel `provenance.ErrSupersededDBOSSystemSchema`. Call the gate on the exact
   `*sql.DB` you are about to pass as `dbos.Config.SQLiteSystemDB`, before you
-  create the context. A database with no DBOS system schema is fresh and is
-  accepted.
+  create the context. `dbos.NewClient` is the same moment under another name: it
+  builds a context of its own from `ClientConfig.SQLiteSystemDB` and migrates in
+  place too, so gate that call as well. A database with no DBOS system schema is
+  fresh and is accepted.
+- The refusal names the real file to delete, derived from the handle with
+  `PRAGMA database_list`, together with its `-wal` and `-shm` siblings. A caller
+  normally passes a DSN, which carries a `file:` scheme and a pragma query string
+  and is therefore not a name any shell accepts; the DSN stays in the message as
+  secondary context only. The refusal also warns that a concurrent first launch
+  records a below-floor version until its migrations finish, so nobody deletes a
+  database that another process is still creating.
 - Rationale: the durable state this refusal protects has one host and no live
   installation worth migrating, and an untested in-place migration of a durable
   execution store is a worse risk than a required recreate.
@@ -74,6 +86,21 @@ that most needs one exact shape.
   keys every durable workflow ID and step name ever written, so it describes no
   library version. Golden digests now pin the identities it keys, so a later edit
   cannot move the durable namespace quietly.
+
+### Durable identity: read this if you leave `ApplicationVersion` empty
+
+The application version is hashed into every durable workflow ID alongside the
+frozen salt. The runtime changed how it *derives* a default one: the superseded
+runtime used the binary hash, and the supported runtime uses
+`sha256(binaryHash || appName)`. A host that leaves `Config.ApplicationVersion`
+empty therefore gets a different version string from the same binary, and the
+same frozen salt then yields different durable workflow IDs.
+
+This is not a durable break here. The upgrade is a clean cut, so no durable state
+is carried across it, and the old default was already rebuild-sensitive: any
+rebuild of the binary moved it. A host that wants durable identity to survive a
+rebuild must set `Config.ApplicationVersion` explicitly; that has always been
+true, and it is now the only way to be unaffected by the derivation change.
 
 
 ## v0.0.6 - 2026-08-26

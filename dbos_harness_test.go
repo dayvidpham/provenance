@@ -1,7 +1,7 @@
 package provenance_test
 
 // dbos_harness_test.go builds the real DBOS + borrowed-tracker stack every adapter
-// test drives, in the issue's startup order (open *sql.DB → NewDBOSContext →
+// test drives, in the issue's startup order (open *sql.DB → dbos.NewContext →
 // OpenBorrowedSQLite → NewDBOSAdapter → Launch). It uses the pinned
 // modernc.org/sqlite driver DBOS itself uses, on a shared temp file, so the DBOS
 // checkpoints and the Provenance domain rows are co-located in one database.
@@ -71,7 +71,7 @@ func newDBOSStackUnlaunched(t *testing.T, wrap func(provenance.Tracker) provenan
 		ApplicationVersion: "test-v1",
 	})
 	if err != nil {
-		t.Fatalf("NewDBOSContext: %v", err)
+		t.Fatalf("dbos.NewContext: %v", err)
 	}
 
 	borrowed, err := provenance.OpenBorrowedSQLite(db)
@@ -168,7 +168,7 @@ func newUnlaunchedRoot(t *testing.T, appVersion string) (dbos.Context, provenanc
 		AppName: "provenance-unlaunched-test", SQLiteSystemDB: db, ApplicationVersion: appVersion,
 	})
 	if err != nil {
-		t.Fatalf("NewDBOSContext: %v", err)
+		t.Fatalf("dbos.NewContext: %v", err)
 	}
 	borrowed, err := provenance.OpenBorrowedSQLite(db)
 	if err != nil {

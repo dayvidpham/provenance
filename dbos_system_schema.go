@@ -25,6 +25,10 @@ var ErrSupersededDBOSSystemSchema = dbossys.ErrSupersededSystemSchema
 // as dbos.Config.SQLiteSystemDB, BEFORE it creates that context. The gate only
 // reads: on refusal the file is unchanged and nothing was opened or launched.
 //
+// dbos.NewClient is the same moment under another name: it builds a context of
+// its own from ClientConfig.SQLiteSystemDB and therefore migrates in place too.
+// Call this gate before that constructor as well.
+//
 // A database with no DBOS system schema is fresh and is accepted; the runtime
 // creates the schema on its first launch.
 func RequireSupportedDBOSSystemSchema(ctx context.Context, systemDB *sql.DB, origin string) error {

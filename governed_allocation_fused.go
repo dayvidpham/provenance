@@ -39,6 +39,21 @@ type HostBoundGovernedAllocator struct {
 // so this constructor does not claim to certify independently assembled pairs;
 // callers must pass the same variables at the one engine construction site.
 // Registration must occur before the host launches root.
+//
+// The host owns two obligations that this constructor cannot discharge for it,
+// because both happen before the root exists:
+//
+//  1. Blank-import "github.com/dbos-inc/dbos-transact-golang/dbos/driver/sqlite"
+//     in the binary. The DBOS runtime keeps no SQLite driver of its own and uses
+//     whichever driver that import registers, even for a caller-supplied handle.
+//     Without it every context construction over SQLite fails at run time, and
+//     the runtime loses the error-code extractor it needs to tell a busy or
+//     locked database apart from a permanent failure.
+//  2. Call RequireSupportedDBOSSystemSchema on the exact *sql.DB, BEFORE the
+//     call that builds the root -- dbos.NewContext, or dbos.NewClient, which
+//     builds a context of its own. Either call migrates a superseded system
+//     database in place while it constructs, and this build supports no such
+//     upgrade, so the preflight has no later moment to run in.
 func NewHostBoundGovernedAllocator(ctx context.Context, root dbos.Context, systemDB *sql.DB, participant GovernedAllocationParticipant) (*HostBoundGovernedAllocator, error) {
 	if ctx == nil {
 		ctx = context.Background()

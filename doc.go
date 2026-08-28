@@ -17,6 +17,24 @@
 // parallel commit ledger). OpenBorrowedSQLite shares one physical SQLite database
 // with a DBOS root.
 //
+// # Host obligations on the borrowed path
+//
+// A host that builds its own DBOS root (NewHostBoundGovernedAllocator,
+// NewDBOSAdapter) owns two steps that Provenance cannot take for it:
+//
+//   - The binary must blank-import
+//     "github.com/dbos-inc/dbos-transact-golang/dbos/driver/sqlite". The DBOS
+//     runtime keeps no SQLite driver of its own and uses whichever driver that
+//     import registers, even for a caller-supplied handle.
+//   - RequireSupportedDBOSSystemSchema must be called on the exact *sql.DB
+//     before the root is built, by either dbos.NewContext or dbos.NewClient
+//     (which builds a context of its own). Both migrate a superseded system
+//     database in place during construction, and this build supports no in-place
+//     upgrade, so no later moment can refuse one.
+//
+// The factory-owned constructors (OpenBoundGovernedAllocator,
+// OpenFusedGovernedAllocator) take both steps themselves.
+//
 // OpenBorrowedSQLite uses the exact caller-owned database/sql pool for both DBOS
 // and Provenance. Provenance never closes that pool; a Ping liveness sentinel
 // makes post-shutdown access return StoreUnavailableError. See dbos_store.go for

@@ -112,7 +112,7 @@ Direct dependencies pinned in `go.mod`:
 | `github.com/dominikbraun/graph` | Directed graph operations, topological sort, cycle detection | v0.23.0 |
 | `github.com/google/uuid` | UUIDv7 generation for IDs | v1.6.0 |
 | `gopkg.in/yaml.v3` | YAML parsing (used by namespace and frontmatter helpers) | v3.0.1 |
-| `modernc.org/sqlite` | Pure-Go SQLite driver, used through `database/sql` (journal, projections, local state) | v1.52.0 |
+| `modernc.org/sqlite` | Pure-Go SQLite driver, used through `database/sql` (journal, projections, local state) | v1.54.0 |
 | `github.com/dbos-inc/dbos-transact-golang` | Durable-execution runtime for the DBOS adapter and borrowed-pool integration | v1.2.0 |
 
 No other direct external dependencies may be added without supervisor approval. Indirect (transitive) dependencies are tracked in `go.mod`'s `indirect` block — see `CONTRIBUTING.md` for why `zombiezen.com/go/sqlite` still appears there.
