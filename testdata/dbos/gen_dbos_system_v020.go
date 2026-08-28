@@ -10,11 +10,17 @@
 // module pinned to the superseded runtime; TESTING.md, "The superseded DBOS
 // system-database fixture", gives the exact commands.
 //
+// The committed fixture was written with the superseded runtime over
+// modernc.org/sqlite v1.52.0, the driver this module pinned at the time. Pin
+// that driver version when you regenerate, so the result stays the file that
+// runtime pairing really produces.
+//
 // The rebuilt file is not byte-identical to the committed fixture. It carries a
 // fresh executor identity and its own SQLite page layout. What reproduces is the
-// shape the clean-cut policy refuses: dbos_migrations.version == 41. If you
-// replace the committed fixture, update the pinned digest in
-// internal/dbosfixture/dbosfixture.go in the same change.
+// shape the clean-cut policy refuses: dbos_migrations.version == 41, one
+// 176128-byte WAL-mode file with no sidecar. If you replace the committed
+// fixture, update the pinned digest in internal/dbosfixture/dbosfixture.go in
+// the same change.
 package main
 
 import (
@@ -63,7 +69,15 @@ func main() {
 	if err := dbos.Launch(root); err != nil {
 		log.Fatalf("launch the superseded DBOS context: %v", err)
 	}
+	// The superseded runtime owns closing the pool it was given, so everything
+	// after this point runs on a fresh handle.
 	dbos.Shutdown(root, 30*time.Second)
+
+	db, err = sql.Open("sqlite", "file:"+*out+"?_pragma=busy_timeout(5000)&mode=rw")
+	if err != nil {
+		log.Fatalf("re-open the written fixture: %v", err)
+	}
+	db.SetMaxOpenConns(1)
 
 	var version int64
 	if err := db.QueryRow(`SELECT version FROM dbos_migrations LIMIT 1`).Scan(&version); err != nil {
@@ -75,12 +89,12 @@ func main() {
 	}
 
 	// Fold the WAL back into the main file and prove the sidecars are gone, so
-	// the committed fixture is one self-contained immutable file.
+	// the committed fixture is one self-contained immutable file. The database
+	// stays in WAL mode: the committed fixture records it (header bytes 18 and
+	// 19 are 2), and leaving WAL mode here would rewrite that header and produce
+	// a file the superseded runtime never wrote.
 	if _, err := db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
 		log.Fatalf("checkpoint the write-ahead log: %v", err)
-	}
-	if _, err := db.Exec(`PRAGMA journal_mode(DELETE)`); err != nil {
-		log.Fatalf("leave write-ahead logging: %v", err)
 	}
 	if err := db.Close(); err != nil {
 		log.Fatalf("close the fixture database: %v", err)

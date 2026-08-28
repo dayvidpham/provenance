@@ -168,17 +168,25 @@ cd "$scratch"
 cp "$repo/testdata/dbos/gen_dbos_system_v020.go" main.go
 go mod init dbosfixture
 go get github.com/dbos-inc/dbos-transact-golang@v0.20.0
-go get modernc.org/sqlite@v1.54.0
-go run . -out ./dbos_system_v020.db
+go get modernc.org/sqlite@v1.52.0
+go run main.go -out ./dbos_system_v020.db   # the file, not the package: it is build-ignored
 sha256sum dbos_system_v020.db
 ```
 
-The generator fails unless the recorded version is 41, checkpoints the
-write-ahead log back into the main file, leaves WAL mode, and proves no `-wal` or
-`-shm` sidecar survives, so the result is one self-contained immutable file.
+The driver pin matters: the committed fixture was written with
+`modernc.org/sqlite` v1.52.0, the version this module pinned when the superseded
+runtime was current. The generator fails unless the recorded version is 41,
+checkpoints the write-ahead log back into the main file, and proves no `-wal` or
+`-shm` sidecar survives, so the result is one self-contained immutable file. It
+stays in WAL mode, which is what the committed fixture records; the committed
+file is 176128 bytes with a 4096-byte page size.
+
+The recipe is verified, not assumed: run offline against the module cache it
+produces a 176128-byte WAL-mode file at system schema version 41 with no
+sidecar, the same shape as the committed fixture.
 
 The rebuilt file is not byte-identical to the committed one: it carries a fresh
-executor identity and its own SQLite page layout. Only the shape reproduces.
+executor identity, so its digest differs on every run. Only the shape reproduces.
 Replacing the committed fixture therefore means updating
 `DBOSSystemV020SHA256` in `internal/dbosfixture/dbosfixture.go` in the same
 change.

@@ -30,9 +30,14 @@ that most needs one exact shape.
   runtime loses the error-code extractor it needs to tell a busy or locked
   database apart from a permanent failure. Provenance links the driver in its own
   factory-owned open path.
-- The SQLite driver moved from `modernc.org/sqlite` v1.52.0 to v1.54.0, forced by
-  the runtime upgrade. That driver is the substrate of the contended-write fixes
-  in v0.0.5 and v0.0.6, so the bump is called out rather than left to `go.mod`.
+- Dependencies the runtime upgrade moved, through minimal version selection.
+  `modernc.org/sqlite` v1.52.0 -> v1.54.0 is the one that matters and the one
+  named in the approved-dependency table: it is the SQLite driver, the substrate
+  of the contended-write fixes in v0.0.5 and v0.0.6, so the bump is called out
+  rather than left to `go.mod`. The transitive set moved with it:
+  `modernc.org/libc` v1.73.0 -> v1.74.3, `golang.org/x/sync` v0.21.0 -> v0.22.0,
+  `golang.org/x/sys` v0.46.0 -> v0.47.0, `golang.org/x/text` v0.38.0 -> v0.40.0,
+  and `github.com/mattn/go-isatty` v0.0.22 -> v0.0.23.
 
 #### Stored databases: a system database from the superseded DBOS runtime is refused
 
