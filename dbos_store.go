@@ -17,6 +17,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+
+	"github.com/dayvidpham/provenance/internal/dbossys"
 )
 
 // StoreUnavailableError is returned by every borrowed-tracker read or write once
@@ -54,7 +56,7 @@ func OpenBorrowedSQLite(db *sql.DB, opts ...Option) (Tracker, error) {
 		return nil, fmt.Errorf(
 			"provenance.OpenBorrowedSQLite: the borrowed *sql.DB is nil — where: borrowed-store open; " +
 				"impact: no shared database to bridge; fix: pass the exact *sql.DB configured as the DBOS " +
-				"root's SqliteSystemDB, or use OpenSQLite/OpenMemory for a standalone tracker")
+				"root's SQLiteSystemDB, or use OpenSQLite/OpenMemory for a standalone tracker")
 	}
 	if err := db.Ping(); err != nil {
 		return nil, fmt.Errorf(
@@ -74,31 +76,16 @@ func OpenBorrowedSQLite(db *sql.DB, opts ...Option) (Tracker, error) {
 }
 
 // borrowedDatabasePath derives the on-disk path of the borrowed handle's main
-// database via PRAGMA database_list. An empty file column means an in-memory,
-// temporary, or pathless database, which cannot back a same-file bridge.
+// database. An empty path means an in-memory, temporary, or pathless database,
+// which cannot back a same-file bridge. The derivation itself lives in
+// internal/dbossys because the DBOS system-schema refusal names the same file.
 func borrowedDatabasePath(db *sql.DB) (string, error) {
-	rows, err := db.Query("PRAGMA database_list")
+	path, err := dbossys.MainDatabaseFile(context.Background(), db)
 	if err != nil {
 		return "", fmt.Errorf(
-			"provenance.OpenBorrowedSQLite: query PRAGMA database_list on the borrowed handle: %w — "+
+			"provenance.OpenBorrowedSQLite: derive the borrowed handle's main database path: %w — "+
 				"where: path derivation; impact: cannot locate the shared file to bridge; fix: the borrowed "+
 				"handle must be a live SQLite connection", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	var path string
-	for rows.Next() {
-		var seq int
-		var name, file string
-		if err := rows.Scan(&seq, &name, &file); err != nil {
-			return "", fmt.Errorf("provenance.OpenBorrowedSQLite: scan PRAGMA database_list row: %w", err)
-		}
-		if name == "main" {
-			path = file
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return "", fmt.Errorf("provenance.OpenBorrowedSQLite: iterate PRAGMA database_list: %w", err)
 	}
 	if path == "" {
 		return "", fmt.Errorf(

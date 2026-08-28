@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -12,6 +11,7 @@ import (
 	dbos "github.com/dbos-inc/dbos-transact-golang/dbos"
 	_ "modernc.org/sqlite"
 
+	"github.com/dayvidpham/provenance/internal/dbosfixture"
 	"github.com/dayvidpham/provenance/internal/dbossys"
 )
 
@@ -20,13 +20,15 @@ import (
 // therefore links no DBOS SQLite driver, which is the only way to observe the
 // real missing-driver failure that a production binary must never produce.
 
-// openFixtureCopy copies an immutable testdata database into the case's own
-// temporary directory and opens that private copy read-write.
-func openFixtureCopy(t *testing.T, name string) *sql.DB {
+// testdataDBOSDir is this package's relative path to the immutable DBOS
+// fixtures.
+var testdataDBOSDir = filepath.Join("..", "..", "testdata", "dbos")
+
+// openSupersededFixtureCopy verifies the fixture's pinned digest, copies it into
+// the case's own temporary directory, and opens that private copy read-write.
+func openSupersededFixtureCopy(t *testing.T) *sql.DB {
 	t.Helper()
-	source := filepath.Join("..", "..", "testdata", "dbos", name)
-	target := filepath.Join(t.TempDir(), name)
-	copyFile(t, source, target)
+	target, _ := dbosfixture.PrivateDBOSSystemV020Copy(t, testdataDBOSDir)
 	db, err := sql.Open("sqlite", "file:"+target+"?_pragma=busy_timeout(5000)&mode=rw")
 	if err != nil {
 		t.Fatalf("open fixture copy %s: %v", target, err)
@@ -69,15 +71,16 @@ func TestInspectSchemaReportsFreshDatabase(t *testing.T) {
 // the exact durable shape the clean-cut policy refuses.
 func TestInspectSchemaReportsSupersededVersionForV020Database(t *testing.T) {
 	t.Parallel()
-	state, version, err := dbossys.InspectSchema(context.Background(), openFixtureCopy(t, "dbos_system_v020.db"))
+	state, version, err := dbossys.InspectSchema(context.Background(), openSupersededFixtureCopy(t))
 	if err != nil {
 		t.Fatalf("InspectSchema on the v0.20 fixture: %v", err)
 	}
 	if state != dbossys.SchemaStateSuperseded {
 		t.Errorf("state=%s want %s", state, dbossys.SchemaStateSuperseded)
 	}
-	if version != 41 {
-		t.Errorf("version=%d want 41, the last migration the superseded runtime applied", version)
+	if version != dbosfixture.SupersededSystemSchemaVersion {
+		t.Errorf("version=%d want %d, the last migration the superseded runtime applied",
+			version, dbosfixture.SupersededSystemSchemaVersion)
 	}
 	if version >= dbossys.FirstSupportedMigrationVersion {
 		t.Errorf("fixture version %d is not below the supported floor %d: the fixture no longer proves anything",
@@ -94,7 +97,7 @@ func TestRequireSupportedSchemaAcceptsFreshDatabase(t *testing.T) {
 
 func TestRequireSupportedSchemaRefusesV020DatabaseWithActionableError(t *testing.T) {
 	t.Parallel()
-	err := dbossys.RequireSupportedSchema(context.Background(), openFixtureCopy(t, "dbos_system_v020.db"), "fixture.db")
+	err := dbossys.RequireSupportedSchema(context.Background(), openSupersededFixtureCopy(t), "fixture.db")
 	if err == nil {
 		t.Fatal("RequireSupportedSchema accepted a superseded system schema; the clean-cut policy is not enforced")
 	}
@@ -115,6 +118,116 @@ func TestRequireSupportedSchemaRefusesV020DatabaseWithActionableError(t *testing
 		if !strings.Contains(message, want) {
 			t.Errorf("refusal message is missing %q; got: %s", want, message)
 		}
+	}
+}
+
+// The refusal has to be actionable in a shell. A production caller passes its
+// DSN as origin, and a durable Modernc DSN carries a "file:" scheme and a pragma
+// query string, so the DSN is not a file name anybody can delete. The fix clause
+// must therefore name the plain path the handle really uses, plus its two SQLite
+// siblings, and must carry no query string at all.
+func TestRequireSupportedSchemaNamesTheRealFileNotTheDSN(t *testing.T) {
+	t.Parallel()
+	target, _ := dbosfixture.PrivateDBOSSystemV020Copy(t, testdataDBOSDir)
+	dsn := "file:" + target + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&mode=rw"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("open the fixture copy through a production-shaped DSN: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = db.Close() })
+
+	err = dbossys.RequireSupportedSchema(context.Background(), db, dsn)
+	if err == nil {
+		t.Fatal("RequireSupportedSchema accepted a superseded system schema")
+	}
+	message := err.Error()
+
+	// The plain path is named before anything else, so a reader sees the file
+	// first and the DSN only as secondary context.
+	if !strings.Contains(message, target) {
+		t.Errorf("refusal never names the real file %s; got: %s", target, message)
+	}
+
+	fixIndex := strings.Index(message, "fix: ")
+	if fixIndex < 0 {
+		t.Fatalf("refusal has no fix clause: %s", message)
+	}
+	fix := message[fixIndex:]
+	for _, want := range []string{target, target + "-wal", target + "-shm"} {
+		if !strings.Contains(fix, want) {
+			t.Errorf("fix clause does not name %s; got: %s", want, fix)
+		}
+	}
+	// A reader copies the fix clause into a shell. Anything from the DSN's query
+	// string there would make the command wrong.
+	for _, forbidden := range []string{"_pragma", "file:", "mode=rw", "?"} {
+		if strings.Contains(fix, forbidden) {
+			t.Errorf("fix clause contains DSN syntax %q, which no shell accepts as a file name; got: %s", forbidden, fix)
+		}
+	}
+}
+
+// A concurrent first launch commits the runtime's migrations one at a time, so a
+// second opener can read a version below the floor while the database is being
+// created, not because it is superseded. The refusal must say so before it tells
+// anybody to delete a file.
+func TestRequireSupportedSchemaWarnsAboutAConcurrentFirstLaunch(t *testing.T) {
+	t.Parallel()
+	err := dbossys.RequireSupportedSchema(context.Background(), openSupersededFixtureCopy(t), "fixture.db")
+	if err == nil {
+		t.Fatal("RequireSupportedSchema accepted a superseded system schema")
+	}
+	message := err.Error()
+	caution := strings.Index(message, "caution: ")
+	fix := strings.Index(message, "fix: ")
+	if caution < 0 {
+		t.Fatalf("refusal does not mention the concurrent-first-launch transient: %s", message)
+	}
+	if fix < 0 || caution > fix {
+		t.Errorf("the caution must precede the deletion instruction; got: %s", message)
+	}
+	for _, want := range []string{"still creating", "no other process"} {
+		if !strings.Contains(message, want) {
+			t.Errorf("caution is missing %q; got: %s", want, message)
+		}
+	}
+}
+
+// MainDatabaseFile answers with the file SQLite itself reports, and reports an
+// empty path (not an error) for a database that has no file.
+func TestMainDatabaseFileReportsTheFileBehindADSN(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "named.db")
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open a named database: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = db.Close() })
+	got, err := dbossys.MainDatabaseFile(context.Background(), db)
+	if err != nil {
+		t.Fatalf("MainDatabaseFile on a named database: %v", err)
+	}
+	if got != path {
+		t.Errorf("MainDatabaseFile = %q, want the plain path %q", got, path)
+	}
+}
+
+func TestMainDatabaseFileReportsNoPathForAnInMemoryDatabase(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open an in-memory database: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = db.Close() })
+	got, err := dbossys.MainDatabaseFile(context.Background(), db)
+	if err != nil {
+		t.Fatalf("MainDatabaseFile on an in-memory database: %v", err)
+	}
+	if got != "" {
+		t.Errorf("MainDatabaseFile = %q, want an empty path for a database with no file", got)
 	}
 }
 
@@ -166,17 +279,5 @@ func TestClassifyOpenFailureReportsNoFailureForNil(t *testing.T) {
 	t.Parallel()
 	if got := dbossys.ClassifyOpenFailure(nil); got != dbossys.OpenFailureNone {
 		t.Fatalf("ClassifyOpenFailure(nil)=%s want %s", got, dbossys.OpenFailureNone)
-	}
-}
-
-// copyFile writes an immutable fixture's bytes to a private mutable path.
-func copyFile(t *testing.T, source, target string) {
-	t.Helper()
-	data, err := os.ReadFile(source)
-	if err != nil {
-		t.Fatalf("read immutable fixture %s: %v", source, err)
-	}
-	if err := os.WriteFile(target, data, 0o600); err != nil {
-		t.Fatalf("write private fixture copy %s: %v", target, err)
 	}
 }

@@ -153,9 +153,63 @@ func InspectSchema(ctx context.Context, db *sql.DB) (SchemaState, int64, error) 
 	return SchemaStateSupported, version, nil
 }
 
+// MainDatabaseFile reports the on-disk path of db's main database, derived from
+// PRAGMA database_list. It returns an empty path, and no error, for an
+// in-memory, temporary, or otherwise pathless database: those have no file an
+// operator can act on.
+//
+// The DSN a caller opens a handle with is not that path. A durable Modernc
+// SQLite DSN carries a "file:" scheme and a pragma query string, so it is not a
+// shell-usable file name; this derivation asks SQLite itself instead.
+func MainDatabaseFile(ctx context.Context, db *sql.DB) (string, error) {
+	if db == nil {
+		return "", fmt.Errorf(
+			"dbossys.MainDatabaseFile: database handle is nil -- where: main-database path derivation; " +
+				"impact: no path was derived and nothing was opened; " +
+				"fix: pass the live *sql.DB whose file you need to name")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rows, err := db.QueryContext(ctx, "PRAGMA database_list")
+	if err != nil {
+		return "", fmt.Errorf(
+			"dbossys.MainDatabaseFile: query PRAGMA database_list -- where: main-database path derivation; "+
+				"impact: the file behind the handle could not be named; "+
+				"fix: pass a live SQLite connection, then retry: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var path string
+	for rows.Next() {
+		var seq int
+		var name, file string
+		if err := rows.Scan(&seq, &name, &file); err != nil {
+			return "", fmt.Errorf(
+				"dbossys.MainDatabaseFile: scan a PRAGMA database_list row -- where: main-database path derivation; "+
+					"impact: the file behind the handle could not be named; "+
+					"fix: pass a live SQLite connection, then retry: %w", err)
+		}
+		if name == "main" {
+			path = file
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf(
+			"dbossys.MainDatabaseFile: iterate PRAGMA database_list -- where: main-database path derivation; "+
+				"impact: the file behind the handle could not be named; "+
+				"fix: pass a live SQLite connection, then retry: %w", err)
+	}
+	return path, nil
+}
+
 // RequireSupportedSchema refuses a system database that a superseded DBOS
-// runtime created. origin names the database for the operator, normally its
-// path or DSN.
+// runtime created. origin names the database as the caller configured it,
+// normally its DSN.
+//
+// The refusal names the real file the operator must delete, derived from the
+// handle itself, because origin is usually a DSN with a scheme and a pragma
+// query string and is therefore not a file name any shell accepts. origin stays
+// in the message as secondary context so the caller can find the call site.
 //
 // The refusal is deliberate and final: Provenance supports no in-place upgrade
 // of a superseded system database, so it must not let the DBOS runtime migrate
@@ -176,9 +230,35 @@ func RequireSupportedSchema(ctx context.Context, db *sql.DB, origin string) erro
 			"-- where: DBOS system-schema preflight, before any DBOS context is created; "+
 			"why: a superseded DBOS runtime wrote it, and this build supports no in-place upgrade of that durable state; "+
 			"impact: nothing was opened, launched, or migrated, and the file is unchanged; "+
-			"fix: drain or abandon the old workflows, delete the database file %s (and its -wal and -shm siblings), "+
-			"then let this build create a fresh one: %w",
-		origin, version, FirstSupportedMigrationVersion, origin, ErrSupersededSystemSchema)
+			"caution: a first launch that is still creating this database records a below-floor version until its "+
+			"migrations finish, so confirm that no other process is opening the same file before you delete anything; "+
+			"fix: drain or abandon the old workflows, %s, then let this build create a fresh one: %w",
+		describeDatabase(ctx, db, origin), version, FirstSupportedMigrationVersion,
+		describeDeletion(ctx, db, origin), ErrSupersededSystemSchema)
+}
+
+// describeDatabase names the database for a human: its real file when the handle
+// can report one, with the caller's origin as secondary context.
+func describeDatabase(ctx context.Context, db *sql.DB, origin string) string {
+	path, err := MainDatabaseFile(ctx, db)
+	if err != nil || path == "" {
+		return origin
+	}
+	if path == origin {
+		return path
+	}
+	return fmt.Sprintf("%s (opened as %s)", path, origin)
+}
+
+// describeDeletion spells out the exact deletion an operator must perform. It
+// names the plain file path and its two SQLite siblings, never the DSN, because
+// this clause is the one a reader copies into a shell.
+func describeDeletion(ctx context.Context, db *sql.DB, origin string) string {
+	path, err := MainDatabaseFile(ctx, db)
+	if err != nil || path == "" {
+		return fmt.Sprintf("delete the database file that %s names, together with its -wal and -shm siblings", origin)
+	}
+	return fmt.Sprintf("delete the database file %s and its two siblings %s-wal and %s-shm", path, path, path)
 }
 
 // ClassifyOpenFailure maps a DBOS construction error onto the closed set of
