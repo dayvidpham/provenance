@@ -854,9 +854,10 @@ func (db *DB) QueryTaskEvents(q journal.JournalQueryV1) (page journal.JournalTas
 
 func scanTaskEventRow(rows *sql.Rows) (journal.TaskEventRow, error) {
 	var journalID, recordedAt int64
+	var producer sql.NullInt64
 	var actorRaw, taskRaw, eventKind string
 	var payload []byte
-	if err := rows.Scan(&journalID, &actorRaw, &recordedAt, &taskRaw, &eventKind, &payload); err != nil {
+	if err := rows.Scan(&journalID, &actorRaw, &recordedAt, &taskRaw, &eventKind, &payload, &producer); err != nil {
 		return journal.TaskEventRow{}, err
 	}
 	actorID, err := journalParseActor(actorRaw)
@@ -867,7 +868,7 @@ func scanTaskEventRow(rows *sql.Rows) (journal.TaskEventRow, error) {
 	if err != nil {
 		return journal.TaskEventRow{}, err
 	}
-	return journal.TaskEventRow{
+	row := journal.TaskEventRow{
 		Row: journal.Row{
 			JournalID:  journal.JournalID(journalID),
 			Kind:       journal.JournalKindTaskEvent,
@@ -877,7 +878,12 @@ func scanTaskEventRow(rows *sql.Rows) (journal.TaskEventRow, error) {
 		TaskID:    taskID,
 		EventKind: journal.EventKind(eventKind),
 		Payload:   append(json.RawMessage(nil), payload...),
-	}, nil
+	}
+	if producer.Valid {
+		id := journal.JournalID(producer.Int64)
+		row.ProducedByOperationJournalID = &id
+	}
+	return row, nil
 }
 
 func (scope *connScope) loadContexts(journalID int64) ([]journal.EventContext, error) {
