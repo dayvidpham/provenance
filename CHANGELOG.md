@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Fixed
+
+- `QueryTaskEvents` now returns `Row.ProducedByOperationJournalID` from the
+  stored task event in both journal and recorded-time order, including filtered
+  and cursor-paged queries through SQLite and borrowed SQLite.
+
 ## v0.1.0 - 2026-09-06
 
 ### Added
