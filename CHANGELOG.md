@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Added
+
+- Optional `AssignmentStartQueryAPI` on SQLite and borrowed SQLite journals:
+  bounded authority-candidate pages, exact assignment-start and producer IDs,
+  corruption checks before filtering, and explicit pinned-empty snapshots.
+  See [assignment-start queries](docs/assignment-start-queries.md) for cursor,
+  lifecycle, physical-work and whole-store audit boundaries.
+
 ## v0.0.7 - 2026-08-28
 
 ### Breaking Changes

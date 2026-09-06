@@ -323,6 +323,23 @@ type borrowedJournal struct {
 	owner *borrowedTracker
 }
 
+var _ AssignmentStartQueryAPI = (*borrowedJournal)(nil)
+
+func (j *borrowedJournal) QueryAssignmentStarts(q AssignmentStartQuery) (AssignmentStartPage, error) {
+	if err := j.owner.available("Journal.QueryAssignmentStarts"); err != nil {
+		return AssignmentStartPage{}, err
+	}
+	api, ok := j.inner.(AssignmentStartQueryAPI)
+	if !ok {
+		return AssignmentStartPage{}, &StoreUnavailableError{
+			Operation: "Journal.QueryAssignmentStarts", Store: "borrowed journal", Stage: "capability check before query",
+			Impact: "no assignment-start page returned", Fix: "use a SQLite journal with AssignmentStartQueryAPI support",
+			Cause: fmt.Errorf("inner journal lacks AssignmentStartQueryAPI"),
+		}
+	}
+	return api.QueryAssignmentStarts(q)
+}
+
 // Facts returns a liveness-gated reader over the same borrowed journal. The
 // accessor itself has no error result, so each query performs the owner check.
 func (j *borrowedJournal) Facts() FactQueryAPI {
