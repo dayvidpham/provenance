@@ -323,7 +323,10 @@ type borrowedJournal struct {
 	owner *borrowedTracker
 }
 
-var _ AssignmentStartQueryAPI = (*borrowedJournal)(nil)
+var (
+	_ AssignmentStartQueryAPI = (*borrowedJournal)(nil)
+	_ ActorOwnershipQueryAPI  = (*borrowedJournal)(nil)
+)
 
 func (j *borrowedJournal) QueryAssignmentStarts(q AssignmentStartQuery) (AssignmentStartPage, error) {
 	if err := j.owner.available("Journal.QueryAssignmentStarts"); err != nil {
@@ -338,6 +341,21 @@ func (j *borrowedJournal) QueryAssignmentStarts(q AssignmentStartQuery) (Assignm
 		}
 	}
 	return api.QueryAssignmentStarts(q)
+}
+
+func (j *borrowedJournal) QueryActorOwnership(ctx context.Context, q ActorOwnershipQuery) (ActorOwnershipSnapshot, error) {
+	if err := j.owner.available("Journal.QueryActorOwnership"); err != nil {
+		return ActorOwnershipSnapshot{}, err
+	}
+	api, ok := j.inner.(ActorOwnershipQueryAPI)
+	if !ok {
+		return ActorOwnershipSnapshot{}, &StoreUnavailableError{
+			Operation: "Journal.QueryActorOwnership", Store: "borrowed journal", Stage: "capability check before query",
+			Impact: "no actor-ownership snapshot returned", Fix: "use a SQLite journal with ActorOwnershipQueryAPI support",
+			Cause: fmt.Errorf("inner journal lacks ActorOwnershipQueryAPI"),
+		}
+	}
+	return api.QueryActorOwnership(ctx, q)
 }
 
 // Facts returns a liveness-gated reader over the same borrowed journal. The

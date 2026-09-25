@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.3.0 - 2026-09-25
+
+### Added
+
+- Optional public `ActorOwnershipQueryAPI` reads an actor's current owned tasks,
+  producing operation, transfer predecessor, selected task-event material, and
+  selected evidence from one SQLite snapshot. SQLite and borrowed SQLite support
+  the API without changing `Journal`, `ContextJournal`, or `Tracker`.
+- Actor-ownership reads fail closed on owner/episode projection disagreement and
+  missing operation producers. Their only output bound is the 8 MiB wire guard;
+  crossing-row diagnostics report the first over-limit running total and work
+  completed before that row.
+- See [actor-ownership queries](docs/actor-ownership-queries.md) for snapshot,
+  producer-selection, cancellation, borrowed-store, and transfer-successor
+  boundaries.
+
+### Compatibility
+
+- The read adds no schema, index, DDL, or migration. Existing v0.2.0-supported
+  databases remain readable without schema changes.
+
 ## v0.2.0 - 2026-09-07
 
 ### Added

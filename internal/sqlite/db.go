@@ -65,6 +65,9 @@ type DB struct {
 	// factHooks are per-instance test seams; production leaves them nil. See
 	// factQueryTestHooks in facts.go.
 	factHooks factQueryTestHooks
+	// actorOwnershipHooks are per-instance test seams; production leaves them
+	// nil. See actorOwnershipTestHooks in actor_ownership.go.
+	actorOwnershipHooks actorOwnershipTestHooks
 }
 
 // foreignKeyDiscipline is the closed selector for how a lease establishes
