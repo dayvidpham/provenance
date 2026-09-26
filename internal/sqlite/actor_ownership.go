@@ -247,14 +247,14 @@ func (db *DB) readActorOwnershipTasks(scope *connScope, actor journal.ActorID, l
 		}
 		task, err := journalParseTask(taskID.String)
 		if err != nil {
-			return actorOwnershipOwnedResult{}, actorOwnershipIntegrity(fmt.Sprintf("owned task %q has a malformed stored task ID", taskID.String), "restore the task identity and its episode rows from the same committed backup", err)
+			return actorOwnershipOwnedResult{}, actorOwnershipIntegrity(journal.ActorOwnershipStageOwnedTasks, fmt.Sprintf("owned task %q has a malformed stored task ID", taskID.String), "restore the task identity and its episode rows from the same committed backup", err)
 		}
 		if !occupant.Valid {
 			return actorOwnershipOwnedResult{}, &journal.OwnerProjectionMismatchError{Task: task, Owner: actor}
 		}
 		active, err := journalParseActor(occupant.String)
 		if err != nil {
-			return actorOwnershipOwnedResult{}, actorOwnershipIntegrity(fmt.Sprintf("owned task %s has malformed active occupant %q", task, occupant.String), "restore the episode occupant from the same committed backup", err)
+			return actorOwnershipOwnedResult{}, actorOwnershipIntegrity(journal.ActorOwnershipStageOwnedTasks, fmt.Sprintf("owned task %s has malformed active occupant %q", task, occupant.String), "restore the episode occupant from the same committed backup", err)
 		}
 		if active != actor {
 			return actorOwnershipOwnedResult{}, &journal.OwnerProjectionMismatchError{Task: task, Owner: actor, ActiveOccupant: &active}
@@ -262,30 +262,35 @@ func (db *DB) readActorOwnershipTasks(scope *connScope, actor journal.ActorID, l
 
 		rowBytes := actorOwnershipLength(taskLength) + actorOwnershipLength(assignmentLength) + actorOwnershipLength(operationLength) + actorOwnershipLength(predecessorLength)
 		observed := snapshot.Work.ResultBytes + rowBytes
+		// A wire-suppressed value has no valid scan destination, and its declared
+		// length is already part of observed, so the running total refuses the row
+		// first. guardNull names that refusal explicitly, which is why deleting it
+		// on its own changes no outcome: it is defence in depth, not a reachable
+		// arm.
 		guardNull := assignmentLength.Valid && !assignmentID.Valid || operationLength.Valid && !operationID.Valid || predecessorLength.Valid && !predecessorID.Valid
 		if observed > limit || guardNull {
 			return actorOwnershipOwnedResult{}, actorOwnershipLimit(actor, journal.ActorOwnershipStageOwnedTasks, limit, observed, snapshot.Work)
 		}
 		if !assignmentID.Valid || !started.Valid || started.Int64 <= 0 || !producer.Valid || producer.Int64 <= 0 || !operationID.Valid {
-			return actorOwnershipOwnedResult{}, actorOwnershipIntegrity(fmt.Sprintf("owned task %s has an active episode without a complete start journal and journal_operations producer", task), "restore the started transition, journal supertype row, and journal_operations row from the same committed backup", nil)
+			return actorOwnershipOwnedResult{}, actorOwnershipIntegrity(journal.ActorOwnershipStageOwnedTasks, fmt.Sprintf("owned task %s has an active episode without a complete start journal and journal_operations producer", task), "restore the started transition, journal supertype row, and journal_operations row from the same committed backup", nil)
 		}
 		assignment := journal.AssignmentID(assignmentID.String)
 		if err := journal.ValidateOperationID(journal.OperationID(assignment)); err != nil {
-			return actorOwnershipOwnedResult{}, actorOwnershipIntegrity(fmt.Sprintf("owned task %s has malformed assignment ID %q", task, assignment), "restore the episode identity from the same committed backup", err)
+			return actorOwnershipOwnedResult{}, actorOwnershipIntegrity(journal.ActorOwnershipStageOwnedTasks, fmt.Sprintf("owned task %s has malformed assignment ID %q", task, assignment), "restore the episode identity from the same committed backup", err)
 		}
 		operation := journal.OperationID(operationID.String)
 		if err := journal.ValidateOperationID(operation); err != nil {
-			return actorOwnershipOwnedResult{}, actorOwnershipIntegrity(fmt.Sprintf("owned task %s has malformed producing operation ID %q", task, operation), "restore journal_operations and the started transition's journal producer", err)
+			return actorOwnershipOwnedResult{}, actorOwnershipIntegrity(journal.ActorOwnershipStageOwnedTasks, fmt.Sprintf("owned task %s has malformed producing operation ID %q", task, operation), "restore journal_operations and the started transition's journal producer", err)
 		}
 		phaseValue := ptypes.Phase(phase.Int64)
 		if !phaseValue.IsValid() {
-			return actorOwnershipOwnedResult{}, actorOwnershipIntegrity(fmt.Sprintf("owned task %s has unknown phase %d", task, phase.Int64), "restore the task and its canonical phase from the same committed backup", nil)
+			return actorOwnershipOwnedResult{}, actorOwnershipIntegrity(journal.ActorOwnershipStageOwnedTasks, fmt.Sprintf("owned task %s has unknown phase %d", task, phase.Int64), "restore the task and its canonical phase from the same committed backup", nil)
 		}
 		row := journal.OwnedTaskRow{TaskID: task, Phase: phaseValue, AssignmentID: assignment, StartedJournalID: journal.JournalID(started.Int64), ProducingOperationID: operation}
 		if predecessorID.Valid {
 			value := journal.AssignmentID(predecessorID.String)
 			if err := journal.ValidateOperationID(journal.OperationID(value)); err != nil {
-				return actorOwnershipOwnedResult{}, actorOwnershipIntegrity(fmt.Sprintf("owned task %s has malformed predecessor assignment %q", task, value), "restore the episode predecessor identity from the same committed backup", err)
+				return actorOwnershipOwnedResult{}, actorOwnershipIntegrity(journal.ActorOwnershipStageOwnedTasks, fmt.Sprintf("owned task %s has malformed predecessor assignment %q", task, value), "restore the episode predecessor identity from the same committed backup", err)
 			}
 			row.PredecessorAssignmentID = &value
 		}
@@ -312,12 +317,8 @@ func actorOwnershipLength(value sql.NullInt64) int64 {
 	return value.Int64
 }
 
-func actorOwnershipIntegrity(problem, fix string, cause error) error {
-	message := fmt.Sprintf("%s — why: the stored row cannot be decoded as a supported ownership fact; where: QueryActorOwnership result-row validation; when: inside the read transaction; impact: no result returned and nothing was written; fix: %s", problem, fix)
-	if cause != nil {
-		return fmt.Errorf("%w: %s: %w", journal.ErrSubtypeIntegrity, message, cause)
-	}
-	return fmt.Errorf("%w: %s", journal.ErrSubtypeIntegrity, message)
+func actorOwnershipIntegrity(stage journal.ActorOwnershipStage, problem, fix string, cause error) error {
+	return &journal.ActorOwnershipIntegrityError{Stage: stage, Problem: problem, Fix: fix, Cause: cause}
 }
 
 func actorOwnershipReadFault(problem, why, when string, cause error) error {
@@ -365,14 +366,14 @@ func (db *DB) readActorOwnershipMaterials(scope *connScope, actor journal.ActorI
 		}
 		task, err := journalParseTask(ownerTask)
 		if err != nil {
-			return actorOwnershipIntegrity(fmt.Sprintf("material owner task %q is malformed", ownerTask), "restore the owned task and producer binding from the same committed backup", err)
+			return actorOwnershipIntegrity(journal.ActorOwnershipStageMaterials, fmt.Sprintf("material owner task %q is malformed", ownerTask), "restore the owned task and producer binding from the same committed backup", err)
 		}
 		taskIndex, exists := index[task]
 		if !exists {
-			return actorOwnershipIntegrity(fmt.Sprintf("material row %d names non-owned task %s", journalID, task), "restore the task, owner episode, and material producer rows from the same committed backup", nil)
+			return actorOwnershipIntegrity(journal.ActorOwnershipStageMaterials, fmt.Sprintf("material row %d names non-owned task %s", journalID, task), "restore the task, owner episode, and material producer rows from the same committed backup", nil)
 		}
 		if !json.Valid(payload) {
-			return actorOwnershipIntegrity(fmt.Sprintf("material row %d has invalid JSON", journalID), "restore the canonical task-event payload from the same committed backup", nil)
+			return actorOwnershipIntegrity(journal.ActorOwnershipStageMaterials, fmt.Sprintf("material row %d has invalid JSON", journalID), "restore the canonical task-event payload from the same committed backup", nil)
 		}
 		snapshot.Tasks[taskIndex].Materials = append(snapshot.Tasks[taskIndex].Materials, journal.OwnedMaterialRow{JournalID: journal.JournalID(journalID), EventKind: journal.EventKind(kind.String), Payload: append(json.RawMessage(nil), payload...)})
 		snapshot.Work.MaterialRows++
@@ -417,14 +418,14 @@ func (db *DB) readActorOwnershipEvidence(scope *connScope, actor journal.ActorID
 		}
 		task, err := journalParseTask(ownerTask)
 		if err != nil {
-			return actorOwnershipIntegrity(fmt.Sprintf("evidence owner task %q is malformed", ownerTask), "restore the owned task and producer binding from the same committed backup", err)
+			return actorOwnershipIntegrity(journal.ActorOwnershipStageEvidence, fmt.Sprintf("evidence owner task %q is malformed", ownerTask), "restore the owned task and producer binding from the same committed backup", err)
 		}
 		taskIndex, exists := index[task]
 		if !exists {
-			return actorOwnershipIntegrity(fmt.Sprintf("evidence row %d names non-owned task %s", journalID, task), "restore the task, owner episode, and evidence producer rows from the same committed backup", nil)
+			return actorOwnershipIntegrity(journal.ActorOwnershipStageEvidence, fmt.Sprintf("evidence row %d names non-owned task %s", journalID, task), "restore the task, owner episode, and evidence producer rows from the same committed backup", nil)
 		}
 		if !json.Valid(payload) {
-			return actorOwnershipIntegrity(fmt.Sprintf("evidence row %d has invalid JSON", journalID), "restore the canonical evidence payload from the same committed backup", nil)
+			return actorOwnershipIntegrity(journal.ActorOwnershipStageEvidence, fmt.Sprintf("evidence row %d has invalid JSON", journalID), "restore the canonical evidence payload from the same committed backup", nil)
 		}
 		snapshot.Tasks[taskIndex].Evidence = append(snapshot.Tasks[taskIndex].Evidence, journal.OwnedEvidenceRow{JournalID: journal.JournalID(journalID), EvidenceKind: journal.EvidenceKind(kind.String), Payload: append([]byte(nil), payload...)})
 		snapshot.Work.EvidenceRows++

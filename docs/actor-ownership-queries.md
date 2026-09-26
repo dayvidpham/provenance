@@ -56,13 +56,22 @@ before copying the row. The first crossing row returns:
 - work completed before that row in `Work`.
 
 No partial snapshot is returned. A value larger than the remaining result budget
-is suppressed by SQLite and is never copied into Go memory.
+is suppressed by SQLite and is never copied into Go memory. The budget is
+compared per value on the wire; the cumulative bound is the read's own
+accounting, which refuses the crossing row rather than returning what it has
+copied so far. The two statements' `ORDER BY` and the row count are not affected
+by the budget: a statement returns every row its filters select, and only the
+byte total decides where the read stops.
 
 If `tasks.owner_id` disagrees with the writer's winning-episode rule, the read
 returns `*OwnerProjectionMismatchError`. `errors.Is(err, ErrProjectionDivergence)`
-is true. A winning start without its `journal_operations` producer returns
-`ErrSubtypeIntegrity`. `Journal.VerifyIntegrity` and `Journal.ReplayProjections`
-are the operator checks named by these diagnostics; both only read.
+is true. A stored row the owning stage's own result set rejects returns
+`*ActorOwnershipIntegrityError`, whose `Stage` names the stage that read it —
+`owned-tasks`, `materials`, or `evidence` — so a consumer can report where the
+damage is instead of guessing. `errors.Is(err, ErrSubtypeIntegrity)` is true, and
+a stored decode cause stays reachable through `errors.Is` and `errors.As`.
+`Journal.VerifyIntegrity` and `Journal.ReplayProjections` are the operator checks
+named by these diagnostics; both only read.
 
 ## Snapshot, cancellation, and lifecycle behavior
 

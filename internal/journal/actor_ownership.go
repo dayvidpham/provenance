@@ -121,6 +121,38 @@ func (e *ActorOwnershipLimitError) Error() string {
 
 func (e *ActorOwnershipLimitError) Unwrap() error { return ErrActorOwnershipLimit }
 
+// ActorOwnershipIntegrityError reports a stored row that one of the three
+// result stages rejected as an ownership fact: the row is present, is inside
+// the stage's own result set, and cannot be decoded as the fact the stage
+// promises. Stage names the stage that rejected the row, so a caller can report
+// where the damage is instead of guessing. The read always sets Stage to one of
+// the three ActorOwnershipStage constants.
+type ActorOwnershipIntegrityError struct {
+	Stage   ActorOwnershipStage
+	Problem string
+	Fix     string
+	Cause   error
+}
+
+func (e *ActorOwnershipIntegrityError) Error() string {
+	message := fmt.Sprintf("%s — why: the stored row cannot be decoded as a supported ownership fact; where: QueryActorOwnership result-row validation, stage %s; when: inside the read transaction; impact: no result returned and nothing was written; fix: %s", e.Problem, e.Stage, e.Fix)
+	if e.Cause != nil {
+		return fmt.Sprintf("%s: %s: %s", ErrSubtypeIntegrity, message, e.Cause)
+	}
+	return fmt.Sprintf("%s: %s", ErrSubtypeIntegrity, message)
+}
+
+// Is makes the typed fault discoverable with errors.Is against the subtype
+// sentinel, and keeps a stored decode cause discoverable exactly as it was
+// before this type existed.
+func (e *ActorOwnershipIntegrityError) Is(target error) bool {
+	return target == ErrSubtypeIntegrity || e.Cause != nil && errors.Is(e.Cause, target)
+}
+
+// Unwrap returns the decode cause, so errors.As still reaches the value the
+// stage rejected the row with.
+func (e *ActorOwnershipIntegrityError) Unwrap() error { return e.Cause }
+
 // OwnerProjectionMismatchError reports disagreement between tasks.owner_id and
 // the newest active owner-responsibility episode selected by the writer.
 type OwnerProjectionMismatchError struct {

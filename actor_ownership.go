@@ -13,6 +13,7 @@ type OwnedEvidenceRow = journal.OwnedEvidenceRow
 type ActorOwnershipWork = journal.ActorOwnershipWork
 type ActorOwnershipStage = journal.ActorOwnershipStage
 type ActorOwnershipLimitError = journal.ActorOwnershipLimitError
+type ActorOwnershipIntegrityError = journal.ActorOwnershipIntegrityError
 type OwnerProjectionMismatchError = journal.OwnerProjectionMismatchError
 
 const (

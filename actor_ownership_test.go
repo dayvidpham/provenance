@@ -592,4 +592,9 @@ func TestActorOwnershipTypedErrorText(t *testing.T) {
 	if mismatch.Error() != wantMismatch || !errors.Is(mismatch, p.ErrProjectionDivergence) {
 		t.Fatalf("mismatch error=%q, want %q", mismatch, wantMismatch)
 	}
+	integrity := &p.ActorOwnershipIntegrityError{Stage: p.ActorOwnershipStageEvidence, Problem: fmt.Sprintf("evidence row %d names non-owned task %s", 42, task), Fix: "restore the task, owner episode, and evidence producer rows from the same committed backup"}
+	wantIntegrity := fmt.Sprintf("provenance: journal subtype integrity violated: evidence row 42 names non-owned task %s — why: the stored row cannot be decoded as a supported ownership fact; where: QueryActorOwnership result-row validation, stage evidence; when: inside the read transaction; impact: no result returned and nothing was written; fix: restore the task, owner episode, and evidence producer rows from the same committed backup", task)
+	if integrity.Error() != wantIntegrity || !errors.Is(integrity, p.ErrSubtypeIntegrity) {
+		t.Fatalf("integrity error=%q, want %q", integrity, wantIntegrity)
+	}
 }

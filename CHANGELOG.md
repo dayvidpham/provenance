@@ -14,6 +14,10 @@ All notable changes to this project will be documented in this file.
   missing operation producers. Their only output bound is the 8 MiB wire guard;
   crossing-row diagnostics report the first over-limit running total and work
   completed before that row.
+- `ActorOwnershipIntegrityError` reports a stored row an ownership read rejected
+  and names the result stage that read it, so a consumer can tell an operator
+  which stage holds the damage. `errors.Is(err, ErrSubtypeIntegrity)` and any
+  stored decode cause still match exactly as before.
 - See [actor-ownership queries](docs/actor-ownership-queries.md) for snapshot,
   producer-selection, cancellation, borrowed-store, and transfer-successor
   boundaries.
