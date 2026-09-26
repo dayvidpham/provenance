@@ -329,184 +329,180 @@ func TestActorOwnershipCancellationAfterBeginRollsBack(t *testing.T) {
 // remaining budget is driven across each guarded column in both directions: a
 // budget that suppresses nothing, one that suppresses a subset, and one that
 // suppresses everything.
+//
+// The exact boundary of each column — a value whose declared length is exactly
+// the remaining budget — is covered per column by
+// TestActorOwnershipWireGuardAdmitsAValueThatExactlyFitsTheBudget, because a
+// budget chosen from this table only lands on a column's declared length by
+// accident, and an accidental landing is a guard nobody has to keep.
 func TestActorOwnershipWireGuardSuppressesValuesThatDoNotFitTheBudget(t *testing.T) {
 	t.Run("owned-task-columns", func(t *testing.T) {
-		db := openActorOwnershipDB(t, ":memory:")
-		actor := insertActorOwnershipActor(t, db, "wire-actor")
-		boot := genesisBoot(t, db, actor)
-		plain := createActorOwnershipTask(t, db, actor, boot, "wire-plain", ptypes.PhaseWorkerSlices)
-		plainStart := startActorOwnershipTask(t, db, actor, boot, plain, "wire-plain-start", actorOwnershipMaterialKind, json.RawMessage(`{"plain":true}`), false)
-		transferred := createActorOwnershipTask(t, db, actor, boot, "wire-transferred", ptypes.PhaseWorkerSlices)
-		startActorOwnershipTask(t, db, actor, boot, transferred, "wire-transferred-prior", actorOwnershipMaterialKind, json.RawMessage(`{"prior":true}`), false)
-		successor := startActorOwnershipSuccessor(t, db, actor, boot, transferred, "wire-transferred-prior", "wire-transferred-successor")
-
-		for _, test := range []struct {
-			name  string
-			bound int64
-		}{
-			{name: "budget-suppresses-every-guarded-value", bound: 1},
-			{name: "budget-covers-the-short-identifiers", bound: 32},
-			{name: "budget-covers-every-guarded-value", bound: 4 << 10},
-		} {
-			t.Run(test.name, func(t *testing.T) {
-				scope := takePoolScope(t, db)
-				defer scope.release()
-				rows, err := scope.conn.QueryContext(scope.ctx, actorOwnershipOwnedTasksSQL,
-					actor.String(), test.bound, transitionStartedID, slotOwnerResponsibilityID, transitionEndedID)
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer rows.Close()
-				audit := &actorOwnershipWireAudit{t: t, statement: "owned tasks", bound: test.bound}
-				var starts []int64
-				predecessors := 0
-				for rows.Next() {
-					var (
-						taskLength, assignmentLength, operationLength, predecessorLength sql.NullInt64
-						taskID, assignmentID, occupant, operationID, predecessorID       sql.NullString
-						phase, started, producer                                         sql.NullInt64
-					)
-					if err := rows.Scan(&taskLength, &taskID, &phase, &assignmentLength, &assignmentID, &occupant, &started, &producer, &operationLength, &operationID, &predecessorLength, &predecessorID); err != nil {
-						t.Fatal(err)
+		fixture := actorOwnershipOwnedTaskWireFixture(t)
+		for _, budget := range actorOwnershipWireOwnedTaskBudgets {
+			t.Run(budget.name, func(t *testing.T) {
+				rows := fixture.drive(t, budget.bound)
+				audit := &actorOwnershipWireAudit{t: t, statement: fixture.statement, bound: budget.bound}
+				for index, row := range rows {
+					for _, column := range row.columns {
+						audit.column(column)
 					}
-					starts = append(starts, started.Int64)
-					// The length column is selected whether or not the wire
-					// suppressed the value, so a stored predecessor is still
-					// countable when its own value was not sent.
-					if predecessorLength.Valid {
-						predecessors++
+					if !row.phase.Valid || !row.started.Valid || !row.producer.Valid || !row.occupant.Valid {
+						t.Fatalf("owned-task row %d lost an unguarded column: phase=%+v started=%+v producer=%+v occupant=%+v", index+1, row.phase, row.started, row.producer, row.occupant)
 					}
-					if !phase.Valid || !started.Valid || !producer.Valid || !occupant.Valid {
-						t.Fatalf("owned-task row %d lost an unguarded column: phase=%+v started=%+v producer=%+v occupant=%+v", len(starts), phase, started, producer, occupant)
-					}
-					audit.column("tasks.id", taskLength, &taskID)
-					audit.column("episodes.assignment_id", assignmentLength, &assignmentID)
-					audit.column("journal_operations.operation_id", operationLength, &operationID)
-					audit.column("episodes.predecessor_assignment_id", predecessorLength, &predecessorID)
-				}
-				if err := rows.Err(); err != nil {
-					t.Fatal(err)
 				}
 				audit.done()
-				if want := []int64{int64(plainStart), int64(successor)}; !reflect.DeepEqual(starts, want) {
-					t.Fatalf("owned-task start order=%v, want %v", starts, want)
-				}
-				if predecessors != 1 {
-					t.Fatalf("%d rows carry a stored predecessor, want exactly the transfer successor", predecessors)
-				}
+				fixture.check(t, rows)
 			})
 		}
 	})
 
 	t.Run("material-columns", func(t *testing.T) {
-		db := openActorOwnershipDB(t, ":memory:")
-		actor := insertActorOwnershipActor(t, db, "wire-material")
-		boot := genesisBoot(t, db, actor)
-		createActorOwnershipTaskWithID(t, db, actor, boot, actorOwnershipWireTaskTwo, ptypes.PhaseWorkerSlices)
-		startActorOwnershipTask(t, db, actor, boot, actorOwnershipWireTaskTwo, "wire-material-first", actorOwnershipMaterialKind, json.RawMessage(`{"small":true}`), false)
-		createActorOwnershipTaskWithID(t, db, actor, boot, actorOwnershipWireTaskOne, ptypes.PhaseWorkerSlices)
-		startActorOwnershipTask(t, db, actor, boot, actorOwnershipWireTaskOne, "wire-material-second", actorOwnershipMaterialKind, actorOwnershipJSONSize(t, 5000), false)
-
-		bindings := actorOwnershipWireBindings(t, db, actorOwnershipWireSource{task: actorOwnershipWireTaskTwo, operation: "wire-material-first"}, actorOwnershipWireSource{task: actorOwnershipWireTaskOne, operation: "wire-material-second"})
-		kinds, err := json.Marshal([]journal.EventKind{actorOwnershipMaterialKind})
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, test := range actorOwnershipWireBudgets {
-			t.Run(test.name, func(t *testing.T) {
-				scope := takePoolScope(t, db)
-				defer scope.release()
-				rows, err := scope.conn.QueryContext(scope.ctx, actorOwnershipMaterialsSQL, bindings, test.bound, string(kinds))
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer rows.Close()
-				audit := &actorOwnershipWireAudit{t: t, statement: "material", bound: test.bound}
-				payloads := make([]int64, 0, 2)
-				for rows.Next() {
-					var (
-						journalID                 int64
-						ownerTask                 string
-						kindLength, payloadLength sql.NullInt64
-						kind                      sql.NullString
-						payload                   []byte
-					)
-					if err := rows.Scan(&journalID, &ownerTask, &kindLength, &kind, &payloadLength, &payload); err != nil {
-						t.Fatal(err)
+		fixture := actorOwnershipMaterialWireFixture(t)
+		for _, budget := range actorOwnershipWireBudgets {
+			t.Run(budget.name, func(t *testing.T) {
+				rows := fixture.drive(t, budget.bound)
+				audit := &actorOwnershipWireAudit{t: t, statement: fixture.statement, bound: budget.bound}
+				for _, row := range rows {
+					for _, column := range row.columns {
+						audit.column(column)
 					}
-					payloads = append(payloads, payloadLength.Int64)
-					audit.column("journal_task_events.event_kind", kindLength, &kind)
-					audit.column("journal_task_events.payload", payloadLength, &payload)
-				}
-				if err := rows.Err(); err != nil {
-					t.Fatal(err)
 				}
 				audit.done()
-				if want := []int64{int64(len(`{"small":true}`)), 5000}; !reflect.DeepEqual(payloads, want) {
-					t.Fatalf("material declared payload lengths=%v, want %v in journal-id order", payloads, want)
-				}
+				fixture.check(t, rows)
 			})
 		}
 	})
 
 	t.Run("evidence-columns", func(t *testing.T) {
-		db := openActorOwnershipDB(t, ":memory:")
-		actor := insertActorOwnershipActor(t, db, "wire-evidence")
-		boot := genesisBoot(t, db, actor)
-		createActorOwnershipTaskWithID(t, db, actor, boot, actorOwnershipWireTaskTwo, ptypes.PhaseWorkerSlices)
-		startActorOwnershipTask(t, db, actor, boot, actorOwnershipWireTaskTwo, "wire-evidence-first", actorOwnershipMaterialKind, json.RawMessage(`{"small":true}`), true)
-		createActorOwnershipTaskWithID(t, db, actor, boot, actorOwnershipWireTaskOne, ptypes.PhaseWorkerSlices)
-		startActorOwnershipTask(t, db, actor, boot, actorOwnershipWireTaskOne, "wire-evidence-second", actorOwnershipMaterialKind, json.RawMessage(`{"large":true}`), true)
-		enlargeActorOwnershipPayload(t, db, "UPDATE journal_evidence SET payload=?1 WHERE journal_id=?2", actorOwnershipJSONSize(t, 5000), actorOwnershipEvidenceJournalID(t, db, actorOwnershipWireTaskOne, actorOwnershipEvidenceKind))
-
-		bindings := actorOwnershipWireBindings(t, db, actorOwnershipWireSource{task: actorOwnershipWireTaskTwo, operation: "wire-evidence-first"}, actorOwnershipWireSource{task: actorOwnershipWireTaskOne, operation: "wire-evidence-second"})
-		kinds, err := json.Marshal([]journal.EvidenceKind{actorOwnershipEvidenceKind})
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, test := range actorOwnershipWireBudgets {
-			t.Run(test.name, func(t *testing.T) {
-				scope := takePoolScope(t, db)
-				defer scope.release()
-				rows, err := scope.conn.QueryContext(scope.ctx, actorOwnershipEvidenceSQL, bindings, test.bound, string(kinds))
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer rows.Close()
-				audit := &actorOwnershipWireAudit{t: t, statement: "evidence", bound: test.bound}
-				payloads := make([]int64, 0, 2)
-				for rows.Next() {
-					var (
-						journalID                 int64
-						ownerTask                 string
-						kindLength, payloadLength sql.NullInt64
-						kind                      sql.NullString
-						payload                   []byte
-					)
-					if err := rows.Scan(&journalID, &ownerTask, &kindLength, &kind, &payloadLength, &payload); err != nil {
-						t.Fatal(err)
+		fixture := actorOwnershipEvidenceWireFixture(t)
+		for _, budget := range actorOwnershipWireBudgets {
+			t.Run(budget.name, func(t *testing.T) {
+				rows := fixture.drive(t, budget.bound)
+				audit := &actorOwnershipWireAudit{t: t, statement: fixture.statement, bound: budget.bound}
+				for _, row := range rows {
+					for _, column := range row.columns {
+						audit.column(column)
 					}
-					payloads = append(payloads, payloadLength.Int64)
-					audit.column("journal_evidence.evidence_kind", kindLength, &kind)
-					audit.column("journal_evidence.payload", payloadLength, &payload)
-				}
-				if err := rows.Err(); err != nil {
-					t.Fatal(err)
 				}
 				audit.done()
-				if want := []int64{int64(len(`{"evidence":"start"}`)), 5000}; !reflect.DeepEqual(payloads, want) {
-					t.Fatalf("evidence declared payload lengths=%v, want %v in journal-id order", payloads, want)
-				}
+				fixture.check(t, rows)
 			})
 		}
 	})
 }
 
+// TestActorOwnershipWireGuardAdmitsAValueThatExactlyFitsTheBudget covers the
+// other direction of the same claim, and does it per column rather than for one
+// representative column: a value whose declared length is EXACTLY the remaining
+// budget must still arrive.
+//
+// That is the one case a strict guard cannot survive. A guard written `<` rather
+// than `<=` suppresses precisely the value whose length equals the budget, so
+// with only budgets that land beside a column's declared length, turning seven
+// of the eight guards strict leaves the whole suite green. Here each guarded
+// column gets its own case derived from the fixture's own stored lengths, so a
+// guard that turns strict on any one of them turns exactly that column's
+// subtest red and the other seven green, and the red names the column.
+func TestActorOwnershipWireGuardAdmitsAValueThatExactlyFitsTheBudget(t *testing.T) {
+	for _, statement := range []struct {
+		name  string
+		build func(*testing.T) actorOwnershipWireFixture
+	}{
+		{name: "owned-task-columns", build: actorOwnershipOwnedTaskWireFixture},
+		{name: "material-columns", build: actorOwnershipMaterialWireFixture},
+		{name: "evidence-columns", build: actorOwnershipEvidenceWireFixture},
+	} {
+		t.Run(statement.name, func(t *testing.T) {
+			actorOwnershipWireBoundary(t, statement.build(t))
+		})
+	}
+}
+
+// actorOwnershipWireBoundary derives one exact-boundary case per guarded column
+// and asserts that the value whose declared length is exactly the remaining
+// budget arrives for each of them.
+//
+// The bound is the shortest value each column actually returns, measured under
+// the production limit where this fixture suppresses nothing, so each case is a
+// real arrival rather than an arithmetic claim. The columns are the ones the
+// driver names, and a column added to a statement without being added to its
+// driver fails the scan instead of going untested, so the list cannot drift away
+// from the SQL silently. A column every row stores as NULL gets no case and is
+// simply absent from the list, which is the one gap this shape cannot close; no
+// such column exists in these three fixtures, and all eight are named in a
+// subtest run. Each subtest also states the safety direction for every column it
+// saw, so the arrival it proves is not bought by hydrating something larger.
+func actorOwnershipWireBoundary(t *testing.T, fixture actorOwnershipWireFixture) {
+	t.Helper()
+	order := make([]string, 0, 8)
+	shortest := make(map[string]int64, 8)
+	for _, row := range fixture.drive(t, journal.MaxActorOwnershipResultBytes) {
+		for _, column := range row.columns {
+			if !column.declared.Valid {
+				continue
+			}
+			if _, seen := shortest[column.name]; !seen {
+				order = append(order, column.name)
+				shortest[column.name] = column.declared.Int64
+				continue
+			}
+			if column.declared.Int64 < shortest[column.name] {
+				shortest[column.name] = column.declared.Int64
+			}
+		}
+	}
+	for _, name := range order {
+		bound := shortest[name]
+		t.Run(name, func(t *testing.T) {
+			admitted := false
+			for _, row := range fixture.drive(t, bound) {
+				for _, column := range row.columns {
+					if !column.declared.Valid {
+						if column.arrived {
+							t.Fatalf("%s %s: a stored NULL column arrived as a value", fixture.statement, column.name)
+						}
+						continue
+					}
+					if column.declared.Int64 > bound && column.arrived {
+						t.Fatalf("%s %s: Go received %d bytes against a %d-byte remaining budget, so a value that does not fit was copied into memory", fixture.statement, column.name, column.size, bound)
+					}
+					if column.name != name || column.declared.Int64 != bound {
+						continue
+					}
+					if !column.arrived {
+						t.Fatalf("%s %s: a value of exactly the remaining %d bytes was suppressed; the budget is inclusive, so a strict < guard is indistinguishable from no guard at all", fixture.statement, name, bound)
+					}
+					admitted = true
+				}
+			}
+			if !admitted {
+				t.Fatalf("%s %s: no value of exactly %d bytes was returned, so this case cannot tell an inclusive guard from a strict one", fixture.statement, name, bound)
+			}
+		})
+	}
+}
+
+// actorOwnershipWireOwnedTaskBudgets walks the remaining budget across the four
+// guarded owned-task columns of that fixture, one case suppressing every guarded
+// value, one covering the short identifiers, and one covering all of them. The
+// exact boundary of each of the four is derived separately, per column, by
+// actorOwnershipWireBoundary.
+var actorOwnershipWireOwnedTaskBudgets = []struct {
+	name  string
+	bound int64
+}{
+	{name: "budget-suppresses-every-guarded-value", bound: 1},
+	{name: "budget-covers-the-short-identifiers", bound: 32},
+	{name: "budget-covers-every-guarded-value", bound: 4 << 10},
+}
+
 // actorOwnershipWireBudgets walks the remaining budget across the two stored
-// values each material and evidence row carries: the 26-byte kind and the
-// payload, which is either 14 and 20 bytes or 5000. Every case therefore
-// suppresses a different subset of the four guarded columns, and the two
-// 5000-byte values stand in for the oversized payload the bound exists for.
+// values each material and evidence row carries: the kind and the payload, which
+// is either 14 and 20 bytes or 5000. Every case therefore suppresses a
+// different subset of the four guarded columns, and the two 5000-byte values
+// stand in for the oversized payload the bound exists for. The exact boundary of
+// each of the four is derived separately, per column, by
+// actorOwnershipWireBoundary.
 var actorOwnershipWireBudgets = []struct {
 	name  string
 	bound int64
@@ -518,15 +514,279 @@ var actorOwnershipWireBudgets = []struct {
 }
 
 // The two wire-guard task identities are named for the order their wire strings
-// sort in, and every subject below creates them the other way round: task two is
+// sort in, and both fixtures below create them the other way round: task two is
 // created first, so a statement ordering by journal ID returns it first while the
 // order its join plan produces is task one. That is what makes the declared
-// length sequences below a real check of the statements' ORDER BY rather than of
-// a coincidence.
+// length sequences the fixtures check a real check of the statements' ORDER BY
+// rather than of a coincidence.
 var (
 	actorOwnershipWireTaskOne = journal.TaskID{Namespace: "actor-ownership", UUID: uuid.MustParse("00000000-0000-4000-8000-000000000001")}
 	actorOwnershipWireTaskTwo = journal.TaskID{Namespace: "actor-ownership", UUID: uuid.MustParse("00000000-0000-4000-8000-000000000002")}
 )
+
+// actorOwnershipWireFixture is one result statement's fixture: a driver that
+// runs that statement against any remaining byte budget, the name the subjects
+// report under, and the stored-order facts the fixture was built to pin. Both
+// wire-guard subjects build their fixtures here, so the two agree on the rows
+// they observe and neither can drift from the other.
+type actorOwnershipWireFixture struct {
+	statement string
+	drive     actorOwnershipWireDriver
+	check     func(t *testing.T, rows []actorOwnershipWireRow)
+}
+
+// actorOwnershipWireDriver runs one of the three result statements with a given
+// remaining byte budget — the value the read binds as its per-value limit — and
+// reports every row it returned.
+type actorOwnershipWireDriver func(t *testing.T, bound int64) []actorOwnershipWireRow
+
+// actorOwnershipWireRow is one row as a result statement returned it. columns
+// carries that row's guarded columns; the remaining fields are the columns the
+// read needs that carry no guard, so a subject can still assert they arrived.
+type actorOwnershipWireRow struct {
+	columns  []actorOwnershipWireColumn
+	phase    sql.NullInt64
+	started  sql.NullInt64
+	producer sql.NullInt64
+	occupant sql.NullString
+}
+
+// declared returns the byte length SQLite declared for one guarded column of
+// this row, and whether the statement selected that column at all.
+func (r actorOwnershipWireRow) declared(name string) (sql.NullInt64, bool) {
+	for _, column := range r.columns {
+		if column.name == name {
+			return column.declared, true
+		}
+	}
+	return sql.NullInt64{}, false
+}
+
+// actorOwnershipWireColumn is one guarded column of one row: the byte length
+// SQLite declared for it, and what the Go scanner was actually handed.
+type actorOwnershipWireColumn struct {
+	name     string
+	declared sql.NullInt64
+	arrived  bool
+	size     int
+}
+
+// actorOwnershipWireColumnAt reads a guarded column's scan destination, which is
+// the only thing that says whether the value crossed the wire.
+func actorOwnershipWireColumnAt(t *testing.T, name string, declared sql.NullInt64, destination any) actorOwnershipWireColumn {
+	t.Helper()
+	arrived, size := actorOwnershipWireValue(t, destination)
+	return actorOwnershipWireColumn{name: name, declared: declared, arrived: arrived, size: size}
+}
+
+// actorOwnershipOwnedTaskWireFixture is the owned-task statement's fixture: one
+// plain owned task and one transferred task whose successor carries a stored
+// predecessor, so all four guarded owned-task columns return a value and one of
+// them returns NULL on the plain row. episodes.actor_id is selected on every row
+// and carries no guard of its own; the read's accounting is what budgets it, which
+// TestActorOwnershipEpisodeOccupantIsBudgetedButNeverSuppressed covers.
+func actorOwnershipOwnedTaskWireFixture(t *testing.T) actorOwnershipWireFixture {
+	t.Helper()
+	db := openActorOwnershipDB(t, ":memory:")
+	actor := insertActorOwnershipActor(t, db, "wire-actor")
+	boot := genesisBoot(t, db, actor)
+	plain := createActorOwnershipTask(t, db, actor, boot, "wire-plain", ptypes.PhaseWorkerSlices)
+	plainStart := startActorOwnershipTask(t, db, actor, boot, plain, "wire-plain-start", actorOwnershipMaterialKind, json.RawMessage(`{"plain":true}`), false)
+	transferred := createActorOwnershipTask(t, db, actor, boot, "wire-transferred", ptypes.PhaseWorkerSlices)
+	startActorOwnershipTask(t, db, actor, boot, transferred, "wire-transferred-prior", actorOwnershipMaterialKind, json.RawMessage(`{"prior":true}`), false)
+	successor := startActorOwnershipSuccessor(t, db, actor, boot, transferred, "wire-transferred-prior", "wire-transferred-successor")
+
+	fixture := actorOwnershipWireFixture{statement: "owned tasks", drive: actorOwnershipOwnedTaskWireDriver(t, db, actor)}
+	fixture.check = func(t *testing.T, rows []actorOwnershipWireRow) {
+		t.Helper()
+		starts := make([]int64, 0, len(rows))
+		predecessors := 0
+		for _, row := range rows {
+			starts = append(starts, row.started.Int64)
+			// The length column is selected whether or not the wire suppressed the
+			// value, so a stored predecessor is still countable when its own value
+			// was not sent.
+			if declared, present := row.declared("episodes.predecessor_assignment_id"); present && declared.Valid {
+				predecessors++
+			}
+		}
+		if want := []int64{int64(plainStart), int64(successor)}; !reflect.DeepEqual(starts, want) {
+			t.Fatalf("owned-task start order=%v, want %v", starts, want)
+		}
+		if predecessors != 1 {
+			t.Fatalf("%d rows carry a stored predecessor, want exactly the transfer successor", predecessors)
+		}
+	}
+	return fixture
+}
+
+// actorOwnershipOwnedTaskWireDriver runs the owned-task statement against a
+// store and actor the caller supplied, so a subject with its own fixture can
+// observe arrivals on the same statement the shared fixtures drive.
+func actorOwnershipOwnedTaskWireDriver(t *testing.T, db *DB, actor journal.ActorID) actorOwnershipWireDriver {
+	t.Helper()
+	return func(t *testing.T, bound int64) []actorOwnershipWireRow {
+		t.Helper()
+		scope := takePoolScope(t, db)
+		defer scope.release()
+		rows, err := scope.conn.QueryContext(scope.ctx, actorOwnershipOwnedTasksSQL, actor.String(), bound, transitionStartedID, slotOwnerResponsibilityID, transitionEndedID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		observed := make([]actorOwnershipWireRow, 0, 2)
+		for rows.Next() {
+			var (
+				taskLength, occupantLength, assignmentLength, operationLength, predecessorLength sql.NullInt64
+				taskID, occupant, assignmentID, operationID, predecessorID                       sql.NullString
+				phase, started, producer                                                         sql.NullInt64
+			)
+			if err := rows.Scan(&taskLength, &taskID, &phase, &assignmentLength, &assignmentID, &occupantLength, &occupant, &started, &producer, &operationLength, &operationID, &predecessorLength, &predecessorID); err != nil {
+				t.Fatal(err)
+			}
+			observed = append(observed, actorOwnershipWireRow{
+				columns: []actorOwnershipWireColumn{
+					actorOwnershipWireColumnAt(t, "tasks.id", taskLength, &taskID),
+					actorOwnershipWireColumnAt(t, "episodes.assignment_id", assignmentLength, &assignmentID),
+					actorOwnershipWireColumnAt(t, "journal_operations.operation_id", operationLength, &operationID),
+					actorOwnershipWireColumnAt(t, "episodes.predecessor_assignment_id", predecessorLength, &predecessorID),
+				},
+				phase: phase, started: started, producer: producer, occupant: occupant,
+			})
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		return observed
+	}
+}
+
+func actorOwnershipMaterialWireFixture(t *testing.T) actorOwnershipWireFixture {
+	t.Helper()
+	db := openActorOwnershipDB(t, ":memory:")
+	actor := insertActorOwnershipActor(t, db, "wire-material")
+	boot := genesisBoot(t, db, actor)
+	createActorOwnershipTaskWithID(t, db, actor, boot, actorOwnershipWireTaskTwo, ptypes.PhaseWorkerSlices)
+	startActorOwnershipTask(t, db, actor, boot, actorOwnershipWireTaskTwo, "wire-material-first", actorOwnershipMaterialKind, json.RawMessage(`{"small":true}`), false)
+	createActorOwnershipTaskWithID(t, db, actor, boot, actorOwnershipWireTaskOne, ptypes.PhaseWorkerSlices)
+	startActorOwnershipTask(t, db, actor, boot, actorOwnershipWireTaskOne, "wire-material-second", actorOwnershipMaterialKind, actorOwnershipJSONSize(t, 5000), false)
+
+	bindings := actorOwnershipWireBindings(t, db, actorOwnershipWireSource{task: actorOwnershipWireTaskTwo, operation: "wire-material-first"}, actorOwnershipWireSource{task: actorOwnershipWireTaskOne, operation: "wire-material-second"})
+	kinds, err := json.Marshal([]journal.EventKind{actorOwnershipMaterialKind})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := actorOwnershipWireFixture{statement: "material"}
+	fixture.drive = func(t *testing.T, bound int64) []actorOwnershipWireRow {
+		t.Helper()
+		scope := takePoolScope(t, db)
+		defer scope.release()
+		rows, err := scope.conn.QueryContext(scope.ctx, actorOwnershipMaterialsSQL, bindings, bound, string(kinds))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		observed := make([]actorOwnershipWireRow, 0, 2)
+		for rows.Next() {
+			var (
+				journalID                 int64
+				ownerTask                 string
+				kindLength, payloadLength sql.NullInt64
+				kind                      sql.NullString
+				payload                   []byte
+			)
+			if err := rows.Scan(&journalID, &ownerTask, &kindLength, &kind, &payloadLength, &payload); err != nil {
+				t.Fatal(err)
+			}
+			observed = append(observed, actorOwnershipWireRow{columns: []actorOwnershipWireColumn{
+				actorOwnershipWireColumnAt(t, "journal_task_events.event_kind", kindLength, &kind),
+				actorOwnershipWireColumnAt(t, "journal_task_events.payload", payloadLength, &payload),
+			}})
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		return observed
+	}
+	fixture.check = func(t *testing.T, rows []actorOwnershipWireRow) {
+		t.Helper()
+		got := actorOwnershipWirePayloadLengths(rows, "journal_task_events.payload")
+		if want := []int64{int64(len(`{"small":true}`)), 5000}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("material declared payload lengths=%v, want %v in journal-id order", got, want)
+		}
+	}
+	return fixture
+}
+
+func actorOwnershipEvidenceWireFixture(t *testing.T) actorOwnershipWireFixture {
+	t.Helper()
+	db := openActorOwnershipDB(t, ":memory:")
+	actor := insertActorOwnershipActor(t, db, "wire-evidence")
+	boot := genesisBoot(t, db, actor)
+	createActorOwnershipTaskWithID(t, db, actor, boot, actorOwnershipWireTaskTwo, ptypes.PhaseWorkerSlices)
+	startActorOwnershipTask(t, db, actor, boot, actorOwnershipWireTaskTwo, "wire-evidence-first", actorOwnershipMaterialKind, json.RawMessage(`{"small":true}`), true)
+	createActorOwnershipTaskWithID(t, db, actor, boot, actorOwnershipWireTaskOne, ptypes.PhaseWorkerSlices)
+	startActorOwnershipTask(t, db, actor, boot, actorOwnershipWireTaskOne, "wire-evidence-second", actorOwnershipMaterialKind, json.RawMessage(`{"large":true}`), true)
+	enlargeActorOwnershipPayload(t, db, "UPDATE journal_evidence SET payload=?1 WHERE journal_id=?2", actorOwnershipJSONSize(t, 5000), actorOwnershipEvidenceJournalID(t, db, actorOwnershipWireTaskOne, actorOwnershipEvidenceKind))
+
+	bindings := actorOwnershipWireBindings(t, db, actorOwnershipWireSource{task: actorOwnershipWireTaskTwo, operation: "wire-evidence-first"}, actorOwnershipWireSource{task: actorOwnershipWireTaskOne, operation: "wire-evidence-second"})
+	kinds, err := json.Marshal([]journal.EvidenceKind{actorOwnershipEvidenceKind})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := actorOwnershipWireFixture{statement: "evidence"}
+	fixture.drive = func(t *testing.T, bound int64) []actorOwnershipWireRow {
+		t.Helper()
+		scope := takePoolScope(t, db)
+		defer scope.release()
+		rows, err := scope.conn.QueryContext(scope.ctx, actorOwnershipEvidenceSQL, bindings, bound, string(kinds))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		observed := make([]actorOwnershipWireRow, 0, 2)
+		for rows.Next() {
+			var (
+				journalID                 int64
+				ownerTask                 string
+				kindLength, payloadLength sql.NullInt64
+				kind                      sql.NullString
+				payload                   []byte
+			)
+			if err := rows.Scan(&journalID, &ownerTask, &kindLength, &kind, &payloadLength, &payload); err != nil {
+				t.Fatal(err)
+			}
+			observed = append(observed, actorOwnershipWireRow{columns: []actorOwnershipWireColumn{
+				actorOwnershipWireColumnAt(t, "journal_evidence.evidence_kind", kindLength, &kind),
+				actorOwnershipWireColumnAt(t, "journal_evidence.payload", payloadLength, &payload),
+			}})
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		return observed
+	}
+	fixture.check = func(t *testing.T, rows []actorOwnershipWireRow) {
+		t.Helper()
+		got := actorOwnershipWirePayloadLengths(rows, "journal_evidence.payload")
+		if want := []int64{int64(len(`{"evidence":"start"}`)), 5000}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("evidence declared payload lengths=%v, want %v in journal-id order", got, want)
+		}
+	}
+	return fixture
+}
+
+// actorOwnershipWirePayloadLengths collects the byte lengths a statement
+// declared for one payload column, in the order it returned its rows, so a
+// subject can state the stored sequence rather than a count.
+func actorOwnershipWirePayloadLengths(rows []actorOwnershipWireRow, name string) []int64 {
+	lengths := make([]int64, 0, len(rows))
+	for _, row := range rows {
+		declared, _ := row.declared(name)
+		lengths = append(lengths, declared.Int64)
+	}
+	return lengths
+}
 
 // actorOwnershipWireAudit answers the question the result byte bound rests on,
 // for the values one statement handed the Go scanner: each guarded value arrived
@@ -543,24 +803,23 @@ type actorOwnershipWireAudit struct {
 	observed  int
 }
 
-func (a *actorOwnershipWireAudit) column(name string, declared sql.NullInt64, destination any) {
+func (a *actorOwnershipWireAudit) column(column actorOwnershipWireColumn) {
 	a.t.Helper()
-	arrived, size := actorOwnershipWireValue(a.t, destination)
-	if !declared.Valid {
-		if arrived {
-			a.t.Fatalf("%s %s: a stored NULL column arrived as a value", a.statement, name)
+	if !column.declared.Valid {
+		if column.arrived {
+			a.t.Fatalf("%s %s: a stored NULL column arrived as a value", a.statement, column.name)
 		}
 		return
 	}
-	if fits := declared.Int64 <= a.bound; arrived != fits {
-		a.t.Fatalf("%s %s: %d declared bytes against a %d-byte remaining budget arrived=%t, want arrived=%t", a.statement, name, declared.Int64, a.bound, arrived, fits)
+	if fits := column.declared.Int64 <= a.bound; column.arrived != fits {
+		a.t.Fatalf("%s %s: %d declared bytes against a %d-byte remaining budget arrived=%t, want arrived=%t", a.statement, column.name, column.declared.Int64, a.bound, column.arrived, fits)
 	}
-	if arrived && int64(size) != declared.Int64 {
-		a.t.Fatalf("%s %s: %d bytes arrived for a declared length of %d", a.statement, name, size, declared.Int64)
+	if column.arrived && int64(column.size) != column.declared.Int64 {
+		a.t.Fatalf("%s %s: %d bytes arrived for a declared length of %d", a.statement, column.name, column.size, column.declared.Int64)
 	}
-	a.hydrated += int64(size)
-	if int64(size) > a.largest {
-		a.largest = int64(size)
+	a.hydrated += int64(column.size)
+	if int64(column.size) > a.largest {
+		a.largest = int64(column.size)
 	}
 	a.observed++
 }
@@ -723,6 +982,131 @@ func TestActorOwnershipByteGuardStopsAtTheCrossingRow(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestActorOwnershipEpisodeOccupantIsBudgetedButNeverSuppressed covers the one
+// variable-width result value the read cannot suppress, and pins the two halves
+// of what it does instead.
+//
+// episodes.actor_id is the live occupant of the winning episode, and the
+// owned-task stage reads a NULL occupant as *OwnerProjectionMismatchError. So
+// the column carries no suppression clause: a merely large but valid occupant
+// must keep arriving, or the bound would report a size refusal to the operator as
+// an accusation that tasks.owner_id disagrees with the writer's winning-episode
+// rule, which is a different fault with a different fix. What it must not do is
+// escape the bound, so its declared length is selected beside the value and added
+// to the row total.
+//
+// Each half is asserted on its own. Counted: the row's total is measured from the
+// statement's own declared lengths, and the read is driven one byte under that
+// total — a limit every guarded column clears and only the occupant's own bytes
+// cross — and it must refuse with *ActorOwnershipLimitError, never with a
+// projection mismatch. Never suppressed: at a one-byte budget, where every
+// guarded column is suppressed, the occupant still arrives intact, and at exactly
+// the row's own total the read succeeds and returns the task.
+func TestActorOwnershipEpisodeOccupantIsBudgetedButNeverSuppressed(t *testing.T) {
+	db := openActorOwnershipDB(t, ":memory:")
+	// A namespace no supported writer produces and no length ceiling rejects, so
+	// the stored occupant parses as a valid actor identity and the only thing
+	// wrong with the row is that it is too large for the budget. Inserting the
+	// agents row directly is what makes episodes.actor_id's reference satisfiable.
+	wide := journal.ActorID{Namespace: strings.Repeat("oversized-occupant-", 256), UUID: uuid.NewSHA1(uuid.NameSpaceURL, []byte("actor/oversized-occupant"))}
+	insertActorOwnershipActorID(t, db, wide)
+	boot := genesisBoot(t, db, wide)
+	task := createActorOwnershipTask(t, db, wide, boot, "occupant-budget", ptypes.PhaseWorkerSlices)
+	startActorOwnershipTask(t, db, wide, boot, task, "occupant-budget-start", actorOwnershipMaterialKind, json.RawMessage(`{"occupied":true}`), false)
+
+	drive := actorOwnershipOwnedTaskWireDriver(t, db, wide)
+	rows := drive(t, journal.MaxActorOwnershipResultBytes)
+	if len(rows) != 1 {
+		t.Fatalf("owned-task statement returned %d rows, want the one oversized-occupant task", len(rows))
+	}
+	if !rows[0].occupant.Valid || rows[0].occupant.String != wide.String() {
+		t.Fatalf("stored occupant=%v, want the oversized actor identity intact", rows[0].occupant)
+	}
+	guarded := int64(0)
+	for _, column := range rows[0].columns {
+		if column.declared.Valid {
+			guarded += column.declared.Int64
+		}
+	}
+	occupant := int64(len(wide.String()))
+	if occupant <= guarded {
+		t.Fatalf("the oversized occupant is %d bytes against %d bytes of guarded columns, so a budget that clears the guarded columns is not crossed by the occupant alone", occupant, guarded)
+	}
+	// The statement declares the occupant's length beside the value, so the row
+	// total the read has to reproduce is the guarded columns plus the occupant,
+	// and the two cases below bracket it to the byte.
+	total := guarded + occupant
+
+	snapshot, err := db.queryActorOwnership(context.Background(), journal.ActorOwnershipQuery{Actor: wide}, total-1)
+	var limitErr *journal.ActorOwnershipLimitError
+	if !errors.As(err, &limitErr) || !errors.Is(err, journal.ErrActorOwnershipLimit) {
+		t.Fatalf("query error=%T %v, want *ActorOwnershipLimitError: the occupant's bytes must be inside the bound", err, err)
+	}
+	var mismatch *journal.OwnerProjectionMismatchError
+	if errors.As(err, &mismatch) || errors.Is(err, journal.ErrProjectionDivergence) {
+		t.Fatalf("query error=%v, a size refusal must not be reported as a projection mismatch", err)
+	}
+	if limitErr.Stage != journal.ActorOwnershipStageOwnedTasks || limitErr.LimitBytes != total-1 || limitErr.ObservedBytes != total || !reflect.DeepEqual(snapshot, journal.ActorOwnershipSnapshot{}) {
+		t.Fatalf("limit error=%+v snapshot=%+v, want the owned-tasks stage refusing at %d observed against a %d-byte limit", limitErr, snapshot, total, total-1)
+	}
+
+	// The same class has to survive a budget BELOW the occupant's own length,
+	// which is the case a suppression clause would get wrong: a suppressed
+	// occupant arrives as a NULL, and the NULL arm turns that into a projection
+	// mismatch. So the refusal here is a size refusal too, not an accusation that
+	// tasks.owner_id disagrees with the writer about a store that agrees.
+	under, err := db.queryActorOwnership(context.Background(), journal.ActorOwnershipQuery{Actor: wide}, occupant-1)
+	var underLimit *journal.ActorOwnershipLimitError
+	if !errors.As(err, &underLimit) || !errors.Is(err, journal.ErrActorOwnershipLimit) {
+		t.Fatalf("query error=%T %v, want *ActorOwnershipLimitError below the occupant's own %d bytes", err, err, occupant)
+	}
+	if errors.As(err, &mismatch) || errors.Is(err, journal.ErrProjectionDivergence) {
+		t.Fatalf("query error=%v, a size refusal below the occupant's length must not be reported as a projection mismatch", err)
+	}
+	if underLimit.Stage != journal.ActorOwnershipStageOwnedTasks || underLimit.LimitBytes != occupant-1 || underLimit.ObservedBytes != total || !reflect.DeepEqual(under, journal.ActorOwnershipSnapshot{}) {
+		t.Fatalf("limit error=%+v snapshot=%+v, want the owned-tasks stage refusing at %d observed against a %d-byte limit", underLimit, under, total, occupant-1)
+	}
+
+	atOne := drive(t, 1)
+	if len(atOne) != 1 {
+		t.Fatalf("owned-task statement returned %d rows at a one-byte budget, want the row whose occupant is never suppressed", len(atOne))
+	}
+	if !atOne[0].occupant.Valid || atOne[0].occupant.String != wide.String() {
+		t.Fatalf("occupant=%v at a one-byte budget, want the oversized identity to cross the wire regardless of the budget", atOne[0].occupant)
+	}
+	suppressed, guardedColumns := 0, 0
+	for _, column := range atOne[0].columns {
+		if !column.declared.Valid {
+			// A stored NULL is not a value the guard can suppress or admit.
+			continue
+		}
+		guardedColumns++
+		if column.arrived {
+			t.Fatalf("guarded column %s arrived at a one-byte budget, so the fixture no longer exercises suppression and the occupant's arrival beside it proves nothing", column.name)
+		}
+		suppressed++
+	}
+	if suppressed == 0 || suppressed != guardedColumns {
+		t.Fatalf("%d of %d guarded columns were suppressed at a one-byte budget, want every one of them suppressed", suppressed, guardedColumns)
+	}
+
+	snapshot, err = db.queryActorOwnership(context.Background(), journal.ActorOwnershipQuery{Actor: wide}, total)
+	if err != nil {
+		t.Fatalf("query at the row's own %d-byte total: %v, want the oversized occupant to be inside its own budget", total, err)
+	}
+	if len(snapshot.Tasks) != 1 || snapshot.Tasks[0].TaskID != task || snapshot.Work.ResultBytes != total {
+		t.Fatalf("snapshot tasks=%+v work=%+v, want the one task carried by a %d-byte result", snapshot.Tasks, snapshot.Work, total)
+	}
+}
+
+// insertActorOwnershipActorID registers an actor identity the test chose, so a
+// fixture can carry an identity shape the writer's own name-based path cannot
+// produce.
+func insertActorOwnershipActorID(t *testing.T, db *DB, actor journal.ActorID) {
+	t.Helper()
+	execActorOwnershipTestSQL(t, db, "INSERT INTO agents (id,kind_id) VALUES (?1,?2)", actor.String(), int(ptypes.AgentKindSoftware))
 }
 
 func actorOwnershipJSONSize(t *testing.T, size int) json.RawMessage {
@@ -1116,21 +1500,44 @@ func TestActorOwnershipIntegrityErrorKeepsItsCauseReachable(t *testing.T) {
 	}
 }
 
+// TestActorOwnershipStageBarrierIsTestOnly scans the package's Go sources and
+// refuses any non-test file that installs the stage barrier seam. The scan is
+// deliberately narrowed to `*.go` and to non-test files: a scratch file or an
+// editor backup that happens to mention the symbol is not a production install,
+// so reading it would turn this subject red for a reason that has nothing to do
+// with the invariant. The subject's own non-vacuity is checked rather than
+// assumed — the file that legitimately declares the seam has to be among the
+// files the glob returns, and at least one other non-test Go file has to have
+// been read, or a glob that matches nothing would report success while testing
+// nothing.
 func TestActorOwnershipStageBarrierIsTestOnly(t *testing.T) {
-	entries, err := os.ReadDir(".")
+	const declaring = "actor_ownership.go"
+	names, err := filepath.Glob("*.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, entry := range entries {
-		if entry.IsDir() || strings.HasSuffix(entry.Name(), "_test.go") || entry.Name() == "actor_ownership.go" {
+	scanned, found := 0, false
+	for _, name := range names {
+		if strings.HasSuffix(name, "_test.go") {
 			continue
 		}
-		contents, err := os.ReadFile(entry.Name())
+		if name == declaring {
+			found = true
+			continue
+		}
+		scanned++
+		contents, err := os.ReadFile(name)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if strings.Contains(string(contents), "installActorOwnershipStageBarrier") {
-			t.Fatalf("non-test production file %s installs actor ownership stage barrier", entry.Name())
+			t.Fatalf("non-test production file %s installs actor ownership stage barrier", name)
 		}
+	}
+	if !found {
+		t.Fatalf("%s was not among the scanned Go files, so the exclusion that lets it declare the seam is untested", declaring)
+	}
+	if scanned == 0 {
+		t.Fatalf("no other non-test Go file was scanned, so the stage-barrier seam was never checked")
 	}
 }

@@ -30,6 +30,7 @@ const actorOwnershipOwnedTasksSQL = `SELECT
  t.phase_id,
  length(CAST(e.assignment_id AS BLOB)),
  CASE WHEN length(CAST(e.assignment_id AS BLOB))<=?2 THEN e.assignment_id END,
+ length(CAST(e.actor_id AS BLOB)),
  e.actor_id,
  started.journal_id,
  op.journal_id,
@@ -232,11 +233,11 @@ func (db *DB) readActorOwnershipTasks(scope *connScope, actor journal.ActorID, l
 	owned := actorOwnershipOwnedResult{tasks: make([]journal.OwnedTaskRow, 0), bindings: make([]actorOwnershipOwnedBinding, 0)}
 	for rows.Next() {
 		var (
-			taskLength, assignmentLength, operationLength, predecessorLength sql.NullInt64
-			taskID, assignmentID, occupant, operationID, predecessorID       sql.NullString
-			phase, started, producer                                         sql.NullInt64
+			taskLength, occupantLength, assignmentLength, operationLength, predecessorLength sql.NullInt64
+			taskID, occupant, assignmentID, operationID, predecessorID                       sql.NullString
+			phase, started, producer                                                         sql.NullInt64
 		)
-		if err := rows.Scan(&taskLength, &taskID, &phase, &assignmentLength, &assignmentID, &occupant, &started, &producer, &operationLength, &operationID, &predecessorLength, &predecessorID); err != nil {
+		if err := rows.Scan(&taskLength, &taskID, &phase, &assignmentLength, &assignmentID, &occupantLength, &occupant, &started, &producer, &operationLength, &operationID, &predecessorLength, &predecessorID); err != nil {
 			return actorOwnershipOwnedResult{}, actorOwnershipReadFault("could not decode an owned-task row", "SQLite returned an unexpected column type or shape", "statement 3 row decoding", err)
 		}
 
@@ -260,7 +261,17 @@ func (db *DB) readActorOwnershipTasks(scope *connScope, actor journal.ActorID, l
 			return actorOwnershipOwnedResult{}, &journal.OwnerProjectionMismatchError{Task: task, Owner: actor, ActiveOccupant: &active}
 		}
 
-		rowBytes := actorOwnershipLength(taskLength) + actorOwnershipLength(assignmentLength) + actorOwnershipLength(operationLength) + actorOwnershipLength(predecessorLength)
+		// episodes.actor_id is the one variable-width column that is counted but
+		// never suppressed. Its declared length is selected beside the value and
+		// added to the row total, so a store holding an oversized actor identifier
+		// is refused by the bound here rather than being hydrated and forgotten.
+		// It carries no CASE WHEN because a suppressed occupant would arrive as a
+		// NULL, and the NULL-occupant arm below reports that as
+		// *OwnerProjectionMismatchError — telling an operator their ownership
+		// projection disagrees with the writer's rule when nothing disagrees. A
+		// size refusal must stay a size refusal, so the value always crosses the
+		// wire and only its length is budgeted.
+		rowBytes := actorOwnershipLength(taskLength) + actorOwnershipLength(occupantLength) + actorOwnershipLength(assignmentLength) + actorOwnershipLength(operationLength) + actorOwnershipLength(predecessorLength)
 		observed := snapshot.Work.ResultBytes + rowBytes
 		// A wire-suppressed value has no valid scan destination, and its declared
 		// length is already part of observed, so the running total refuses the row
