@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -402,7 +403,9 @@ func TestActorOwnershipWireGuardSuppressesValuesThatDoNotFitTheBudget(t *testing
 // of the eight guards strict leaves the whole suite green. Here each guarded
 // column gets its own case derived from the fixture's own stored lengths, so a
 // guard that turns strict on any one of them turns exactly that column's
-// subtest red and the other seven green, and the red names the column.
+// subtest red and the other seven green, and the red names the column. The
+// subject also asserts, before it runs, that it derived a case for every guarded
+// column the fixture declares, so the eight cases cannot quietly become none.
 func TestActorOwnershipWireGuardAdmitsAValueThatExactlyFitsTheBudget(t *testing.T) {
 	for _, statement := range []struct {
 		name  string
@@ -428,10 +431,13 @@ func TestActorOwnershipWireGuardAdmitsAValueThatExactlyFitsTheBudget(t *testing.
 // driver names, and a column added to a statement without being added to its
 // driver fails the scan instead of going untested, so the list cannot drift away
 // from the SQL silently. A column every row stores as NULL gets no case and is
-// simply absent from the list, which is the one gap this shape cannot close; no
-// such column exists in these three fixtures, and all eight are named in a
-// subtest run. Each subtest also states the safety direction for every column it
-// saw, so the arrival it proves is not bought by hydrating something larger.
+// simply absent from the collected list, which is the one gap the walk itself
+// cannot close; actorOwnershipWireFloor closes it from the other side, by
+// asserting the collected list is every column the fixture declares it guards,
+// so a statement whose declared lengths all came back NULL fails here loudly
+// rather than running no subtest and passing. Each subtest also states the safety
+// direction for every column it saw, so the arrival it proves is not bought by
+// hydrating something larger.
 func actorOwnershipWireBoundary(t *testing.T, fixture actorOwnershipWireFixture) {
 	t.Helper()
 	order := make([]string, 0, 8)
@@ -451,6 +457,7 @@ func actorOwnershipWireBoundary(t *testing.T, fixture actorOwnershipWireFixture)
 			}
 		}
 	}
+	actorOwnershipWireFloor(t, fixture, order)
 	for _, name := range order {
 		bound := shortest[name]
 		t.Run(name, func(t *testing.T) {
@@ -479,6 +486,47 @@ func actorOwnershipWireBoundary(t *testing.T, fixture actorOwnershipWireFixture)
 				t.Fatalf("%s %s: no value of exactly %d bytes was returned, so this case cannot tell an inclusive guard from a strict one", fixture.statement, name, bound)
 			}
 		})
+	}
+}
+
+// actorOwnershipWireFloor is the anti-vacuity assertion the boundary walk needs
+// and cannot make about itself: it collected the guarded columns the fixture
+// declared, all of them, and did not collect nothing.
+//
+// A walk that derives its own cases cannot notice its own emptiness. If every
+// declared length came back NULL — a guard written `NULL<=?2`, a length column
+// dropped from the SELECT list behind an arity the driver no longer checks — the
+// walk collects no column, runs no subtest, and passes, which is a green that
+// asserts nothing. So the collected list is compared against a list written
+// down beside the driver, by name rather than by count, because a name is what a
+// maintainer can act on: a legitimate new guard is expected to fail here once,
+// loudly, naming the column to add, and a floor that only counted would either
+// miss that change or hide it in a number.
+//
+// Three failures, each for a different reason:
+//
+//   - the fixture declares no expected columns, so the comparison below is
+//     vacuous in the other direction and the walk is pinned to nothing;
+//   - the walk collected nothing, which is the mutation this exists to catch;
+//   - the two lists differ, so a column the statement guards is covered by no
+//     boundary case, or a case is asserted for a column the statement dropped.
+//
+// The comparison is on the set, not the order, because the order is the driver's
+// scan order and carries no claim worth pinning.
+func actorOwnershipWireFloor(t *testing.T, fixture actorOwnershipWireFixture, collected []string) {
+	t.Helper()
+	if len(fixture.wantColumns) == 0 {
+		t.Fatalf("%s: this fixture declares no expected guarded columns, so the boundary walk is pinned to nothing; name every column the statement guards in wantColumns", fixture.statement)
+	}
+	if len(collected) == 0 {
+		t.Fatalf("%s: the boundary walk collected no guarded column, because no row declared a byte length for any of %v, so no subtest ran and this subject proved nothing", fixture.statement, fixture.wantColumns)
+	}
+	got := slices.Clone(collected)
+	want := slices.Clone(fixture.wantColumns)
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Fatalf("%s: the boundary walk covered the guarded columns %v, want %v; a column added to or removed from the statement's guards has to be added to or removed from this fixture's wantColumns, or this subject covers it not at all", fixture.statement, got, want)
 	}
 }
 
@@ -526,13 +574,23 @@ var (
 
 // actorOwnershipWireFixture is one result statement's fixture: a driver that
 // runs that statement against any remaining byte budget, the name the subjects
-// report under, and the stored-order facts the fixture was built to pin. Both
-// wire-guard subjects build their fixtures here, so the two agree on the rows
-// they observe and neither can drift from the other.
+// report under, the guarded columns the statement is expected to carry, and the
+// stored-order facts the fixture was built to pin. Both wire-guard subjects build
+// their fixtures here, so the two agree on the rows they observe and neither can
+// drift from the other.
+//
+// wantColumns is the fixture's own list of every column the statement guards
+// under a remaining-budget bound — the `CASE WHEN length(CAST(x AS BLOB))<=?n
+// THEN x END` pair, not the unguarded length the read's own accounting budgets.
+// The driver already scans every selected column, so a statement that grew or
+// lost a guarded column fails the driver's Scan arity first; wantColumns is what
+// makes the next step loud as well, so the boundary walk cannot simply stop
+// covering a column the maintainer already had to wire into the driver.
 type actorOwnershipWireFixture struct {
-	statement string
-	drive     actorOwnershipWireDriver
-	check     func(t *testing.T, rows []actorOwnershipWireRow)
+	statement   string
+	wantColumns []string
+	drive       actorOwnershipWireDriver
+	check       func(t *testing.T, rows []actorOwnershipWireRow)
 }
 
 // actorOwnershipWireDriver runs one of the three result statements with a given
@@ -596,7 +654,11 @@ func actorOwnershipOwnedTaskWireFixture(t *testing.T) actorOwnershipWireFixture 
 	startActorOwnershipTask(t, db, actor, boot, transferred, "wire-transferred-prior", actorOwnershipMaterialKind, json.RawMessage(`{"prior":true}`), false)
 	successor := startActorOwnershipSuccessor(t, db, actor, boot, transferred, "wire-transferred-prior", "wire-transferred-successor")
 
-	fixture := actorOwnershipWireFixture{statement: "owned tasks", drive: actorOwnershipOwnedTaskWireDriver(t, db, actor)}
+	fixture := actorOwnershipWireFixture{
+		statement:   "owned tasks",
+		wantColumns: []string{"tasks.id", "episodes.assignment_id", "journal_operations.operation_id", "episodes.predecessor_assignment_id"},
+		drive:       actorOwnershipOwnedTaskWireDriver(t, db, actor),
+	}
 	fixture.check = func(t *testing.T, rows []actorOwnershipWireRow) {
 		t.Helper()
 		starts := make([]int64, 0, len(rows))
@@ -676,7 +738,7 @@ func actorOwnershipMaterialWireFixture(t *testing.T) actorOwnershipWireFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fixture := actorOwnershipWireFixture{statement: "material"}
+	fixture := actorOwnershipWireFixture{statement: "material", wantColumns: []string{"journal_task_events.event_kind", "journal_task_events.payload"}}
 	fixture.drive = func(t *testing.T, bound int64) []actorOwnershipWireRow {
 		t.Helper()
 		scope := takePoolScope(t, db)
@@ -734,7 +796,7 @@ func actorOwnershipEvidenceWireFixture(t *testing.T) actorOwnershipWireFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fixture := actorOwnershipWireFixture{statement: "evidence"}
+	fixture := actorOwnershipWireFixture{statement: "evidence", wantColumns: []string{"journal_evidence.evidence_kind", "journal_evidence.payload"}}
 	fixture.drive = func(t *testing.T, bound int64) []actorOwnershipWireRow {
 		t.Helper()
 		scope := takePoolScope(t, db)
