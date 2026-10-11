@@ -38,7 +38,10 @@ go.work.sum
 # Dolt database files (added by bd init)
 .dolt/
 *.db
+*.db-wal
+*.db-shm
 
 # Immutable test fixtures are the one exception to the *.db rule above: these
 # bytes are checked-in source data, not a runtime database.
 !testdata/dbos/*.db
+!testdata/id-format/*.db

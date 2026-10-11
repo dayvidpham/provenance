@@ -95,6 +95,99 @@ references zero, rather than inventing JournalIDs or content digests. The main
 worker must resolve the proposal's stronger “complete valid envelope” obligation
 with its plan owner; this fixture must not be represented as satisfying it.
 
+### Released-owner follow-up: exact API and executable gap proof
+
+The follow-up investigation inspected **all non-test Go source in the pinned
+Pasture v0.0.16 module**, not only the ingress path. `WriteReference` has no
+declaration or use anywhere in that released module. The exact missing kinds and
+their envelope positions are:
+
+| Envelope reference | Declared owner kind | Declaration in `internal/lifecycle/model/definition.go` |
+| --- | --- | --- |
+| `Runtime.Definition` | `DefinitionRuntimeContract` (1) | line 13; wrapper lines 75–79 |
+| `Schema.Definition` | `DefinitionLifecycleSchema` (2) | line 14; wrapper lines 80–83 |
+| `Implementation.Definition` | `DefinitionEpochImplementation` (5) | line 17; wrapper lines 92–95 |
+| `Retention.Definition` | `DefinitionRetentionPolicy` (8) | line 20; wrapper lines 105–110 |
+
+Each kind identifier occurs exactly once in production Go: its enum declaration.
+There are **no typed owner uses** implementing registration, resolution, or
+kind/content verification for these four kinds. `DefinitionSnapshot` and
+`DefinitionStateRecord` in that file are model shapes, not a factory or reader;
+`DefinitionSnapshot.Body` (line 43) is only an accessor for its private body.
+The planned generic owner directory `internal/lifecycle/definitions` does not
+exist. The release's own
+`llm/plan/proposal-10-hook-lifecycle-architecture.md:667` lists definition
+resolution (`DefinitionQuery`, that owning package) as **not built**.
+
+Actual available production surfaces, with locations in that same source pin:
+
+- `receipt/write.go:33–40`: every `GatedWrite` field is private. Its complete
+  exported factory inventory is `NewDefinitionActivation`, `NewLineageLinks`,
+  and `NewDisclosure`; there is no general definition/reference constructor.
+- `receipt/write.go:48–93`: `NewDefinitionActivation` accepts only
+  `model.LifecycleMetamodelManifest` plus body bytes, verifies their SHA-256
+  agreement, and produces definition/activation evidence with owner-derived
+  operation/command identities. It accepts no `DefinitionKind` or typed envelope
+  reference. Its coordinate validation checks nonzero ID/version/content, **not
+  an allow-list of metamodel IDs**; therefore this is not a claim that it rejects
+  every arbitrarily renamed coordinate. Renaming a metamodel coordinate or
+  re-labelling its returned JournalID is not an owner-verified runtime/schema/
+  implementation/retention definition.
+- `receipt/write.go:168–175,283–301`: `Service.Commit` requires a constructor-
+  built write and a matching legalized warrant. A zero/unconstructed write with
+  a genuine definition-activation warrant is refused before journal I/O.
+- `receipt/definition.go:28–75,83–125`: `EnsureActiveMetamodel` and
+  `ResolveActiveMetamodel` use `metamodel.Active()`/`metamodel.Body()` and return
+  only `LifecycleMetamodelRef` with `DefinitionMetamodel`. They cannot produce
+  one of the four missing typed references.
+- `gate/gate.go:46–60,140–154`: definition activation is explicitly the
+  **metamodel** write class; its constructor takes only a content identity.
+  Legalizing an activation warrant is not generic definition-kind validation.
+- `receipt/service.go:295–319`: delivery validation checks runtime contract,
+  event, capture/origin, body/binding limits, and host-version source, but does
+  **not** verify the four definition references. `projection/rebuild.go:67–70,
+  97–107` decodes and preserves envelopes; it does not resolve their definitions.
+  Thus receipt/replay success cannot prove definition completeness.
+- `ingress/claude/capture.go:30–42` fills runtime contract and host version, not
+  definition JournalIDs; `handlers/hook_lifecycle.go:186–190` supplies the zero
+  envelope on the real Claude ingress route.
+
+`builder/definition_gap_test.go` adds executable evidence:
+
+Run the explicit root target `make test-id-format-builder` alongside the normal
+root race gate for URI migration release evidence. The builder is a separate
+module deliberately excluded from root `./...`; this target verifies its module
+sums and runs its complete race suite, including the pinned API boundary checks.
+
+1. `TestPreviousDefinitionWriterAPIBoundary` inspects the actual pinned owner's
+   constructor signature, private write fields, complete gated-write factory
+   inventory, absence of `WriteReference`, absence of the generic owner
+   directory, and single unused declaration of each of the four kind identifiers
+   across **all** released non-test Go source. It fails if that API boundary
+   changes, prompting reinvestigation rather than retaining a stale gap claim.
+2. `TestPreviousDefinitionCommitRequiresConstructedWrite` opens a checksum-
+   verified private corpus copy and obtains a real legalized activation warrant.
+   The old `Service.Commit` rejects an unconstructed write with typed gate
+   refusal, no returned definition IDs, and exact unchanged journal evidence;
+   the real journal integrity verifier still passes. No mocked journal is used.
+3. `TestPreviousDefinitionConstructorRejectsMissingOwnerInputs` demonstrates
+   that the real constructor refuses a missing coordinate or missing body,
+   returning no usable operation identity/write class. It invents no digest.
+4. `TestPreviousDefinitionOwnerResolvesOnlyMetamodel` uses the genuine active
+   metamodel body/coordinate, real constructor, warrant, commit and resolver on
+   another private copy. It requires the actual metamodel reference and evidence
+   body normalized by the released `provenance.Canonicalize` owner (including
+   that codec's empty-array-to-null normalization), verifies all four distinct
+   missing references remain zero, and invokes the real journal integrity
+   verifier. It does not handcraft the normalized bytes or dependent digests.
+
+**Result:** the stronger four-reference requirement is blocked by the released
+owner API, not solved by a new fixture recipe. Raw `provenance.Journal.Apply`
+could store caller-defined evidence, but without these Pasture owner factories,
+definition codecs/resolvers and kind verification that would invent the missing
+registration contract. No such substitute was used. The archive, manifest,
+checksum and builder construction recipe are unchanged by this follow-up.
+
 No new CLI conversion, converted owner verification, migration rollback,
 marker-last, or new normal-open checks are implemented here. Those are the
 integration owners' responsibility; both repositories should consume these same
@@ -113,6 +206,12 @@ codecs.
 - `go vet ./...` in `builder/`: PASS.
 - `CGO_ENABLED=0 go build -o /tmp/opencode/previous-writer-fixture-builder ./...`
   in `builder/`: PASS (build-only; no CGO-disabled tests).
+- Definition-gap follow-up, Go 1.26.1 through the worktree's Nix dev shell:
+  `nix develop ../../.. --command env CGO_ENABLED=1 go test -race -shuffle=on
+  -fullpath -timeout=20m ./...` in `builder/`: PASS (9.145s), including all four
+  new old-owner gap/API regression tests and the existing authentic corpus tests.
+  `nix develop ../../.. --command go vet ./...`: PASS. Archive SHA-256 rechecked
+  and unchanged.
 
 These are standalone fixture-preparation gates, not the main worktree's full
 integration gates. No commit or push was performed by the fixture preparer.

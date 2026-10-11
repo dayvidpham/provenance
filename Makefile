@@ -1,4 +1,4 @@
-.PHONY: build fmt lint test test-local clean
+.PHONY: build fmt lint test test-local test-id-format-builder clean
 
 build: fmt lint test
 	CGO_ENABLED=0 go build ./...
@@ -24,6 +24,12 @@ PKG ?= ./...
 RUN ?= .
 test-local:
 	CGO_ENABLED=1 go test -race -shuffle=on -fullpath -timeout=20m -run '$(RUN)' $(PKG)
+
+# The previous-writer builder is a deliberately separate module. URI migration
+# release evidence requires this additional gate; root ./... cannot discover it.
+test-id-format-builder:
+	cd testdata/id-format/builder && go mod verify
+	cd testdata/id-format/builder && CGO_ENABLED=1 go test -race -shuffle=on -fullpath -timeout=20m ./...
 
 clean:
 	rm -rf bin/
