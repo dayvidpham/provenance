@@ -18,29 +18,27 @@ type namespacedID interface {
 	TaskID | ActorID | ActivityID | CommentID
 }
 
-// parseID is a generic helper that parses "namespace--uuid" into any ID type
+// parseID is a generic helper that parses "namespace/uuid" into any ID type
 // matching the namespacedID constraint.
 //
-// It splits on the rightmost "--" separator (handles namespaces containing "--"),
-// validates that the namespace is non-empty, and parses the UUID portion.
+// It splits on the last slash, preserving the opaque namespace verbatim,
+// and requires a canonical hyphenated UUID suffix (any UUID version).
 // The caller parameter is used in error messages (e.g. "ParseTaskID").
 // Returns ErrInvalidID on any parse failure.
 func parseID[T namespacedID](raw, caller string) (T, error) {
 	var zero T
-	idx := strings.LastIndex(raw, "--")
-	if idx < 0 {
-		return zero, fmt.Errorf("%w: %s — no '--' separator found in %q — "+
-			"expected format is 'namespace--uuidv7'", ErrInvalidID, caller, raw)
+	idx := strings.LastIndexByte(raw, '/')
+	if idx <= 0 || !canonicalUUIDShape(raw[idx+1:]) {
+		reason := "missing or empty namespace, separator, or canonical UUID suffix"
+		if retired := strings.LastIndex(raw, "--"); retired > 0 && canonicalUUIDShape(raw[retired+2:]) {
+			reason = "retired two-dash separator"
+		}
+		return zero, fmt.Errorf("%w: %s: %s in %q — where: namespaced identity parser; when: before lookup; impact: no identity returned; fix: use <namespace>/<uuid> with a non-empty namespace and a 36-character hyphenated UUID", ErrInvalidID, caller, reason, raw)
 	}
 	ns := raw[:idx]
-	if ns == "" {
-		return zero, fmt.Errorf("%w: %s — empty namespace in %q — "+
-			"namespace must be non-empty, e.g. 'aura-plugins--<uuid>'", ErrInvalidID, caller, raw)
-	}
-	u, err := uuid.Parse(raw[idx+2:])
+	u, err := uuid.Parse(raw[idx+1:])
 	if err != nil {
-		return zero, fmt.Errorf("%w: %s — invalid UUID in %q: %v — "+
-			"the part after the last '--' must be a valid UUID", ErrInvalidID, caller, raw, err)
+		return zero, fmt.Errorf("%w: %s: invalid UUID in %q (%v) — where: namespaced identity parser; when: before lookup; impact: no identity returned; fix: use <namespace>/<uuid> with a valid 36-character hyphenated UUID", ErrInvalidID, caller, raw, err)
 	}
 	// Type switch to construct the correct concrete type.
 	// This is safe because T is constrained to our known ID types.
@@ -58,23 +56,40 @@ func parseID[T namespacedID](raw, caller string) (T, error) {
 	return result.(T), nil
 }
 
+func canonicalUUIDShape(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i := range s {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if s[i] != '-' {
+				return false
+			}
+			continue
+		}
+		if !('0' <= s[i] && s[i] <= '9' || 'a' <= s[i] && s[i] <= 'f' || 'A' <= s[i] && s[i] <= 'F') {
+			return false
+		}
+	}
+	return true
+}
+
 // TaskID uniquely identifies a task (PROV-O Entity).
 // The Namespace scopes the ID to a project (e.g., "aura-plugins").
 // The UUID is a UUIDv7 (time-sortable, globally unique).
-// Wire format: "namespace--uuid".
+// Wire format: "namespace/uuid".
 type TaskID struct {
 	Namespace string
 	UUID      uuid.UUID
 }
 
-// String returns the wire format: "namespace--uuid".
+// String returns the wire format: "namespace/uuid".
 func (id TaskID) String() string {
-	return id.Namespace + "--" + id.UUID.String()
+	return id.Namespace + "/" + id.UUID.String()
 }
 
-// ParseTaskID parses "namespace--uuid" into a TaskID.
-// Uses strings.LastIndex to split on the rightmost "--" separator,
-// which correctly handles namespaces that contain "--" themselves.
+// ParseTaskID parses "namespace/uuid" into a TaskID.
+// The last slash separates the UUID from the opaque namespace.
 // Returns ErrInvalidID if the format is invalid or the UUID is malformed.
 func ParseTaskID(s string) (TaskID, error) {
 	return parseID[TaskID](s, "ParseTaskID")
@@ -82,19 +97,19 @@ func ParseTaskID(s string) (TaskID, error) {
 
 // ActorID uniquely identifies a human, model, or software actor (PROV-O Agent).
 // Actor kind is metadata and never creates a second identity domain or wire
-// format. Wire format: "namespace--uuid".
+// format. Wire format: "namespace/uuid".
 type ActorID struct {
 	Namespace string
 	UUID      uuid.UUID
 }
 
-// String returns the wire format: "namespace--uuid".
+// String returns the wire format: "namespace/uuid".
 func (id ActorID) String() string {
-	return id.Namespace + "--" + id.UUID.String()
+	return id.Namespace + "/" + id.UUID.String()
 }
 
-// ParseActorID parses "namespace--uuid" into an ActorID.
-// Uses strings.LastIndex to split on the rightmost "--" separator.
+// ParseActorID parses "namespace/uuid" into an ActorID.
+// The last slash separates the UUID from the opaque namespace.
 // Returns ErrInvalidID if the format is invalid or the UUID is malformed.
 func ParseActorID(s string) (ActorID, error) {
 	return parseID[ActorID](s, "ParseActorID")
@@ -106,7 +121,7 @@ func ParseActorID(s string) (ActorID, error) {
 // the wire format is identical.
 type AgentID = ActorID
 
-// ParseAgentID parses "namespace--uuid" into the canonical ActorID domain.
+// ParseAgentID parses "namespace/uuid" into the canonical ActorID domain.
 //
 // Deprecated: use ParseActorID.
 func ParseAgentID(s string) (AgentID, error) {
@@ -114,38 +129,38 @@ func ParseAgentID(s string) (AgentID, error) {
 }
 
 // ActivityID uniquely identifies an activity (PROV-O Activity).
-// Wire format: "namespace--uuid".
+// Wire format: "namespace/uuid".
 type ActivityID struct {
 	Namespace string
 	UUID      uuid.UUID
 }
 
-// String returns the wire format: "namespace--uuid".
+// String returns the wire format: "namespace/uuid".
 func (id ActivityID) String() string {
-	return id.Namespace + "--" + id.UUID.String()
+	return id.Namespace + "/" + id.UUID.String()
 }
 
-// ParseActivityID parses "namespace--uuid" into an ActivityID.
-// Uses strings.LastIndex to split on the rightmost "--" separator.
+// ParseActivityID parses "namespace/uuid" into an ActivityID.
+// The last slash separates the UUID from the opaque namespace.
 // Returns ErrInvalidID if the format is invalid or the UUID is malformed.
 func ParseActivityID(s string) (ActivityID, error) {
 	return parseID[ActivityID](s, "ParseActivityID")
 }
 
 // CommentID uniquely identifies a comment.
-// Wire format: "namespace--uuid".
+// Wire format: "namespace/uuid".
 type CommentID struct {
 	Namespace string
 	UUID      uuid.UUID
 }
 
-// String returns the wire format: "namespace--uuid".
+// String returns the wire format: "namespace/uuid".
 func (id CommentID) String() string {
-	return id.Namespace + "--" + id.UUID.String()
+	return id.Namespace + "/" + id.UUID.String()
 }
 
-// ParseCommentID parses "namespace--uuid" into a CommentID.
-// Uses strings.LastIndex to split on the rightmost "--" separator.
+// ParseCommentID parses "namespace/uuid" into a CommentID.
+// The last slash separates the UUID from the opaque namespace.
 // Returns ErrInvalidID if the format is invalid or the UUID is malformed.
 func ParseCommentID(s string) (CommentID, error) {
 	return parseID[CommentID](s, "ParseCommentID")
