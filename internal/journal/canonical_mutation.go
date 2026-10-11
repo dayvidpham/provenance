@@ -639,7 +639,7 @@ type canonicalOptionalMarker byte
 const (
 	canonicalOptionalAbsent  canonicalOptionalMarker = '0'
 	canonicalOptionalPresent canonicalOptionalMarker = '1'
-	canonicalV1ZeroIdentity                          = "--00000000-0000-0000-0000-000000000000"
+	canonicalV1ZeroIdentity                          = "/00000000-0000-0000-0000-000000000000"
 )
 
 func optionalMarker(marker canonicalOptionalMarker) []byte { return []byte{byte(marker)} }

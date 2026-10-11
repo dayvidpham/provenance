@@ -20,7 +20,7 @@ import (
 // error — the exact shape modernc produces when its interrupt watcher fires
 // while SQLite is still waiting for the writer lock.
 type scriptedBeginQueryer struct {
-	conn          *sql.Conn
+	conn          sqlConnection
 	busy          error
 	beginAttempts atomic.Int64
 	zeroBudget    atomic.Int64

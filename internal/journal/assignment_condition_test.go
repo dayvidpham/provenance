@@ -16,11 +16,11 @@ import (
 
 func assignmentAssertionFixture(t *testing.T) AssignmentActiveAssertion {
 	t.Helper()
-	task, err := ptypes.ParseTaskID("fixture--018f0000-0000-7000-8000-000000000001")
+	task, err := ptypes.ParseTaskID("fixture/018f0000-0000-7000-8000-000000000001")
 	if err != nil {
 		t.Fatal(err)
 	}
-	actor, err := ptypes.ParseActorID("fixture--018f0000-0000-7000-8000-000000000002")
+	actor, err := ptypes.ParseActorID("fixture/018f0000-0000-7000-8000-000000000002")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +208,7 @@ func TestAssignmentActiveCanonicalRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(golden, prepared.CanonicalBytes()) || fmt.Sprintf("%x", sha256.Sum256(golden)) != "ded32ff7e1c7d269f5f2d6ed0334c22e356c1c5685b07de9383790c70695279b" {
+	if !bytes.Equal(golden, prepared.CanonicalBytes()) || fmt.Sprintf("%x", sha256.Sum256(golden)) != "43f7574db457ad916ad670b9c50a9c1b695e29fe0881c18dab42a182fab5ed20" {
 		t.Fatal("independent V2 assignment bytes or digest drifted")
 	}
 	decoded, err := DecodeCanonicalMutation(prepared.CanonicalBytes())

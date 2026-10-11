@@ -831,7 +831,7 @@ func optionalTaskString(id journal.TaskID) string {
 	return id.String()
 }
 
-func (scope *connScope) validateCanonicalTaskEvent(anchor, jid int64, effect journal.Effect) error {
+func canonicalTaskEventPayload(effect journal.Effect) (journal.EventKind, []byte, error) {
 	kind := effect.EventKind
 	payload := effect.Payload
 	if effect.Sort == journal.EffectTaskCreate || effect.Sort == journal.EffectTaskCreateAllocated {
@@ -845,11 +845,19 @@ func (scope *connScope) validateCanonicalTaskEvent(anchor, jid int64, effect jou
 		var err error
 		payload, err = encodeMutationFamilyPayload(effect)
 		if err != nil {
-			return err
+			return "", nil, err
 		}
 	}
 	if len(payload) == 0 {
 		payload = []byte(`{}`)
+	}
+	return kind, payload, nil
+}
+
+func (scope *connScope) validateCanonicalTaskEvent(anchor, jid int64, effect journal.Effect) error {
+	kind, payload, err := canonicalTaskEventPayload(effect)
+	if err != nil {
+		return err
 	}
 	if err := scope.compareSingleRow(anchor, jid, canonicalTaskEventRow, []string{effect.TaskID.String(), string(kind), string(payload)}); err != nil {
 		return err

@@ -415,8 +415,8 @@ func TestDBOSCompletedRetryUsesOneValidBaselineAndOneFieldChangePerFamily(t *tes
 		}
 		return base
 	}
-	comment, _ := ParseCommentID("family--018f0000-0000-7000-8000-000000000031")
-	altComment, _ := ParseCommentID("family--018f0000-0000-7000-8000-000000000032")
+	comment, _ := ParseCommentID("family/018f0000-0000-7000-8000-000000000031")
+	altComment, _ := ParseCommentID("family/018f0000-0000-7000-8000-000000000032")
 	families := []dbosFamilyBaseline{
 		makeCreate(EffectTaskCreate, "task_create"),
 		makeCreate(EffectTaskCreateAllocated, "task_create_allocated"),

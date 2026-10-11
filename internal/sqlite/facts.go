@@ -87,6 +87,10 @@ func (db *DB) QueryEvidence(q journal.EvidenceQuery) (journal.EvidencePage, erro
 	if err != nil {
 		return journal.EvidencePage{}, fmt.Errorf("QueryEvidence: %w", err)
 	}
+	return evidencePage(rows, snapshot, next), nil
+}
+
+func evidencePage(rows []factPageRow, snapshot journal.JournalID, next *journal.FactCursor) journal.EvidencePage {
 	page := journal.EvidencePage{SnapshotMaxJournalID: snapshot, Next: next, Rows: make([]journal.EvidenceRow, 0, len(rows))}
 	for _, row := range rows {
 		page.Rows = append(page.Rows, journal.EvidenceRow{
@@ -97,7 +101,7 @@ func (db *DB) QueryEvidence(q journal.EvidenceQuery) (journal.EvidencePage, erro
 			ProducingOperationJournalID: row.producingOperationJournalID,
 		})
 	}
-	return page, nil
+	return page
 }
 
 // normalizeFactQueryFilter is retained as the matcher boundary used by
@@ -172,29 +176,8 @@ func (db *DB) queryFacts(kind factSelectorKind, page journal.FactPageRequest, fi
 			return err
 		}
 
-		result, err := scope.conn.QueryContext(scope.ctx, binding.kind.pageMatchSQL(), binding.args...)
-		if err != nil {
-			return fmt.Errorf("bounded fact page SQL: %w", err)
-		}
-		defer result.Close()
-		for result.Next() {
-			row, err := scanFactPageRow(result, kind)
-			if err != nil {
-				return err
-			}
-			rows = append(rows, row)
-		}
-		if err := result.Err(); err != nil {
-			return fmt.Errorf("bounded fact page SQL: iterate rows: %w", err)
-		}
-		for i := range rows {
-			contexts, err := scope.loadVerifiedFactContexts(binding.contexts, int64(rows[i].journalID))
-			if err != nil {
-				return err
-			}
-			rows[i].contexts = contexts
-		}
-		return nil
+		rows, err = readFactPageInTransaction(scope.ctx, scope.conn, binding)
+		return err
 	}); err != nil {
 		return nil, 0, nil, err
 	}
@@ -212,16 +195,20 @@ func (db *DB) queryFacts(kind factSelectorKind, page journal.FactPageRequest, fi
 // row in the same read transaction used for the page. A nonzero watermark is
 // a positional boundary, not an unchecked integer supplied to page SQL.
 func (scope *connScope) resolveFactSnapshot(page *journal.FactPageRequest) error {
+	return resolveFactSnapshotInTransaction(scope.ctx, scope.conn, page)
+}
+
+func resolveFactSnapshotInTransaction(ctx context.Context, reader sqlQueryer, page *journal.FactPageRequest) error {
 	if page.SnapshotMaxJournalID == 0 {
 		var maxID int64
-		if err := scope.conn.QueryRowContext(scope.ctx, "SELECT COALESCE(MAX(journal_id), ?1) FROM journal", 0).Scan(&maxID); err != nil {
+		if err := reader.QueryRowContext(ctx, "SELECT COALESCE(MAX(journal_id), ?1) FROM journal", 0).Scan(&maxID); err != nil {
 			return fmt.Errorf("resolve fact snapshot: read committed journal maximum: %w", err)
 		}
 		page.SnapshotMaxJournalID = journal.JournalID(maxID)
 		return nil
 	}
 	var boundary int64
-	err := scope.conn.QueryRowContext(scope.ctx, "SELECT journal_id FROM journal WHERE journal_id=?1", int64(page.SnapshotMaxJournalID)).Scan(&boundary)
+	err := reader.QueryRowContext(ctx, "SELECT journal_id FROM journal WHERE journal_id=?1", int64(page.SnapshotMaxJournalID)).Scan(&boundary)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("%w: snapshot watermark %d is not an existing committed journal boundary — where: fact query snapshot validation; when: before page SQL; impact: pagination could include facts appended after a forged boundary; fix: use the SnapshotMaxJournalID returned by an earlier page or leave it zero for a new positional query", journal.ErrInvalidQuery, page.SnapshotMaxJournalID)
 	}

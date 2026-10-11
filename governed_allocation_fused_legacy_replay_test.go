@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -19,8 +21,21 @@ import (
 // name, its participant counter is local to its own closure, and its frozen baseline
 // expectations are immutable literals rather than shared fixture state.
 
-func TestFusedLegacyRunAllocateReopensBaselineWorkflowWithoutParticipant(t *testing.T) {
+func TestFusedRunAllocateReopensCurrentFormatBaselineWithoutParticipant(t *testing.T) {
 	t.Parallel()
+	// The old serialized execution is an immutable refusal fixture, not a
+	// runtime compatibility arm. Its outer shape alone is still supported.
+	retiredBytes, err := os.ReadFile("testdata/id-format/fused_workflow_input_retired.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var retired fusedWorkflowInput
+	if err := json.Unmarshal(retiredBytes, &retired); err != nil {
+		t.Fatalf("decode retired fixture envelope: %v", err)
+	}
+	if _, err := retired.allocationRequest(); !errors.Is(err, ErrInvalidID) {
+		t.Fatalf("retired serialized workflow request error=%v, want invalid ID refusal", err)
+	}
 
 	ctx := context.Background()
 	dsn := "file:" + filepath.Join(t.TempDir(), "legacy-fused-replay.db") + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
@@ -83,14 +98,15 @@ func TestFusedLegacyRunAllocateReopensBaselineWorkflowWithoutParticipant(t *test
 		_ = firstAllocator.Close(30 * time.Second)
 		t.Fatalf("canonicalize baseline allocation request: %v", err)
 	}
-	// These are literal bytes emitted by baseline 2b923b9. Do not regenerate
-	// either expectation with current constructors: this test is the compatibility
-	// fixture proving the simple receipt and DBOS workflow input remain frozen.
-	wantCanonical := []byte(`{"version":1,"kind":2,"operationID":"legacy-replay-allocation","actorID":"legacy-replay--00000000-0000-0000-0000-000000000001","command":"test.allocate","parentAssignmentID":"assignment/legacy-replay/root","children":[{"taskID":"legacy-replay--9bdc1fda-ccaa-581c-a1d7-489bbfad3658","assignmentID":"assignment/legacy-replay/child","occupant":"legacy-replay--00000000-0000-0000-0000-000000000001","title":"legacy replay child","description":"baseline fused workflow replay test","type":2,"priority":2,"phase":8}]}`)
-	wantWorkflowInput := []byte(`{"version":1,"authority":3,"canonicalRequest":"eyJ2ZXJzaW9uIjoxLCJraW5kIjoyLCJvcGVyYXRpb25JRCI6ImxlZ2FjeS1yZXBsYXktYWxsb2NhdGlvbiIsImFjdG9ySUQiOiJsZWdhY3ktcmVwbGF5LS0wMDAwMDAwMC0wMDAwLTAwMDAtMDAwMC0wMDAwMDAwMDAwMDEiLCJjb21tYW5kIjoidGVzdC5hbGxvY2F0ZSIsInBhcmVudEFzc2lnbm1lbnRJRCI6ImFzc2lnbm1lbnQvbGVnYWN5LXJlcGxheS9yb290IiwiY2hpbGRyZW4iOlt7InRhc2tJRCI6ImxlZ2FjeS1yZXBsYXktLTliZGMxZmRhLWNjYWEtNTgxYy1hMWQ3LTQ4OWJiZmFkMzY1OCIsImFzc2lnbm1lbnRJRCI6ImFzc2lnbm1lbnQvbGVnYWN5LXJlcGxheS9jaGlsZCIsIm9jY3VwYW50IjoibGVnYWN5LXJlcGxheS0tMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAxIiwidGl0bGUiOiJsZWdhY3kgcmVwbGF5IGNoaWxkIiwiZGVzY3JpcHRpb24iOiJiYXNlbGluZSBmdXNlZCB3b3JrZmxvdyByZXBsYXkgdGVzdCIsInR5cGUiOjIsInByaW9yaXR5IjoyLCJwaGFzZSI6OH1dfQ=="}`)
+	// Independently pinned current-format bytes retain the simple baseline shape,
+	// but explicitly replace its retired namespaced identities. Opaque operation
+	// and assignment IDs are unchanged. Do not derive expectations with production
+	// constructors: that would hide serialization drift.
+	wantCanonical := []byte(`{"version":1,"kind":2,"operationID":"legacy-replay-allocation","actorID":"legacy-replay/00000000-0000-0000-0000-000000000001","command":"test.allocate","parentAssignmentID":"assignment/legacy-replay/root","children":[{"taskID":"legacy-replay/9bdc1fda-ccaa-581c-a1d7-489bbfad3658","assignmentID":"assignment/legacy-replay/child","occupant":"legacy-replay/00000000-0000-0000-0000-000000000001","title":"legacy replay child","description":"baseline fused workflow replay test","type":2,"priority":2,"phase":8}]}`)
+	wantWorkflowInput := []byte(`{"version":1,"authority":3,"canonicalRequest":"eyJ2ZXJzaW9uIjoxLCJraW5kIjoyLCJvcGVyYXRpb25JRCI6ImxlZ2FjeS1yZXBsYXktYWxsb2NhdGlvbiIsImFjdG9ySUQiOiJsZWdhY3ktcmVwbGF5LzAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsImNvbW1hbmQiOiJ0ZXN0LmFsbG9jYXRlIiwicGFyZW50QXNzaWdubWVudElEIjoiYXNzaWdubWVudC9sZWdhY3ktcmVwbGF5L3Jvb3QiLCJjaGlsZHJlbiI6W3sidGFza0lEIjoibGVnYWN5LXJlcGxheS85YmRjMWZkYS1jY2FhLTU4MWMtYTFkNy00ODliYmZhZDM2NTgiLCJhc3NpZ25tZW50SUQiOiJhc3NpZ25tZW50L2xlZ2FjeS1yZXBsYXkvY2hpbGQiLCJvY2N1cGFudCI6ImxlZ2FjeS1yZXBsYXkvMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAxIiwidGl0bGUiOiJsZWdhY3kgcmVwbGF5IGNoaWxkIiwiZGVzY3JpcHRpb24iOiJiYXNlbGluZSBmdXNlZCB3b3JrZmxvdyByZXBsYXkgdGVzdCIsInR5cGUiOjIsInByaW9yaXR5IjoyLCJwaGFzZSI6OH1dfQ=="}`)
 	if !bytes.Equal(canonical, wantCanonical) {
 		_ = firstAllocator.Close(30 * time.Second)
-		t.Fatalf("current simple canonical bytes drifted from baseline 2b923b9: got=%q want=%q", canonical, wantCanonical)
+		t.Fatalf("current simple canonical bytes drifted from slash-format baseline: got=%q want=%q", canonical, wantCanonical)
 	}
 
 	first, err := firstAllocator.RunAllocate(ctx, "legacy-replay-allocation-workflow", root.AssignmentRow.JournalID, request)
@@ -138,9 +154,10 @@ func TestFusedLegacyRunAllocateReopensBaselineWorkflowWithoutParticipant(t *test
 		_ = firstAllocator.Close(30 * time.Second)
 		t.Fatalf("baseline allocation receipt=%+v, want simple allocation shape", receipt)
 	}
-	// This is the literal DBOS_JSON payload persisted by baseline 2b923b9. Seed
-	// its normal base64 wire representation directly rather than invoking the
-	// current result writer, so reopen exercises compatibility with history.
+	// This structured-ID DBOS_JSON result retains the baseline shape: Namespace
+	// and UUID are separate, so there is no retired separator to translate here.
+	// Seed its literal normal base64 representation rather than calling the result
+	// writer. Only the explicitly current-format workflow/receipt above is replayed.
 	wantHistoricalOutput := []byte(`{"Closure":{"version":1,"operationID":"legacy-replay-allocation","kind":2,"anchor":4,"children":[{"Ordinal":0,"TaskID":{"Namespace":"legacy-replay","UUID":"9bdc1fda-ccaa-581c-a1d7-489bbfad3658"},"AssignmentID":"assignment/legacy-replay/child","Occupant":{"Namespace":"legacy-replay","UUID":"00000000-0000-0000-0000-000000000001"},"TaskRow":{"OperationID":"legacy-replay-allocation","EffectOrdinal":0,"Subordinal":0,"JournalID":5},"AssignmentRow":{"OperationID":"legacy-replay-allocation","EffectOrdinal":0,"Subordinal":1,"JournalID":6}}]},"Failure":null}`)
 	if _, err := firstAllocator.system.DB().ExecContext(ctx, `UPDATE workflow_status SET output=?1 WHERE workflow_uuid=?2`, base64.StdEncoding.EncodeToString(wantHistoricalOutput), "legacy-replay-allocation-workflow"); err != nil {
 		_ = firstAllocator.Close(30 * time.Second)

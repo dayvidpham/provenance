@@ -15,8 +15,8 @@ import (
 func TestStoredOperationIdentityUsesStructuralCanonicalComparison(t *testing.T) {
 	t.Parallel()
 	db := newJournalDB(t)
-	actorA, _ := ptypes.ParseActorID("fixture--018f0000-0000-7000-8000-000000000002")
-	actorB, _ := ptypes.ParseActorID("fixture--018f0000-0000-7000-8000-000000000003")
+	actorA, _ := ptypes.ParseActorID("fixture/018f0000-0000-7000-8000-000000000002")
+	actorB, _ := ptypes.ParseActorID("fixture/018f0000-0000-7000-8000-000000000003")
 	canonicalBytes, err := os.ReadFile("../../testdata/contract/mutation_v1_v004.bin")
 	if err != nil {
 		t.Fatal(err)
@@ -31,7 +31,7 @@ func TestStoredOperationIdentityUsesStructuralCanonicalComparison(t *testing.T) 
 	exact := journal.OperationInput{
 		OperationID: "fixture-operation", ActorID: actorA, AuthorityJournalID: &authority, CommandDigest: []byte("command"),
 		Conditions: []journal.Condition{{Kind: journal.ConditionCurrentFact, Selector: journal.FactSelector{Kind: journal.FactEvidence, Filter: journal.FactFilter{TaskScope: journal.FactTaskScope{Kind: journal.FactTaskUnscoped}}, EvidenceKind: "fixture.evidence"}, AssertedJournalID: 0}},
-		Effects:    []journal.Effect{{Sort: journal.EffectBootstrapAuthority, ResultSlot: "root", BootstrapLabel: "root", OperationAuthorityID: journal.OperationAuthorityID(actorA.String())}},
+		Effects:    []journal.Effect{{Sort: journal.EffectBootstrapAuthority, ResultSlot: "root", BootstrapLabel: "root", OperationAuthorityID: journal.OperationAuthorityID("fixture--018f0000-0000-7000-8000-000000000002")}},
 	}
 	reconciled := 0
 	if err := compareStoredOperationIdentity(stored, exact, func(input journal.OperationInput) (journal.OperationInput, error) {
@@ -67,7 +67,7 @@ func TestStoredOperationIdentityUsesStructuralCanonicalComparison(t *testing.T) 
 		})
 	}
 
-	task, _ := ptypes.ParseTaskID("fixture--018f0000-0000-7000-8000-000000000020")
+	task, _ := ptypes.ParseTaskID("fixture/018f0000-0000-7000-8000-000000000020")
 	allocatedInput := journal.OperationInput{OperationID: "allocated", ActorID: actorA, CommandDigest: []byte("allocated"), Effects: []journal.Effect{{Sort: journal.EffectTaskCreateAllocated, ResultSlot: "task", TaskID: task, Type: ptypes.TaskTypeTask, Priority: ptypes.PriorityMedium, Phase: ptypes.PhaseUnscoped}}}
 	allocatedMutation, err := journal.Canonicalize(allocatedInput)
 	if err != nil {
@@ -82,7 +82,7 @@ func TestStoredOperationIdentityUsesStructuralCanonicalComparison(t *testing.T) 
 
 func TestStoredOperationIdentitySeparatesCorruptionFromOpaqueConflict(t *testing.T) {
 	t.Parallel()
-	actor, _ := ptypes.ParseActorID("fixture--018f0000-0000-7000-8000-000000000002")
+	actor, _ := ptypes.ParseActorID("fixture/018f0000-0000-7000-8000-000000000002")
 	canonicalBytes, err := os.ReadFile("../../testdata/contract/mutation_v1_v004.bin")
 	if err != nil {
 		t.Fatal(err)
@@ -149,7 +149,7 @@ func TestApplyReplayAxisAndIndexMatrixHasZeroDurableDelta(t *testing.T) {
 	db := newJournalDB(t)
 	actor, task := seedActorAndTask(t, db)
 	authority := genesisBoot(t, db, actor)
-	other, _ := ptypes.ParseActorID("fixture--018f0000-0000-7000-8000-000000000099")
+	other, _ := ptypes.ParseActorID("fixture/018f0000-0000-7000-8000-000000000099")
 	scope, err := db.bindScope(context.Background(), projectionTargetLive)
 	if err != nil {
 		t.Fatalf("bind alternate actor seed scope: %v", err)
@@ -214,7 +214,7 @@ func TestApplyReplayAxisAndIndexMatrixHasZeroDurableDelta(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	alternateTask, _ := ptypes.ParseTaskID("fixture--018f0000-0000-7000-8000-000000000098")
+	alternateTask, _ := ptypes.ParseTaskID("fixture/018f0000-0000-7000-8000-000000000098")
 
 	cases := []struct {
 		name   string

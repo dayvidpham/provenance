@@ -392,7 +392,7 @@ func journalMax(t *testing.T, tr provenance.Tracker) provenance.JournalID {
 }
 
 func nonZeroActor() provenance.ActorID {
-	id, err := provenance.ParseActorID("provenance-test--019f0000-0000-7000-8000-000000000001")
+	id, err := provenance.ParseActorID("provenance-test/019f0000-0000-7000-8000-000000000001")
 	if err != nil {
 		panic(err)
 	}

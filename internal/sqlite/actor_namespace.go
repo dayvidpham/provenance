@@ -122,7 +122,7 @@ const (
 	fixedSoftwareAgentInconsistent
 )
 
-func fixedSoftwareAgent(ctx context.Context, conn *sql.Conn, id ptypes.AgentID) (ptypes.SoftwareAgent, fixedSoftwareAgentMatch, error) {
+func fixedSoftwareAgent(ctx context.Context, conn sqlQueryer, id ptypes.AgentID) (ptypes.SoftwareAgent, fixedSoftwareAgentMatch, error) {
 	rows, err := conn.QueryContext(ctx, "SELECT a.kind_id, s.name, s.version, s.source FROM agents a LEFT JOIN agents_software s ON s.agent_id=a.id WHERE a.id=?1", id.String())
 	if err != nil {
 		return ptypes.SoftwareAgent{}, fixedSoftwareAgentAbsent, fixedAgentActivationError(err, fmt.Sprintf("existing actor %q could not be loaded", id.String()), "the actor preflight query failed", "fixedSoftwareAgent", "before activation writes", "the activation is aborted and no rows are changed", "repair database access or schema integrity, then retry")
@@ -153,7 +153,7 @@ const (
 	fixedActorEntryConflict
 )
 
-func inspectFixedActorEntry(ctx context.Context, conn *sql.Conn, entry journal.FixedActorEntry, metadata string) (fixedActorEntryMatch, error) {
+func inspectFixedActorEntry(ctx context.Context, conn sqlQueryer, entry journal.FixedActorEntry, metadata string) (fixedActorEntryMatch, error) {
 	rows, err := conn.QueryContext(ctx, "SELECT actor_id, namespace, kind_id, name, metadata FROM fixed_actor_manifest_entries WHERE actor_id=?1 OR (namespace=?2 AND name=?3)", entry.ActorID.String(), entry.Namespace, entry.Name)
 	if err != nil {
 		return fixedActorEntryAbsent, fixedAgentActivationError(err, fmt.Sprintf("manifest identity %q/%q could not be loaded", entry.Namespace, entry.Name), "the manifest preflight query failed", "inspectFixedActorEntry", "before activation writes", "the activation is aborted and no rows are changed", "repair database access or schema integrity, then retry")
@@ -262,7 +262,7 @@ func (db *DB) NamespaceClaims() ([]journal.ActorNamespaceClaim, error) {
 	return loadNamespaceClaims(scope.ctx, scope.conn)
 }
 
-func loadNamespaceClaims(ctx context.Context, conn *sql.Conn) ([]journal.ActorNamespaceClaim, error) {
+func loadNamespaceClaims(ctx context.Context, conn sqlQueryer) ([]journal.ActorNamespaceClaim, error) {
 	rows, err := conn.QueryContext(ctx, "SELECT namespace, claimant_id, range_min, range_max, codec FROM actor_namespace_claims ORDER BY namespace ASC")
 	if err != nil {
 		return nil, fmt.Errorf("loadNamespaceClaims: %w", err)
@@ -282,7 +282,7 @@ func loadNamespaceClaims(ctx context.Context, conn *sql.Conn) ([]journal.ActorNa
 	return claims, nil
 }
 
-func getNamespaceClaim(ctx context.Context, conn *sql.Conn, namespace string) (journal.ActorNamespaceClaim, bool, error) {
+func getNamespaceClaim(ctx context.Context, conn sqlQueryer, namespace string) (journal.ActorNamespaceClaim, bool, error) {
 	rows, err := conn.QueryContext(ctx, "SELECT namespace, claimant_id, range_min, range_max, codec FROM actor_namespace_claims WHERE namespace=?1", namespace)
 	if err != nil {
 		return journal.ActorNamespaceClaim{}, false, fmt.Errorf("getNamespaceClaim %q: %w", namespace, err)
