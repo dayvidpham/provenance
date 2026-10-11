@@ -31,6 +31,14 @@ canonical bytes and their identity-dependent digests change representation.
    External owners may translate declared structured fields using the effect
    and context callbacks. They must not rewrite prose, raw host bindings, opaque
    authority/operation/result IDs, or host-body content digests.
+   The context callback alone is not a canonical rewrite: the effect callback
+   must translate matching canonical-backed extension contexts identically.
+   Extension contexts in canonical conditions have no rewrite hook and must
+   remain identity-equivalent; unsupported translations fail verification.
+   This first converter treats edge targets as namespaced task references.
+   Previously accepted opaque non-identity edge targets are unsupported and
+   fail preflight with the offending column/key; they require an explicit
+   target-owner contract, not a guessed reinterpretation or discarded edge.
 3. Convert application-owned tables through their owners in **the same tx**.
 4. Call `VerifyIDConversionInTx(ctx, tx)` for journal, canonical, allocation,
    evidence and projection-owner checks. This uses no pooled connection.

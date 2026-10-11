@@ -61,3 +61,16 @@ func TestRetiredCanonicalConversionPreservesOpaqueAuthority(t *testing.T) {
 		t.Fatal("opaque retired-looking authority token changed")
 	}
 }
+
+func TestRetiredIdentityRejectsPartialSlashConversion(t *testing.T) {
+	const suffix = "018f0000-0000-7000-8000-000000000002"
+	for _, namespace := range []string{"https://github.com/fixture/my--repo/nested", "file:///tmp/my--repo/", "my--project"} {
+		if _, err := ConvertRetiredIdentity(namespace + "/" + suffix); err == nil {
+			t.Fatalf("partial slash identity in opaque namespace %q was accepted", namespace)
+		}
+		got, err := ConvertRetiredIdentity(namespace + "--" + suffix)
+		if err != nil || got != namespace+"/"+suffix {
+			t.Fatalf("authentic retired %q conversion=%q,%v", namespace, got, err)
+		}
+	}
+}

@@ -265,6 +265,8 @@ func TestRetiredCorpusPreflightRefusesCollisionMalformedAndCorruptEvidence(t *te
 		{"malformed", `UPDATE journal SET actor_id='malformed' WHERE journal_id=1`},
 		{"subtype-payload", `UPDATE journal_evidence SET payload='{}' WHERE journal_id=(SELECT MIN(journal_id) FROM journal_evidence)`},
 		{"evidence-digest", `UPDATE journal_evidence SET content_digest=zeroblob(32) WHERE journal_id=(SELECT MIN(journal_id) FROM journal_evidence)`},
+		{"opaque-edge", `INSERT INTO edges(source_id,target_id,kind_id,created_at) SELECT id,'opaque-external-handle',1,1 FROM tasks LIMIT 1`},
+		{"partially-converted", `UPDATE tasks SET id=namespace||'/'||SUBSTR(id,LENGTH(namespace)+3) WHERE id=(SELECT MIN(id) FROM tasks)`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -286,6 +288,8 @@ func TestRetiredCorpusPreflightRefusesCollisionMalformedAndCorruptEvidence(t *te
 			}
 			if _, err := provenance.ConvertIDsInTx(context.Background(), tx, provenance.IDConversionOptions{}); err == nil {
 				t.Fatal("preflight accepted independent retired corruption")
+			} else if tc.name == "opaque-edge" && (!strings.Contains(err.Error(), "edges.target_id") || !strings.Contains(err.Error(), "opaque-external-handle")) {
+				t.Fatalf("unsupported opaque edge lacks owner column/key diagnostic: %v", err)
 			}
 			var after int
 			if err := tx.QueryRow("SELECT COUNT(*) FROM tasks WHERE INSTR(id,'--')>0").Scan(&after); err != nil {

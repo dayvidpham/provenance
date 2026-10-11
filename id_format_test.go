@@ -133,6 +133,29 @@ func TestUnknownIDFormatFailsClosed(t *testing.T) {
 	}
 }
 
+func TestEmptyExistingIDFormatMarkerFailsClosed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "empty-marker.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE provenance_id_format(singleton INTEGER PRIMARY KEY,format TEXT); INSERT INTO provenance_id_format VALUES(1,'')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provenance.InspectIDFormat(context.Background(), db); !errors.Is(err, provenance.ErrIDFormat) {
+		t.Fatalf("empty marker escaped unknown-format refusal: %v", err)
+	}
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if err := provenance.PublishIDFormatInTx(context.Background(), tx); !errors.Is(err, provenance.ErrIDFormat) {
+		t.Fatalf("empty conflicting marker reported successful publication: %v", err)
+	}
+}
+
 func TestAuthenticPreviousWriterCorpusRefusedBeforeDecode(t *testing.T) {
 	archive, err := os.ReadFile("testdata/id-format/previous-writer.db")
 	if err != nil {

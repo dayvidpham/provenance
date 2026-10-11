@@ -17,8 +17,8 @@ import (
 // runtime parser, lookup, or alias resolution uses the retired representation.
 func ConvertRetiredIdentity(raw string) (string, error) {
 	i := strings.LastIndex(raw, "--")
-	if i <= 0 {
-		return "", fmt.Errorf("retired identity %q has no non-empty namespace and final two-dash UUID; fix: repair the archived identity before offline conversion", raw)
+	if i <= 0 || strings.LastIndexByte(raw, '/') > i {
+		return "", fmt.Errorf("retired identity %q has no non-empty namespace and final two-dash UUID, or a slash follows that separator; where: offline identity preflight; no identity returned; fix: restore a single-format archive before conversion", raw)
 	}
 	id, err := ptypes.ParseTaskID(raw[:i] + "/" + raw[i+2:])
 	if err != nil {

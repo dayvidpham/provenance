@@ -69,7 +69,7 @@ func InspectIDFormat(ctx context.Context, reader IDFormatReader) (IDFormatInspec
 	}
 	if markerExists {
 		var rows, invalid int
-		if err := reader.QueryRowContext(ctx, "SELECT COUNT(*),COALESCE(SUM(CASE WHEN singleton<>1 OR singleton IS NULL OR format IS NULL THEN 1 ELSE 0 END),0) FROM provenance_id_format").Scan(&rows, &invalid); err != nil {
+		if err := reader.QueryRowContext(ctx, "SELECT COUNT(*),COALESCE(SUM(CASE WHEN singleton<>1 OR singleton IS NULL OR format IS NULL OR format='' THEN 1 ELSE 0 END),0) FROM provenance_id_format").Scan(&rows, &invalid); err != nil {
 			return result, fmt.Errorf("%w: inspect marker shape before activation; no identities decoded; fix: restore the complete archive: %v", ErrIDFormat, err)
 		}
 		if rows > 1 || invalid > 0 {

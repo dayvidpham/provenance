@@ -17,7 +17,11 @@ type IDConversionReport = sqlite.IDConversionReport
 // fields. Callbacks must not begin/commit transactions, read a second connection,
 // rewrite prose, or guess digests. Native host bindings remain opaque evidence.
 type IDConversionOptions struct {
-	RewriteEffect  func(Effect) (Effect, error)
+	RewriteEffect func(Effect) (Effect, error)
+	// RewriteContext translates extension-kind SQL context rows. For contexts
+	// backed by a canonical effect, RewriteEffect must translate the identical
+	// context too. Canonical condition extension contexts have no rewrite hook:
+	// they must remain identity-equivalent, otherwise verification fails closed.
 	RewriteContext func(string, string) (string, error)
 }
 
@@ -48,6 +52,10 @@ func migrateSessionCommandDigest(oldActor, newActor string, stored []byte, old, 
 		oldAtomic += fmt.Sprintf("|%d:%s:%s:%s:%s", i, e.Sort, retiredTaskString(e.TaskID), string(e.EventKind), string(e.AssignmentID))
 	}
 	candidates := [][2][]string{{{"atomic", oldAtomic}, {"atomic", atomicCanonical(newEffects)}}}
+	if len(oldEffects) == 2 && oldEffects[0].Sort == EffectAssignmentEnd && oldEffects[1].Sort == EffectAssignmentStart {
+		a, b := oldEffects, newEffects
+		candidates = append(candidates, [2][]string{{"assignment-transfer", retiredTaskString(a[1].TaskID), string(a[0].SlotID), string(a[0].AssignmentID), string(a[1].AssignmentID), a[1].Occupant.Namespace + "--" + a[1].Occupant.UUID.String()}, {"assignment-transfer", b[1].TaskID.String(), string(b[0].SlotID), string(b[0].AssignmentID), string(b[1].AssignmentID), b[1].Occupant.String()}})
+	}
 	if len(oldEffects) == 1 {
 		a, b := oldEffects[0], newEffects[0]
 		switch a.Sort {

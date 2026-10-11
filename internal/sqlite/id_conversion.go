@@ -423,7 +423,7 @@ func ConvertIDsInTx(ctx context.Context, tx *sql.Tx, options IDConversionOptions
 		newActor, err := journal.ConvertRetiredIdentity(actor)
 		if err != nil {
 			rows.Close()
-			return report, err
+			return report, fmt.Errorf("operation %q journal.actor_id %q preflight failed before writes: %w", operation, actor, err)
 		}
 		if supplement, ok := supplements[operation]; ok {
 			if !bytes.Equal(command, supplement.OldSupplementCommandDigest) {
