@@ -1,12 +1,29 @@
 package provenance
 
-import "github.com/dayvidpham/provenance/pkg/ptypes"
+import (
+	"time"
+
+	"github.com/dayvidpham/provenance/pkg/ptypes"
+)
 
 // Option configures a Tracker at creation time.
 type Option func(*options)
 
 type options struct {
-	registry ptypes.ModelRegistry
+	registry                         ptypes.ModelRegistry
+	borrowedActivationBusyTimeout    time.Duration
+	borrowedActivationBusyTimeoutSet bool
+	activationObserver               func(string)
+}
+
+// WithBorrowedActivationBusyTimeout sets the borrowed schema activation tier
+// only. It does not change ordinary leases, standalone opens, or the 30s retry
+// ceiling. OpenBorrowedSQLiteContext rejects values below one millisecond.
+func WithBorrowedActivationBusyTimeout(timeout time.Duration) Option {
+	return func(o *options) {
+		o.borrowedActivationBusyTimeout = timeout
+		o.borrowedActivationBusyTimeoutSet = true
+	}
 }
 
 func defaultOptions() options {

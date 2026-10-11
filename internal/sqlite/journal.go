@@ -304,6 +304,9 @@ func (scope *connScope) verifyIntegrityMode(allowLegacyFactContexts bool) (err e
 	if err := scope.verifyForeignKeyTopology(); err != nil {
 		return err
 	}
+	// Activation's per-invocation test barrier is after real integrity reads,
+	// while the outer BEGIN IMMEDIATE still owns the entire activation.
+	scope.observeActivation("integrity")
 	if err := scope.verifySubtypeIntegrity(); err != nil {
 		return err
 	}

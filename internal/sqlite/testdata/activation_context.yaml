@@ -1,0 +1,21 @@
+cases:
+  - name: cancel-after-contention
+    phase: contended
+    tier_ms: 500
+    holder: true
+  - name: cancel-backoff
+    phase: backoff
+    tier_ms: 500
+    holder: true
+  - name: cancel-integrity
+    phase: integrity
+    tier_ms: 500
+    holder: false
+  - name: cancel-replay
+    phase: replay
+    tier_ms: 500
+    holder: false
+  - name: cancel-tiny-tier
+    phase: contended
+    tier_ms: 1
+    holder: true

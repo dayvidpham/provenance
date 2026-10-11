@@ -415,7 +415,11 @@ func (scope *connScope) replayProjectionsReadOnlyLegacyCompatible() (result jour
 }
 
 func (scope *connScope) replayProjectionsMode(allowLegacyFactContexts bool) (result journal.ReplayResult, err error) {
-	return scope.replayProjectionsModeWithStoredSnapshotBarrier(allowLegacyFactContexts, nil)
+	var afterStoredSnapshot func()
+	if scope.activationConfig != nil && scope.activationConfig.Observer != nil {
+		afterStoredSnapshot = func() { scope.observeActivation("replay") }
+	}
+	return scope.replayProjectionsModeWithStoredSnapshotBarrier(allowLegacyFactContexts, afterStoredSnapshot)
 }
 
 // replayProjectionsModeWithStoredSnapshotBarrier keeps the production replay path

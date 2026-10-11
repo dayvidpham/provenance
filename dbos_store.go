@@ -52,23 +52,41 @@ func (e *StoreUnavailableError) Unwrap() error { return e.Cause }
 // as the standalone alternative. Provenance accepts the caller-owned pool limits
 // as supplied and neither validates nor mutates them.
 func OpenBorrowedSQLite(db *sql.DB, opts ...Option) (Tracker, error) {
+	return OpenBorrowedSQLiteContext(context.Background(), db, opts...)
+}
+
+// OpenBorrowedSQLiteContext activates on the caller-owned pool using ctx for
+// every open-time wait. The returned tracker does not retain this context.
+// Cancellation refuses the open; it never closes the caller's pool.
+func OpenBorrowedSQLiteContext(ctx context.Context, db *sql.DB, opts ...Option) (tracker Tracker, err error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("provenance.OpenBorrowedSQLiteContext: nil context during borrowed-store open; no tracker returned; fix: supply a live context or use OpenBorrowedSQLite")
+	}
+	defer func() {
+		if err != nil && ctx.Err() != nil {
+			err = errors.Join(err, context.Cause(ctx))
+		}
+	}()
+	if err := context.Cause(ctx); err != nil {
+		return nil, fmt.Errorf("provenance.OpenBorrowedSQLiteContext: caller cancelled before borrowed-store open: %w; no tracker returned; fix: retry with a live context", err)
+	}
 	if db == nil {
 		return nil, fmt.Errorf(
 			"provenance.OpenBorrowedSQLite: the borrowed *sql.DB is nil — where: borrowed-store open; " +
 				"impact: no shared database to bridge; fix: pass the exact *sql.DB configured as the DBOS " +
 				"root's SQLiteSystemDB, or use OpenSQLite/OpenMemory for a standalone tracker")
 	}
-	if err := db.Ping(); err != nil {
+	if err := db.PingContext(ctx); err != nil {
 		return nil, fmt.Errorf(
 			"provenance.OpenBorrowedSQLite: the borrowed *sql.DB failed a liveness ping — where: borrowed-store "+
 				"open; impact: the shared database is not reachable; fix: open and configure the *sql.DB before "+
 				"borrowing it: %w", err)
 	}
-	path, err := borrowedDatabasePath(db)
+	path, err := borrowedDatabasePathContext(ctx, db)
 	if err != nil {
 		return nil, err
 	}
-	inner, err := openBorrowedTracker(db, opts...)
+	inner, err := openBorrowedTrackerContext(ctx, db, path, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("provenance.OpenBorrowedSQLite: activate the borrowed database/sql pool for shared file %q: %w", path, err)
 	}
@@ -80,7 +98,11 @@ func OpenBorrowedSQLite(db *sql.DB, opts ...Option) (Tracker, error) {
 // which cannot back a same-file bridge. The derivation itself lives in
 // internal/dbossys because the DBOS system-schema refusal names the same file.
 func borrowedDatabasePath(db *sql.DB) (string, error) {
-	path, err := dbossys.MainDatabaseFile(context.Background(), db)
+	return borrowedDatabasePathContext(context.Background(), db)
+}
+
+func borrowedDatabasePathContext(ctx context.Context, db *sql.DB) (string, error) {
+	path, err := dbossys.MainDatabaseFile(ctx, db)
 	if err != nil {
 		return "", fmt.Errorf(
 			"provenance.OpenBorrowedSQLite: derive the borrowed handle's main database path: %w — "+

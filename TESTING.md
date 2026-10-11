@@ -303,3 +303,28 @@ The exception is deliberately narrow: bounded, non-durable, one operation, and
 the per-attempt wait remains SQLite's. Do not extend it to storage operations —
 those still make one inner attempt and return escaped `BUSY`/`LOCKED` unchanged,
 and DBOS step options own durable retry.
+
+`OpenBorrowedSQLiteContext` additionally carries the opening caller's context
+through pool acquisition, path validation, activation SQL, and retry timers.
+`WithBorrowedActivationBusyTimeout` sets an activation-only tier (at least 1ms).
+Context activation reserves at most 80% of the tier for a lock attempt and shares
+one cleanup context for rollback and verified PRAGMA restoration, bounded by
+min(100ms, 20% of the tier). An unprovable connection is discarded. Tiny tiers
+round the SQLite wait down to zero rather than inflating it to a millisecond.
+The ordinary wrapper without an explicit tier preserves 5s attempts / the 30s
+ceiling; ordinary leases and standalone opens are unchanged. The returned tracker
+never retains the opening context.
+
+Connection creation/setup remains caller-owned. A caller that needs a first-use
+contention bound must supply a connector whose initialization SQL honors its
+Connect context; modernc DSN `_pragma` initialization itself uses Background.
+The activation option does not rewrite the pool's DSN or change its owner.
+
+The real-lock cancellation test's 30ms scheduling tolerance is separate from
+the configured tier. The independent holder stays locked until opener completion,
+including rollback, restoration/discard, diagnostics, and driver close. For
+cross-repository test builds only, the `provenance_testhooks` tag enables
+`WithBorrowedActivationObserverForTest`; its per-invocation synchronous phases are
+`attempt`, `contended`, `backoff`, `schema`, `integrity`, and `replay`. Normal
+builds do not export that option. Run its public API proof with the same race
+flags and `-tags provenance_testhooks -run '^TestBorrowedActivationPublicCancelDuringContendedAttempt$' .`.
