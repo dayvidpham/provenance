@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.4.0 - 2026-10-11
+
+### Added
+
+- Context-aware borrowed activation: the activation path receives the caller's
+  context and selects on it between attempts, so a cancelled context stops
+  within one SQLite busy tier instead of running to the activation ceilings.
+- An activation-only busy tier and bounded cleanup on abandon, plus a tagged
+  per-invocation test observer for real-lock cancellation proofs.
+
+### Compatibility
+
+- Additive only: existing callers keep the previous behavior and ceilings; no
+  schema, DDL, or migration changes.
+
 ## v0.3.0 - 2026-09-25
 
 ### Added
