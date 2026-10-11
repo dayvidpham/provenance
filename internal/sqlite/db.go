@@ -151,7 +151,20 @@ type connScope struct {
 	restoreForeignKeysOff bool
 	// discarded marks a connection already poisoned for the pool. Nothing further
 	// is executed on it.
-	discarded bool
+	discarded        bool
+	activationConfig *BorrowedActivationConfig
+	cleanupCtx       context.Context
+	cleanupCancel    context.CancelFunc
+	activationPath   string
+}
+
+// BorrowedActivationConfig applies only while opening a borrowed store. Zero
+// BusyTimeout preserves the compatibility policy; Observer is a per-invocation
+// test seam and is nil in normal production wiring.
+type BorrowedActivationConfig struct {
+	BusyTimeout time.Duration
+	Path        string
+	Observer    func(string)
 }
 
 func (scope *connScope) release() {
@@ -272,9 +285,13 @@ func closedScopeError() error {
 // borrowConnScope binds a connection whose lifetime belongs to activation or
 // preflight. Releasing the returned scope is intentionally a no-op.
 func borrowConnScope(conn *sql.Conn, target projectionTarget) *connScope {
+	return borrowConnScopeContext(context.Background(), conn, target)
+}
+
+func borrowConnScopeContext(ctx context.Context, conn *sql.Conn, target projectionTarget) *connScope {
 	return &connScope{
 		conn:             conn,
-		ctx:              context.Background(),
+		ctx:              ctx,
 		projectionTarget: target,
 	}
 }
@@ -343,17 +360,43 @@ func Open(dbPath string, models []ptypes.ModelEntry) (*DB, error) {
 // caller remains required by the public borrowed-store API, but this package has
 // no path bridge or second connection.
 func OpenBorrowed(runtime *sql.DB, models []ptypes.ModelEntry) (*DB, error) {
+	return OpenBorrowedContext(context.Background(), runtime, models, BorrowedActivationConfig{})
+}
+
+// OpenBorrowedContext carries ctx through pool acquisition and the one schema
+// activation implementation. It never stores ctx on the returned DB.
+func OpenBorrowedContext(ctx context.Context, runtime *sql.DB, models []ptypes.ModelEntry, config BorrowedActivationConfig) (*DB, error) {
+	if ctx == nil {
+		return nil, errors.New("sqlite.OpenBorrowedContext: nil context during activation; no store returned; fix: supply a live context")
+	}
+	if err := context.Cause(ctx); err != nil {
+		return nil, err
+	}
 	if runtime == nil {
 		return nil, errors.New("borrowed database/sql pool is nil")
 	}
-	if err := runtime.PingContext(context.Background()); err != nil {
+	if err := runtime.PingContext(ctx); err != nil {
 		return nil, fmt.Errorf("ping borrowed database/sql pool: %w", err)
 	}
-	activationConn, err := runtime.Conn(context.Background())
+	activationConn, err := runtime.Conn(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("lease borrowed activation connection: %w", err)
 	}
-	activation := borrowConnScope(activationConn, projectionTargetLive)
+	activation := borrowConnScopeContext(ctx, activationConn, projectionTargetLive)
+	activation.activationPath = config.Path
+	if config.BusyTimeout != 0 && config.BusyTimeout.Milliseconds() < 1 {
+		_ = activationConn.Close()
+		return nil, errors.New("sqlite.OpenBorrowedContext: activation tier below 1ms during open; no store returned; fix: supply at least 1ms")
+	}
+	policy := defaultActivationRetryPolicy()
+	if config.BusyTimeout != 0 {
+		policy.attemptBusyTimeout = config.BusyTimeout
+	}
+	if config.BusyTimeout != 0 || ctx.Done() != nil || config.Observer != nil {
+		config.BusyTimeout = policy.attemptBusyTimeout
+		activation.activationConfig = &config
+	}
+	defer activation.endCleanup()
 	// Activation rewrites busy_timeout and foreign_keys on this connection, which
 	// belongs to the caller's pool. Snapshot both before the first attempt so the
 	// connection goes back exactly as it arrived.
@@ -366,14 +409,11 @@ func OpenBorrowed(runtime *sql.DB, models []ptypes.ModelEntry) (*DB, error) {
 	// The borrowed pool's file is shared by definition, so activation waits out a
 	// concurrent activation or migration within the bounded budget instead of
 	// failing this open on the first contended attempt.
-	err = activateSchemaWithRetry(activation, models, defaultActivationRetryPolicy())
+	err = activateSchemaWithRetry(activation, models, policy)
 	restoreErr := restorePragmas()
 	closeErr := activationConn.Close()
 	if err != nil {
-		if restoreErr != nil {
-			return nil, fmt.Errorf("activate borrowed database/schema: %w", errors.Join(err, restoreErr))
-		}
-		return nil, fmt.Errorf("activate borrowed database/schema: %w", err)
+		return nil, fmt.Errorf("activate borrowed database/schema: %w", errors.Join(err, restoreErr, closeErr))
 	}
 	if restoreErr != nil {
 		return nil, restoreErr
@@ -685,21 +725,35 @@ func defaultActivationRetryPolicy() activationRetryPolicy {
 // activation is the single sanctioned exception, and it does not extend to
 // storage operations, which still make one inner attempt.
 //
-// The budget is uncancellable in practice today: both retrying call sites reach
-// this through borrowConnScope, whose ctx is context.Background, because Open and
-// OpenBorrowed take no context. The cancellation arm below is kept so that a
-// future context-carrying caller is honoured the moment one exists, rather than
-// silently waiting out the whole budget.
+// Borrowed context callers also bound cleanup within the supplied busy tier.
 func activateSchemaWithRetry(scope *connScope, models []ptypes.ModelEntry, policy activationRetryPolicy) error {
 	started := time.Now()
 	deadline := started.Add(policy.ceiling)
 	// A non-positive delay would turn the bounded wait into a spin, so the backoff
 	// always starts at a real duration.
 	delay := max(policy.initialDelay, time.Millisecond)
+	var lastErr error
 	for attempt := 1; ; attempt++ {
+		if cause := context.Cause(scope.ctx); cause != nil {
+			return scope.activationCancelled(attempt-1, cause)
+		}
+		if attempt > 1 && !time.Now().Before(deadline) {
+			return activationContendedError(scope, policy, attempt-1, time.Since(started), lastErr)
+		}
+		scope.endCleanup()
 		err := activateSchema(scope, models, policy)
+		lastErr = err
 		if err == nil {
 			return nil
+		}
+		if isBusyError(err) {
+			scope.observeActivation("contended")
+		}
+		if cause := context.Cause(scope.ctx); cause != nil {
+			return scope.activationCancelled(attempt, errors.Join(cause, err))
+		}
+		if scope.discarded {
+			return err
 		}
 		if !isBusyError(err) {
 			return err
@@ -707,16 +761,12 @@ func activateSchemaWithRetry(scope *connScope, models []ptypes.ModelEntry, polic
 		if !time.Now().Before(deadline) {
 			return activationContendedError(scope, policy, attempt, time.Since(started), err)
 		}
-		timer := time.NewTimer(delay)
+		scope.observeActivation("backoff")
+		timer := time.NewTimer(min(delay, time.Until(deadline)))
 		select {
 		case <-scope.ctx.Done():
 			timer.Stop()
-			cancelTarget, _ := activationTargetDisplay(scope)
-			return fmt.Errorf(
-				"activate SQLite schema on %s: canceled after %d contended attempt(s) while waiting for the file's write lock (%w); "+
-					"nothing was written — every attempt rolled back; retry the open once the caller's context is live again",
-				cancelTarget, attempt, errors.Join(scope.ctx.Err(), err),
-			)
+			return scope.activationCancelled(attempt, errors.Join(context.Cause(scope.ctx), err))
 		case <-timer.C:
 		}
 		delay *= 2
@@ -724,6 +774,38 @@ func activateSchemaWithRetry(scope *connScope, models []ptypes.ModelEntry, polic
 			delay = policy.maxDelay
 		}
 	}
+}
+
+func (scope *connScope) observeActivation(phase string) {
+	if scope.activationConfig != nil && scope.activationConfig.Observer != nil {
+		scope.activationConfig.Observer(phase)
+	}
+}
+
+func (scope *connScope) activationCancelled(attempts int, cause error) error {
+	target, _ := activationTargetDisplay(scope)
+	return fmt.Errorf("activate SQLite schema on %s: caller cancelled after %d attempt(s): %w; where: internal/sqlite.activateSchemaWithRetry, startup activation; impact: no tracker returned; any uncertain transaction or restoration state is reported in the cause and its connection retired; fix: retry with a live context after checking the store", target, attempts, cause)
+}
+
+// cleanupContext is shared by rollback and verified restoration for the final
+// attempt, never a fresh budget for each cleanup statement. Earlier completed
+// attempts finish cleanup before the next attempt can start.
+func (scope *connScope) cleanupContext() context.Context {
+	if scope.cleanupCtx == nil {
+		budget := pragmaControlTimeout
+		if scope.activationConfig != nil {
+			budget = min(100*time.Millisecond, scope.activationConfig.BusyTimeout/5)
+		}
+		scope.cleanupCtx, scope.cleanupCancel = context.WithTimeout(context.Background(), budget)
+	}
+	return scope.cleanupCtx
+}
+
+func (scope *connScope) endCleanup() {
+	if scope.cleanupCancel != nil {
+		scope.cleanupCancel()
+	}
+	scope.cleanupCtx, scope.cleanupCancel = nil, nil
 }
 
 // activationContendedError reports an exhausted activation budget in the terms
@@ -754,6 +836,12 @@ func activationContendedError(scope *connScope, policy activationRetryPolicy, at
 // It asks SQLite itself so a borrowed pool, whose path this package never sees,
 // still reports a real path. It runs only on a failure path.
 func activationTargetDisplay(scope *connScope) (display string, resolved bool) {
+	if scope.activationPath != "" {
+		return scope.activationPath, true
+	}
+	if scope.activationConfig != nil {
+		return "the activating SQLite database", false
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	var file string
@@ -764,7 +852,14 @@ func activationTargetDisplay(scope *connScope) (display string, resolved bool) {
 }
 
 func activateSchema(scope *connScope, models []ptypes.ModelEntry, policy activationRetryPolicy) error {
-	if err := scope.applyActivationPragmas(policy.attemptBusyTimeout); err != nil {
+	busyTier := policy.attemptBusyTimeout
+	if scope.activationConfig != nil {
+		busyTier = busyTier / 5 * 4
+		if deadline, ok := scope.ctx.Deadline(); ok {
+			busyTier = min(busyTier, max(0, time.Until(deadline))/5*4)
+		}
+	}
+	if err := scope.applyActivationPragmas(busyTier); err != nil {
 		return err
 	}
 	// BEGIN IMMEDIATE, not BEGIN. Activation reads before it writes (~30 CREATE
@@ -779,7 +874,8 @@ func activateSchema(scope *connScope, models []ptypes.ModelEntry, policy activat
 	// activation's contract is that the schema, its verification, and the replay
 	// commit or roll back together; verifying outside the write lock would
 	// validate a snapshot that another writer could invalidate before COMMIT.
-	err := runImmediateTransaction(scope.ctx, scope.conn, func() error {
+	operation := func() error {
+		scope.observeActivation("schema")
 		if err := scope.ensureSchema(models); err != nil {
 			return fmt.Errorf("apply schema: %w", err)
 		}
@@ -790,7 +886,15 @@ func activateSchema(scope *connScope, models []ptypes.ModelEntry, policy activat
 			return fmt.Errorf("journal replay: %w", err)
 		}
 		return nil
-	})
+	}
+	scope.observeActivation("attempt")
+	var err error
+	if scope.activationConfig != nil {
+		err = runScopedTransaction(scope.ctx, scope.conn, "BEGIN IMMEDIATE", operation, scope)
+		// The caller's captured PRAGMAs are restored once by OpenBorrowedContext.
+		return err
+	}
+	err = runImmediateTransaction(scope.ctx, scope.conn, operation)
 	restoreErr := scope.enableForeignKeys()
 	if err != nil {
 		if restoreErr != nil {
@@ -914,8 +1018,18 @@ func limitTransactionBusyTimeout(ctx context.Context, conn sqlQueryer) (func() e
 	return rearm, restore, probeContention, nil
 }
 
-func runScopedTransaction(ctx context.Context, conn sqlQueryer, begin string, operation func() error) (err error) {
-	rearmBusyTimeout, restoreBusyTimeout, probeContention, err := limitTransactionBusyTimeout(ctx, conn)
+func runScopedTransaction(ctx context.Context, conn sqlQueryer, begin string, operation func() error, activation ...*connScope) (err error) {
+	var activationScope *connScope
+	if len(activation) != 0 {
+		activationScope = activation[0]
+	}
+	rearmBusyTimeout, restoreBusyTimeout := func() error { return nil }, func() error { return nil }
+	var probeContention func(string) (error, error)
+	// Activation already owns its tier and the outer retry. Do not widen it,
+	// introduce nested BEGIN retries, or start independent one-second cleanups.
+	if activationScope == nil {
+		rearmBusyTimeout, restoreBusyTimeout, probeContention, err = limitTransactionBusyTimeout(ctx, conn)
+	}
 	if err != nil {
 		return err
 	}
@@ -931,9 +1045,22 @@ func runScopedTransaction(ctx context.Context, conn sqlQueryer, begin string, op
 	backoff := 2 * time.Millisecond
 	var lastBusy error
 	for {
+		if activationScope != nil {
+			if cause := context.Cause(ctx); cause != nil {
+				return cause
+			}
+		}
 		_, err = conn.ExecContext(ctx, begin)
 		if err == nil {
 			break
+		}
+		if activationScope != nil {
+			_, rollbackErr := conn.ExecContext(activationScope.cleanupContext(), "ROLLBACK")
+			if rollbackErr != nil && !strings.Contains(rollbackErr.Error(), "no transaction is active") {
+				activationScope.markBad()
+				return errors.Join(err, fmt.Errorf("activation BEGIN outcome uncertain; rollback failed and connection retired: %w; fix: inspect the store before retrying", rollbackErr))
+			}
+			return err
 		}
 		// database/sql may report a context deadline while a driver is completing
 		// BEGIN on the pinned connection. Clear that possible transaction with an
@@ -1009,6 +1136,7 @@ func runScopedTransaction(ctx context.Context, conn sqlQueryer, begin string, op
 		}
 	}
 	committed := false
+	commitAttempted := false
 	defer func() {
 		if committed {
 			return
@@ -1016,21 +1144,42 @@ func runScopedTransaction(ctx context.Context, conn sqlQueryer, begin string, op
 		// The caller's context can be canceled precisely because the transaction
 		// needs to abort. Use a fresh bounded context to guarantee cleanup on the
 		// connection rather than leaving it write-locked after cancellation.
-		rollbackCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		var rollbackCtx context.Context
+		cancel := func() {}
+		if activationScope != nil {
+			rollbackCtx = activationScope.cleanupContext()
+		} else {
+			rollbackCtx, cancel = context.WithTimeout(context.Background(), time.Second)
+		}
 		_, rollbackErr := conn.ExecContext(rollbackCtx, "ROLLBACK")
 		cancel()
 		if rollbackErr != nil {
+			if activationScope != nil {
+				activationScope.markBad()
+				rollbackErr = fmt.Errorf("activation transaction outcome uncertain; connection retired; inspect the store before retrying: %w", rollbackErr)
+			}
 			if err == nil {
 				err = fmt.Errorf("rollback uncommitted SQLite transaction: %w", rollbackErr)
 			} else {
 				err = errors.Join(err, fmt.Errorf("rollback failed: %w", rollbackErr))
 			}
+		} else if activationScope != nil && commitAttempted {
+			err = errors.Join(err, errors.New("activation rollback confirmed after failed commit; this attempt did not commit; fix: retry the open after resolving the reported commit error"))
 		}
 	}()
 	if err = operation(); err != nil {
 		return err
 	}
+	if activationScope != nil {
+		if cause := context.Cause(ctx); cause != nil {
+			return cause
+		}
+	}
+	commitAttempted = true
 	if _, err = conn.ExecContext(ctx, "COMMIT"); err != nil {
+		if activationScope != nil {
+			return fmt.Errorf("commit SQLite activation transaction failed: %w; where: internal/sqlite.runScopedTransaction, startup commit; impact: no tracker returned, transaction outcome depends on the reported rollback result; fix: inspect the store if rollback is uncertain before retrying", err)
+		}
 		return fmt.Errorf("commit SQLite transaction: %w", err)
 	}
 	committed = true
@@ -1383,8 +1532,7 @@ func (scope *connScope) suppressCheckConstraints(what string) (func(error) error
 // activation failure that also loses the caller's pool configuration is exactly
 // the condition the caller must be told about.
 func captureBorrowedActivationPragmas(scope *connScope) (func() error, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), pragmaControlTimeout)
-	defer cancel()
+	ctx := scope.ctx
 	foreignKeys, err := readForeignKeysPragma(ctx, scope.conn)
 	if err != nil {
 		return nil, err
@@ -1401,8 +1549,10 @@ func captureBorrowedActivationPragmas(scope *connScope) (func() error, error) {
 		foreignKeysValue = "ON"
 	}
 	return func() error {
-		restoreCtx, restoreCancel := context.WithTimeout(context.Background(), pragmaControlTimeout)
-		defer restoreCancel()
+		if scope.discarded {
+			return errors.New("sqlite.OpenBorrowedContext: activation connection retired after uncertain transaction cleanup; no connection returned to pool; fix: inspect store state before retrying")
+		}
+		restoreCtx := scope.cleanupContext()
 		var restoreErr error
 		// Both restores are proven by read-back: an activation that left a
 		// transaction open on this connection would otherwise make the foreign_keys

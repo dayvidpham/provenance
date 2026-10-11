@@ -57,12 +57,23 @@ func openTracker(dbPath string, opts ...Option) (Tracker, error) {
 // database/sql pool. The internal store uses that exact pool and does not close
 // it when the Tracker is closed.
 func openBorrowedTracker(db *sql.DB, opts ...Option) (Tracker, error) {
+	return openBorrowedTrackerContext(context.Background(), db, "", opts...)
+}
+
+func openBorrowedTrackerContext(ctx context.Context, db *sql.DB, path string, opts ...Option) (Tracker, error) {
 	o := defaultOptions()
 	for _, opt := range opts {
 		opt(&o)
 	}
 
-	store, err := dbsqlite.OpenBorrowed(db, o.registry.Models())
+	config := dbsqlite.BorrowedActivationConfig{Path: path, Observer: o.activationObserver}
+	if o.borrowedActivationBusyTimeoutSet {
+		if o.borrowedActivationBusyTimeout.Milliseconds() < 1 {
+			return nil, fmt.Errorf("provenance.openBorrowedTrackerContext: borrowed activation busy tier %s resolves below 1ms during open; no tracker returned; fix: supply a positive tier of at least 1ms", o.borrowedActivationBusyTimeout)
+		}
+		config.BusyTimeout = o.borrowedActivationBusyTimeout
+	}
+	store, err := dbsqlite.OpenBorrowedContext(ctx, db, o.registry.Models(), config)
 	if err != nil {
 		return nil, fmt.Errorf("provenance.openBorrowedTracker: %w", err)
 	}
