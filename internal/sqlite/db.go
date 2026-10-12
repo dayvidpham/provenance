@@ -1019,6 +1019,13 @@ func limitTransactionBusyTimeout(ctx context.Context, conn sqlQueryer) (func() e
 }
 
 func runScopedTransaction(ctx context.Context, conn sqlQueryer, begin string, operation func() error, activation ...*connScope) (err error) {
+	return runScopedTransactionWithPolicy(ctx, conn, begin, operation, false, activation...)
+}
+
+// singleAttempt preserves the registration contract: SQLite owns one busy tier,
+// even when a caller has a longer deadline. Other transaction callers retain
+// their existing deadline-driven policy.
+func runScopedTransactionWithPolicy(ctx context.Context, conn sqlQueryer, begin string, operation func() error, singleAttempt bool, activation ...*connScope) (err error) {
 	var activationScope *connScope
 	if len(activation) != 0 {
 		activationScope = activation[0]
@@ -1070,6 +1077,11 @@ func runScopedTransaction(ctx context.Context, conn sqlQueryer, begin string, op
 		_, _ = conn.ExecContext(rollbackCtx, "ROLLBACK")
 		cancel()
 		if !isBusyError(err) {
+			if singleAttempt {
+				// Registration never re-enters BEGIN, even for the otherwise
+				// harmless contention-evidence probe used by other callers.
+				return errors.Join(err, ctx.Err())
+			}
 			// The deadline can interrupt an attempt while SQLite is still
 			// waiting for the writer lock, so a contended wait can end with
 			// only the context error. Consumers classify contention from the
@@ -1096,6 +1108,9 @@ func runScopedTransaction(ctx context.Context, conn sqlQueryer, begin string, op
 			return err
 		}
 		lastBusy = err
+		if singleAttempt {
+			return errors.Join(err, ctx.Err())
+		}
 		// Callers without a deadline keep the pre-existing contract: one attempt
 		// under the standing busy_timeout, busy surfaced as-is — even when their
 		// context is already cancelled.

@@ -138,7 +138,14 @@ type borrowedTracker struct {
 // available checks the borrowed handle's liveness before a public operation,
 // returning a fully-populated StoreUnavailableError if the sentinel is closed.
 func (b *borrowedTracker) available(op string) error {
-	if err := b.sentinel.Ping(); err != nil {
+	return b.availableContext(context.Background(), op)
+}
+
+func (b *borrowedTracker) availableContext(ctx context.Context, op string) error {
+	if err := b.sentinel.PingContext(ctx); err != nil {
+		if ctx.Err() != nil {
+			err = errors.Join(err, ctx.Err(), context.Cause(ctx))
+		}
 		return &StoreUnavailableError{
 			Operation: op,
 			Store:     fmt.Sprintf("borrowed SQLite (DBOS-owned *sql.DB, shared file %q)", b.path),
@@ -267,10 +274,17 @@ func (b *borrowedTracker) RegisterMLAgent(namespace string, role Role, provider 
 }
 
 func (b *borrowedTracker) RegisterSoftwareAgent(namespace, name, version, source string) (SoftwareAgent, error) {
-	if err := b.available("RegisterSoftwareAgent"); err != nil {
+	return b.RegisterSoftwareAgentContext(context.Background(), namespace, name, version, source)
+}
+
+func (b *borrowedTracker) RegisterSoftwareAgentContext(ctx context.Context, namespace, name, version, source string) (SoftwareAgent, error) {
+	if ctx == nil {
+		return SoftwareAgent{}, fmt.Errorf("provenance.Tracker.RegisterSoftwareAgentContext: nil context during borrowed registration; no agent created; fix: supply a live context or use RegisterSoftwareAgent")
+	}
+	if err := b.availableContext(ctx, "RegisterSoftwareAgent"); err != nil {
 		return SoftwareAgent{}, err
 	}
-	return b.inner.RegisterSoftwareAgent(namespace, name, version, source)
+	return b.inner.(SoftwareAgentRegistrarContext).RegisterSoftwareAgentContext(ctx, namespace, name, version, source)
 }
 
 func (b *borrowedTracker) RegisterFixedSoftwareAgent(reg FixedSoftwareAgentRegistration) (SoftwareAgent, error) {
