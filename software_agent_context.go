@@ -1,6 +1,9 @@
 package provenance
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 // SoftwareAgentRegistrarContext is an additive capability implemented by trackers
 // returned by OpenSQLite, OpenMemory, and OpenBorrowedSQLite. Tracker is unchanged
@@ -18,3 +21,15 @@ var (
 	_ SoftwareAgentRegistrarContext = (*sqliteTracker)(nil)
 	_ SoftwareAgentRegistrarContext = (*borrowedTracker)(nil)
 )
+
+// Preserve both cancellation identity and a caller-supplied Cause without
+// repeating an error already present in the chain.
+func registrationContextError(ctx context.Context, err error) error {
+	if ctx.Err() != nil && !errors.Is(err, ctx.Err()) {
+		err = errors.Join(err, ctx.Err())
+	}
+	if cause := context.Cause(ctx); cause != nil && !errors.Is(err, cause) {
+		err = errors.Join(err, cause)
+	}
+	return err
+}

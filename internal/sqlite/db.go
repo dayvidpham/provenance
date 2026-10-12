@@ -1022,7 +1022,10 @@ func runScopedTransaction(ctx context.Context, conn sqlQueryer, begin string, op
 	return runScopedTransactionWithPolicy(ctx, conn, begin, operation, false, activation...)
 }
 
-// singleAttempt preserves the registration contract: SQLite owns one busy tier,
+const singleRegistrationAttempt = true
+
+// runScopedTransactionWithPolicy preserves the registration contract when
+// singleAttempt is set: SQLite owns one busy tier,
 // even when a caller has a longer deadline. Other transaction callers retain
 // their existing deadline-driven policy.
 func runScopedTransactionWithPolicy(ctx context.Context, conn sqlQueryer, begin string, operation func() error, singleAttempt bool, activation ...*connScope) (err error) {

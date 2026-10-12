@@ -144,7 +144,7 @@ func (b *borrowedTracker) available(op string) error {
 func (b *borrowedTracker) availableContext(ctx context.Context, op string) error {
 	if err := b.sentinel.PingContext(ctx); err != nil {
 		if ctx.Err() != nil {
-			err = errors.Join(err, ctx.Err(), context.Cause(ctx))
+			return fmt.Errorf("provenance.%s: caller context ended (cancelled or deadline exceeded) during borrowed-handle liveness precheck; operation not attempted; fix: retry with a live context: %w", op, registrationContextError(ctx, err))
 		}
 		return &StoreUnavailableError{
 			Operation: op,
@@ -274,17 +274,31 @@ func (b *borrowedTracker) RegisterMLAgent(namespace string, role Role, provider 
 }
 
 func (b *borrowedTracker) RegisterSoftwareAgent(namespace, name, version, source string) (SoftwareAgent, error) {
-	return b.RegisterSoftwareAgentContext(context.Background(), namespace, name, version, source)
+	return b.registerSoftwareAgentContext(context.Background(), "RegisterSoftwareAgent", namespace, name, version, source)
 }
 
 func (b *borrowedTracker) RegisterSoftwareAgentContext(ctx context.Context, namespace, name, version, source string) (SoftwareAgent, error) {
+	return b.registerSoftwareAgentContext(ctx, "RegisterSoftwareAgentContext", namespace, name, version, source)
+}
+
+func (b *borrowedTracker) registerSoftwareAgentContext(ctx context.Context, operation, namespace, name, version, source string) (SoftwareAgent, error) {
 	if ctx == nil {
 		return SoftwareAgent{}, fmt.Errorf("provenance.Tracker.RegisterSoftwareAgentContext: nil context during borrowed registration; no agent created; fix: supply a live context or use RegisterSoftwareAgent")
 	}
-	if err := b.availableContext(ctx, "RegisterSoftwareAgent"); err != nil {
+	if err := b.availableContext(ctx, operation); err != nil {
 		return SoftwareAgent{}, err
 	}
-	return b.inner.(SoftwareAgentRegistrarContext).RegisterSoftwareAgentContext(ctx, namespace, name, version, source)
+	api, ok := b.inner.(SoftwareAgentRegistrarContext)
+	if !ok {
+		return SoftwareAgent{}, &StoreUnavailableError{
+			Operation: operation,
+			Store:     "borrowed SQLite tracker",
+			Stage:     "capability check before registration",
+			Impact:    "the inner tracker lacks context-aware software-agent registration; no registration attempted",
+			Fix:       "use a SQLite-backed tracker that implements SoftwareAgentRegistrarContext",
+		}
+	}
+	return api.RegisterSoftwareAgentContext(ctx, namespace, name, version, source)
 }
 
 func (b *borrowedTracker) RegisterFixedSoftwareAgent(reg FixedSoftwareAgentRegistration) (SoftwareAgent, error) {

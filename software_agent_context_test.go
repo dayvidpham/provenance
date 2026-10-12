@@ -17,9 +17,10 @@ import (
 
 // Observe the production BEGIN entry, not a test-only registration handler.
 type registrationConnector struct {
-	dsn      string
-	begin    atomic.Pointer[chan struct{}]
-	attempts atomic.Int32
+	dsn               string
+	begin             atomic.Pointer[chan struct{}]
+	attempts          atomic.Int32
+	cancelAfterInsert atomic.Pointer[context.CancelFunc]
 }
 
 func (c *registrationConnector) Driver() driver.Driver { return &sqlite.Driver{} }
@@ -43,7 +44,13 @@ func (c *registrationConn) ExecContext(ctx context.Context, query string, args [
 			close(*entered)
 		}
 	}
-	return c.Conn.(driver.ExecerContext).ExecContext(ctx, query, args)
+	result, err := c.Conn.(driver.ExecerContext).ExecContext(ctx, query, args)
+	if err == nil && query == "INSERT INTO agents (id, kind_id) VALUES (?1, ?2)" {
+		if cancel := c.owner.cancelAfterInsert.Swap(nil); cancel != nil {
+			(*cancel)()
+		}
+	}
+	return result, err
 }
 func (c *registrationConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	return c.Conn.(driver.QueryerContext).QueryContext(ctx, query, args)
@@ -154,6 +161,22 @@ func TestSoftwareAgentContextColdRegistrationCancellation(t *testing.T) {
 	if _, err := conn.ExecContext(t.Context(), "ROLLBACK"); err != nil {
 		t.Fatal(err)
 	}
+	// Cancel after BEGIN and the base insert actually succeeded. The software
+	// subtype and base row must roll back together on the production path.
+	if err := pool.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM agents").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	beforeRows := count
+	insertCtx, insertCancel := context.WithCancel(t.Context())
+	defer insertCancel()
+	connector.cancelAfterInsert.Store(&insertCancel)
+	_, err = registrar.RegisterSoftwareAgentContext(insertCtx, "test", "rollback", "1", "source")
+	if !errors.Is(err, context.Canceled) || connector.cancelAfterInsert.Load() != nil {
+		t.Fatalf("insert cancellation not observed: %v", err)
+	}
+	if err := pool.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM agents").Scan(&count); err != nil || count != beforeRows {
+		t.Fatalf("partial registration: rows=%d want=%d err=%v", count, beforeRows, err)
+	}
 }
 
 func TestSoftwareAgentContextPoolCancellation(t *testing.T) {
@@ -181,6 +204,9 @@ func TestSoftwareAgentContextPoolCancellation(t *testing.T) {
 	_, err = tracker.(provenance.SoftwareAgentRegistrarContext).RegisterSoftwareAgentContext(ctx, "test", "pool", "1", "source")
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("pool cancellation: %v", err)
+	}
+	if _, unavailable := provenance.AsStoreUnavailable(err); unavailable {
+		t.Fatalf("live pool cancellation classified as unavailable store: %v", err)
 	}
 	if pool.Stats().WaitCount == 0 {
 		t.Fatal("test did not wait for pool capacity")
