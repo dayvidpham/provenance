@@ -69,14 +69,37 @@ func (db *DB) RegisterMLAgent(namespace string, role ptypes.Role, provider ptype
 
 // RegisterSoftwareAgent registers a new software agent with a UUIDv7 ID.
 func (db *DB) RegisterSoftwareAgent(namespace, name, version, source string) (ptypes.SoftwareAgent, error) {
-	id := ptypes.AgentID{Namespace: namespace, UUID: uuid.Must(uuid.NewV7())}
-	scope, err := db.bindScope(context.Background(), projectionTargetLive)
+	agent, err := db.RegisterSoftwareAgentContext(context.Background(), namespace, name, version, source)
 	if err != nil {
-		return ptypes.SoftwareAgent{}, fmt.Errorf("sqlite.RegisterSoftwareAgent: lease connection: %w", err)
+		return ptypes.SoftwareAgent{}, fmt.Errorf("sqlite.RegisterSoftwareAgent: %w", err)
+	}
+	return agent, nil
+}
+
+// RegisterSoftwareAgentContext uses one caller-scoped lease and lock attempt.
+// No invocation context is retained by DB.
+func (db *DB) RegisterSoftwareAgentContext(ctx context.Context, namespace, name, version, source string) (agent ptypes.SoftwareAgent, err error) {
+	if ctx == nil {
+		return agent, errors.New("sqlite.RegisterSoftwareAgentContext: nil context during registration; no agent created; fix: supply a live context or use RegisterSoftwareAgent")
+	}
+	defer func() {
+		if err != nil && ctx.Err() != nil {
+			if !errors.Is(err, ctx.Err()) {
+				err = errors.Join(err, ctx.Err())
+			}
+			if cause := context.Cause(ctx); !errors.Is(err, cause) {
+				err = errors.Join(err, cause)
+			}
+		}
+	}()
+	id := ptypes.AgentID{Namespace: namespace, UUID: uuid.Must(uuid.NewV7())}
+	scope, err := db.bindScope(ctx, projectionTargetLive)
+	if err != nil {
+		return ptypes.SoftwareAgent{}, fmt.Errorf("sqlite.RegisterSoftwareAgentContext: lease connection: %w", err)
 	}
 	defer scope.release()
 
-	if err := runImmediateTransaction(scope.ctx, scope.conn, func() error {
+	if err := runScopedTransactionWithPolicy(scope.ctx, scope.conn, "BEGIN IMMEDIATE", func() error {
 		if _, err := scope.conn.ExecContext(scope.ctx, insertAgentSQL, id.String(), int(ptypes.AgentKindSoftware)); err != nil {
 			return fmt.Errorf("failed to insert base agent row: %w", err)
 		}
@@ -84,8 +107,8 @@ func (db *DB) RegisterSoftwareAgent(namespace, name, version, source string) (pt
 			return fmt.Errorf("failed to insert software agent row: %w", err)
 		}
 		return nil
-	}); err != nil {
-		return ptypes.SoftwareAgent{}, fmt.Errorf("sqlite.RegisterSoftwareAgent: transactional registration failed: %w", err)
+	}, singleRegistrationAttempt); err != nil {
+		return ptypes.SoftwareAgent{}, fmt.Errorf("sqlite.RegisterSoftwareAgentContext: transactional registration failed: %w", err)
 	}
 	return ptypes.SoftwareAgent{Agent: ptypes.Agent{ID: id, Kind: ptypes.AgentKindSoftware}, Name: name, Version: version, Source: source}, nil
 }

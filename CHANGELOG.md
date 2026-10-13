@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Added
+
+- Optional `SoftwareAgentRegistrarContext` for caller-scoped software-agent
+  registration on standalone and borrowed SQLite trackers. Existing `Tracker`
+  implementations and registration signatures remain source-compatible.
+- Registration propagates cancellation through pool acquisition and one SQLite
+  lock attempt; see [context-aware registration](docs/software-agent-registration.md).
+
 ## v0.4.0 - 2026-10-11
 
 ### Added

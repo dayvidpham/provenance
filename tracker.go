@@ -250,9 +250,17 @@ func (t *sqliteTracker) RegisterMLAgent(namespace string, role Role, provider Pr
 }
 
 func (t *sqliteTracker) RegisterSoftwareAgent(namespace, name, version, source string) (SoftwareAgent, error) {
-	sa, err := t.db.RegisterSoftwareAgent(namespace, name, version, source)
+	agent, err := t.RegisterSoftwareAgentContext(context.Background(), namespace, name, version, source)
 	if err != nil {
 		return SoftwareAgent{}, fmt.Errorf("provenance.Tracker.RegisterSoftwareAgent: %w", err)
+	}
+	return agent, nil
+}
+
+func (t *sqliteTracker) RegisterSoftwareAgentContext(ctx context.Context, namespace, name, version, source string) (SoftwareAgent, error) {
+	sa, err := t.db.RegisterSoftwareAgentContext(ctx, namespace, name, version, source)
+	if err != nil {
+		return SoftwareAgent{}, fmt.Errorf("provenance.Tracker.RegisterSoftwareAgentContext: %w", err)
 	}
 	return sa, nil
 }
