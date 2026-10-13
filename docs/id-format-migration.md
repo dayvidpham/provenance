@@ -76,3 +76,10 @@ separate builder. Its README records the previous writer's definition-reference
 limitations explicitly. It is not a runtime compatibility reader or evidence
 of a live-store migration. Application CLI, lifecycle replay and operator
 cutover verification are separate integration responsibilities.
+
+The legacy zero-reference corpus remains immutable. The prior exception request
+has been withdrawn/superseded by the maintainer's PROPOSAL-17 definition-writer
+change. Nonzero runtime/schema/implementation/retention reference coverage will
+consume its approved complete-envelope occurrence and production verifiers
+after that change lands; the existing legacy bytes are not relabelled as complete
+coverage, and no new source/release/corpus pin is invented in advance.

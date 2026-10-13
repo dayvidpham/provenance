@@ -95,10 +95,15 @@ references zero, rather than inventing JournalIDs or content digests. The main
 worker must resolve the proposal's stronger “complete valid envelope” obligation
 with its plan owner; this fixture must not be represented as satisfying it.
 
-Review A round 1 still treats this as a BLOCKER. A narrowly scoped exception is
-requested on URI-SLICE-1; neither this README nor passing gap tests ratify
-that exception. Until the maintainer records approval and the reviewers accept
-its scope, full complete-envelope coverage remains unsatisfied.
+The earlier narrow exception request is **withdrawn/superseded**, not ratified.
+The maintainer directive is “let's write it now”: PROPOSAL-17 is implementing
+genuine definition writers for these four kinds and a complete-envelope
+occurrence. S1's nonzero coverage depends on consuming that approved occurrence
+and its real owner verifiers when PROPOSAL-17 lands. No source revision, release
+pin or complete-corpus checksum is asserted before those artifacts exist.
+Keep this legacy archive and manifest byte-identical; add the new approved
+coverage separately, never backfill invented references into the old corpus.
+Complete-envelope acceptance remains pending that dependency and review.
 
 Here “complete” means each of `Runtime.Definition`, `Schema.Definition`,
 `Implementation.Definition` and `Retention.Definition` has an authentic,
