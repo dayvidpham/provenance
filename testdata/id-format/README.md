@@ -95,6 +95,20 @@ references zero, rather than inventing JournalIDs or content digests. The main
 worker must resolve the proposal's stronger “complete valid envelope” obligation
 with its plan owner; this fixture must not be represented as satisfying it.
 
+Review A round 1 still treats this as a BLOCKER. A narrowly scoped exception is
+requested on URI-SLICE-1; neither this README nor passing gap tests ratify
+that exception. Until the maintainer records approval and the reviewers accept
+its scope, full complete-envelope coverage remains unsatisfied.
+
+Here “complete” means each of `Runtime.Definition`, `Schema.Definition`,
+`Implementation.Definition` and `Retention.Definition` has an authentic,
+owner-produced nonzero definition JournalID, its matching kind and content
+identity, and an owner-resolvable registered definition. The runtime contract,
+host version/source and capture-origin representation must also be valid and
+preserved, together with the native bindings and named raw evidence. Merely
+encoding all envelope fields, preserving four zero references, or inventing
+referent IDs/digests does not prove those registration/graph/integrity paths.
+
 ### Released-owner follow-up: exact API and executable gap proof
 
 The follow-up investigation inspected **all non-test Go source in the pinned
