@@ -19,7 +19,7 @@ func TestTaskIDString(t *testing.T) {
 		Namespace: "aura-plugins",
 		UUID:      uuid.MustParse("018f4b12-3456-7890-abcd-ef0123456789"),
 	}
-	want := "aura-plugins--018f4b12-3456-7890-abcd-ef0123456789"
+	want := "aura-plugins/018f4b12-3456-7890-abcd-ef0123456789"
 	if got := id.String(); got != want {
 		t.Errorf("TaskID.String() = %q, want %q", got, want)
 	}
@@ -40,8 +40,8 @@ func TestParseTaskIDRoundTrip(t *testing.T) {
 }
 
 func TestParseTaskIDNamespaceWithDashes(t *testing.T) {
-	// Namespace that contains "--" — must split on the rightmost "--"
-	raw := "my--fancy--ns--018f4b12-3456-7890-abcd-ef0123456789"
+	// Namespace containing "--" remains opaque; only the last slash separates it.
+	raw := "my--fancy--ns/018f4b12-3456-7890-abcd-ef0123456789"
 	id, err := ptypes.ParseTaskID(raw)
 	if err != nil {
 		t.Fatalf("ParseTaskID(%q) unexpected error: %v", raw, err)
@@ -97,7 +97,7 @@ func TestAgentIDString(t *testing.T) {
 		Namespace: "my-project",
 		UUID:      uuid.MustParse("018f4b12-3456-7890-abcd-ef0123456789"),
 	}
-	want := "my-project--018f4b12-3456-7890-abcd-ef0123456789"
+	want := "my-project/018f4b12-3456-7890-abcd-ef0123456789"
 	if got := id.String(); got != want {
 		t.Errorf("AgentID.String() = %q, want %q", got, want)
 	}
@@ -148,7 +148,7 @@ func TestActivityIDString(t *testing.T) {
 		Namespace: "ns",
 		UUID:      uuid.MustParse("018f4b12-3456-7890-abcd-ef0123456789"),
 	}
-	want := "ns--018f4b12-3456-7890-abcd-ef0123456789"
+	want := "ns/018f4b12-3456-7890-abcd-ef0123456789"
 	if got := id.String(); got != want {
 		t.Errorf("ActivityID.String() = %q, want %q", got, want)
 	}
@@ -187,7 +187,7 @@ func TestCommentIDString(t *testing.T) {
 		Namespace: "project",
 		UUID:      uuid.MustParse("018f4b12-3456-7890-abcd-ef0123456789"),
 	}
-	want := "project--018f4b12-3456-7890-abcd-ef0123456789"
+	want := "project/018f4b12-3456-7890-abcd-ef0123456789"
 	if got := id.String(); got != want {
 		t.Errorf("CommentID.String() = %q, want %q", got, want)
 	}

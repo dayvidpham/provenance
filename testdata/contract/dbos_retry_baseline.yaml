@@ -8,7 +8,7 @@ cases:
       command: command
       recordedAt: 600
       effectRecordedAt: 700
-      commentID: retry--018f0000-0000-7000-8000-000000000011
+      commentID: retry/018f0000-0000-7000-8000-000000000011
       updateTitle: updated
       updateDescription: updated description
       updateNotes: notes

@@ -104,6 +104,16 @@ type sqlQueryer interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
+// sqlConnection also covers scope-owned connection lifecycle operations.
+// Transaction adapters reject those operations: migration scopes only borrow
+// Query/Exec/Prepare and never acquire or end the caller's transaction.
+type sqlConnection interface {
+	sqlQueryer
+	PrepareContext(context.Context, string) (*sql.Stmt, error)
+	Raw(func(any) error) error
+	Close() error
+}
+
 // sqlRowScanner permits shared row decoders to accept *sql.Row and *sql.Rows.
 type sqlRowScanner interface {
 	Scan(...any) error
@@ -137,7 +147,7 @@ func (target projectionTarget) label() string {
 // connScope is the package's connection-ownership contract. conn is pinned for
 // the scope's lifetime; release returns it to database/sql exactly once.
 type connScope struct {
-	conn             *sql.Conn
+	conn             sqlConnection
 	ctx              context.Context
 	projectionTarget projectionTarget
 	releaseOnce      sync.Once
@@ -875,6 +885,12 @@ func activateSchema(scope *connScope, models []ptypes.ModelEntry, policy activat
 	// commit or roll back together; verifying outside the write lock would
 	// validate a snapshot that another writer could invalidate before COMMIT.
 	operation := func() error {
+		if err := requireCurrentIDFormat(scope.ctx, scope.conn, scope.activationPath); err != nil {
+			return err
+		}
+		if err := initializeEmptyIDFormat(scope.ctx, scope.conn); err != nil {
+			return err
+		}
 		scope.observeActivation("schema")
 		if err := scope.ensureSchema(models); err != nil {
 			return fmt.Errorf("apply schema: %w", err)
@@ -1207,7 +1223,7 @@ func runScopedTransactionWithPolicy(ctx context.Context, conn sqlQueryer, begin 
 // runImmediateTransaction owns the explicit BEGIN IMMEDIATE pattern used where
 // read-before-write checks must hold SQLite write ownership on this exact
 // connection. It is not a generic storage framework.
-func runImmediateTransaction(ctx context.Context, conn *sql.Conn, operation func() error) error {
+func runImmediateTransaction(ctx context.Context, conn sqlQueryer, operation func() error) error {
 	return runScopedTransaction(ctx, conn, "BEGIN IMMEDIATE", operation)
 }
 
@@ -1215,7 +1231,7 @@ func runImmediateTransaction(ctx context.Context, conn *sql.Conn, operation func
 
 // readForeignKeysPragma reports this connection's current connection-local
 // foreign-key enforcement state.
-func readForeignKeysPragma(ctx context.Context, conn *sql.Conn) (bool, error) {
+func readForeignKeysPragma(ctx context.Context, conn sqlQueryer) (bool, error) {
 	var enabled int
 	if err := conn.QueryRowContext(ctx, "PRAGMA foreign_keys").Scan(&enabled); err != nil {
 		return false, fmt.Errorf(
@@ -1229,7 +1245,7 @@ func readForeignKeysPragma(ctx context.Context, conn *sql.Conn) (bool, error) {
 
 // readBusyTimeoutPragma reports this connection's current busy-timeout budget in
 // milliseconds.
-func readBusyTimeoutPragma(ctx context.Context, conn *sql.Conn) (int64, error) {
+func readBusyTimeoutPragma(ctx context.Context, conn sqlQueryer) (int64, error) {
 	var busyTimeoutMS int64
 	if err := conn.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&busyTimeoutMS); err != nil {
 		return 0, fmt.Errorf(
@@ -1334,7 +1350,7 @@ func (write pragmaWrite) enabled() bool {
 // every write of a pragma this package captures and restores is verified, and an
 // unverifiable one is reported to the caller, whose fail-closed action is to
 // retire the connection.
-func setPragmaVerified(ctx context.Context, conn *sql.Conn, write pragmaWrite) error {
+func setPragmaVerified(ctx context.Context, conn sqlQueryer, write pragmaWrite) error {
 	value := pragmaOnOff(write.enabled())
 	if _, err := conn.ExecContext(ctx, write.statement()); err != nil {
 		return fmt.Errorf("set PRAGMA %s=%s: %w", write.pragma(), value, err)
@@ -1362,7 +1378,7 @@ func setPragmaVerified(ctx context.Context, conn *sql.Conn, write pragmaWrite) e
 // write landed, for the same reason setPragmaVerified does: an
 // unverified restore can leave a borrowed connection carrying a contention
 // budget its owner never chose.
-func setBusyTimeoutVerified(ctx context.Context, conn *sql.Conn, milliseconds int64) error {
+func setBusyTimeoutVerified(ctx context.Context, conn sqlQueryer, milliseconds int64) error {
 	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout=%d", milliseconds)); err != nil {
 		return fmt.Errorf("set PRAGMA busy_timeout=%d: %w", milliseconds, err)
 	}
@@ -1963,6 +1979,9 @@ func preflightExistingReadOnly(target openTarget, models []ptypes.ModelEntry) (b
 	}
 	defer conn.Close()
 	preflight := borrowConnScope(conn, projectionTargetLive)
+	if err := requireCurrentIDFormat(preflight.ctx, conn, target.display); err != nil {
+		return false, err
+	}
 	existing, err := preflight.tableExists("journal")
 	if err != nil {
 		return existing, err

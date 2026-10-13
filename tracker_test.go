@@ -159,7 +159,7 @@ func TestShowNotFound(t *testing.T) {
 	t.Parallel()
 	tr := openTestTracker(t)
 
-	fakeID, err := provenance.ParseTaskID("ns--00000000-0000-7000-8000-000000000000")
+	fakeID, err := provenance.ParseTaskID("ns/00000000-0000-7000-8000-000000000000")
 	if err != nil {
 		t.Fatalf("ParseTaskID error: %v", err)
 	}

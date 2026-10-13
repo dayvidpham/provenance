@@ -14,13 +14,10 @@ import (
 
 func v004FixtureInput(t *testing.T) OperationInput {
 	t.Helper()
-	actor, err := ptypes.ParseActorID("fixture--018f0000-0000-7000-8000-000000000002")
-	if err != nil {
-		t.Fatal(err)
-	}
 	return OperationInput{
 		Conditions: []Condition{{Kind: ConditionCurrentFact, Selector: FactSelector{Kind: FactEvidence, Filter: FactFilter{TaskScope: FactTaskScope{Kind: FactTaskUnscoped}}, EvidenceKind: "fixture.evidence"}, AssertedJournalID: 0}},
-		Effects:    []Effect{{Sort: EffectBootstrapAuthority, ResultSlot: "root", BootstrapLabel: "root", OperationAuthorityID: OperationAuthorityID(actor.String())}},
+		// Authority IDs are opaque: this retired-looking token must stay verbatim.
+		Effects: []Effect{{Sort: EffectBootstrapAuthority, ResultSlot: "root", BootstrapLabel: "root", OperationAuthorityID: OperationAuthorityID("fixture--018f0000-0000-7000-8000-000000000002")}},
 	}
 }
 
@@ -114,11 +111,11 @@ func TestConditionExactFactCanonicalRoundTrip(t *testing.T) {
 // Stage, Notes, ResultSlot) and that the canonical bytes round-trip strictly.
 // Malformed and irrelevant inputs must fail normalization.
 func TestActivityCreateCanonicalRoundTrip(t *testing.T) {
-	actID, err := ptypes.ParseActivityID("fixture--018f0000-0000-7000-8000-000000000010")
+	actID, err := ptypes.ParseActivityID("fixture/018f0000-0000-7000-8000-000000000010")
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ptypes.ParseAgentID("fixture--018f0000-0000-7000-8000-000000000011")
+	agent, err := ptypes.ParseAgentID("fixture/018f0000-0000-7000-8000-000000000011")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,12 +173,12 @@ func TestActivityCreateCanonicalRoundTrip(t *testing.T) {
 	}{
 		{"activity-id", func() Effect {
 			e2 := completeEffect
-			e2.ActivityID, _ = ptypes.ParseActivityID("fixture--018f0000-0000-7000-8000-000000000099")
+			e2.ActivityID, _ = ptypes.ParseActivityID("fixture/018f0000-0000-7000-8000-000000000099")
 			return e2
 		}},
 		{"agent-id", func() Effect {
 			e2 := completeEffect
-			e2.ActivityAgentID, _ = ptypes.ParseAgentID("fixture--018f0000-0000-7000-8000-000000000099")
+			e2.ActivityAgentID, _ = ptypes.ParseAgentID("fixture/018f0000-0000-7000-8000-000000000099")
 			return e2
 		}},
 		{"phase", func() Effect {
@@ -253,7 +250,7 @@ func TestActivityCreateCanonicalRoundTrip(t *testing.T) {
 
 	// Irrelevant field: TaskID must not be set on ActivityCreate
 	irrelevant := completeEffect
-	task, _ := ptypes.ParseTaskID("fixture--018f0000-0000-7000-8000-000000000020")
+	task, _ := ptypes.ParseTaskID("fixture/018f0000-0000-7000-8000-000000000020")
 	irrelevant.TaskID = task
 	if _, err := Canonicalize(OperationInput{Effects: []Effect{irrelevant}}); !errors.Is(err, ErrCanonicalMutation) {
 		t.Fatalf("irrelevant TaskID accepted: %v", err)
@@ -287,7 +284,7 @@ func TestMutationV1RejectsOldShapeAndMalformedFrames(t *testing.T) {
 
 func TestMutationV1BoundsAndIrrelevantFields(t *testing.T) {
 	validCondition := v004FixtureInput(t).Conditions[0]
-	taskID, _ := ptypes.ParseTaskID("fixture--018f0000-0000-7000-8000-000000000021")
+	taskID, _ := ptypes.ParseTaskID("fixture/018f0000-0000-7000-8000-000000000021")
 	boundary := v004FixtureInput(t)
 	boundary.Conditions = make([]Condition, MaxCanonicalConditions)
 	for i := range boundary.Conditions {
@@ -371,8 +368,8 @@ func TestMutationV1EveryResourceBoundaryIsExact(t *testing.T) {
 		})
 	}
 
-	task, _ := ptypes.ParseTaskID("fixture--018f0000-0000-7000-8000-000000000021")
-	actor, _ := ptypes.ParseActorID("fixture--018f0000-0000-7000-8000-000000000022")
+	task, _ := ptypes.ParseTaskID("fixture/018f0000-0000-7000-8000-000000000021")
+	actor, _ := ptypes.ParseActorID("fixture/018f0000-0000-7000-8000-000000000022")
 	context, _ := TaskContext(task)
 	dimensions := []struct {
 		name string
@@ -474,7 +471,7 @@ func repeatEffects(value Effect, count int) []Effect {
 }
 
 func TestMutationV1RejectsMalformedUnionOperands(t *testing.T) {
-	task, _ := ptypes.ParseTaskID("fixture--018f0000-0000-7000-8000-000000000001")
+	task, _ := ptypes.ParseTaskID("fixture/018f0000-0000-7000-8000-000000000001")
 	context, _ := TaskContext(task)
 	cases := map[string]OperationInput{
 		"unknown-condition":    {Conditions: []Condition{{Kind: ConditionKind(99), Selector: FactSelector{Kind: FactEvidence, Filter: FactFilter{TaskScope: FactTaskScope{Kind: FactTaskUnscoped}}, EvidenceKind: "fixture.evidence"}}}},
@@ -503,7 +500,7 @@ func TestMutationV1RejectsMalformedUnionOperands(t *testing.T) {
 }
 
 func TestDecisionEvidenceContextsAreSemantic(t *testing.T) {
-	task, _ := ptypes.ParseTaskID("fixture--018f0000-0000-7000-8000-000000000001")
+	task, _ := ptypes.ParseTaskID("fixture/018f0000-0000-7000-8000-000000000001")
 	ctx, _ := TaskContext(task)
 	for _, effect := range []Effect{{Sort: EffectDecision, DecisionKind: "fixture.decision", Contexts: []EventContext{ctx}}, {Sort: EffectEvidence, EvidenceKind: "fixture.evidence", Contexts: []EventContext{ctx}}} {
 		with, err := Canonicalize(OperationInput{Effects: []Effect{effect}})

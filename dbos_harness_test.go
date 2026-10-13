@@ -234,7 +234,7 @@ func (s *dbosStack) createTaskOp(opID, namespace, title string) provenance.Opera
 // newTaskID mints a fresh UUIDv7 TaskID in namespace, matching how Session.Create
 // mints ids.
 func newTaskID(namespace string) provenance.TaskID {
-	id, err := provenance.ParseTaskID(namespace + "--" + uuidV7())
+	id, err := provenance.ParseTaskID(namespace + "/" + uuidV7())
 	if err != nil {
 		panic(fmt.Sprintf("newTaskID: %v", err))
 	}

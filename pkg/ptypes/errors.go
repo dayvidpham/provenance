@@ -29,10 +29,11 @@ var (
 	ErrAlreadyClosed = error(errSentinel("provenance: task is already closed"))
 
 	// ErrInvalidID is returned when a string cannot be parsed as a valid ID.
-	// The expected wire format is "namespace--uuidv7".
-	// To fix: ensure the ID string was produced by TaskID.String(), AgentID.String(),
+	// The expected wire format is "namespace/uuid", split on the last slash.
+	// To fix: ensure the ID string was produced by TaskID.String(), ActorID.String(),
 	// ActivityID.String(), or CommentID.String(), or that the namespace is non-empty
-	// and the UUID portion is a valid v7 UUID.
+	// and the suffix is a valid 36-character hyphenated UUID. Nil and non-v7 UUIDs
+	// are accepted; retired two-dash identity input is rejected.
 	ErrInvalidID = error(errSentinel("provenance: invalid ID format"))
 
 	// ErrAgentKindMismatch is returned when querying a typed agent with the wrong kind.

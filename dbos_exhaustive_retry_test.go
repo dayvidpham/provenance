@@ -282,7 +282,8 @@ var auditedDurableTables = []string{
 	"journal_authority_assignment_episodes", "journal_authority_assignment_transitions", "journal_authority_bootstraps",
 	"journal_activity_creations", "journal_decision_contexts", "journal_decisions", "journal_evidence", "journal_evidence_contexts", "journal_kinds", "journal_operation_result_slots", "journal_operations",
 	"journal_task_event_contexts", "journal_task_events", "labels", "ml_models", "notifications", "operation_outputs", "phases",
-	"priorities", "providers", "queues", "roles", "sqlite_sequence", "stages", "statuses", "streams", "task_attributions",
+	// Persistent ID-format metadata is part of the zero-write snapshot, not an excluded runtime table.
+	"priorities", "provenance_id_format", "providers", "queues", "roles", "sqlite_sequence", "stages", "statuses", "streams", "task_attributions",
 	"task_types", "tasks", "workflow_events", "workflow_events_history", "workflow_schedules", "workflow_status",
 }
 
@@ -411,7 +412,7 @@ func dbosAllOperandOperation(t *testing.T, fixture retryMatrixFixture, target Ta
 
 func dbosAllOperandOperationFromFixture(t *testing.T, fixture retryMatrixFixture, target TaskID, baseline testcorpus.Case[dbosRetryInput, dbosRetryExpected]) (OperationInput, CommittedResult) {
 	t.Helper()
-	task, err := ParseTaskID("retry--018f0000-0000-7000-8000-000000000010")
+	task, err := ParseTaskID("retry/018f0000-0000-7000-8000-000000000010")
 	if err != nil {
 		t.Fatal(err)
 	}

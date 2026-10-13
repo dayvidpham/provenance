@@ -37,7 +37,7 @@ type ComposedGovernedAllocationOutcome struct {
 type composedSupplementReferenceReader interface{ fusedtx.SQLReader }
 
 type composedSupplementConnReader struct {
-	conn *sql.Conn
+	conn sqlQueryer
 }
 
 func (reader composedSupplementConnReader) QueryRow(ctx context.Context, query string, args ...any) fusedtx.Row {

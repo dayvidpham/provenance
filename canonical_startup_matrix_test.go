@@ -367,7 +367,7 @@ func TestStartupCorruptionMatrixLeavesBytesUnchanged(t *testing.T) {
 			corruptStartupSQL(t, tr, `DELETE FROM tasks WHERE id=?1`, f.task.String())
 		},
 		"task-spurious": func(t *testing.T, tr *startupCorruptionHandle, f startupFixture) {
-			corruptStartupSQL(t, tr, `INSERT INTO tasks SELECT 'matrix--018f0000-0000-7000-8000-000000000099',namespace,title,description,status_id,priority_id,type_id,phase_id,owner_id,notes,created_at,updated_at,closed_at,close_reason,last_journal_id FROM tasks WHERE id=?1`, f.task.String())
+			corruptStartupSQL(t, tr, `INSERT INTO tasks SELECT 'matrix/018f0000-0000-7000-8000-000000000099',namespace,title,description,status_id,priority_id,type_id,phase_id,owner_id,notes,created_at,updated_at,closed_at,close_reason,last_journal_id FROM tasks WHERE id=?1`, f.task.String())
 		},
 		"attribution": func(t *testing.T, tr *startupCorruptionHandle, f startupFixture) {
 			corruptStartupSQL(t, tr, `DELETE FROM task_attributions WHERE task_id=?1`, f.task.String())
@@ -412,7 +412,7 @@ func TestStartupCorruptionMatrixLeavesBytesUnchanged(t *testing.T) {
 			corruptStartupSQL(t, tr, `INSERT INTO labels(task_id,name) VALUES(?1,'spurious')`, f.target.String())
 		},
 		"comment-id": func(t *testing.T, tr *startupCorruptionHandle, f startupFixture) {
-			corruptStartupSQL(t, tr, `UPDATE comments SET id='matrix--018f0000-0000-7000-8000-000000000098' WHERE id=?1`, f.comment.String())
+			corruptStartupSQL(t, tr, `UPDATE comments SET id='matrix/018f0000-0000-7000-8000-000000000098' WHERE id=?1`, f.comment.String())
 		},
 		"comment-task": func(t *testing.T, tr *startupCorruptionHandle, f startupFixture) {
 			corruptStartupSQL(t, tr, `UPDATE comments SET task_id=?1 WHERE id=?2`, f.target.String(), f.comment.String())
@@ -430,7 +430,7 @@ func TestStartupCorruptionMatrixLeavesBytesUnchanged(t *testing.T) {
 			corruptStartupSQL(t, tr, `DELETE FROM comments WHERE id=?1`, f.comment.String())
 		},
 		"comment-spurious": func(t *testing.T, tr *startupCorruptionHandle, f startupFixture) {
-			corruptStartupSQL(t, tr, `INSERT INTO comments(id,task_id,author_id,body,created_at) SELECT 'matrix--018f0000-0000-7000-8000-000000000097',task_id,author_id,body,created_at FROM comments WHERE id=?1`, f.comment.String())
+			corruptStartupSQL(t, tr, `INSERT INTO comments(id,task_id,author_id,body,created_at) SELECT 'matrix/018f0000-0000-7000-8000-000000000097',task_id,author_id,body,created_at FROM comments WHERE id=?1`, f.comment.String())
 		},
 		"result-slot-missing": func(t *testing.T, tr *startupCorruptionHandle, f startupFixture) {
 			corruptStartupSQL(t, tr, `DELETE FROM journal_operation_result_slots WHERE journal_id=?1 AND result_slot_id='one'`, int64(f.anchor))

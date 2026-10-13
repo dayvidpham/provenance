@@ -117,7 +117,7 @@ func TestDBOSFailureWireCorpus(t *testing.T) {
 
 func mustFixtureActivityID(t *testing.T) ptypes.ActivityID {
 	t.Helper()
-	activity, err := ptypes.ParseActivityID("fixture--018f0000-0000-7000-8000-000000000004")
+	activity, err := ptypes.ParseActivityID("fixture/018f0000-0000-7000-8000-000000000004")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -387,7 +387,7 @@ func TestDBOSOutcomeDiffCoversTypedMetadata(t *testing.T) {
 	for _, tc := range []struct {
 		field  DBOSDiagnosticField
 		mutate func(*CanonicalApplyFailure)
-	}{{DBOSDiagFieldActivityID, func(f *CanonicalApplyFailure) { f.ActivityID = "other--018f0000-0000-7000-8000-000000000005" }}, {DBOSDiagFieldExistingJournalID, func(f *CanonicalApplyFailure) { value := int64(18); f.ExistingJournalID = &value }}} {
+	}{{DBOSDiagFieldActivityID, func(f *CanonicalApplyFailure) { f.ActivityID = "other/018f0000-0000-7000-8000-000000000005" }}, {DBOSDiagFieldExistingJournalID, func(f *CanonicalApplyFailure) { value := int64(18); f.ExistingJournalID = &value }}} {
 		t.Run(string(tc.field), func(t *testing.T) {
 			malformed := activityControl
 			failure := *activityControl.Failure

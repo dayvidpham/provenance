@@ -213,31 +213,32 @@ var (
 // Parse function re-exports
 // ---------------------------------------------------------------------------
 
-// ParseTaskID parses "namespace--uuid" into a TaskID.
+// ParseTaskID parses "namespace/uuid" into a TaskID, splitting on the last slash.
 // See ptypes.ParseTaskID for full documentation.
 func ParseTaskID(s string) (TaskID, error) {
 	return ptypes.ParseTaskID(s)
 }
 
-// ParseActorID parses "namespace--uuid" into the sole ActorID identity domain.
+// ParseActorID parses "namespace/uuid" into the sole ActorID identity domain.
+// Canonical UUID shape is required; nil and non-v7 UUIDs are accepted.
 func ParseActorID(s string) (ActorID, error) {
 	return ptypes.ParseActorID(s)
 }
 
-// ParseAgentID parses "namespace--uuid" into the ActorID domain.
+// ParseAgentID parses "namespace/uuid" into the ActorID domain.
 //
 // Deprecated: use ParseActorID.
 func ParseAgentID(s string) (AgentID, error) {
 	return ptypes.ParseAgentID(s)
 }
 
-// ParseActivityID parses "namespace--uuid" into an ActivityID.
+// ParseActivityID parses "namespace/uuid" into an ActivityID.
 // See ptypes.ParseActivityID for full documentation.
 func ParseActivityID(s string) (ActivityID, error) {
 	return ptypes.ParseActivityID(s)
 }
 
-// ParseCommentID parses "namespace--uuid" into a CommentID.
+// ParseCommentID parses "namespace/uuid" into a CommentID.
 // See ptypes.ParseCommentID for full documentation.
 func ParseCommentID(s string) (CommentID, error) {
 	return ptypes.ParseCommentID(s)

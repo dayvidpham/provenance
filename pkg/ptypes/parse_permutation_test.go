@@ -132,7 +132,7 @@ func TestParseID_SuccessPermutations(t *testing.T) {
 
 		for _, ns := range spec.Namespaces {
 			for _, uuidSpec := range spec.UUIDs {
-				input := ns.Value + "--" + uuidSpec.Value
+				input := ns.Value + "/" + uuidSpec.Value
 				testName := fmt.Sprintf("%s/%s/%s", idType.Name, ns.Name, uuidSpec.Name)
 
 				t.Run(testName, func(t *testing.T) {

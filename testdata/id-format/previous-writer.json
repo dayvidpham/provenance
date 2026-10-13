@@ -1,0 +1,451 @@
+{
+  "sha256": "e2ec1b5721624ab80aa9d04f7283d5ae3fc4d403ace9fab49616056cb0e27fc0",
+  "actor": {
+    "Namespace": "https://github.com/fixture/my--repo/nested",
+    "UUID": "01a12a80-36e9-70fc-8b7e-f25e9c67e96b"
+  },
+  "genesis": {
+    "OperationID": "fixture/genesis",
+    "ActorID": {
+      "Namespace": "https://github.com/fixture/my--repo/nested",
+      "UUID": "01a12a80-36e9-70fc-8b7e-f25e9c67e96b"
+    },
+    "Command": "fixture.root.v1",
+    "Root": {
+      "TaskID": {
+        "Namespace": "https://github.com/fixture/my--repo/nested",
+        "UUID": "815bc6eb-1308-5ed6-baa6-864aa6d061c6"
+      },
+      "AssignmentID": "fixture/assignment/root",
+      "Occupant": {
+        "Namespace": "https://github.com/fixture/my--repo/nested",
+        "UUID": "01a12a80-36e9-70fc-8b7e-f25e9c67e96b"
+      },
+      "Title": "SYNTHETIC fixture root",
+      "Description": "Historical prose with -- stays unchanged.",
+      "Type": "task",
+      "Priority": "medium",
+      "Phase": "worker_slices"
+    }
+  },
+  "allocation": {
+    "Version": 1,
+    "Allocation": {
+      "OperationID": "fixture/allocation",
+      "ActorID": {
+        "Namespace": "https://github.com/fixture/my--repo/nested",
+        "UUID": "01a12a80-36e9-70fc-8b7e-f25e9c67e96b"
+      },
+      "Command": "fixture.allocate.v1",
+      "ParentAssignmentID": "fixture/assignment/root",
+      "Children": [
+        {
+          "TaskID": {
+            "Namespace": "https://github.com/fixture/my--repo/nested",
+            "UUID": "4c93d013-d8e0-5a37-9232-f49d7e09c1c3"
+          },
+          "AssignmentID": "fixture/assignment/first",
+          "Occupant": {
+            "Namespace": "https://github.com/fixture/my--repo/nested",
+            "UUID": "01a12a80-36e9-70fc-8b7e-f25e9c67e96b"
+          },
+          "Title": "SYNTHETIC fixture first",
+          "Description": "Historical prose with -- stays unchanged.",
+          "Type": "task",
+          "Priority": "medium",
+          "Phase": "worker_slices"
+        },
+        {
+          "TaskID": {
+            "Namespace": "https://github.com/fixture/my--repo/nested",
+            "UUID": "40d22e99-9036-566f-b746-c23a35eefd8a"
+          },
+          "AssignmentID": "fixture/assignment/second",
+          "Occupant": {
+            "Namespace": "https://github.com/fixture/my--repo/nested",
+            "UUID": "01a12a80-36e9-70fc-8b7e-f25e9c67e96b"
+          },
+          "Title": "SYNTHETIC fixture second",
+          "Description": "Historical prose with -- stays unchanged.",
+          "Type": "task",
+          "Priority": "medium",
+          "Phase": "worker_slices"
+        }
+      ]
+    },
+    "Conditions": null,
+    "ReferenceScope": {
+      "Kind": 0,
+      "Subjects": null
+    },
+    "SupplementalEffects": [
+      {
+        "Sort": 0,
+        "ResultSlot": "fixture/allocation-event",
+        "ActorID": {
+          "Namespace": "",
+          "UUID": "00000000-0000-0000-0000-000000000000"
+        },
+        "RecordedAtOverride": null,
+        "TaskID": {
+          "Namespace": "https://github.com/fixture/my--repo/nested",
+          "UUID": "4c93d013-d8e0-5a37-9232-f49d7e09c1c3"
+        },
+        "EventKind": "fixture.allocation.supplement",
+        "Payload": {},
+        "Contexts": null,
+        "Title": "",
+        "Description": "",
+        "Type": "bug",
+        "Priority": "critical",
+        "Phase": "request",
+        "CloseReason": "",
+        "UpdateTitle": null,
+        "UpdateDescription": null,
+        "UpdatePriority": null,
+        "UpdatePhase": null,
+        "UpdateNotes": null,
+        "Forced": false,
+        "BootstrapLabel": "",
+        "OperationAuthorityID": "",
+        "AssignmentID": "",
+        "SlotID": "",
+        "Occupant": {
+          "Namespace": "",
+          "UUID": "00000000-0000-0000-0000-000000000000"
+        },
+        "Predecessor": "",
+        "Parent": "",
+        "DecisionKind": "",
+        "EvidenceKind": "",
+        "ContentDigest": null,
+        "ActivityID": {
+          "Namespace": "",
+          "UUID": "00000000-0000-0000-0000-000000000000"
+        },
+        "ActivityAgentID": {
+          "Namespace": "",
+          "UUID": "00000000-0000-0000-0000-000000000000"
+        },
+        "ActivityPhase": "request",
+        "ActivityStage": "not_started",
+        "ActivityNotes": "",
+        "EdgeTargetID": "",
+        "EdgeRelKind": "blocked_by",
+        "Label": "",
+        "CommentIdentity": {
+          "Namespace": "",
+          "UUID": "00000000-0000-0000-0000-000000000000"
+        },
+        "CommentAuthor": {
+          "Namespace": "",
+          "UUID": "00000000-0000-0000-0000-000000000000"
+        },
+        "CommentBody": ""
+      }
+    ]
+  },
+  "root": {
+    "Ordinal": 0,
+    "TaskID": {
+      "Namespace": "https://github.com/fixture/my--repo/nested",
+      "UUID": "815bc6eb-1308-5ed6-baa6-864aa6d061c6"
+    },
+    "AssignmentID": "fixture/assignment/root",
+    "Occupant": {
+      "Namespace": "https://github.com/fixture/my--repo/nested",
+      "UUID": "01a12a80-36e9-70fc-8b7e-f25e9c67e96b"
+    },
+    "TaskRow": {
+      "OperationID": "fixture/genesis",
+      "EffectOrdinal": 0,
+      "Subordinal": 0,
+      "JournalID": 2
+    },
+    "AssignmentRow": {
+      "OperationID": "fixture/genesis",
+      "EffectOrdinal": 0,
+      "Subordinal": 1,
+      "JournalID": 3
+    }
+  },
+  "children": [
+    {
+      "Ordinal": 0,
+      "TaskID": {
+        "Namespace": "https://github.com/fixture/my--repo/nested",
+        "UUID": "4c93d013-d8e0-5a37-9232-f49d7e09c1c3"
+      },
+      "AssignmentID": "fixture/assignment/first",
+      "Occupant": {
+        "Namespace": "https://github.com/fixture/my--repo/nested",
+        "UUID": "01a12a80-36e9-70fc-8b7e-f25e9c67e96b"
+      },
+      "TaskRow": {
+        "OperationID": "fixture/allocation",
+        "EffectOrdinal": 0,
+        "Subordinal": 0,
+        "JournalID": 5
+      },
+      "AssignmentRow": {
+        "OperationID": "fixture/allocation",
+        "EffectOrdinal": 0,
+        "Subordinal": 1,
+        "JournalID": 6
+      }
+    },
+    {
+      "Ordinal": 1,
+      "TaskID": {
+        "Namespace": "https://github.com/fixture/my--repo/nested",
+        "UUID": "40d22e99-9036-566f-b746-c23a35eefd8a"
+      },
+      "AssignmentID": "fixture/assignment/second",
+      "Occupant": {
+        "Namespace": "https://github.com/fixture/my--repo/nested",
+        "UUID": "01a12a80-36e9-70fc-8b7e-f25e9c67e96b"
+      },
+      "TaskRow": {
+        "OperationID": "fixture/allocation",
+        "EffectOrdinal": 1,
+        "Subordinal": 0,
+        "JournalID": 7
+      },
+      "AssignmentRow": {
+        "OperationID": "fixture/allocation",
+        "EffectOrdinal": 1,
+        "Subordinal": 1,
+        "JournalID": 8
+      }
+    }
+  ],
+  "comment": {
+    "Namespace": "https://github.com/fixture/my--repo/nested",
+    "UUID": "01a12a80-372f-77c3-9668-970945790648"
+  },
+  "activity": {
+    "Namespace": "https://github.com/fixture/my--repo/nested",
+    "UUID": "c907b654-0629-58c9-966a-e286dca200cf"
+  },
+  "occurrence_journal_ids": [
+    19,
+    21
+  ],
+  "native_bindings": [
+    {
+      "Kind": 1,
+      "NativeName": "session_id",
+      "Value": "SYNTHETIC-session"
+    },
+    {
+      "Kind": 5,
+      "NativeName": "agent_id",
+      "Value": "https://github.com/fixture/my--repo/nested--01a12a80-36e9-70fc-8b7e-f25e9c67e96b"
+    },
+    {
+      "Kind": 7,
+      "NativeName": "task_id",
+      "Value": "https://github.com/fixture/my--repo/nested--4c93d013-d8e0-5a37-9232-f49d7e09c1c3"
+    }
+  ],
+  "envelope": {
+    "Runtime": {
+      "Definition": {
+        "Definition": 0,
+        "Kind": 0,
+        "Content": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "Contract": "claude-code/2.1.261"
+    },
+    "HostVersion": "2.1.261",
+    "hostVersionSource": "caller-supplied",
+    "Schema": {
+      "Definition": {
+        "Definition": 0,
+        "Kind": 0,
+        "Content": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      }
+    },
+    "Implementation": {
+      "Definition": {
+        "Definition": 0,
+        "Kind": 0,
+        "Content": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      }
+    },
+    "Retention": {
+      "Definition": {
+        "Definition": 0,
+        "Kind": 0,
+        "Content": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      }
+    }
+  },
+  "blobs": [
+    {
+      "digest": "sha256:30f33747b4867d5550e67ced3274deec33360722bde28b1d0c512c81931d58e0",
+      "body": "U1lOVEhFVElDIHVucmVmZXJlbmNlZCBhZ2VkIGJvZHk=",
+      "byte_count": 32,
+      "written_at": 1880000000000
+    },
+    {
+      "digest": "sha256:511dc6d17a9023fabbfaca6e576ff29344ea050a7a34396d5a686ade4c6c80cf",
+      "body": "U1lOVEhFVElDIHVucmVmZXJlbmNlZCByZWNlbnQgYm9keQ==",
+      "byte_count": 34,
+      "written_at": 1999000000000
+    },
+    {
+      "digest": "sha256:7f359ac96dc95108e6e48db1d45c025c9940e6ba7bc3ff9400d8da2e45a5ba5c",
+      "body": "eyJmaXh0dXJlIjoiU1lOVEhFVElDIGhvc3QgZXZpZGVuY2UsIG5vdCBsaXZlIGNhcHR1cmUiLCJvbGRfYWN0b3JfdXJpIjoiaHR0cHM6Ly9naXRodWIuY29tL2ZpeHR1cmUvbXktLXJlcG8vbmVzdGVkLS0wMWExMmE4MC0zNmU5LTcwZmMtOGI3ZS1mMjVlOWM2N2U5NmIiLCJvbGRfdGFza191cmkiOiJodHRwczovL2dpdGh1Yi5jb20vZml4dHVyZS9teS0tcmVwby9uZXN0ZWQtLTRjOTNkMDEzLWQ4ZTAtNWEzNy05MjMyLWY0OWQ3ZTA5YzFjMyIsInNlc3Npb25faWQiOiJTWU5USEVUSUMtc2Vzc2lvbiJ9",
+      "byte_count": 285,
+      "written_at": 2000000000000
+    },
+    {
+      "digest": "sha256:df698396e8f0e95dcc411c21b9b3646cf8b16ff1d2332a579c3e6ca915e71019",
+      "body": "U1lOVEhFVElDIHVucmVmZXJlbmNlZCB1bmtub3duIGJvZHk=",
+      "byte_count": 35,
+      "written_at": 0
+    }
+  ],
+  "snapshot_at": 2000000000000,
+  "writer_window": 60000000000,
+  "verified": [
+    "previous Journal.VerifyIntegrity before close and after real OpenSQLite reopen",
+    "previous root and governed allocation exact-retry receipt verification",
+    "previous lifecycle Reader.Records and Reader.Payload",
+    "SQLite integrity_check and foreign_key_check",
+    "complete WAL checkpoint, all connections closed, no sidecars"
+  ]
+}

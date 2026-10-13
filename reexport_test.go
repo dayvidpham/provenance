@@ -159,7 +159,7 @@ func TestReexportSentinelErrorIdentity(t *testing.T) {
 // Verifies that the root parse functions produce the same results.
 
 func TestReexportParseFunctionIdentity(t *testing.T) {
-	validID := "ns--018f4b12-3456-7890-abcd-ef0123456789"
+	validID := "ns/018f4b12-3456-7890-abcd-ef0123456789"
 
 	// ParseTaskID
 	rootTask, rootErr := provenance.ParseTaskID(validID)

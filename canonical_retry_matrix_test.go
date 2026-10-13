@@ -88,7 +88,7 @@ func retryMismatchCandidates(t *testing.T, f retryMatrixFixture) map[string]Oper
 	add("effect-order", func(v *OperationInput) { v.Effects[5], v.Effects[6] = v.Effects[6], v.Effects[5] })
 	altTask := newCorpusTaskID()
 	altCtx, _ := TaskContext(altTask)
-	altComment, _ := ParseCommentID("retry--018f0000-0000-7000-8000-000000000012")
+	altComment, _ := ParseCommentID("retry/018f0000-0000-7000-8000-000000000012")
 	at := int64(701)
 	title, description, notes := "changed", "changed description", "changed notes"
 	priority, phase := PriorityCritical, PhaseImplPlan

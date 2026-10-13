@@ -2,7 +2,6 @@ package sqlite
 
 import (
 	"context"
-	"database/sql"
 
 	"github.com/dayvidpham/provenance/internal/fusedtx"
 )
@@ -12,7 +11,7 @@ import (
 // lifecycle methods: standalone callers own BEGIN IMMEDIATE and fused callers
 // let DBOS own the outer transaction.
 type allocationSQLTx struct {
-	conn *sql.Conn
+	conn sqlConnection
 }
 
 var _ fusedtx.SQLTx = allocationSQLTx{}
