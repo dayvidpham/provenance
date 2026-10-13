@@ -22,6 +22,10 @@ func TestTransactionEvidenceReaderSharesProductionPageAndSeesUncommittedTruth(t 
 	if len(want.Rows) != 1 || want.Rows[0].EffectiveActorID != actor {
 		t.Fatalf("positive control: %+v", want)
 	}
+	wantResult, err := db.LookupCommitted("tx-evidence")
+	if err != nil || wantResult.Kind != journal.CommittedExact || len(wantResult.ResultSlots) != 1 || wantResult.ResultSlots[0].ProducedJournalID != want.Rows[0].JournalID {
+		t.Fatalf("committed slot positive control: %+v, %v", wantResult, err)
+	}
 	// Pool size one makes any accidental second lease fail at the context ceiling,
 	// not quietly verify committed pre-conversion data through another connection.
 	db.db.SetMaxOpenConns(1)
@@ -40,6 +44,10 @@ func TestTransactionEvidenceReaderSharesProductionPageAndSeesUncommittedTruth(t 
 	if err != nil || !reflect.DeepEqual(got, want) {
 		t.Fatalf("same production semantics: %+v, %v; want %+v", got, err, want)
 	}
+	gotResult, err := reader.LookupCommitted("tx-evidence")
+	if err != nil || !reflect.DeepEqual(gotResult, wantResult) {
+		t.Fatalf("same production result semantics: %+v, %v; want %+v", gotResult, err, wantResult)
+	}
 	if _, err := tx.ExecContext(ctx, "PRAGMA defer_foreign_keys=ON"); err != nil {
 		t.Fatal(err)
 	}
@@ -50,11 +58,22 @@ func TestTransactionEvidenceReaderSharesProductionPageAndSeesUncommittedTruth(t 
 	if err != nil || len(got.Rows) != 0 {
 		t.Fatalf("reader must see uncommitted deletion: %+v, %v", got, err)
 	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM journal_operations WHERE operation_id='tx-evidence'"); err != nil {
+		t.Fatal(err)
+	}
+	gotResult, err = reader.LookupCommitted("tx-evidence")
+	if err != nil || !reflect.DeepEqual(gotResult, journal.CommittedResult{Kind: journal.CommittedAbsent}) {
+		t.Fatalf("lookup must see uncommitted deletion: %+v, %v", gotResult, err)
+	}
 	if err := tx.Rollback(); err != nil {
 		t.Fatal(err)
 	}
 	got, err = db.QueryEvidence(query)
 	if err != nil || !reflect.DeepEqual(got, want) {
 		t.Fatalf("caller rollback retained journal truth: %+v, %v", got, err)
+	}
+	gotResult, err = db.LookupCommitted("tx-evidence")
+	if err != nil || !reflect.DeepEqual(gotResult, wantResult) {
+		t.Fatalf("caller rollback retained operation: %+v, %v", gotResult, err)
 	}
 }
