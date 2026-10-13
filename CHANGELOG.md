@@ -12,6 +12,30 @@ All notable changes to this project will be documented in this file.
 - Registration propagates cancellation through pool acquisition and one SQLite
   lock attempt; see [context-aware registration](docs/software-agent-registration.md).
 
+## v0.6.0 - 2026-10-13
+
+### Added
+
+- Slash-joined namespaced identities: task, actor, agent, activity and comment
+  IDs join the namespace and the UUID with "/"; parsing splits on the last
+  slash; non-git namespaces render as `file://<path>/<uuid>`; the retired "--"
+  form is rejected cleanly (no dual-read).
+- A transaction-bound evidence reader plus the same-transaction committed
+  result-slot lookup (`LookupCommitted`), sharing reconstruction and integrity
+  checks.
+
+### Changed
+
+- The identity format is a hard cutover for consumers: migrate stored
+  identities through the transactional cutover path (owner verification,
+  partial-identity rejection, transfer-digest migration, marker-last
+  publication).
+
+### Compatibility
+
+- The reader and lookup are additive; existing callers keep their behavior.
+  The identity format change is breaking for consumers of the "--" form.
+
 ## v0.5.0 - 2026-10-12
 
 ### Added
