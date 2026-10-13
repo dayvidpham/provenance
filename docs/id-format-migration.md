@@ -45,6 +45,10 @@ canonical bytes and their identity-dependent digests change representation.
 5. Bind `NewTransactionEvidenceReader(ctx, tx)` for application-owner replay.
    It uses the production evidence page/scanner and effective-actor semantics.
    Carry the first page's snapshot watermark across all subsequent pages.
+   The same reader's `LookupCommitted(operationID)` reconstructs typed result
+   slots and emitted events with ordinary journal integrity checks on this tx.
+   It observes the full transaction view, not the evidence page watermark;
+   keep the caller's view stable while resolving a multi-page snapshot.
    Replay and verify external projections and the complete raw evidence
    inventory without invoking reclamation.
 6. Call `PublishIDFormatInTx(ctx, tx)` **last**, after all application-owner

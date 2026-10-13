@@ -24,6 +24,24 @@ func NewTransactionEvidenceReader(ctx context.Context, tx *sql.Tx) (*Transaction
 	return &TransactionEvidenceReader{ctx: ctx, tx: tx}, nil
 }
 
+// LookupCommitted reconstructs the operation's emitted events and typed result
+// slots using only the caller's transaction, with the same validation as the
+// ordinary journal lookup. Committed means present in this transaction's view:
+// it includes the caller's uncommitted changes and does not commit them. Unlike
+// QueryEvidence's page watermark, this lookup observes the full transaction view.
+// The caller must keep that view stable if resolving a multi-page snapshot.
+func (reader *TransactionEvidenceReader) LookupCommitted(op journal.OperationID) (journal.CommittedResult, error) {
+	if err := journal.ValidateOperationID(op); err != nil {
+		return journal.CommittedResult{}, fmt.Errorf("TransactionEvidenceReader.LookupCommitted: %w", err)
+	}
+	scope := &connScope{ctx: reader.ctx, conn: migrationConnection{reader.tx}, projectionTarget: projectionTargetLive}
+	result, err := scope.lookupCommitted(op)
+	if err != nil {
+		return journal.CommittedResult{}, fmt.Errorf("TransactionEvidenceReader.LookupCommitted: operation %q in caller transaction: %w", op, err)
+	}
+	return result, nil
+}
+
 func (reader *TransactionEvidenceReader) QueryEvidence(q journal.EvidenceQuery) (journal.EvidencePage, error) {
 	if err := q.Validate(); err != nil {
 		return journal.EvidencePage{}, fmt.Errorf("QueryEvidenceInTx: %w", err)

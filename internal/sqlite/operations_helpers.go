@@ -1043,6 +1043,12 @@ func (db *DB) LookupCommitted(op journal.OperationID) (journal.CommittedResult, 
 		return journal.CommittedResult{}, fmt.Errorf("LookupCommitted: lease pooled connection: %w", err)
 	}
 	defer scope.release()
+	return scope.lookupCommitted(op)
+}
+
+// lookupCommitted shares result reconstruction and integrity checks between
+// pooled reads and readers bound to a caller-owned transaction.
+func (scope *connScope) lookupCommitted(op journal.OperationID) (journal.CommittedResult, error) {
 	stored, found, err := scope.lookupOperation(op)
 	if err != nil {
 		return journal.CommittedResult{}, err
