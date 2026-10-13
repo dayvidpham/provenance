@@ -12,6 +12,19 @@ All notable changes to this project will be documented in this file.
 - Registration propagates cancellation through pool acquisition and one SQLite
   lock attempt; see [context-aware registration](docs/software-agent-registration.md).
 
+## v0.5.0 - 2026-10-12
+
+### Added
+
+- Context-aware software-agent registration: the caller's context reaches pool
+  acquisition and the registration transaction, so a cancelled context stops
+  within one SQLite busy tier instead of running to completion. Existing
+  callers keep the previous behavior (additive API).
+
+### Compatibility
+
+- Additive only: no breaking changes; no schema, DDL, or migration changes.
+
 ## v0.4.0 - 2026-10-11
 
 ### Added
