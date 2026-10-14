@@ -205,9 +205,10 @@ O(journal), and on a large store it costs seconds, which is longer than a host
 lifecycle hook's whole invocation deadline. A store that has not changed since it
 was last verified must not pay for it again, so `internal/sqlite` keeps a durable
 **verified-as-of ledger**: a singleton row recording the store generation, the
-journal tail identity (the highest `journal_id` and a digest of that row), and the
-shape id of this build's closed schema contract (the expected activation objects,
-the covered-table trigger set, the seed definitions, and the identity format).
+journal tail identity (the highest `journal_id` and a digest of that row), the
+digest of the covered-table presence set it was written under, and the shape id of
+this build's closed schema contract (the expected activation objects, the
+covered-table trigger set, the seed definitions, and the identity format).
 
 The ledger is written where the state it describes is made true, in the same
 transaction: at the end of activation's write transaction, after activation's own
@@ -218,14 +219,25 @@ refuses to record a store which moved while the read-only checks ran.
 Opening reads the ledger in O(1) — one row, one `INTEGER PRIMARY KEY` maximum, one
 row by primary key — and skips `VerifyIntegrity` and `ReplayProjections` only while
 it still describes the store as it stands. That skip takes no write lock. Every
-table this package's schema owns carries one write trigger per DML verb, and each
-trigger advances the store generation, so any write at all — a projection edit, a
+covered table that exists carries one write trigger per DML verb, and each trigger
+advances the store generation, so any write at all — a projection edit, a
 migration, an out-of-band update by another tool — makes the ledger stale and
 sends the next open down the full path. A crash between a write and its ledger
 update leaves the generation ahead of the ledger, which is the same mismatch, and
 never a skip. The structural half of the currency probe, including the
 journal-spine shape preflight and the trigger-coverage check, always runs, so DDL
 damage is refused on the fast path exactly as before.
+
+DDL advances no generation, so the ledger carries its own schema-shape guard: it
+records the digest of the covered-table presence set it was written under, and a
+covered table that appears or disappears afterwards changes that digest and stops
+the ledger matching. A covered table may legitimately be absent while a caller
+completes a legacy store's schema inside its own transaction
+(`EnsureSchemaInTx` during the identity cutover, where `provenance_id_format` is
+created later by `PublishIDFormatInTx`): trigger creation covers only the tables
+that exist and this step never creates a table it does not own, while the absent
+table's return fails the ledger's own presence digest and the currency probe's
+expected-object check.
 
 A store whose ledger is absent, unreadable, of another build's shape, or
 mismatched takes the unchanged full path, and its ledger is re-persisted only

@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Fixed
+
+- The verified-as-of ledger no longer fails schema completion on a legacy store
+  that legitimately does not carry every table the ledger watches.
+  `EnsureSchemaInTx` runs activation's schema step inside the URI cutover's own
+  transaction on a pre-operations store, where `provenance_id_format` does not
+  exist yet — activation's `initializeEmptyIDFormat`, or the cutover's
+  `PublishIDFormatInTx`, owns that ordering — and the ledger created one change
+  trigger per covered table unconditionally, failing with
+  `no such table: main.provenance_id_format`. Trigger creation is now limited to
+  the covered tables that exist, and this step still creates no table it does not
+  own. The ledger's guarantee is unchanged: its row now also records the digest of
+  the covered-table presence set it was written under, so a covered table that
+  appears or disappears afterwards — DDL fires no change trigger — stops the
+  ledger matching by itself, and the next open runs the full checks.
+
 ## v0.8.0 - 2026-10-14
 
 ### Changed
@@ -22,6 +40,7 @@ All notable changes to this project will be documented in this file.
   Measured on a 30 MiB store (46,966 journal rows, 23,482 tasks): a borrowed
   open fell from 5.56 s to 2.2 ms, and the file-backed `Open` from 16.7 s to
   0.35 s. A store's first open after a write still runs the full checks.
+
 ## v0.7.0 - 2026-10-14
 
 ### Added

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -40,13 +41,19 @@ import (
 //     activation objects, the covered-table trigger set, the seed definitions,
 //     and the identity format). A build that changes the shape refuses every
 //     ledger written by an older build.
+//   - tables_digest: the digest of the covered-table presence set the ledger was
+//     written under. A covered table that appears or disappears afterwards —
+//     including one a schema-completion step creates later, such as
+//     provenance_id_format — changes it, so the ledger stops matching even though
+//     DDL advances no generation.
 //
-// The fast path reads all four in O(1) — a single row, an INTEGER PRIMARY KEY
-// maximum, and one row by primary key — and skips the whole-store checks only
-// when they still match the store as it stands. The structural half of the
-// currency probe (schema objects, closed-lookup seed rows, operations and
-// fact-context shapes, the journal spine shape, and trigger coverage) always
-// runs, so DDL damage is refused on the fast path exactly as before.
+// The fast path reads all four in time bounded by the closed schema and not by
+// the store — one ledger row, a sqlite_master enumeration, an INTEGER PRIMARY KEY
+// maximum, and one row by primary key — and skips the whole-store checks only when
+// they still match the store as it stands. The structural half of the currency
+// probe (schema objects, closed-lookup seed rows, operations and fact-context
+// shapes, the journal spine shape, and trigger coverage) always runs, so DDL damage
+// is refused on the fast path exactly as before.
 //
 // Fail closed. An absent, unreadable, ambiguous, or mismatched ledger, and a
 // store whose generation moved during the verification itself, all run the full
@@ -72,8 +79,8 @@ const (
 	verifiedStoreTable = "provenance_verified_store"
 	// verifiedLedgerVersion is bumped whenever the ledger's meaning changes, so
 	// a ledger written by an older build is never trusted. It participates in
-	// shapeID.
-	verifiedLedgerVersion = "provenance.verified-store.v1"
+	// shapeID. v2 adds the recorded covered-table presence set (tables_digest).
+	verifiedLedgerVersion = "provenance.verified-store.v2"
 	// verifiedTriggerPrefix names the per-table change triggers. Trigger names
 	// are derived from the closed covered-table set, never from caller input.
 	verifiedTriggerPrefix = "provenance_store_generation_on_"
@@ -174,16 +181,28 @@ const (
 		journal_id INTEGER NOT NULL,
 		journal_digest TEXT NOT NULL,
 		shape_id TEXT NOT NULL,
+		tables_digest TEXT NOT NULL,
 		verified_count INTEGER NOT NULL,
 		verified_at INTEGER NOT NULL) STRICT`
+	// verifiedLedgerTablesDigestColumnDDL adds the covered-table presence digest to
+	// a ledger table created by the previous build. It is idempotent through the
+	// column probe in ensureVerifiedLedgerColumns, and the empty default it leaves
+	// on an existing row cannot match a live presence digest, so an upgraded store
+	// fails closed to the full path rather than trusting the old row.
+	verifiedLedgerTablesDigestColumnDDL = `ALTER TABLE provenance_verified_store ADD COLUMN tables_digest TEXT NOT NULL DEFAULT ''`
 )
 
 // verifiedStoreIdentity is the O(1) identity of the store as it stands: the DML
-// generation, the journal tail id, and a digest of that tail row.
+// generation, the journal tail id, a digest of that tail row, and the digest of
+// the covered-table presence set. The presence digest is what makes the ledger
+// self-contained about schema shape: a covered table that appears or disappears
+// after the row was written changes this identity, even though DDL advances no
+// generation.
 type verifiedStoreIdentity struct {
-	generation int64
-	journalID  int64
-	digest     string
+	generation   int64
+	journalID    int64
+	digest       string
+	tablesDigest string
 }
 
 // verifiedLedger is one persisted verified-as-of row.
@@ -226,7 +245,32 @@ func (scope *connScope) ensureVerifiedLedgerSchema() error {
 			return fmt.Errorf("ensureVerifiedLedgerSchema: %q: %w", statement, err)
 		}
 	}
+	if err := scope.ensureVerifiedLedgerColumns(); err != nil {
+		return err
+	}
+	present, err := scope.verifiedCoveredTablesPresent()
+	if err != nil {
+		return err
+	}
+	presentSet := make(map[string]struct{}, len(present))
+	for _, table := range present {
+		presentSet[table] = struct{}{}
+	}
+	// One change trigger per DML verb, and only for tables that exist. A covered
+	// table may legitimately be absent: EnsureSchemaInTx completes the schema of a
+	// pre-operations legacy store inside the caller's transaction, and
+	// provenance_id_format is created later by whichever path owns that ordering
+	// (activation's initializeEmptyIDFormat, or the cutover's PublishIDFormatInTx).
+	// Completing the schema must not fail, and must not create a table this
+	// package does not own at that point. The absent table cannot leave a stale
+	// ledger either way: its absence fails the currency probe's expected-object
+	// check, and the ledger row records the presence set it was written under
+	// (see readVerifiedStoreIdentity), so a table that appears or disappears
+	// afterwards stops the ledger matching on its own.
 	for _, table := range verifiedCoveredTableNames {
+		if _, ok := presentSet[table]; !ok {
+			continue
+		}
 		for _, event := range verifiedTriggerEvents {
 			statement := fmt.Sprintf(
 				`CREATE TRIGGER IF NOT EXISTS provenance_store_generation_on_%s_%s AFTER %s ON %s BEGIN UPDATE provenance_store_generation SET generation = generation + 1 WHERE id = 1; END`,
@@ -237,6 +281,62 @@ func (scope *connScope) ensureVerifiedLedgerSchema() error {
 		}
 	}
 	return nil
+}
+
+// ensureVerifiedLedgerColumns adds the presence-digest column to a ledger table
+// created before it existed. It is idempotent through the column probe, and it is
+// the only migration this package performs on its own table.
+func (scope *connScope) ensureVerifiedLedgerColumns() error {
+	columns, err := scope.tableColumns(verifiedStoreTable)
+	if err != nil {
+		return fmt.Errorf("ensureVerifiedLedgerColumns: read %s columns: %w", verifiedStoreTable, err)
+	}
+	if _, ok := columns["tables_digest"]; ok {
+		return nil
+	}
+	if _, err := scope.conn.ExecContext(scope.ctx, verifiedLedgerTablesDigestColumnDDL); err != nil {
+		return fmt.Errorf("ensureVerifiedLedgerColumns: add tables_digest to %s: %w", verifiedStoreTable, err)
+	}
+	return nil
+}
+
+// verifiedCoveredTablesPresent returns the covered tables that exist right now, in
+// a stable order. The ledger records the digest of this set, so a covered table
+// appearing or disappearing — including one a schema-completion step creates
+// later, such as provenance_id_format — changes the store's identity and stops the
+// ledger matching. An absent covered table is not an error here: see
+// ensureVerifiedLedgerSchema.
+func (scope *connScope) verifiedCoveredTablesPresent() ([]string, error) {
+	covered := make(map[string]struct{}, len(verifiedCoveredTableNames))
+	for _, table := range verifiedCoveredTableNames {
+		covered[table] = struct{}{}
+	}
+	present := make([]string, 0, len(verifiedCoveredTableNames))
+	err := scope.queryRows("SELECT name FROM sqlite_master WHERE type = 'table'", nil, func(rows *sql.Rows) error {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return err
+		}
+		if _, ok := covered[name]; ok {
+			present = append(present, name)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("enumerate covered tables: %w", err)
+	}
+	sort.Strings(present)
+	return present, nil
+}
+
+// verifiedTablesDigest is the digest of one covered-table presence set. It is
+// order-insensitive over the set, so the value depends only on which covered
+// tables exist, and a set that gains or loses a table always digests differently.
+func verifiedTablesDigest(present []string) string {
+	names := append([]string(nil), present...)
+	sort.Strings(names)
+	sum := sha256.Sum256([]byte(strings.Join(names, "\n")))
+	return hex.EncodeToString(sum[:])
 }
 
 // verifiedShapeID is the digest of this build's closed schema contract. It is
@@ -284,6 +384,11 @@ func (scope *connScope) readVerifiedStoreIdentity() (verifiedStoreIdentity, erro
 		fmt.Sprintf("SELECT generation FROM %s WHERE id = 1", storeGenerationTable)).Scan(&identity.generation); err != nil {
 		return verifiedStoreIdentity{}, fmt.Errorf("read store generation: %w", err)
 	}
+	present, err := scope.verifiedCoveredTablesPresent()
+	if err != nil {
+		return verifiedStoreIdentity{}, err
+	}
+	identity.tablesDigest = verifiedTablesDigest(present)
 	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT COALESCE(MAX(journal_id), 0) FROM journal").Scan(&identity.journalID); err != nil {
 		return verifiedStoreIdentity{}, fmt.Errorf("read journal tail id: %w", err)
 	}
@@ -318,8 +423,8 @@ func (scope *connScope) readVerifiedLedger() (verifiedLedger, bool) {
 		shape  string
 	)
 	err := scope.conn.QueryRowContext(scope.ctx,
-		fmt.Sprintf("SELECT generation, journal_id, journal_digest, shape_id, verified_count, verified_at FROM %s WHERE id = 1", verifiedStoreTable)).
-		Scan(&ledger.identity.generation, &ledger.identity.journalID, &ledger.identity.digest, &shape, &ledger.count, &ledger.verifiedAt)
+		fmt.Sprintf("SELECT generation, journal_id, journal_digest, shape_id, tables_digest, verified_count, verified_at FROM %s WHERE id = 1", verifiedStoreTable)).
+		Scan(&ledger.identity.generation, &ledger.identity.journalID, &ledger.identity.digest, &shape, &ledger.identity.tablesDigest, &ledger.count, &ledger.verifiedAt)
 	if err != nil {
 		return verifiedLedger{}, false
 	}
@@ -387,17 +492,18 @@ func (scope *connScope) writeVerifiedLedger() error {
 		return nil
 	}
 	if _, err := scope.conn.ExecContext(scope.ctx, fmt.Sprintf(`INSERT INTO %s
-		(id, generation, journal_id, journal_digest, shape_id, verified_count, verified_at)
-		VALUES (1, ?1, ?2, ?3, ?4, 1, ?5)
+		(id, generation, journal_id, journal_digest, shape_id, tables_digest, verified_count, verified_at)
+		VALUES (1, ?1, ?2, ?3, ?4, ?5, 1, ?6)
 		ON CONFLICT(id) DO UPDATE SET
 			generation = excluded.generation,
 			journal_id = excluded.journal_id,
 			journal_digest = excluded.journal_digest,
 			shape_id = excluded.shape_id,
+			tables_digest = excluded.tables_digest,
 			verified_count = %s.verified_count + 1,
 			verified_at = excluded.verified_at`,
 		verifiedStoreTable, verifiedStoreTable),
-		identity.generation, identity.journalID, identity.digest, shape, time.Now().UTC().UnixNano()); err != nil {
+		identity.generation, identity.journalID, identity.digest, shape, identity.tablesDigest, time.Now().UTC().UnixNano()); err != nil {
 		return fmt.Errorf("writeVerifiedLedger: %w", err)
 	}
 	return nil
@@ -470,6 +576,13 @@ func (scope *connScope) activationSchemaIsPristine() (bool, error) {
 // carries its change trigger. A dropped trigger, or a table rebuilt without
 // recreating one, reports not-current so activation reinstalls coverage; a
 // trigger on a table this build does not cover is ignored.
+//
+// Coverage is required for the WHOLE covered set, not only for the tables that
+// exist. Creation is conditional (ensureVerifiedLedgerSchema) because a covered
+// table may legitimately be absent while a caller completes a legacy store's
+// schema, but currency is not: a store missing a covered table answers "not
+// current" here as well as at the expected-object check, so it can never take the
+// fast path until its schema is complete.
 func (scope *connScope) activationLedgerCoverageCurrent() (bool, error) {
 	present := make(map[string]struct{}, len(expectedActivationObjects))
 	err := scope.queryRows("SELECT name FROM sqlite_master WHERE type = 'trigger'", nil, func(rows *sql.Rows) error {

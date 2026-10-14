@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"slices"
@@ -277,6 +278,205 @@ func TestVerifiedLedgerFastPathOnAStoreWithNoJournalRows(t *testing.T) {
 	}
 	if after, _ := ledgerRow(t, path); after != count+1 {
 		t.Fatalf("verified_count after the tail became non-empty = %d, want %d; the full path must have run", after, count+1)
+	}
+}
+
+// TestVerifiedLedgerPresenceOfCoveredTablesIsPartOfItsIdentity pins the
+// covered-table presence digest the ledger records. A covered table that
+// disappears — raw DDL, no data write, so the DML generation is untouched — must
+// stop the ledger matching on its own, without help from the currency probe's
+// object check, and the next open must run the full checks. A covered table that
+// appears afterwards is the same mismatch in the other direction, because the
+// digest is over the set.
+func TestVerifiedLedgerPresenceOfCoveredTablesIsPartOfItsIdentity(t *testing.T) {
+	path := t.TempDir() + "/presence.db"
+	_, seeded := seedLedgerStore(t, path)
+
+	db, err := Open(path, nil)
+	if err != nil {
+		t.Fatalf("reopen to read the ledger: %v", err)
+	}
+	scope := takePoolScope(t, db)
+	before, err := scope.readVerifiedStoreIdentity()
+	if err != nil {
+		scope.release()
+		_ = db.Close()
+		t.Fatalf("read the store identity: %v", err)
+	}
+	if current, err := scope.verifiedLedgerCurrent(); err != nil || !current {
+		scope.release()
+		_ = db.Close()
+		t.Fatalf("a freshly re-verified store must be current: current=%v err=%v", current, err)
+	}
+	// Raw DDL drops a covered table. DDL fires no change trigger, so the store's
+	// DML generation is provably unchanged by it. governed_allocation_genesis is
+	// empty, so dropping it violates no foreign key, and activation recreates it.
+	if _, err := scope.conn.ExecContext(scope.ctx, "DROP TABLE governed_allocation_genesis"); err != nil {
+		scope.release()
+		_ = db.Close()
+		t.Fatalf("drop a covered table: %v", err)
+	}
+	after, err := scope.readVerifiedStoreIdentity()
+	if err != nil {
+		scope.release()
+		_ = db.Close()
+		t.Fatalf("read the store identity after the drop: %v", err)
+	}
+	currentAfter, err := scope.verifiedLedgerCurrent()
+	scope.release()
+	if err != nil {
+		t.Fatalf("ledger check after the drop: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	if after.generation != before.generation || after.journalID != before.journalID || after.digest != before.digest {
+		t.Fatalf("the drop advanced the DML identity; this test needs DDL that fires no change trigger: before=%+v after=%+v", before, after)
+	}
+	if after.tablesDigest == before.tablesDigest {
+		t.Fatalf("covered-table presence digest unchanged after dropping a covered table: %q", after.tablesDigest)
+	}
+	if currentAfter {
+		t.Fatal("the ledger still matched a store missing a covered table it was written with")
+	}
+
+	// The digest is over the set, so a table appearing is the same comparison in
+	// the other direction.
+	present := slices.Clone(verifiedCoveredTableNames)
+	slices.Sort(present)
+	if verifiedTablesDigest(present) != before.tablesDigest {
+		t.Fatalf("the digest of the full covered set %q is not what the ledger recorded (%q)", verifiedTablesDigest(present), before.tablesDigest)
+	}
+	reduced := slices.DeleteFunc(slices.Clone(present), func(name string) bool { return name == "governed_allocation_genesis" })
+	if verifiedTablesDigest(reduced) == before.tablesDigest {
+		t.Fatal("removing a covered table did not change the presence digest")
+	}
+	appeared := append(slices.Clone(reduced), "governed_allocation_genesis")
+	if verifiedTablesDigest(appeared) != before.tablesDigest {
+		t.Fatal("adding a covered table back did not restore the presence digest; the digest is not set-based")
+	}
+
+	// The ledger check above is what makes the fast path unavailable. The open must
+	// therefore take the full path, and activation must repair the store: the
+	// covered table is recreated and the ledger describes the store again.
+	if err := reopenFileBacked(t, path); err != nil {
+		t.Fatalf("open after a covered table disappeared: %v", err)
+	}
+	if count, ok := ledgerRow(t, path); !ok || count < seeded {
+		t.Fatalf("ledger row after the repair: present=%v count=%d, want present with count >= %d", ok, count, seeded)
+	}
+	repaired, err := Open(path, nil)
+	if err != nil {
+		t.Fatalf("reopen the repaired store: %v", err)
+	}
+	scope = takePoolScope(t, repaired)
+	var recreated bool
+	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='governed_allocation_genesis')").Scan(&recreated); err != nil {
+		scope.release()
+		_ = repaired.Close()
+		t.Fatalf("probe the recreated covered table: %v", err)
+	}
+	repairedCurrent, err := scope.verifiedLedgerCurrent()
+	scope.release()
+	if err != nil {
+		_ = repaired.Close()
+		t.Fatalf("ledger check after the repair: %v", err)
+	}
+	if err := repaired.Close(); err != nil {
+		t.Fatalf("close the repaired store: %v", err)
+	}
+	if !recreated {
+		t.Fatal("the open did not repair the store: the covered table is still missing")
+	}
+	if !repairedCurrent {
+		t.Fatal("the ledger does not describe the repaired store")
+	}
+}
+
+// TestVerifiedLedgerSchemaCompletionToleratesAbsentOwnedTable pins the legacy-store
+// path: completing the schema inside a caller-owned transaction must tolerate a
+// covered table that legitimately does not exist yet, must not create it, and must
+// still install the change triggers for the covered tables that do exist.
+func TestVerifiedLedgerSchemaCompletionToleratesAbsentOwnedTable(t *testing.T) {
+	ctx := context.Background()
+	path := t.TempDir() + "/legacy-completion.db"
+	pool, err := sql.Open(sqliteDriverName, "file:"+path)
+	if err != nil {
+		t.Fatalf("open legacy pool: %v", err)
+	}
+	defer func() {
+		if err := pool.Close(); err != nil {
+			t.Errorf("close legacy pool: %v", err)
+		}
+	}()
+	pool.SetMaxOpenConns(1)
+	for _, statement := range []string{
+		`CREATE TABLE tasks (id TEXT PRIMARY KEY, namespace TEXT NOT NULL, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', status_id INTEGER NOT NULL DEFAULT 0, priority_id INTEGER NOT NULL DEFAULT 2, type_id INTEGER NOT NULL DEFAULT 2, phase_id INTEGER NOT NULL, owner_id TEXT, notes TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, closed_at INTEGER, close_reason TEXT NOT NULL DEFAULT '')`,
+		`CREATE TABLE agents (id TEXT PRIMARY KEY, kind_id INTEGER NOT NULL)`,
+		`CREATE TABLE journal (journal_id INTEGER PRIMARY KEY AUTOINCREMENT, kind_id INTEGER NOT NULL, actor_id TEXT, recorded_at INTEGER NOT NULL, produced_by_operation_journal_id INTEGER)`,
+		`CREATE TABLE journal_task_events (journal_id INTEGER PRIMARY KEY REFERENCES journal(journal_id), task_id TEXT NOT NULL, event_kind TEXT NOT NULL, payload TEXT NOT NULL)`,
+	} {
+		if _, err := pool.Exec(statement); err != nil {
+			t.Fatalf("build legacy store: %v", err)
+		}
+	}
+
+	conn, err := pool.Conn(ctx)
+	if err != nil {
+		t.Fatalf("lease legacy connection: %v", err)
+	}
+	defer func() {
+		if err := conn.Close(); err != nil {
+			t.Errorf("close legacy connection: %v", err)
+		}
+	}()
+	restoreFK, err := PauseForeignKeys(ctx, conn)
+	if err != nil {
+		t.Fatalf("pause foreign keys: %v", err)
+	}
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		_ = restoreFK(err)
+		t.Fatalf("begin: %v", err)
+	}
+	opErr := EnsureSchemaInTx(ctx, tx, nil)
+	if opErr != nil {
+		_ = tx.Rollback()
+		_ = restoreFK(opErr)
+		t.Fatalf("schema completion on a legacy store with a covered table absent: %v", opErr)
+	}
+	// The absent covered table must still be absent: this step owns no part of its
+	// creation (activation's initializeEmptyIDFormat, or the cutover's
+	// PublishIDFormatInTx does).
+	var idFormatPresent bool
+	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='provenance_id_format')").Scan(&idFormatPresent); err != nil {
+		t.Fatalf("probe provenance_id_format: %v", err)
+	}
+	if idFormatPresent {
+		t.Fatal("schema completion created provenance_id_format; that ordering belongs to activation or the cutover, not here")
+	}
+	for _, want := range []struct {
+		trigger string
+		present bool
+	}{
+		{"provenance_store_generation_on_tasks_INSERT", true},
+		{"provenance_store_generation_on_journal_task_events_DELETE", true},
+		{"provenance_store_generation_on_provenance_id_format_INSERT", false},
+	} {
+		var exists bool
+		if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?1)", want.trigger).Scan(&exists); err != nil {
+			t.Fatalf("probe trigger %s: %v", want.trigger, err)
+		}
+		if exists != want.present {
+			t.Fatalf("trigger %s present=%v, want %v", want.trigger, exists, want.present)
+		}
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("roll back the legacy completion: %v", err)
+	}
+	if err := restoreFK(nil); err != nil {
+		t.Fatalf("restore foreign keys: %v", err)
 	}
 }
 
