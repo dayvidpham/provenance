@@ -397,6 +397,20 @@ func OpenBorrowedContext(ctx context.Context, runtime *sql.DB, models []ptypes.M
 		activation.activationConfig = &config
 	}
 	defer activation.endCleanup()
+	// A store whose schema, closed lookups, and version markers already match
+	// this build needs no activation: beginning the write transaction here would
+	// write nothing while starving every concurrent open of the same file of the
+	// write lock. The probe behind activationWouldChangeNothing is read-only (no
+	// DDL, no write pragmas, no write lock) and conservative, so a non-current
+	// store still reaches the full activation below unchanged. An installed
+	// observer is an explicit request to watch the activation lifecycle, so it
+	// always runs activation and keeps that seam's behaviour intact.
+	if config.Observer == nil && activation.activationWouldChangeNothing(models) {
+		if err := activationConn.Close(); err != nil {
+			return nil, fmt.Errorf("return borrowed activation connection: %w", err)
+		}
+		return &DB{db: runtime, foreignKeys: foreignKeysPoolBorrowed}, nil
+	}
 	// Activation rewrites busy_timeout and foreign_keys on this connection, which
 	// belongs to the caller's pool. Snapshot both before the first attempt so the
 	// connection goes back exactly as it arrived.
@@ -648,9 +662,15 @@ func openFileBacked(target openTarget, existingJournal bool, models []ptypes.Mod
 		err = fmt.Errorf("schema changed between read-only preflight (journal=%t) and activation (journal=%t); retry after concurrent schema work finishes", existingJournal, actualExisting)
 	}
 	if err == nil {
-		// A file-backed open contends with any other process holding this path's
-		// write lock, so it shares the borrowed path's bounded activation budget.
-		err = activateSchemaWithRetry(activation, models, defaultActivationRetryPolicy())
+		// The read-only preflight above already validated an existing store; the
+		// probe decides whether activation could still change anything. A current
+		// file skips the write transaction entirely (no write lock), while a
+		// non-current file keeps today's activation byte-for-byte.
+		if !activation.activationWouldChangeNothing(models) {
+			// A file-backed open contends with any other process holding this path's
+			// write lock, so it shares the borrowed path's bounded activation budget.
+			err = activateSchemaWithRetry(activation, models, defaultActivationRetryPolicy())
+		}
 	}
 	if err == nil {
 		// Pre-existing, deliberately left as is: these two pragmas run after the
@@ -1696,25 +1716,30 @@ func (scope *connScope) ensureSchema(models []ptypes.ModelEntry) error {
 
 // Seed data ------------------------------------------------------------------
 
+// referenceSeeds is the closed reference-data seed set activation writes with
+// INSERT OR IGNORE. It is package-level so the currency probe can verify every
+// seeded row already exists before activation is allowed to skip; the seeder and
+// the probe share one definition rather than two that could drift.
+var referenceSeeds = []struct {
+	kind  referenceSeedKind
+	names []string
+}{
+	{seedStatuses, []string{"open", "in_progress", "closed"}},
+	{seedPriorities, []string{"critical", "high", "medium", "low", "backlog"}},
+	{seedTaskTypes, []string{"bug", "feature", "task", "epic", "chore"}},
+	{seedEdgeKinds, []string{"blocked_by", "derived_from", "supersedes", "discovered_from", "generated_by", "attributed_to"}},
+	{seedAgentKinds, []string{"human", "machine_learning", "software"}},
+	{seedProviders, []string{"anthropic", "google", "openai", "local"}},
+	{seedRoles, []string{"human", "architect", "supervisor", "worker", "reviewer"}},
+	{seedPhases, []string{"request", "elicit", "propose", "review", "plan_uat", "ratify", "handoff", "impl_plan", "worker_slices", "code_review", "impl_uat", "landing", "unscoped"}},
+	{seedStages, []string{"not_started", "in_progress", "blocked", "complete"}},
+}
+
 func (scope *connScope) seedReferenceData(models []ptypes.ModelEntry) error {
-	seeds := []struct {
-		kind  referenceSeedKind
-		names []string
-	}{
-		{seedStatuses, []string{"open", "in_progress", "closed"}},
-		{seedPriorities, []string{"critical", "high", "medium", "low", "backlog"}},
-		{seedTaskTypes, []string{"bug", "feature", "task", "epic", "chore"}},
-		{seedEdgeKinds, []string{"blocked_by", "derived_from", "supersedes", "discovered_from", "generated_by", "attributed_to"}},
-		{seedAgentKinds, []string{"human", "machine_learning", "software"}},
-		{seedProviders, []string{"anthropic", "google", "openai", "local"}},
-		{seedRoles, []string{"human", "architect", "supervisor", "worker", "reviewer"}},
-		{seedPhases, []string{"request", "elicit", "propose", "review", "plan_uat", "ratify", "handoff", "impl_plan", "worker_slices", "code_review", "impl_uat", "landing", "unscoped"}},
-		{seedStages, []string{"not_started", "in_progress", "blocked", "complete"}},
-	}
 	// Each lookup's statement is prepared once and reused across its rows, for
 	// the same reason as the model registry below: the rows are few but the
 	// parse is not, and this seeds nine lookups on every activation.
-	for _, seed := range seeds {
+	for _, seed := range referenceSeeds {
 		if err := scope.seedReferenceKind(seed.kind, seed.names); err != nil {
 			return err
 		}
@@ -1780,6 +1805,33 @@ func (kind referenceSeedKind) query() string {
 		return "INSERT OR IGNORE INTO phases (id,name) VALUES (?1,?2)"
 	case seedStages:
 		return "INSERT OR IGNORE INTO stages (id,name) VALUES (?1,?2)"
+	default:
+		panic("unknown reference seed kind")
+	}
+}
+
+// selectQuery returns the read-only form of one lookup's rows for the currency
+// probe. Like query, it is a compile-time constant per kind.
+func (kind referenceSeedKind) selectQuery() string {
+	switch kind {
+	case seedStatuses:
+		return "SELECT id, name FROM statuses"
+	case seedPriorities:
+		return "SELECT id, name FROM priorities"
+	case seedTaskTypes:
+		return "SELECT id, name FROM task_types"
+	case seedEdgeKinds:
+		return "SELECT id, name FROM edge_kinds"
+	case seedAgentKinds:
+		return "SELECT id, name FROM agent_kinds"
+	case seedProviders:
+		return "SELECT id, name FROM providers"
+	case seedRoles:
+		return "SELECT id, name FROM roles"
+	case seedPhases:
+		return "SELECT id, name FROM phases"
+	case seedStages:
+		return "SELECT id, name FROM stages"
 	default:
 		panic("unknown reference seed kind")
 	}
