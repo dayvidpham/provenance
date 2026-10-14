@@ -45,6 +45,35 @@ They measure pooled reads, one `Apply` writer with readers, and contending
 `CurrentFact` writers. Their standard benchmark metrics and domain counters are
 performance observations only; ordinary tests remain the correctness proof.
 
+## Cross-repo consumer oracle
+
+The store-layer safety contract — a structurally-current store whose projections
+disagree with the folded journal must be REFUSED at open, not served — is
+asserted twice, in two places that fail independently:
+
+- Here, by `borrowed_currency_convergence_test.go`
+  (`TestBorrowedOpenRefusesProjectionDamageActivationWouldRefuse`).
+- In the consumer, by Pasture's
+  `cmd/pasture/hook_lifecycle_reader_production_test.go`
+  (`TestReaderIntegrityRowsAreHandlerOnlyBecauseTheStoreRefusesTheDamage`).
+
+The consumer's subject is the one that caught provenance v0.6.1: the
+schema-currency fast path skipped activation's own `verifyIntegrity` and
+`replayProjections` checks, so projection damage was opened successfully and the
+own-suite regression test that came with the v0.6.2 fix did not exist yet. The CI
+job `consumer-oracle` therefore runs the consumer's oracle, unchanged, against
+the revision under test, so a regression of this class fails here instead of
+waiting for someone to run the consumer suite. Run it locally with:
+
+```bash
+bash .github/consumer-oracle/run.sh
+```
+
+`PROVENANCE_DIR`, `PASTURE_SHA`, and `WORK_DIR` are overridable; the script's
+header records the pinned consumer revision, the single compatibility adaptation
+it applies (Pasture cannot compile against provenance >= v0.6.0 until its own
+identity-format cutover lands), and exactly what this gate does not cover.
+
 ## Test map
 
 | Layer | Purpose | Representative files |

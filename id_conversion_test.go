@@ -266,7 +266,6 @@ func TestRetiredCorpusPreflightRefusesCollisionMalformedAndCorruptEvidence(t *te
 		{"subtype-payload", `UPDATE journal_evidence SET payload='{}' WHERE journal_id=(SELECT MIN(journal_id) FROM journal_evidence)`},
 		{"evidence-digest", `UPDATE journal_evidence SET content_digest=zeroblob(32) WHERE journal_id=(SELECT MIN(journal_id) FROM journal_evidence)`},
 		{"opaque-edge", `INSERT INTO edges(source_id,target_id,kind_id,created_at) SELECT id,'opaque-external-handle',1,1 FROM tasks LIMIT 1`},
-		{"partially-converted", `UPDATE tasks SET id=namespace||'/'||SUBSTR(id,LENGTH(namespace)+3) WHERE id=(SELECT MIN(id) FROM tasks)`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased
+## v0.8.0 - 2026-10-14
 
 ### Changed
 
@@ -22,6 +22,29 @@ All notable changes to this project will be documented in this file.
   Measured on a 30 MiB store (46,966 journal rows, 23,482 tasks): a borrowed
   open fell from 5.56 s to 2.2 ms, and the file-backed `Open` from 16.7 s to
   0.35 s. A store's first open after a write still runs the full checks.
+## v0.7.0 - 2026-10-14
+
+### Added
+
+- `EnsureSchemaInTx` — in-transaction schema completion. A caller can bring a
+  store's schema up to this build's full shape **inside its own**
+  `BEGIN IMMEDIATE`, so a conversion commits atomically:
+  `BEGIN IMMEDIATE` → `EnsureSchemaInTx` → convert → verify → commit. This is
+  what makes a legacy store convertible at all: without it the conversion
+  fails with `no such table: governed_allocation_operations`.
+- `PauseForeignKeys` — a verified connection-level foreign-key bracket.
+  Activation relies on foreign keys being **OFF** for its table rebuilds, and
+  an in-transaction `PRAGMA foreign_keys=OFF` is a **no-op**; this exports the
+  off-before / on-after bracket with read-back verification.
+
+### Fixed
+
+- `ConvertIDsInTx` now tolerates the slash form as well as the retired
+  two-dash form, so a partly-converted store converts instead of failing with
+  `retired identity … has no … final two-dash separator`, and it skips
+  relations a legacy store does not yet carry. `VerifyIDConversionInTx` is
+  deliberately unchanged and remains fail-closed when those relations are
+  missing.
 
 ## v0.6.2 - 2026-10-14
 

@@ -15,7 +15,17 @@ import (
 
 // ConvertRetiredIdentity is private to internal offline migration callers. No
 // runtime parser, lookup, or alias resolution uses the retired representation.
+//
+// It tolerates an identity already written in the current slash form: a
+// partly-converted store (an interrupted conversion, or a writer that left keys
+// mixed) must still convert, and the slash value is simply returned normalized.
+// This is not a compatibility reader — nothing resolves the retired form at
+// runtime — and a value that is neither a canonical slash identity nor a retired
+// two-dash identity is still refused.
 func ConvertRetiredIdentity(raw string) (string, error) {
+	if current, err := ptypes.ParseTaskID(raw); err == nil {
+		return current.String(), nil
+	}
 	i := strings.LastIndex(raw, "--")
 	if i <= 0 || strings.LastIndexByte(raw, '/') > i {
 		return "", fmt.Errorf("retired identity %q has no non-empty namespace and final two-dash UUID, or a slash follows that separator; where: offline identity preflight; no identity returned; fix: restore a single-format archive before conversion", raw)

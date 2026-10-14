@@ -31,7 +31,7 @@
 
       # Package metadata
       pname = "provenance";
-      version = "0.6.2";
+      version = "0.7.0";
 
       # Go package attribute — null uses default from nixpkgs
       goAttr = null;
