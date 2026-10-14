@@ -339,111 +339,57 @@ func ConvertIDsInTx(ctx context.Context, tx *sql.Tx, options IDConversionOptions
 			return report, err
 		}
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT operation_id,canonical_request,canonical_digest FROM governed_allocation_operations ORDER BY anchor_journal_id`)
-	if err != nil {
-		return report, err
-	}
 	var allocations []allocationChange
 	allocationByOperation := map[string]allocationChange{}
 	supplements := map[string]allocation.ConvertedRequest{}
-	for rows.Next() {
-		var operation string
-		var canonical, digest []byte
-		if err := rows.Scan(&operation, &canonical, &digest); err != nil {
-			rows.Close()
-			return report, err
-		}
-		converted, err := allocation.ConvertRetiredRequest(canonical, digest)
-		if err != nil {
-			rows.Close()
-			return report, fmt.Errorf("allocation %q preflight: %w", operation, err)
-		}
-		change := allocationChange{operation, converted, append([]byte(nil), digest...)}
-		allocations = append(allocations, change)
-		allocationByOperation[operation] = change
-		if converted.SupplementOperation != "" {
-			supplements[string(converted.SupplementOperation)] = converted
-		}
-	}
-	err = rows.Err()
-	rows.Close()
+	// A store written before the operations layer has neither relation; there is
+	// nothing of that layer to convert, and the identity columns already handled
+	// above still convert. Probing existence keeps conversion working on a
+	// legacy store instead of failing on a missing table.
+	hasAllocations, err := conversionTableExists(ctx, tx, "governed_allocation_operations")
 	if err != nil {
 		return report, err
 	}
-	rows, err = tx.QueryContext(ctx, `SELECT operations.operation_id,journal.actor_id,operations.canonical_mutation,operations.mutation_digest,operations.command_digest,operations.mutation_encoding_version FROM journal_operations operations JOIN journal USING(journal_id) ORDER BY journal_id`)
+	if hasAllocations {
+		rows, err := tx.QueryContext(ctx, `SELECT operation_id,canonical_request,canonical_digest FROM governed_allocation_operations ORDER BY anchor_journal_id`)
+		if err != nil {
+			return report, err
+		}
+		for rows.Next() {
+			var operation string
+			var canonical, digest []byte
+			if err := rows.Scan(&operation, &canonical, &digest); err != nil {
+				rows.Close()
+				return report, err
+			}
+			converted, err := allocation.ConvertRetiredRequest(canonical, digest)
+			if err != nil {
+				rows.Close()
+				return report, fmt.Errorf("allocation %q preflight: %w", operation, err)
+			}
+			change := allocationChange{operation, converted, append([]byte(nil), digest...)}
+			allocations = append(allocations, change)
+			allocationByOperation[operation] = change
+			if converted.SupplementOperation != "" {
+				supplements[string(converted.SupplementOperation)] = converted
+			}
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return report, err
+		}
+	}
+	hasOperations, err := conversionTableExists(ctx, tx, "journal_operations")
 	if err != nil {
 		return report, err
 	}
 	var mutations []mutationChange
-	for rows.Next() {
-		var operation, actor string
-		var storedVersion sql.NullString
-		var canonical, digest, command []byte
-		if err := rows.Scan(&operation, &actor, &canonical, &digest, &command, &storedVersion); err != nil {
-			rows.Close()
+	if hasOperations {
+		mutations, err = planMutationChanges(ctx, tx, allocationByOperation, supplements, options)
+		if err != nil {
 			return report, err
 		}
-		if receipt, owned := allocationByOperation[operation]; owned {
-			if len(canonical) != 0 || storedVersion.Valid || !bytes.Equal(digest, receipt.oldDigest) || !bytes.Equal(command, []byte(receipt.converted.Command)) {
-				rows.Close()
-				return report, fmt.Errorf("governed operation %q anchor mutation digest/canonical state disagrees with its owner receipt; fix: restore matching archived receipt and anchor", operation)
-			}
-			mutations = append(mutations, mutationChange{operation, nil, receipt.converted.Digest[:], command, "", nil})
-			continue
-		}
-		old, err := journal.ConvertRetiredCanonicalMutation(canonical, digest)
-		if err != nil {
-			rows.Close()
-			return report, fmt.Errorf("operation %q preflight: %w", operation, err)
-		}
-		if !storedVersion.Valid || storedVersion.String != old.EncodingVersion().String() {
-			rows.Close()
-			return report, fmt.Errorf("operation %q has mismatched canonical encoding column/bytes; no writes performed; fix: restore matching archived encoding version", operation)
-		}
-		if err := validateRetiredPayloads(ctx, tx, operation, old); err != nil {
-			rows.Close()
-			return report, err
-		}
-		converted := old
-		if options.RewriteEffect != nil {
-			effects := old.NormalizedEffects()
-			for i := range effects {
-				effects[i], err = options.RewriteEffect(effects[i])
-				if err != nil {
-					rows.Close()
-					return report, err
-				}
-			}
-			converted, err = journal.Canonicalize(journal.OperationInput{Effects: effects, Conditions: old.NormalizedConditions()})
-			if err != nil {
-				rows.Close()
-				return report, err
-			}
-		}
-		newActor, err := journal.ConvertRetiredIdentity(actor)
-		if err != nil {
-			rows.Close()
-			return report, fmt.Errorf("operation %q journal.actor_id %q preflight failed before writes: %w", operation, actor, err)
-		}
-		if supplement, ok := supplements[operation]; ok {
-			if !bytes.Equal(command, supplement.OldSupplementCommandDigest) {
-				rows.Close()
-				return report, fmt.Errorf("operation %q: old composed command digest disagrees with allocation owner's recipe; no conversion writes; fix: restore the same committed receipt", operation)
-			}
-			command = supplement.NewSupplementCommandDigest
-		} else if options.RewriteCommand != nil {
-			command, err = options.RewriteCommand(actor, newActor, command, old, converted)
-			if err != nil {
-				rows.Close()
-				return report, err
-			}
-		}
-		mutations = append(mutations, mutationChange{operation, converted.CanonicalBytes(), converted.DerivedDigest(), command, converted.EncodingVersion().String(), converted.NormalizedEffects()})
-	}
-	err = rows.Err()
-	rows.Close()
-	if err != nil {
-		return report, err
 	}
 	if _, err := tx.ExecContext(ctx, "PRAGMA defer_foreign_keys=ON"); err != nil {
 		return report, err
@@ -537,6 +483,101 @@ func ConvertIDsInTx(ctx context.Context, tx *sql.Tx, options IDConversionOptions
 		report.ChangedAllocations++
 	}
 	return report, nil
+}
+
+// conversionTableExists reports whether the caller's conversion transaction can
+// see a relation, so converting a store written before the operations layer
+// skips the layers its build never created instead of failing on a missing
+// table. The identity columns and journal rows that do exist still convert.
+func conversionTableExists(ctx context.Context, tx *sql.Tx, table string) (bool, error) {
+	var exists bool
+	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?)", table).Scan(&exists); err != nil {
+		return false, fmt.Errorf("ID conversion: probe relation %s before conversion; store unchanged; fix: restore a readable SQLite store: %w", table, err)
+	}
+	return exists, nil
+}
+
+// planMutationChanges reads every journal operation and plans its conversion
+// through its owner codec without writing. It runs only when the caller's
+// transaction can see journal_operations: a store without that relation has no
+// canonical state to convert.
+func planMutationChanges(ctx context.Context, tx *sql.Tx, allocationByOperation map[string]allocationChange, supplements map[string]allocation.ConvertedRequest, options IDConversionOptions) ([]mutationChange, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT operations.operation_id,journal.actor_id,operations.canonical_mutation,operations.mutation_digest,operations.command_digest,operations.mutation_encoding_version FROM journal_operations operations JOIN journal USING(journal_id) ORDER BY journal_id`)
+	if err != nil {
+		return nil, err
+	}
+	var mutations []mutationChange
+	for rows.Next() {
+		var operation, actor string
+		var storedVersion sql.NullString
+		var canonical, digest, command []byte
+		if err := rows.Scan(&operation, &actor, &canonical, &digest, &command, &storedVersion); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if receipt, owned := allocationByOperation[operation]; owned {
+			if len(canonical) != 0 || storedVersion.Valid || !bytes.Equal(digest, receipt.oldDigest) || !bytes.Equal(command, []byte(receipt.converted.Command)) {
+				rows.Close()
+				return nil, fmt.Errorf("governed operation %q anchor mutation digest/canonical state disagrees with its owner receipt; fix: restore matching archived receipt and anchor", operation)
+			}
+			mutations = append(mutations, mutationChange{operation, nil, receipt.converted.Digest[:], command, "", nil})
+			continue
+		}
+		old, err := journal.ConvertRetiredCanonicalMutation(canonical, digest)
+		if err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("operation %q preflight: %w", operation, err)
+		}
+		if !storedVersion.Valid || storedVersion.String != old.EncodingVersion().String() {
+			rows.Close()
+			return nil, fmt.Errorf("operation %q has mismatched canonical encoding column/bytes; no writes performed; fix: restore matching archived encoding version", operation)
+		}
+		if err := validateRetiredPayloads(ctx, tx, operation, old); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		converted := old
+		if options.RewriteEffect != nil {
+			effects := old.NormalizedEffects()
+			for i := range effects {
+				effects[i], err = options.RewriteEffect(effects[i])
+				if err != nil {
+					rows.Close()
+					return nil, err
+				}
+			}
+			converted, err = journal.Canonicalize(journal.OperationInput{Effects: effects, Conditions: old.NormalizedConditions()})
+			if err != nil {
+				rows.Close()
+				return nil, err
+			}
+		}
+		newActor, err := journal.ConvertRetiredIdentity(actor)
+		if err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("operation %q journal.actor_id %q preflight failed before writes: %w", operation, actor, err)
+		}
+		if supplement, ok := supplements[operation]; ok {
+			if !bytes.Equal(command, supplement.OldSupplementCommandDigest) {
+				rows.Close()
+				return nil, fmt.Errorf("operation %q: old composed command digest disagrees with allocation owner's recipe; no conversion writes; fix: restore the same committed receipt", operation)
+			}
+			command = supplement.NewSupplementCommandDigest
+		} else if options.RewriteCommand != nil {
+			command, err = options.RewriteCommand(actor, newActor, command, old, converted)
+			if err != nil {
+				rows.Close()
+				return nil, err
+			}
+		}
+		mutations = append(mutations, mutationChange{operation, converted.CanonicalBytes(), converted.DerivedDigest(), command, converted.EncodingVersion().String(), converted.NormalizedEffects()})
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	return mutations, nil
 }
 
 type migrationSQLTx struct{ transactionFactReader }

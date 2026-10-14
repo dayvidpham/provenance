@@ -62,15 +62,22 @@ func TestRetiredCanonicalConversionPreservesOpaqueAuthority(t *testing.T) {
 	}
 }
 
-func TestRetiredIdentityRejectsPartialSlashConversion(t *testing.T) {
+// ConvertRetiredIdentity is the private offline converter, not a runtime reader.
+// It now tolerates a value already in the current slash form (so a
+// partly-converted store still converts) while still converting the retired
+// two-dash form and still refusing a value that is neither.
+func TestRetiredIdentityToleratesSlashFormAndConvertsRetired(t *testing.T) {
 	const suffix = "018f0000-0000-7000-8000-000000000002"
 	for _, namespace := range []string{"https://github.com/fixture/my--repo/nested", "file:///tmp/my--repo/", "my--project"} {
-		if _, err := ConvertRetiredIdentity(namespace + "/" + suffix); err == nil {
-			t.Fatalf("partial slash identity in opaque namespace %q was accepted", namespace)
+		if got, err := ConvertRetiredIdentity(namespace + "/" + suffix); err != nil || got != namespace+"/"+suffix {
+			t.Fatalf("slash-form identity in opaque namespace %q conversion=%q,%v", namespace, got, err)
 		}
 		got, err := ConvertRetiredIdentity(namespace + "--" + suffix)
 		if err != nil || got != namespace+"/"+suffix {
 			t.Fatalf("authentic retired %q conversion=%q,%v", namespace, got, err)
+		}
+		if _, err := ConvertRetiredIdentity(namespace + "::" + suffix); err == nil {
+			t.Fatalf("malformed identity in opaque namespace %q was accepted", namespace)
 		}
 	}
 }

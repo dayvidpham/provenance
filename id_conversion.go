@@ -29,6 +29,36 @@ func ConvertIDsInTx(ctx context.Context, tx *sql.Tx, options IDConversionOptions
 	return sqlite.ConvertIDsInTx(ctx, tx, sqlite.IDConversionOptions{RewriteEffect: options.RewriteEffect, RewriteContext: options.RewriteContext, RewriteCommand: migrateSessionCommandDigest})
 }
 
+// EnsureSchemaInTx brings the store schema up to this build's full shape inside
+// the caller-owned transaction, without beginning, committing, rolling back, or
+// publishing the identity-format marker. The offline cutover calls it after
+// BEGIN IMMEDIATE and before ConvertIDsInTx so a legacy store has the
+// governed_allocation_operations and journal_operations relations conversion and
+// verification read. It is idempotent and does nothing on a current store.
+func EnsureSchemaInTx(ctx context.Context, tx *sql.Tx, models []ModelEntry) error {
+	return sqlite.EnsureSchemaInTx(ctx, tx, models)
+}
+
+// PauseForeignKeys disables connection-local foreign-key enforcement on the
+// caller's pinned connection and returns a restore that re-enables and verifies
+// it. SQLite ignores PRAGMA foreign_keys while a transaction is open, so the
+// caller pauses enforcement before BEGIN IMMEDIATE and restores it after
+// COMMIT/ROLLBACK; an in-transaction PRAGMA foreign_keys=OFF is a silent no-op,
+// and the schema rebuilds (journal producing-operation FK completion) need
+// enforcement off. The restore takes the caller's own error and returns the
+// error the caller should return, so a failed restore is never dropped.
+//
+// Usage requires a named error return:
+//
+//	restoreFK, err := PauseForeignKeys(ctx, conn)
+//	if err != nil {
+//		return err
+//	}
+//	defer func() { err = restoreFK(err) }()
+func PauseForeignKeys(ctx context.Context, conn *sql.Conn) (func(error) error, error) {
+	return sqlite.PauseForeignKeys(ctx, conn)
+}
+
 func VerifyIDConversionInTx(ctx context.Context, tx *sql.Tx) error {
 	return sqlite.VerifyIDConversionInTx(ctx, tx)
 }
