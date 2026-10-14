@@ -411,10 +411,12 @@ func OpenBorrowedContext(ctx context.Context, runtime *sql.DB, models []ptypes.M
 	// this build needs no activation: beginning the write transaction here would
 	// write nothing while starving every concurrent open of the same file of the
 	// write lock. The probe behind activationWouldChangeNothing is read-only (no
-	// DDL, no write pragmas, no write lock) and conservative, so a non-current
-	// store still reaches the full activation below unchanged. An installed
-	// observer is an explicit request to watch the activation lifecycle, so it
-	// always runs activation and keeps that seam's behaviour intact.
+	// DDL, no write pragmas, no write lock), at least as strict as activation (it
+	// also runs activation's own integrity and replay-convergence checks), and
+	// conservative, so a non-current or diverged store still reaches the full
+	// activation below unchanged and is refused there. An installed observer is an
+	// explicit request to watch the activation lifecycle, so it always runs
+	// activation and keeps that seam's behaviour intact.
 	if config.Observer == nil && activation.activationWouldChangeNothing(models) {
 		if err := activationConn.Close(); err != nil {
 			return nil, fmt.Errorf("return borrowed activation connection: %w", err)
@@ -673,9 +675,10 @@ func openFileBacked(target openTarget, existingJournal bool, models []ptypes.Mod
 	}
 	if err == nil {
 		// The read-only preflight above already validated an existing store; the
-		// probe decides whether activation could still change anything. A current
-		// file skips the write transaction entirely (no write lock), while a
-		// non-current file keeps today's activation byte-for-byte.
+		// probe decides whether activation could still change anything. A current,
+		// converged file skips the write transaction entirely (no write lock),
+		// while a non-current or diverged file keeps today's activation
+		// byte-for-byte (and is refused there exactly as before).
 		if !activation.activationWouldChangeNothing(models) {
 			// A file-backed open contends with any other process holding this path's
 			// write lock, so it shares the borrowed path's bounded activation budget.
