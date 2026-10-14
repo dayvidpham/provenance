@@ -2,6 +2,41 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.5.3 - 2026-10-14
+
+### Changed
+
+- The open path is O(1) for a store that has not changed since it was last
+  verified. A durable **verified-as-of ledger** records, in one row, the store
+  generation, the journal tail identity, the digest of the covered-table presence
+  set it was written under, and the shape id of this build's closed schema
+  contract, and it is written in the same transaction as the verification that
+  makes it true: at the end of activation, or under the currency probe's
+  compare-and-set when those checks run on an already-active store. Opening reads
+  it in O(1) and skips `VerifyIntegrity` and `ReplayProjections` only while it
+  still describes the store as it stands; the structural half of the currency
+  probe, including the journal-spine shape and per-table change-trigger coverage,
+  always runs, so DDL damage is still refused on the fast path. Every covered
+  table carries one write trigger per DML verb, and each trigger advances the
+  store generation, so any write — a projection edit, a migration, an out-of-band
+  update by another tool — or any crash between a write and its ledger update
+  falls back to the full path, never to a skip. Trigger creation covers only the
+  covered tables that exist and this step creates no table it does not own; a
+  covered table that appears or disappears afterwards is caught by the recorded
+  covered-table presence digest, because DDL fires no change trigger. A ledger
+  that is absent, unreadable, of an older version, or mismatched takes the
+  unchanged full path. Measured on a 30 MiB store (46,966 journal rows, 23,482
+  tasks): a borrowed open fell from 5.56 s to 2.2 ms, and the file-backed `Open`
+  from 16.7 s to 0.35 s. A store's first open after a write still runs the full
+  checks.
+
+### Compatibility
+
+- Additive only: no breaking changes to the public API or the domain schema. Two
+  internal bookkeeping tables (`provenance_store_generation`,
+  `provenance_verified_store`) and one change trigger per covered table are added
+  on activation; no existing table, column, or row is altered.
+
 ## v0.5.2 - 2026-10-14
 
 ### Fixed
