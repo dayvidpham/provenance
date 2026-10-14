@@ -133,6 +133,13 @@ const (
 // store write lock. It is deliberately conservative: any read failure, missing
 // object, or unexpected state reports false, so the caller falls back to the full
 // activation, which then writes what is missing or surfaces the canonical error.
+//
+// "Exactly what activation would produce" is NOT only structural: activation also
+// verifies whole-journal integrity and refuses a store whose stored projections
+// disagree with a from-empty re-derivation of the folded journal. The probe runs
+// those same read-only checks (activationReadOnlyChecksPass) so it is at least as
+// strict as activation — a store activation would refuse is never served as
+// "current" with the damage untouched.
 func (scope *connScope) activationWouldChangeNothing(models []ptypes.ModelEntry) bool {
 	checks := []func() (bool, error){
 		scope.activationSchemaObjectsCurrent,
@@ -141,6 +148,10 @@ func (scope *connScope) activationWouldChangeNothing(models []ptypes.ModelEntry)
 		scope.activationFactContextSchemaCurrent,
 		func() (bool, error) { return scope.activationReferenceSeedsCurrent() },
 		func() (bool, error) { return scope.activationMLModelsCurrent(models) },
+		// Last, and only reached by a structurally-current store: this is the
+		// most expensive probe and the one activation's own convergence
+		// comparison lives in.
+		scope.activationReadOnlyChecksPass,
 	}
 	for _, check := range checks {
 		current, err := check()
@@ -149,6 +160,35 @@ func (scope *connScope) activationWouldChangeNothing(models []ptypes.ModelEntry)
 		}
 	}
 	return true
+}
+
+// activationReadOnlyChecksPass runs the read-only half of activation's own
+// transaction — verifyIntegrity then replayProjections, in the same order
+// activateSchema runs them — and reports whether both would pass. Activation
+// refuses a store whose whole-journal integrity check fails closed or whose
+// stored projections diverge from a from-empty re-derivation of the folded
+// journal (an out-of-range phase, an owner that disagrees with the folded
+// journal); the currency probe must be at least as strict, or the skip would
+// serve exactly the damage activation refuses.
+//
+// It reuses activation's own checks rather than a parallel convergence notion, so
+// the two can never drift. Both are read-only with respect to the main database:
+// the read-only startup preflight already runs this same pair on a `mode=ro`
+// connection, and the replay derives into connection-scoped TEMP tables, so this
+// takes no store write lock and a genuinely current store still skips activation
+// without one.
+//
+// Any failure — divergence, damaged journal, or an unreadable store — reports
+// not-current. The activation path then re-runs the same checks inside its write
+// transaction and surfaces the canonical error, so nothing is masked.
+func (scope *connScope) activationReadOnlyChecksPass() (bool, error) {
+	if err := scope.verifyIntegrity(); err != nil {
+		return false, nil
+	}
+	if _, err := scope.replayProjections(); err != nil {
+		return false, nil
+	}
+	return true, nil
 }
 
 // activationSchemaObjectsCurrent verifies every object activation creates exists
