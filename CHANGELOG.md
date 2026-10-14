@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased
+## v0.5.1 - 2026-10-14
 
 ### Added
 
@@ -11,6 +11,20 @@ All notable changes to this project will be documented in this file.
   implementations and registration signatures remain source-compatible.
 - Registration propagates cancellation through pool acquisition and one SQLite
   lock attempt; see [context-aware registration](docs/software-agent-registration.md).
+
+### Fixed
+
+- Opening an already-current store no longer enters activation's write
+  transaction. A strictly read-only currency probe first compares the live store
+  against a freshly activated empty store — every schema object (with its exact
+  DDL text) and every closed reference-lookup row must match, plus activation's
+  own `ml_models` currency rule — and then re-runs activation's read-only
+  integrity and projection-convergence probes, so a store that is not current
+  still falls through to activation and reports the identical error. Under a busy
+  host, concurrent short-lived processes (lifecycle hooks) previously took
+  `BEGIN IMMEDIATE` on every open even when the schema was already current, and
+  starved the shared SQLite store: a blocking hook burned its full deadline and a
+  plain read burned the whole activation budget.
 
 ## v0.5.0 - 2026-10-12
 
