@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.6.2 - 2026-10-14
+
+### Fixed
+
+- The read-only currency fast path now runs activation's own convergence
+  checks. It previously proved only *structural* currency — schema objects,
+  closed reference lookups, `ml_models` — so a structurally-current store
+  carrying projection damage could skip activation and be **served with the
+  damage**: an out-of-range `tasks.phase_id` or an owner projection that
+  disagreed with the folded journal was no longer refused at open. The probe
+  now runs `verifyIntegrity` and `replayProjections` — the same functions, in
+  the same order, that activation runs — and treats any error as **not
+  current**, so a damaged store still falls through to the unchanged
+  activation path and reports the identical error. A converged store still
+  takes no write lock.
+
 ## v0.6.1 - 2026-10-14
 
 ### Added
