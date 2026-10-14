@@ -150,6 +150,59 @@ jobs:
       - name: ast-grep scan
         run: ast-grep scan --config sgconfig.yml --globs '!vendor/**' --globs '!worktree/**' .
 
+  consumer-oracle:
+    # The store-layer gate that used to live only in the consumer.
+    #
+    # Provenance v0.6.1 shipped a hole where the schema-currency fast path
+    # stopped running activation's convergence checks, so a structurally-current
+    # store carrying projection damage OPENED SUCCESSFULLY instead of being
+    # refused. This repo's CI was green throughout; what caught it was Pasture's
+    # cmd/pasture reader suite, whose
+    # TestReaderIntegrityRowsAreHandlerOnlyBecauseTheStoreRefusesTheDamage
+    # requires the open-time replay convergence check to refuse the damage
+    # before any gate read runs.
+    #
+    # This job runs that consumer oracle, unchanged, against the revision under
+    # test. It is a real cross-repo check: Pasture's fixture recipe, Pasture's
+    # assertions, Pasture's production open path. See
+    # .github/consumer-oracle/run.sh for the pin, the single documented
+    # compatibility adaptation, and what this gate cannot catch.
+    #
+    # Cost: a shallow fetch of the pinned consumer plus a cold build of
+    # cmd/pasture's test binary (whose TestMain also builds the CLI). Measured
+    # here: ~15 s warm-cached and ~30 s cold-cache on a many-core workstation,
+    # so budget roughly 1-3 min cold on a 2-vCPU runner. The module and build
+    # caches are restored below, and this job runs alongside build/race/lint
+    # rather than ahead of them. The timeout only guards against a hang.
+    name: Consumer Oracle (pinned Pasture)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: "1.26"
+          cache: true
+          # The consumer's module and build caches land in the same directories,
+          # so this cache covers them too. Keying on go.sum and on the runner
+          # script (which owns the consumer pin) means a pin bump re-downloads
+          # deliberately instead of reusing a cache saved for another revision.
+          cache-dependency-path: |
+            go.sum
+            .github/consumer-oracle/run.sh
+
+      # The consumer test binary needs a C toolchain (runtime/cgo is in the
+      # build graph of Pasture's SQLite stack). ubuntu-latest already ships gcc;
+      # this makes that dependency explicit rather than incidental.
+      - name: Verify the C toolchain the consumer build needs
+        run: gcc --version
+
+      - name: Run the pinned Pasture reader oracle against this checkout
+        run: bash .github/consumer-oracle/run.sh
+
 # `nix flake check` (which additionally builds the package derivation and
 # runs the same gates through the pinned nixpkgs toolchain) is intentionally
 # NOT wired into CI yet — it stays a local/manual gate until a nix job is
