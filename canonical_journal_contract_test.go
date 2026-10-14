@@ -721,6 +721,19 @@ func TestCanonicalSchemaMigrationAndMixedLegacyRowsAreIdempotent(t *testing.T) {
 	if err = tracker.Close(); err != nil {
 		t.Fatal(err)
 	}
+	// The mixed-new operation above committed after the open that persisted the
+	// verified-as-of ledger, so the next open re-verifies the store and
+	// re-persists the ledger row (open_verified.go): that row is the open path's
+	// only write, and it happens once per store change. Baseline after it, so the
+	// loop below is still the claim it was written for — reopening a schema that
+	// needs no migration rewrites nothing.
+	tracker, err = OpenSQLite(path)
+	if err != nil {
+		t.Fatalf("reopen to establish the verified-as-of ledger: %v", err)
+	}
+	if err = tracker.Close(); err != nil {
+		t.Fatal(err)
+	}
 	stable, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)

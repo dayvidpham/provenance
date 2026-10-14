@@ -516,6 +516,14 @@ func TestActivationCurrencyMatchesFreshActivation(t *testing.T) {
 	for _, object := range expectedActivationObjects {
 		want[object.kind+"\x00"+object.name] = struct{}{}
 	}
+	// activation's last step installs the verified-as-of ledger: one change
+	// trigger per covered table, named from the same closed set the coverage
+	// check reads (open_verified.go).
+	for _, table := range verifiedCoveredTableNames {
+		for _, trigger := range verifiedTriggerNamesFor(table) {
+			want["trigger\x00"+trigger] = struct{}{}
+		}
+	}
 	for key := range want {
 		if _, ok := actual[key]; !ok {
 			t.Errorf("expectedActivationObjects lists %q but activation did not create it; update activation_currency.go", key)

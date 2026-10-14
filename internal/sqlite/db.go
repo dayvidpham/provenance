@@ -166,6 +166,11 @@ type connScope struct {
 	cleanupCtx       context.Context
 	cleanupCancel    context.CancelFunc
 	activationPath   string
+	// ephemeralStore marks a store that does not outlive this open — a
+	// process-unique in-memory database. Activation skips the verified-as-of
+	// ledger there (open_verified.go): there is no earlier verification for a
+	// store that is re-created on every open.
+	ephemeralStore bool
 }
 
 // BorrowedActivationConfig applies only while opening a borrowed store. Zero
@@ -410,12 +415,15 @@ func OpenBorrowedContext(ctx context.Context, runtime *sql.DB, models []ptypes.M
 	// A store whose schema, closed lookups, and version markers already match
 	// this build needs no activation: beginning the write transaction here would
 	// write nothing while starving every concurrent open of the same file of the
-	// write lock. The probe behind activationWouldChangeNothing is read-only (no
-	// DDL, no write pragmas, no write lock), at least as strict as activation (it
-	// also runs activation's own integrity and replay-convergence checks), and
-	// conservative, so a non-current or diverged store still reaches the full
-	// activation below unchanged and is refused there. An installed observer is an
-	// explicit request to watch the activation lifecycle, so it always runs
+	// write lock. The probe behind activationWouldChangeNothing is read-only in
+	// its structural half and at least as strict as activation — it also runs
+	// activation's own integrity and replay-convergence checks, or skips them only
+	// when the durable verified-as-of ledger (open_verified.go) proves the store
+	// has not changed since the last time both passed. Its one write, on the path
+	// that had to run those checks, is the ledger row a single bounded write
+	// transaction commits. Any non-current or diverged store still reaches the
+	// full activation below unchanged and is refused there. An installed observer
+	// is an explicit request to watch the activation lifecycle, so it always runs
 	// activation and keeps that seam's behaviour intact.
 	if config.Observer == nil && activation.activationWouldChangeNothing(models) {
 		if err := activationConn.Close(); err != nil {
@@ -643,6 +651,12 @@ func openInMemory(target openTarget, models []ptypes.ModelEntry) (*DB, error) {
 		return nil, fmt.Errorf("lease in-memory activation connection %q: %w", target.display, err)
 	}
 	activation := borrowConnScope(activationConn, projectionTargetLive)
+	// A process-unique memory database never outlives the open that created it, so
+	// there is no earlier verification for the verified-as-of ledger to accelerate
+	// and activation does not create it here (open_verified.go). That keeps the
+	// in-memory activation path at its previous cost instead of spending it on a
+	// per-table trigger set nothing can ever read.
+	activation.ephemeralStore = true
 	// A process-unique memory database has no other writer, so there is nothing to
 	// wait for beyond the single attempt's own busy timeout.
 	if err := activateSchema(activation, models, defaultActivationRetryPolicy()); err != nil {
@@ -923,6 +937,12 @@ func activateSchema(scope *connScope, models []ptypes.ModelEntry, policy activat
 		}
 		if _, err := scope.replayProjections(); err != nil {
 			return fmt.Errorf("journal replay: %w", err)
+		}
+		// The ledger is written in THIS transaction, after the same verification
+		// activation just ran, so the durable "verified as of" record and the
+		// writes that make it true commit or roll back together.
+		if err := scope.writeVerifiedLedger(); err != nil {
+			return err
 		}
 		return nil
 	}
@@ -1730,7 +1750,14 @@ func (scope *connScope) ensureSchema(models []ptypes.ModelEntry) error {
 	if err := scope.ensureJournalSchema(); err != nil {
 		return err
 	}
-	return scope.ensureOperationsSchema()
+	if err := scope.ensureOperationsSchema(); err != nil {
+		return err
+	}
+	// Last, after every table rebuild above: the verified-as-of ledger and its
+	// per-table change triggers. Creating them here means a rebuild that dropped a
+	// covered table has already finished, so coverage is complete when this
+	// returns.
+	return scope.ensureVerifiedLedgerSchema()
 }
 
 // Seed data ------------------------------------------------------------------
@@ -2041,6 +2068,12 @@ func preflightExistingReadOnly(target openTarget, models []ptypes.ModelEntry) (b
 	if err != nil {
 		return existing, err
 	}
+	// ledgerCurrent records that the durable verified-as-of ledger still describes
+	// this store, which is what lets the whole-store integrity and replay checks
+	// below (and the isolated activation clone that re-runs them on a copy) be
+	// skipped. It is set only after the structural checks that precede it pass, and
+	// a read error leaves it false: the slow path is always the safe default.
+	ledgerCurrent := false
 	if existing {
 		contextSchema, err := preflight.classifyFactContextSchema()
 		if err != nil {
@@ -2049,24 +2082,54 @@ func preflightExistingReadOnly(target openTarget, models []ptypes.ModelEntry) (b
 		if err := preflight.preflightCanonicalColumnsReadOnly(); err != nil {
 			return true, err
 		}
-		if contextSchema == factContextSchemaLegacy {
-			if err := preflight.verifyIntegrityReadOnlyLegacyCompatible(); err != nil {
+		if contextSchema != factContextSchemaLegacy {
+			// The journal-spine shape preflight is reachable today through
+			// replayProjections below; run it first so the ledger skip cannot be
+			// taken over a spine whose column set moved out of band.
+			if err := preflight.preflightSchema(); err != nil {
 				return true, err
 			}
-			if _, err := preflight.replayProjectionsReadOnlyLegacyCompatible(); err != nil {
-				return true, err
+			if current, err := preflight.verifiedLedgerCurrent(); err == nil {
+				ledgerCurrent = current
 			}
-		} else {
-			if err := preflight.verifyIntegrity(); err != nil {
-				return true, err
+			// A current ledger alone does not prove the schema is one activation
+			// would accept: the isolated clone below stays the gate for a schema
+			// whose object names collide, so the clone may be skipped only for a
+			// schema that is exactly this build's object set.
+			if ledgerCurrent {
+				if pristine, err := preflight.activationSchemaIsPristine(); err != nil || !pristine {
+					ledgerCurrent = false
+				}
 			}
-			if _, err := preflight.replayProjections(); err != nil {
-				return true, err
+		}
+		if !ledgerCurrent {
+			if contextSchema == factContextSchemaLegacy {
+				if err := preflight.verifyIntegrityReadOnlyLegacyCompatible(); err != nil {
+					return true, err
+				}
+				if _, err := preflight.replayProjectionsReadOnlyLegacyCompatible(); err != nil {
+					return true, err
+				}
+			} else {
+				if err := preflight.verifyIntegrity(); err != nil {
+					return true, err
+				}
+				if _, err := preflight.replayProjections(); err != nil {
+					return true, err
+				}
 			}
 		}
 	}
-	if err := preflightActivationClone(conn, models); err != nil {
-		return existing, err
+	// The isolated activation clone exists to prove activation would accept this
+	// store without writing it: it copies the database and runs activation on the
+	// copy. A current verified-as-of ledger proves the same thing more cheaply —
+	// this store is already what activation produces, nothing covered has moved
+	// since both checks passed, and activation would write nothing — so the copy
+	// is skipped. Any store that is not provably current still takes it.
+	if !ledgerCurrent {
+		if err := preflightActivationClone(conn, models); err != nil {
+			return existing, err
+		}
 	}
 	return existing, nil
 }
