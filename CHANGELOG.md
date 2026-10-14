@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Changed
+
+- The open path is O(1) for a store that has not changed since it was last
+  verified. A durable **verified-as-of ledger** records, in one row, the store
+  generation, the journal tail identity, and the shape id of this build's closed
+  schema contract, and it is written in the same transaction as the verification
+  that makes it true (activation, or the currency probe's post-verification
+  compare-and-set). Opening reads it in O(1) and skips `VerifyIntegrity` and
+  `ReplayProjections` only while it still describes the store as it stands; the
+  structural half of the currency probe, including the journal-spine shape and
+  per-table change-trigger coverage, always runs, so DDL damage is still refused
+  on the fast path. Every change to a table this package's schema owns advances
+  the generation through a write trigger, so any write — a projection edit, a
+  migration, an out-of-band update by another tool — or any crash between a
+  write and its ledger update falls back to the full path, never to a skip.
+  Measured on a 30 MiB store (46,966 journal rows, 23,482 tasks): a borrowed
+  open fell from 5.56 s to 2.2 ms, and the file-backed `Open` from 16.7 s to
+  0.35 s. A store's first open after a write still runs the full checks.
+
 ## v0.6.2 - 2026-10-14
 
 ### Fixed

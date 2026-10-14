@@ -198,6 +198,47 @@ per-attempt wait is still `busy_timeout`, because `BEGIN IMMEDIATE` holds the
 write lock across the integrity and replay probes; see
 [TESTING.md](../TESTING.md), "Waiting and retries".
 
+### Verified-as-of ledger
+
+Whole-store verification — `VerifyIntegrity` plus `ReplayProjections` — is
+O(journal), and on a large store it costs seconds, which is longer than a host
+lifecycle hook's whole invocation deadline. A store that has not changed since it
+was last verified must not pay for it again, so `internal/sqlite` keeps a durable
+**verified-as-of ledger**: a singleton row recording the store generation, the
+journal tail identity (the highest `journal_id` and a digest of that row), and the
+shape id of this build's closed schema contract (the expected activation objects,
+the covered-table trigger set, the seed definitions, and the identity format).
+
+The ledger is written where the state it describes is made true, in the same
+transaction: at the end of activation's write transaction, after activation's own
+integrity and replay checks, and — when the currency probe runs those checks on an
+already-active store — under a compare-and-set inside `BEGIN IMMEDIATE` that
+refuses to record a store which moved while the read-only checks ran.
+
+Opening reads the ledger in O(1) — one row, one `INTEGER PRIMARY KEY` maximum, one
+row by primary key — and skips `VerifyIntegrity` and `ReplayProjections` only while
+it still describes the store as it stands. That skip takes no write lock. Every
+table this package's schema owns carries one write trigger per DML verb, and each
+trigger advances the store generation, so any write at all — a projection edit, a
+migration, an out-of-band update by another tool — makes the ledger stale and
+sends the next open down the full path. A crash between a write and its ledger
+update leaves the generation ahead of the ledger, which is the same mismatch, and
+never a skip. The structural half of the currency probe, including the
+journal-spine shape preflight and the trigger-coverage check, always runs, so DDL
+damage is refused on the fast path exactly as before.
+
+A store whose ledger is absent, unreadable, of another build's shape, or
+mismatched takes the unchanged full path, and its ledger is re-persisted only
+after those checks pass — one row in a bounded write transaction, which is the
+open path's only write, and only when the row does not already record exactly the
+state the checks just covered, so an open of a store whose activation changes
+nothing still rewrites nothing.
+
+The two immutable fact-context relations stay static foreign-key relations with
+no triggers of their own beyond the ledger's, whose bodies only advance the
+generation; any other trigger on them is still refused by the fact-context shape
+classifier.
+
 ## Dependency Graph
 
 `internal/graph` adapts SQLite task and edge storage to
