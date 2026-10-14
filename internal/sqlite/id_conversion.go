@@ -44,7 +44,6 @@ const (
 	identityEdgeTarget
 	identityAttributionTask
 	identityAttributionActor
-	identityNamespaceClaimant
 	identityManifestActor
 	identityJournalActor
 	identityJournalActivity
@@ -93,8 +92,6 @@ func (field identityColumnSQL) readSQL() string {
 		return `SELECT DISTINCT "task_id" FROM "task_attributions" WHERE "task_id" IS NOT NULL`
 	case identityAttributionActor:
 		return `SELECT DISTINCT "actor_id" FROM "task_attributions" WHERE "actor_id" IS NOT NULL`
-	case identityNamespaceClaimant:
-		return `SELECT DISTINCT "claimant_id" FROM "actor_namespace_claims" WHERE "claimant_id" IS NOT NULL`
 	case identityManifestActor:
 		return `SELECT DISTINCT "actor_id" FROM "fixed_actor_manifest_entries" WHERE "actor_id" IS NOT NULL`
 	case identityJournalActor:
@@ -158,8 +155,6 @@ func (field identityColumnSQL) updateSQL() string {
 		return `UPDATE "task_attributions" SET "task_id"=? WHERE "task_id"=?`
 	case identityAttributionActor:
 		return `UPDATE "task_attributions" SET "actor_id"=? WHERE "actor_id"=?`
-	case identityNamespaceClaimant:
-		return `UPDATE "actor_namespace_claims" SET "claimant_id"=? WHERE "claimant_id"=?`
 	case identityManifestActor:
 		return `UPDATE "fixed_actor_manifest_entries" SET "actor_id"=? WHERE "actor_id"=?`
 	case identityJournalActor:
@@ -202,18 +197,131 @@ func (field identityColumnSQL) updateContextSQL() string {
 	}
 }
 
+// identityDeclarationKind records where an owned identity column's typing comes
+// from. Membership is a citation of an owning declaration, never an inference
+// from a column's name.
+type identityDeclarationKind uint8
+
+const (
+	// identityFromRelationKey is a relation's own declared identity key. The
+	// owner codec parses it into a structured identity type; other relations may
+	// reference it, but it is not itself a foreign key.
+	identityFromRelationKey identityDeclarationKind = iota + 1
+	// identityFromForeignKey is a reference into an identity-keyed relation,
+	// declared by a real SQLite foreign key.
+	identityFromForeignKey
+	// identityFromModelType is a codec-parsed structured identity field the model
+	// types without a SQLite foreign key, so the schema cannot declare it.
+	identityFromModelType
+)
+
+// identityDeclaration is the owning declaration that admits a column to the set.
+// Conversion parses the column's value, so every member must carry one.
+type identityDeclaration struct {
+	kind identityDeclarationKind
+	// reference is the FK target ("table.column") for identityFromForeignKey.
+	reference string
+	// ownerType names the owning codec for identityFromRelationKey and
+	// identityFromModelType: the ptypes identity type, or the journal encoder for
+	// a structured context identity.
+	ownerType string
+}
+
+func identityRelationKey(ownerType string) identityDeclaration {
+	return identityDeclaration{kind: identityFromRelationKey, ownerType: ownerType}
+}
+func identityReference(reference string) identityDeclaration {
+	return identityDeclaration{kind: identityFromForeignKey, reference: reference}
+}
+func identityModelType(ownerType string) identityDeclaration {
+	return identityDeclaration{kind: identityFromModelType, ownerType: ownerType}
+}
+
 type identityColumn struct {
 	table, column string
 	selector      identityColumnSQL
+	declaration   identityDeclaration
 }
 
+// The classification rule for this set:
+//
+//	IN  an owner-declared identity type — a foreign key into an identity-keyed
+//	    relation, or a codec-parsed structured identity field.
+//	OUT an opaque, equality-only label preserved byte-exact whatever its bytes.
+//
+// A column is IN only through its declaration above; a name that merely looks
+// identity-shaped is not a declaration. actor_namespace_claims.claimant_id is the
+// motivating OUT case: the contract calls it an opaque claimant identity and its
+// DDL is TEXT NOT NULL with no foreign key, unlike its FK-typed neighbours
+// (journal.actor_id, fixed_actor_manifest_entries.actor_id → agents.id). Readers
+// compare it for equality only, and the writer stores a bare namespace string, so
+// parsing it would refuse every store a real writer produces. It is recorded in
+// preservedOpaqueColumns below, and the two-way drift gate in
+// id_conversion_identity_declaration_test.go keeps both sides complete.
 var ownedIdentityColumns = []identityColumn{
-	{"tasks", "id", identityTaskID}, {"tasks", "owner_id", identityTaskOwner}, {"agents", "id", identityAgentID}, {"agents_human", "agent_id", identityHumanAgent}, {"agents_ml", "agent_id", identityMLAgent}, {"agents_software", "agent_id", identitySoftwareAgent},
-	{"activities", "id", identityActivityID}, {"activities", "agent_id", identityActivityAgent}, {"comments", "id", identityCommentID}, {"comments", "task_id", identityCommentTask}, {"comments", "author_id", identityCommentAuthor}, {"labels", "task_id", identityLabelTask},
-	{"edges", "source_id", identityEdgeSource}, {"edges", "target_id", identityEdgeTarget}, {"task_attributions", "task_id", identityAttributionTask}, {"task_attributions", "actor_id", identityAttributionActor},
-	{"actor_namespace_claims", "claimant_id", identityNamespaceClaimant}, {"fixed_actor_manifest_entries", "actor_id", identityManifestActor}, {"journal", "actor_id", identityJournalActor},
-	{"journal_activity_creations", "activity_id", identityJournalActivity}, {"journal_authority_assignment_episodes", "task_id", identityAssignmentTask}, {"journal_authority_assignment_episodes", "actor_id", identityAssignmentActor},
-	{"journal_decisions", "task_id", identityDecisionTask}, {"journal_evidence", "task_id", identityEvidenceTask}, {"journal_task_events", "task_id", identityEventTask}, {"governed_allocation_operations", "actor_id", identityAllocationActor},
+	{"tasks", "id", identityTaskID, identityRelationKey("ptypes.TaskID")},
+	{"tasks", "owner_id", identityTaskOwner, identityReference("agents.id")},
+	{"agents", "id", identityAgentID, identityRelationKey("ptypes.ActorID")},
+	{"agents_human", "agent_id", identityHumanAgent, identityReference("agents.id")},
+	{"agents_ml", "agent_id", identityMLAgent, identityReference("agents.id")},
+	{"agents_software", "agent_id", identitySoftwareAgent, identityReference("agents.id")},
+	{"activities", "id", identityActivityID, identityRelationKey("ptypes.ActivityID")},
+	{"activities", "agent_id", identityActivityAgent, identityReference("agents.id")},
+	{"comments", "id", identityCommentID, identityRelationKey("ptypes.CommentID")},
+	{"comments", "task_id", identityCommentTask, identityReference("tasks.id")},
+	{"comments", "author_id", identityCommentAuthor, identityReference("agents.id")},
+	{"labels", "task_id", identityLabelTask, identityReference("tasks.id")},
+	{"edges", "source_id", identityEdgeSource, identityReference("tasks.id")},
+	{"edges", "target_id", identityEdgeTarget, identityModelType("ptypes.TaskID")},
+	{"task_attributions", "task_id", identityAttributionTask, identityReference("tasks.id")},
+	{"task_attributions", "actor_id", identityAttributionActor, identityReference("agents.id")},
+	{"fixed_actor_manifest_entries", "actor_id", identityManifestActor, identityReference("agents.id")},
+	{"journal", "actor_id", identityJournalActor, identityReference("agents.id")},
+	{"journal_activity_creations", "activity_id", identityJournalActivity, identityReference("activities.id")},
+	{"journal_authority_assignment_episodes", "task_id", identityAssignmentTask, identityReference("tasks.id")},
+	{"journal_authority_assignment_episodes", "actor_id", identityAssignmentActor, identityReference("agents.id")},
+	{"journal_decisions", "task_id", identityDecisionTask, identityReference("tasks.id")},
+	{"journal_evidence", "task_id", identityEvidenceTask, identityReference("tasks.id")},
+	{"journal_task_events", "task_id", identityEventTask, identityReference("tasks.id")},
+	{"governed_allocation_operations", "actor_id", identityAllocationActor, identityReference("agents.id")},
+}
+
+// ownedContextIdentityColumns is the declared membership for the kind/identity
+// context relations. Each row stores a context kind beside its identity; the
+// identity converts only under a kind the owner codec parses (task, actor,
+// activity) and is preserved byte-exact otherwise, so the declaration cites the
+// owner codec rather than a foreign key.
+var ownedContextIdentityColumns = []identityColumn{
+	{"journal_decision_contexts", "context_identity", identityDecisionContext, identityModelType("journal encoded event-context identity")},
+	{"journal_evidence_contexts", "context_identity", identityEvidenceContext, identityModelType("journal encoded event-context identity")},
+	{"journal_task_event_contexts", "context_identity", identityEventContext, identityModelType("journal encoded event-context identity")},
+}
+
+// preservedOpaqueColumn records a *_id-named TEXT column this package
+// deliberately keeps OUT of the owned identity set: an opaque, equality-only
+// label that conversion must preserve byte-exact and never parse. Its reason is
+// the recorded judgment the drift gate requires, so the OUT side of the
+// classification is explicit rather than an omission.
+type preservedOpaqueColumn struct {
+	table, column, reason string
+}
+
+// The drift gate in id_conversion_identity_declaration_test.go fails on any
+// *_id-named TEXT column in neither set, so a new column is red by default: it
+// must be declared an owned identity or recorded here on purpose.
+var preservedOpaqueColumns = []preservedOpaqueColumn{
+	{"actor_namespace_claims", "claimant_id", "opaque claimant label; contract §7.1 example is the bare namespace; equality-only (activation and manifest readers), no FK, stored verbatim"},
+	{"journal_operations", "operation_id", "opaque operation handle supplied by the caller; never an identity, never converted"},
+	{"journal_operation_result_slots", "result_slot_id", "opaque caller-named result slot; equality-only lookup key"},
+	{"journal_authorities", "operation_authority_id", "opaque authority handle; the canonical receipt binds it verbatim"},
+	{"journal_authority_assignment_episodes", "assignment_id", "opaque assignment handle; the released writer emits non-identity strings"},
+	{"journal_authority_assignment_episodes", "predecessor_assignment_id", "opaque assignment handle; equality-only chain link"},
+	{"journal_authority_assignment_episodes", "parent_assignment_id", "opaque assignment handle; equality-only chain link"},
+	{"journal_authority_assignment_transitions", "assignment_id", "opaque assignment handle; equality-only reference"},
+	{"governed_allocation_operations", "operation_id", "opaque operation handle; equality-only receipt key"},
+	{"governed_allocation_genesis", "operation_id", "opaque operation handle; equality-only reference"},
+	{"governed_composed_supplement_owners", "supplement_operation_id", "opaque operation handle; equality-only supplement key"},
+	{"governed_composed_supplement_owners", "governed_operation_id", "opaque operation handle; equality-only reference"},
 }
 
 type identityChange struct {
@@ -293,11 +401,7 @@ func ConvertIDsInTx(ctx context.Context, tx *sql.Tx, options IDConversionOptions
 			return report, err
 		}
 	}
-	for _, field := range []identityColumn{
-		{"journal_decision_contexts", "context_identity", identityDecisionContext},
-		{"journal_evidence_contexts", "context_identity", identityEvidenceContext},
-		{"journal_task_event_contexts", "context_identity", identityEventContext},
-	} {
+	for _, field := range ownedContextIdentityColumns {
 		table := field.table
 		var exists bool
 		if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?)", table).Scan(&exists); err != nil {

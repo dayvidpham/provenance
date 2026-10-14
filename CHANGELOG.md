@@ -2,10 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased
+## v0.8.1 - 2026-10-14
 
 ### Fixed
 
+- `actor_namespace_claims.claimant_id` is no longer classified as an owned
+  identity. The contract calls it an opaque claimant identity and its DDL is
+  `TEXT NOT NULL` with no foreign key, unlike its FK-typed neighbours
+  (`journal.actor_id`, `fixed_actor_manifest_entries.actor_id` → `agents.id`);
+  readers compare it for equality only, and the writer stores a bare namespace
+  string. The conversion preflight parsed it as an owned identity anyway, so the
+  live store's `"pasture-system"` claim was refused with `ID conversion preflight
+  actor_namespace_claims.claimant_id key "pasture-system"`, and because every
+  old-writer archive carries the same bare label there was no documented
+  recovery. The column is now preserved byte-exact: the ordinary fenced cutover
+  converts such a store with the claim row unchanged, and **no operator repair
+  was needed or added** — no row rewrite, no deletion, no literal special-case,
+  no parser tolerance. A malformed value in a true identity column still refuses
+  exactly as before.
+- The owned identity set is now a declared membership. Every member cites an
+  owning declaration — a foreign key into an identity-keyed relation, or a
+  codec-parsed structured identity field — and a two-way schema drift gate fails
+  when a member has no declaration, when a declared identity reference is missing
+  from the set, or when a `*_id`-named `TEXT` column is in neither the owned set
+  nor the recorded preserved-opaque set. A new such column is therefore red by
+  default rather than silently inherited.
 - The verified-as-of ledger no longer fails schema completion on a legacy store
   that legitimately does not carry every table the ledger watches.
   `EnsureSchemaInTx` runs activation's schema step inside the URI cutover's own
