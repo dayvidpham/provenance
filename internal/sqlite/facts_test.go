@@ -903,10 +903,22 @@ func TestFactQueryCorruptionFailsClosedWithoutChangingSQLiteArtifacts(t *testing
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close corrupted fixture: %v", err)
 	}
-	before := sqliteArtifactBytes(t, path)
 	db, err = Open(path, nil)
 	if err != nil {
 		t.Fatalf("reopen corrupted fixture: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close reopened corrupted fixture: %v", err)
+	}
+	// Baseline here, after the reopen re-verified the store and re-persisted the
+	// verified-as-of ledger (open_verified.go) and then closed it again. The next
+	// open is the read-only fast path — the ledger now describes the store as it
+	// stands — so the artifacts below isolate exactly what this test pins: the
+	// corrupt READ writes nothing.
+	before := sqliteArtifactBytes(t, path)
+	db, err = Open(path, nil)
+	if err != nil {
+		t.Fatalf("reopen corrupted fixture for the corrupt read: %v", err)
 	}
 
 	_, err = db.Facts().QueryDecisions(journal.DecisionQuery{

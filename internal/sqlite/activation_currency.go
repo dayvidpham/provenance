@@ -101,6 +101,12 @@ var expectedActivationObjects = []activationSchemaObject{
 	{"table", "governed_operation_effect_rows"},
 	{"table", "governed_allocation_genesis"},
 	{"table", "governed_composed_supplement_owners"},
+	// ensureVerifiedLedgerSchema verified-as-of ledger: the DML change counter, the
+	// verified-as-of row, and (checked separately by activationLedgerCoverageCurrent,
+	// because their names are derived rather than listed) one change trigger per
+	// covered table. See open_verified.go.
+	{"table", storeGenerationTable},
+	{"table", verifiedStoreTable},
 }
 
 // obsoleteActivationObjects are objects activation drops on every open (with IF
@@ -126,18 +132,28 @@ const (
 )
 
 // activationWouldChangeNothing reports whether this store is already exactly what
-// this build's activation would produce, so activation would write nothing. It
-// uses reads only: no DDL, no write pragmas, and no write transaction, hence no
-// store write lock. It is deliberately conservative: any read failure, missing
-// object, or unexpected state reports false, so the caller falls back to the full
+// this build's activation would produce, so activation would write nothing. Its
+// structural checks use reads only: no DDL, no write pragmas, and no write
+// transaction. It is deliberately conservative: any read failure, missing object,
+// or unexpected state reports false, so the caller falls back to the full
 // activation, which then writes what is missing or surfaces the canonical error.
 //
 // "Exactly what activation would produce" is NOT only structural: activation also
 // verifies whole-journal integrity and refuses a store whose stored projections
 // disagree with a from-empty re-derivation of the folded journal. The probe runs
-// those same read-only checks (activationReadOnlyChecksPass) so it is at least as
-// strict as activation — a store activation would refuse is never served as
-// "current" with the damage untouched.
+// those same read-only checks — [connScope.activationConvergenceVerified] — so it
+// is at least as strict as activation: a store activation would refuse is never
+// served as "current" with the damage untouched.
+//
+// The convergence check itself is skipped only when the durable verified-as-of
+// ledger proves the store has not changed since the last whole-store verification
+// (open_verified.go), and that skip takes no write lock. The structural checks
+// below always run, so DDL damage — a dropped or altered object, a spine table
+// whose columns moved, a removed change trigger — is refused on the fast path
+// exactly as it was before the ledger existed. When the checks DO have to run,
+// the probe persists the ledger for the state they covered, which is this
+// function's one write (a single row, inside its own bounded write transaction),
+// and only on the path that had to do the whole-store work anyway.
 func (scope *connScope) activationWouldChangeNothing(models []ptypes.ModelEntry) bool {
 	checks := []func() (bool, error){
 		scope.activationSchemaObjectsCurrent,
@@ -145,10 +161,17 @@ func (scope *connScope) activationWouldChangeNothing(models []ptypes.ModelEntry)
 		scope.activationFactContextSchemaCurrent,
 		func() (bool, error) { return scope.activationReferenceSeedsCurrent() },
 		func() (bool, error) { return scope.activationMLModelsCurrent(models) },
+		// Journal-spine column shapes: the one DDL change that reaches a covered
+		// table's content without advancing the generation.
+		scope.activationSpineShapeCurrent,
+		// Every covered table must still carry its change trigger, or the
+		// generation would stop tracking that table's writes.
+		scope.activationLedgerCoverageCurrent,
 		// Last, and only reached by a structurally-current store: this is the
 		// most expensive probe and the one activation's own convergence
-		// comparison lives in.
-		scope.activationReadOnlyChecksPass,
+		// comparison lives in. It is skipped outright when the verified-as-of
+		// ledger still describes the store as it stands.
+		scope.activationConvergenceVerified,
 	}
 	for _, check := range checks {
 		current, err := check()
@@ -159,33 +182,39 @@ func (scope *connScope) activationWouldChangeNothing(models []ptypes.ModelEntry)
 	return true
 }
 
-// activationReadOnlyChecksPass runs the read-only half of activation's own
-// transaction — verifyIntegrity then replayProjections, in the same order
-// activateSchema runs them — and reports whether both would pass. Activation
-// refuses a store whose whole-journal integrity check fails closed or whose
-// stored projections diverge from a from-empty re-derivation of the folded
-// journal (an out-of-range phase, an owner that disagrees with the folded
-// journal); the currency probe must be at least as strict, or the skip would
-// serve exactly the damage activation refuses.
+// activationConvergenceVerified reports whether the whole-store convergence
+// checks activation would run can be skipped or have just passed.
 //
-// It reuses activation's own checks rather than a parallel convergence notion, so
-// the two can never drift. Both are read-only with respect to the main database:
-// the read-only startup preflight already runs this same pair on a `mode=ro`
-// connection, and the replay derives into connection-scoped TEMP tables, so this
-// takes no store write lock and a genuinely current store still skips activation
-// without one.
+// Fast path: the durable verified-as-of ledger still describes the store as it
+// stands, so nothing VerifyIntegrity or ReplayProjections cover has moved since
+// the last time both passed. That read is O(1) — one ledger row, one INTEGER
+// PRIMARY KEY maximum, one row by primary key — and it takes no write lock.
 //
-// Any failure — divergence, damaged journal, or an unreadable store — reports
-// not-current. The activation path then re-runs the same checks inside its write
-// transaction and surfaces the canonical error, so nothing is masked.
-func (scope *connScope) activationReadOnlyChecksPass() (bool, error) {
+// Slow path: run the same read-only pair activation runs, in the same order, and
+// then persist the ledger for the state the checks covered. Persisting is a
+// compare-and-set inside BEGIN IMMEDIATE: if any writer committed during the
+// read-only checks the ledger is not written and this reports false, so the
+// caller takes the full activation path instead of recording a verification that
+// did not cover the committed state.
+//
+// Any failure — divergence, damaged journal, unreadable store, or a moved store —
+// reports not-current. The activation path then re-runs the same checks inside its
+// write transaction and surfaces the canonical error, so nothing is masked.
+func (scope *connScope) activationConvergenceVerified() (bool, error) {
+	if current, err := scope.verifiedLedgerCurrent(); err == nil && current {
+		return true, nil
+	}
+	before, err := scope.readVerifiedStoreIdentity()
+	if err != nil {
+		return false, nil
+	}
 	if err := scope.verifyIntegrity(); err != nil {
 		return false, nil
 	}
 	if _, err := scope.replayProjections(); err != nil {
 		return false, nil
 	}
-	return true, nil
+	return scope.persistVerifiedLedgerIfUnchanged(before), nil
 }
 
 // activationSchemaObjectsCurrent verifies every object activation creates exists

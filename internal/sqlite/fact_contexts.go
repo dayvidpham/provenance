@@ -305,11 +305,21 @@ func (scope *connScope) validateFactContextTableShape(relation factContextRelati
 	if fkCount != 1 || !fkValid {
 		return factContextIntegrityError("malformed "+relation.tableName()+" parent foreign key", "fact-context schema classification", "reference only "+relation.parentTable()+"(journal_id) from "+relation.parentColumn())
 	}
-	var triggers int
-	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT COUNT(*) FROM sqlite_master WHERE type=?1 AND tbl_name=?2", "trigger", relation.tableName()).Scan(&triggers); err != nil {
+	// The relation must stay the static subtype foreign key relation this
+	// classifier just verified, so it may carry no trigger OTHER than the
+	// verified-as-of ledger's own change triggers (open_verified.go). Those only
+	// advance the store generation and never implement the parent relationship,
+	// and they are recognised by the ledger's trigger-name prefix rather than by
+	// an exact name: a build that renames them must not leave an upgraded store
+	// permanently refused by this classifier. Any other trigger means the
+	// relation was replaced by a trigger-driven one, which is refused exactly as
+	// before.
+	var foreignTriggers int
+	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT COUNT(*) FROM sqlite_master WHERE type=?1 AND tbl_name=?2 AND name NOT LIKE ?3",
+		"trigger", relation.tableName(), verifiedTriggerPrefix+"%").Scan(&foreignTriggers); err != nil {
 		return factContextIntegrityError("could not inspect "+relation.tableName()+" triggers", "fact-context schema classification", "restore the relation without triggers: "+err.Error())
 	}
-	if triggers != 0 {
+	if foreignTriggers != 0 {
 		return factContextIntegrityError("malformed trigger on "+relation.tableName(), "fact-context schema classification", "remove the trigger and restore the static subtype foreign key relation")
 	}
 	return nil
