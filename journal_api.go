@@ -9,6 +9,7 @@ import (
 	"context"
 
 	"github.com/dayvidpham/provenance/internal/journal"
+	dbsqlite "github.com/dayvidpham/provenance/internal/sqlite"
 )
 
 // Journal identity and discriminator types.
@@ -56,6 +57,12 @@ type (
 	CanonicalMutation       = journal.CanonicalMutation
 	CanonicalMutationError  = journal.CanonicalMutationError
 	MutationEncodingVersion = journal.MutationEncodingVersion
+
+	// Batched apply surface (§9): one transaction, per-record outcomes.
+	BatchRecordOutcome = journal.BatchRecordOutcome
+	BatchRecordResult  = journal.BatchRecordResult
+	BatchResult        = journal.BatchResult
+	BatchApplyError    = journal.BatchApplyError
 
 	// Condition types (§9.5 pre-conditions).
 	FactTaskScopeKind         = journal.FactTaskScopeKind
@@ -177,6 +184,14 @@ const (
 	CommittedExact    = journal.CommittedExact
 	CommittedConflict = journal.CommittedConflict
 
+	// Per-record batch outcomes (§9).
+	BatchRecordCommitted      = journal.BatchRecordCommitted
+	BatchRecordShortCircuited = journal.BatchRecordShortCircuited
+	BatchRecordConflict       = journal.BatchRecordConflict
+	BatchRecordFailed         = journal.BatchRecordFailed
+	BatchRecordNotRecorded    = journal.BatchRecordNotRecorded
+	MaxBatchRecords           = journal.MaxBatchRecords
+
 	// Task-status projection (§8.1).
 	TaskStatusOpen       = journal.TaskStatusOpen
 	TaskStatusInProgress = journal.TaskStatusInProgress
@@ -281,6 +296,11 @@ var (
 	ErrInjectedFault               = journal.ErrInjectedFault
 	ErrDishonestMigrationTimestamp = journal.ErrDishonestMigrationTimestamp
 	ErrCanonicalMutation           = journal.ErrCanonicalMutation
+
+	// Batched-apply sentinels (§9).
+	ErrBatchApply    = journal.ErrBatchApply
+	ErrBatchEmpty    = journal.ErrBatchEmpty
+	ErrBatchTooLarge = journal.ErrBatchTooLarge
 )
 
 // Journal is the ordered global-journal surface.
@@ -308,6 +328,25 @@ type ContextJournal interface {
 	ApplyContext(ctx context.Context, in OperationInput) (CommittedResult, error)
 }
 
+// BatchJournal is the optional batched-write extension to ContextJournal.
+// ApplyBatchContext commits a bounded batch of operations in ONE SQLite
+// transaction and reports a per-record outcome for every input, preserving the
+// §9.4 idempotent-replay short-circuit, the §11 conflict classification, and the
+// per-record error taxonomy. The two store-wide integrity gates run once over
+// the transaction's final state — the transaction is their natural scope — while
+// every per-record check is unchanged. Journal and ContextJournal remain
+// unchanged so existing external implementations continue to compile; a caller
+// that needs batching type-asserts to BatchJournal, exactly as the deadline-aware
+// caller type-asserts to ContextJournal.
+type BatchJournal interface {
+	ContextJournal
+	ApplyBatchContext(ctx context.Context, inputs []OperationInput) (BatchResult, error)
+}
+
 // Journal returns the ordered global-journal surface backed by the same SQLite
 // connection as the task tracker.
 func (t *sqliteTracker) Journal() Journal { return t.db }
+
+// The concrete store implements the optional batch extension, so a consumer's
+// BatchJournal type-assertion on Tracker.Journal() succeeds.
+var _ BatchJournal = (*dbsqlite.DB)(nil)

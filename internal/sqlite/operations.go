@@ -722,12 +722,18 @@ func (scope *connScope) foldPreparedOperation(in journal.OperationInput, prepare
 
 	// Post-fold gates: subtype integrity (§10 rule 8), anchor-only actor placement
 	// (§2.1, §10 rule 5), and close-ends-assignment (§8.1 / owner_responsibility
-	// regression c).
-	if txErr = scope.verifySubtypeIntegrity(); txErr != nil {
-		return journal.CommittedResult{}, txErr
-	}
-	if txErr = scope.verifyActorPlacement(); txErr != nil {
-		return journal.CommittedResult{}, txErr
+	// regression c). The first two are STORE-WIDE invariants; the batch path
+	// defers them (options.deferStoreGates) and runs them once over the final
+	// transaction state, which is the same invariant over the same committed
+	// state at the transaction's natural scope. The close-ends-assignment gate is
+	// per-operation and always runs here.
+	if !options.deferStoreGates {
+		if txErr = scope.verifySubtypeIntegrity(); txErr != nil {
+			return journal.CommittedResult{}, txErr
+		}
+		if txErr = scope.verifyActorPlacement(); txErr != nil {
+			return journal.CommittedResult{}, txErr
+		}
 	}
 	if txErr = scope.validateClosesEndAssignments(anchorJID, in.Effects); txErr != nil {
 		return journal.CommittedResult{}, txErr
