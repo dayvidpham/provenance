@@ -499,6 +499,33 @@ func (j *borrowedJournal) ApplyContext(ctx context.Context, in OperationInput) (
 	return j.inner.Apply(in)
 }
 
+func (j *borrowedJournal) ApplyBatch(in []OperationInput) (BatchResult, error) {
+	return j.ApplyBatchContext(context.Background(), in)
+}
+
+func (j *borrowedJournal) ApplyBatchContext(ctx context.Context, in []OperationInput) (BatchResult, error) {
+	if err := j.owner.available("Journal.ApplyBatch"); err != nil {
+		return BatchResult{}, err
+	}
+	if j.owner.journalApplyFault != nil {
+		if err := j.owner.journalApplyFault(); err != nil {
+			return BatchResult{}, err
+		}
+	}
+	batch, ok := j.inner.(BatchJournal)
+	if !ok {
+		// The borrowed inner journal does not support batching. Refusing is the
+		// honest outcome: falling back to per-record Apply would silently break
+		// the one-transaction, all-or-nothing guarantee the caller asked for.
+		return BatchResult{}, fmt.Errorf(
+			"provenance: the borrowed journal's inner implementation does not support ApplyBatchContext, " +
+				"so a batch cannot be committed in one transaction — where: borrowedJournal.ApplyBatchContext; " +
+				"impact: nothing was committed; fix: use the pinned provenance store, or apply the records " +
+				"one at a time through Apply")
+	}
+	return batch.ApplyBatchContext(ctx, in)
+}
+
 func (j *borrowedJournal) LookupCommitted(op OperationID) (CommittedResult, error) {
 	if err := j.owner.available("Journal.LookupCommitted"); err != nil {
 		return CommittedResult{}, err

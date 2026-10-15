@@ -2,6 +2,67 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.9.0 - 2026-10-14
+
+### Added
+
+- **Batched apply: one transaction, many records.** The journal surface gains an
+  optional `BatchJournal` extension — `ApplyBatchContext(ctx, inputs)` (and the
+  concrete `ApplyBatch`) — that commits a bounded batch of operations in ONE
+  `BEGIN IMMEDIATE` transaction and returns a **per-record outcome** for every
+  input. Each record is folded through the SAME per-operation reducer step
+  `Apply` uses, so the §9.4 idempotent-replay short-circuit, the §11 conflict
+  classification, the per-effect authorization, the close-ends-assignment gate,
+  and the per-record error taxonomy are preserved exactly: an identical committed
+  `OperationID` reports `BatchRecordShortCircuited`, a reused `OperationID` with a
+  different identity reports `BatchRecordConflict` carrying the typed
+  `*OperationConflict`, and any other failure carries the same typed error `Apply`
+  returns. `BatchResult.Records` is aligned by index with the inputs, so a caller
+  (the daemon lifecycle write lane) maps outcomes positionally without guessing
+  and never has to report a committed record as unknown. The batch is
+  all-or-nothing: the first failing record rolls the whole transaction back, every
+  record this batch newly folded is reported `BatchRecordNotRecorded`, and a
+  short-circuited record stays `BatchRecordShortCircuited` because its earlier
+  transaction is durable. The two store-wide integrity gates
+  (`verifySubtypeIntegrity`, `verifyActorPlacement`) run once over the final
+  transaction state — their natural scope — while every per-record check is
+  unchanged, so the batch is at least as strict per record as `Apply`. An empty
+  batch is refused (`ErrBatchEmpty`); a batch larger than `MaxBatchRecords` (256)
+  is refused (`ErrBatchTooLarge`); a busy writer lock is handled by the same
+  bounded retry `Apply` uses. `Journal` and `ContextJournal` are unchanged, so
+  existing external implementations keep compiling, and the borrowed store
+  implements the extension.
+
+### Changed
+
+- Measured on a private file-backed WAL sandbox store (never the live store), on
+  a fresh store per arm so both arms commit the same 2,000 records and neither is
+  measured against a larger journal. Taken 2026-10-14 by the phase-2 implementer
+  on branch `provenance-01a13c08--feat--batch-apply-api` based on `origin/main`
+  `cabce5d` (v0.8.1), Go 1.26.1, AMD Ryzen 9 7950X3D, `GOMAXPROCS=32`. Exact
+  command (the supported race configuration, three runs, medians):
+
+      CGO_ENABLED=1 go test -race -fullpath -timeout=30m -run '^$' \
+        -bench '^BenchmarkBatchApplySerialLatency$' -benchtime=1x ./internal/sqlite/
+
+  Uninstrumented (production) configuration, one run for the shape:
+
+      CGO_ENABLED=1 go test -fullpath -timeout=30m -run '^$' \
+        -bench '^BenchmarkBatchApplySerialLatency$' -benchtime=1x ./internal/sqlite/
+
+  Serial p50 per record, 2,000 records, batch size 20:
+
+  | configuration | per-record path | batched path (B=20) | speed-up |
+  |---|---|---|---|
+  | race (median of 3) | 106.09 ms | 11.64 ms | 9.1x |
+  | uninstrumented (1 run) | 2.60 ms | 0.45 ms | 5.7x |
+
+  The per-record p50 grows with the journal because the store-wide integrity
+  gate is O(journal) per `Apply`; the batched path pays that gate once per batch,
+  which is the whole of the improvement and the reason the batch hoists it. Both
+  arms commit identical records and the batched arm is verified committed; these
+  numbers are performance observations only, never a correctness oracle.
+
 ## v0.8.1 - 2026-10-14
 
 ### Fixed
