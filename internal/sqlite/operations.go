@@ -487,6 +487,8 @@ func prepareApplyInput(in journal.OperationInput) (journal.OperationInput, journ
 // canonical operation entrypoints. foldOptions is package-private; public Apply
 // always supplies the zero value.
 func (db *DB) applyPreparedOperation(ctx context.Context, in journal.OperationInput, prepared journal.CanonicalMutation, callerMutationDigest []byte, options foldOptions) (res journal.CommittedResult, err error) {
+	ctx, timings := sqlTimingOperation(ctx, "Apply", db)
+	defer timings.flush()
 	scope, err := db.bindScope(ctx, projectionTargetLive)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -589,7 +591,9 @@ func (scope *connScope) foldOperation(in journal.OperationInput, faultHook func(
 // foldPreparedOperation owns the savepoint-based fold. Public DB.Apply calls it
 // after BEGIN IMMEDIATE acquires write ownership; foldOperation calls it after
 // canonicalizing raw input.
-func (scope *connScope) foldPreparedOperation(in journal.OperationInput, prepared journal.CanonicalMutation, callerMutationDigest []byte, options foldOptions) (journal.CommittedResult, error) {
+func (scope *connScope) foldPreparedOperation(in journal.OperationInput, prepared journal.CanonicalMutation, callerMutationDigest []byte, options foldOptions) (result journal.CommittedResult, err error) {
+	timing := sqlTimingStart(scope.ctx, "fold")
+	defer func() { timing.finish(err) }()
 	// SAVEPOINT (not BEGIN) so foldOperation composes as a nested transaction when
 	// migration folds many per-task operations inside one outer savepoint (§9.5,
 	// §13 whole-batch atomicity); standalone it behaves as an ordinary atomic

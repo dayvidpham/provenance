@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.10.1 - 2026-10-16
+
+### Fixed
+
+- Exact operation replay can reuse the durable verified-as-of proof within its
+  current SQLite transaction snapshot instead of rescanning unchanged canonical
+  operations. Canonical identity and authority checks remain unchanged. Missing,
+  stale, unreadable, or structurally incompatible proof retains the full check;
+  generation changes within a mixed batch invalidate reuse. No public API or
+  default configuration changes.
+
+### Added
+
+- Internal transaction timing instrumentation requires the `pasture_experiment`
+  build tag and explicit private sandbox/artifact environment settings. Normal
+  builds retain nil hooks and perform no artifact I/O. The experiment exclusively
+  creates a fresh private artifact, refuses existing entries and SQLite database
+  or sidecar destinations, and reports sticky output failures without changing
+  transaction results. It is not intended for live/operator stores.
+
 ## v0.10.0 - 2026-10-16
 
 ### Added

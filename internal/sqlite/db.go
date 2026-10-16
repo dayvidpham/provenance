@@ -54,14 +54,17 @@ func (result *closeResult) do(closeFunc func() error) error {
 // DB is the pooled SQLite database handle and persistence owner. It owns the
 // database/sql lifecycle only; each operation explicitly leases a connScope.
 type DB struct {
-	db           *sql.DB
-	ownsPool     bool
-	foreignKeys  foreignKeyDiscipline
-	lifecycleMu  sync.Mutex
-	closed       bool
-	activeScopes sync.WaitGroup
-	scopeCancels map[*connScope]context.CancelFunc
-	close        closeResult
+	// Timing safety metadata only; no default-build extra SQL or behavior.
+	timingDatabasePath  string
+	timingDatabaseKnown bool
+	db                  *sql.DB
+	ownsPool            bool
+	foreignKeys         foreignKeyDiscipline
+	lifecycleMu         sync.Mutex
+	closed              bool
+	activeScopes        sync.WaitGroup
+	scopeCancels        map[*connScope]context.CancelFunc
+	close               closeResult
 	// factHooks are per-instance test seams; production leaves them nil. See
 	// factQueryTestHooks in facts.go.
 	factHooks factQueryTestHooks
@@ -229,7 +232,9 @@ func (db *DB) bindScope(ctx context.Context, target projectionTarget) (*connScop
 	// A scope gets its own cancellation boundary so Close can stop only scopes
 	// admitted through this DB, including scopes whose callers use Background.
 	scopeCtx, cancel := context.WithCancel(ctx)
+	connectionTiming := sqlTimingStart(ctx, "sql_conn")
 	conn, err := db.db.Conn(scopeCtx)
+	connectionTiming.finish(err)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf(
@@ -398,6 +403,7 @@ func OpenBorrowedContext(ctx context.Context, runtime *sql.DB, models []ptypes.M
 		return nil, fmt.Errorf("lease borrowed activation connection: %w", err)
 	}
 	activation := borrowConnScopeContext(ctx, activationConn, projectionTargetLive)
+	timingPath, timingKnown := sqlTimingDatabase(ctx, activationConn)
 	activation.activationPath = config.Path
 	if config.BusyTimeout != 0 && config.BusyTimeout.Milliseconds() < 1 {
 		_ = activationConn.Close()
@@ -429,7 +435,7 @@ func OpenBorrowedContext(ctx context.Context, runtime *sql.DB, models []ptypes.M
 		if err := activationConn.Close(); err != nil {
 			return nil, fmt.Errorf("return borrowed activation connection: %w", err)
 		}
-		return &DB{db: runtime, foreignKeys: foreignKeysPoolBorrowed}, nil
+		return &DB{db: runtime, foreignKeys: foreignKeysPoolBorrowed, timingDatabasePath: timingPath, timingDatabaseKnown: timingKnown}, nil
 	}
 	// Activation rewrites busy_timeout and foreign_keys on this connection, which
 	// belongs to the caller's pool. Snapshot both before the first attempt so the
@@ -455,7 +461,7 @@ func OpenBorrowedContext(ctx context.Context, runtime *sql.DB, models []ptypes.M
 	if closeErr != nil {
 		return nil, fmt.Errorf("return borrowed activation connection: %w", closeErr)
 	}
-	return &DB{db: runtime, foreignKeys: foreignKeysPoolBorrowed}, nil
+	return &DB{db: runtime, foreignKeys: foreignKeysPoolBorrowed, timingDatabasePath: timingPath, timingDatabaseKnown: timingKnown}, nil
 }
 
 type openTarget struct {
@@ -668,7 +674,7 @@ func openInMemory(target openTarget, models []ptypes.ModelEntry) (*DB, error) {
 		_ = runtime.Close()
 		return nil, fmt.Errorf("return in-memory activation connection %q: %w", target.display, err)
 	}
-	return &DB{db: runtime, ownsPool: true}, nil
+	return &DB{db: runtime, ownsPool: true, timingDatabaseKnown: true}, nil
 }
 
 func openFileBacked(target openTarget, existingJournal bool, models []ptypes.ModelEntry) (*DB, error) {
@@ -682,6 +688,7 @@ func openFileBacked(target openTarget, existingJournal bool, models []ptypes.Mod
 		return nil, fmt.Errorf("lease activation connection for %q: %w", target.display, err)
 	}
 	activation := borrowConnScope(activationConn, projectionTargetLive)
+	timingPath, timingKnown := sqlTimingDatabase(context.Background(), activationConn)
 
 	actualExisting, err := activation.tableExists("journal")
 	if err == nil && actualExisting != existingJournal {
@@ -729,7 +736,7 @@ func openFileBacked(target openTarget, existingJournal bool, models []ptypes.Mod
 	if err != nil {
 		return nil, fmt.Errorf("open runtime pool for %q: %w", target.display, err)
 	}
-	return &DB{db: runtime, ownsPool: true}, nil
+	return &DB{db: runtime, ownsPool: true, timingDatabasePath: timingPath, timingDatabaseKnown: timingKnown}, nil
 }
 
 // activationRetryPolicy bounds a contended schema activation. attemptBusyTimeout
@@ -1059,9 +1066,14 @@ func limitTransactionBusyTimeout(ctx context.Context, conn sqlQueryer) (func() e
 		if _, err := conn.ExecContext(probeCtx, "PRAGMA busy_timeout=0"); err != nil {
 			return nil, nil
 		}
+		probeTiming := sqlTimingStart(ctx, "begin_probe")
 		_, beginErr := conn.ExecContext(probeCtx, begin)
+		probeTiming.finish(beginErr)
 		if beginErr == nil {
-			if _, rollbackErr := conn.ExecContext(probeCtx, "ROLLBACK"); rollbackErr != nil {
+			rollbackTiming := sqlTimingStart(ctx, "rollback_probe")
+			_, rollbackErr := conn.ExecContext(probeCtx, "ROLLBACK")
+			rollbackTiming.finish(rollbackErr)
+			if rollbackErr != nil {
 				return nil, fmt.Errorf("roll back the post-deadline contention probe's transaction: %w", rollbackErr)
 			}
 			return nil, nil
@@ -1113,18 +1125,35 @@ func runScopedTransactionWithPolicy(ctx context.Context, conn sqlQueryer, begin 
 	}()
 	backoff := 2 * time.Millisecond
 	var lastBusy error
+	beginTiming := sqlTimingStart(ctx, "begin_wait")
+	beginFinished := false
+	var transactionTiming sqlTimingSpan
+	defer func() {
+		if !beginFinished {
+			beginTiming.finish(err)
+		}
+	}()
 	for {
 		if activationScope != nil {
 			if cause := context.Cause(ctx); cause != nil {
 				return cause
 			}
 		}
+		attemptTiming := sqlTimingStart(ctx, "begin_attempt")
 		_, err = conn.ExecContext(ctx, begin)
+		attemptTiming = attemptTiming.stop()
+		if err == nil {
+			transactionTiming = attemptTiming.next("transaction_scope")
+			beginTiming = beginTiming.endedAt(attemptTiming)
+		}
+		attemptTiming.finish(err)
 		if err == nil {
 			break
 		}
 		if activationScope != nil {
+			rollbackTiming := sqlTimingStart(ctx, "rollback_begin_cleanup")
 			_, rollbackErr := conn.ExecContext(activationScope.cleanupContext(), "ROLLBACK")
+			rollbackTiming.finish(rollbackErr)
 			if rollbackErr != nil && !strings.Contains(rollbackErr.Error(), "no transaction is active") {
 				activationScope.markBad()
 				return errors.Join(err, fmt.Errorf("activation BEGIN outcome uncertain; rollback failed and connection retired: %w; fix: inspect the store before retrying", rollbackErr))
@@ -1136,7 +1165,9 @@ func runScopedTransactionWithPolicy(ctx context.Context, conn sqlQueryer, begin 
 		// independent bounded context so a timed-out contender cannot retain a
 		// write lock and starve the writer that it was contending with.
 		rollbackCtx, cancel := context.WithTimeout(context.Background(), time.Second)
-		_, _ = conn.ExecContext(rollbackCtx, "ROLLBACK")
+		rollbackTiming := sqlTimingStart(ctx, "rollback_begin_cleanup")
+		_, rollbackErr := conn.ExecContext(rollbackCtx, "ROLLBACK")
+		rollbackTiming.finish(rollbackErr)
 		cancel()
 		if !isBusyError(err) {
 			if singleAttempt {
@@ -1212,6 +1243,9 @@ func runScopedTransactionWithPolicy(ctx context.Context, conn sqlQueryer, begin 
 			return errors.Join(rearmErr, err)
 		}
 	}
+	// Start at the successful BEGIN return, before recording aggregate wait.
+	beginTiming.finish(nil)
+	beginFinished = true
 	committed := false
 	commitAttempted := false
 	defer func() {
@@ -1228,7 +1262,19 @@ func runScopedTransactionWithPolicy(ctx context.Context, conn sqlQueryer, begin 
 		} else {
 			rollbackCtx, cancel = context.WithTimeout(context.Background(), time.Second)
 		}
+		rollbackTiming := sqlTimingStart(ctx, "rollback")
 		_, rollbackErr := conn.ExecContext(rollbackCtx, "ROLLBACK")
+		rollbackTiming = rollbackTiming.stop()
+		transactionTiming = transactionTiming.endedAt(rollbackTiming)
+		rollbackTiming.finish(rollbackErr)
+		outcome := "rolled_back"
+		if commitAttempted {
+			outcome = "commit_error_rolled_back"
+		}
+		if rollbackErr != nil {
+			outcome = "rollback_error"
+		}
+		transactionTiming.outcome(outcome)
 		cancel()
 		if rollbackErr != nil {
 			if activationScope != nil {
@@ -1244,7 +1290,10 @@ func runScopedTransactionWithPolicy(ctx context.Context, conn sqlQueryer, begin 
 			err = errors.Join(err, errors.New("activation rollback confirmed after failed commit; this attempt did not commit; fix: retry the open after resolving the reported commit error"))
 		}
 	}()
-	if err = operation(); err != nil {
+	bodyTiming := sqlTimingStart(ctx, "body")
+	err = operation()
+	bodyTiming.finish(err)
+	if err != nil {
 		return err
 	}
 	if activationScope != nil {
@@ -1253,13 +1302,21 @@ func runScopedTransactionWithPolicy(ctx context.Context, conn sqlQueryer, begin 
 		}
 	}
 	commitAttempted = true
-	if _, err = conn.ExecContext(ctx, "COMMIT"); err != nil {
+	commitTiming := sqlTimingStart(ctx, "commit")
+	_, err = conn.ExecContext(ctx, "COMMIT")
+	commitTiming = commitTiming.stop()
+	if err == nil {
+		transactionTiming = transactionTiming.endedAt(commitTiming)
+	}
+	commitTiming.finish(err)
+	if err != nil {
 		if activationScope != nil {
 			return fmt.Errorf("commit SQLite activation transaction failed: %w; where: internal/sqlite.runScopedTransaction, startup commit; impact: no tracker returned, transaction outcome depends on the reported rollback result; fix: inspect the store if rollback is uncertain before retrying", err)
 		}
 		return fmt.Errorf("commit SQLite transaction: %w", err)
 	}
 	committed = true
+	transactionTiming.outcome("committed")
 	return nil
 }
 

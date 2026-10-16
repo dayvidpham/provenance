@@ -400,7 +400,9 @@ func (scope *connScope) verifyWatermarkPresence() error {
 // anchor row missing one. It backs the journal CHECK constraint that also enforces
 // this, and is the §15 convergence tool's placement guard. Returns
 // journal.ErrActorPlacement on any violation.
-func (scope *connScope) verifyActorPlacement() error {
+func (scope *connScope) verifyActorPlacement() (timingErr error) {
+	timing := sqlTimingStart(scope.ctx, "gate_actor_placement")
+	defer func() { timing.finish(timingErr) }()
 	var (
 		badJID   int64
 		subord   bool
@@ -614,7 +616,9 @@ func (scope *connScope) subtypeTablesPresent() (map[journal.JournalKind]subtypeT
 	return present, nil
 }
 
-func (scope *connScope) verifySubtypeIntegrity() error {
+func (scope *connScope) verifySubtypeIntegrity() (err error) {
+	timing := sqlTimingStart(scope.ctx, "gate_subtype_integrity")
+	defer func() { timing.finish(err) }()
 	tables, err := scope.subtypeTablesPresent()
 	if err != nil {
 		return err
