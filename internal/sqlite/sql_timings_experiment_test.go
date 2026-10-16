@@ -207,18 +207,72 @@ func TestSQLTimingsChild(t *testing.T) {
 	actor := ptypes.ActorID{Namespace: "timing-test", UUID: uuid.New()}
 	seedActor(t, db, actor)
 	authority := genesisBoot(t, db, actor)
+	// This subprocess runs only this serial test, so observing the existing
+	// writer hook cannot race another test or mutate the parent's globals.
+	// Keep the actual public entrypoints, recorder factory, and artifact writer:
+	// manually releasing a scope before r.flush would not pin their defer order.
+	write := sqlTimingWrite
+	defer func() { sqlTimingWrite = write }()
+	boundary, method, outcome := "Apply/success", "Apply", "committed"
+	flushes := 0
+	sqlTimingWrite = func(r *sqlTimingRecorder) {
+		db.lifecycleMu.Lock()
+		registered := len(db.scopeCancels)
+		db.lifecycleMu.Unlock()
+		if inUse := db.db.Stats().InUse; registered != 0 || inUse != 0 {
+			t.Fatalf("%s: artifact flush preceded scope release: registered=%d in_use=%d", boundary, registered, inUse)
+		}
+		if r.method != method {
+			t.Fatalf("%s: flushed method=%s, want %s", boundary, r.method, method)
+		}
+		transactions := 0
+		for _, event := range r.events {
+			if event.Phase == "transaction_scope" {
+				transactions++
+				if event.Outcome != outcome {
+					t.Fatalf("%s: transaction outcome=%s, want %s", boundary, event.Outcome, outcome)
+				}
+			}
+		}
+		if transactions != 1 {
+			t.Fatalf("%s: transaction events=%d, want 1", boundary, transactions)
+		}
+		flushes++
+		write(r)
+	}
+	assertFlush := func(want int) {
+		t.Helper()
+		if os.Getenv("PASTURE_EXPERIMENT_SQL_TIMINGS") == "" {
+			want = 0
+		}
+		if flushes != want {
+			t.Fatalf("%s: public entrypoint flushes=%d, want %d", boundary, flushes, want)
+		}
+	}
 	in := batchDecisionInput("timing-one", actor, authority, `{}`)
 	if _, err := db.Apply(in); err != nil {
 		t.Fatal(err)
 	}
+	assertFlush(1)
+	boundary, method = "ApplyBatchContext/success", "ApplyBatchContext"
 	inputs := []journal.OperationInput{batchDecisionInput("timing-two", actor, authority, `{}`), batchDecisionInput("timing-three", actor, authority, `{}`)}
 	if _, err := db.ApplyBatchContext(t.Context(), inputs); err != nil {
 		t.Fatal(err)
 	}
+	assertFlush(2)
+	boundary, method, outcome = "Apply/rollback", "Apply", "rolled_back"
 	in.CommandDigest = []byte("conflict")
 	if _, err := db.Apply(in); err == nil {
 		t.Fatal("conflict control unexpectedly committed")
 	}
+	assertFlush(3)
+	boundary, method = "ApplyBatchContext/rollback", "ApplyBatchContext"
+	inputs[0].CommandDigest = []byte("batch-conflict")
+	if result, err := db.ApplyBatchContext(t.Context(), inputs); err == nil || result.Committed {
+		t.Fatalf("batch conflict control unexpectedly committed: %+v, %v", result, err)
+	}
+	assertFlush(4)
+	sqlTimingWrite = write
 	if os.Getenv("PASTURE_EXPERIMENT_SQL_TIMINGS") == "" {
 		ctx := context.Background()
 		if allocations := testing.AllocsPerRun(10, func() {
