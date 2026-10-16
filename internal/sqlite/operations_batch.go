@@ -101,6 +101,8 @@ func (db *DB) ApplyBatchContext(ctx context.Context, inputs []journal.OperationI
 		prepared[i] = preparedBatchOperation{in: in, prepared: canonical, callerMutationDigest: callerMutationDigest}
 	}
 
+	ctx, timings := sqlTimingOperation(ctx, "ApplyBatchContext")
+	defer timings.flush()
 	scope, leaseErr := db.bindScope(ctx, projectionTargetLive)
 	if leaseErr != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {

@@ -673,7 +673,9 @@ func (scope *connScope) verifyFactContextIntegrityReadOnlyLegacyCompatible() err
 	return scope.verifyFactContextIntegrityMode(true)
 }
 
-func (scope *connScope) verifyFactContextIntegrityMode(allowLegacy bool) error {
+func (scope *connScope) verifyFactContextIntegrityMode(allowLegacy bool) (timingErr error) {
+	timing := sqlTimingStart(scope.ctx, "gate_fact_context_integrity")
+	defer func() { timing.finish(timingErr) }()
 	state, err := scope.classifyFactContextSchema()
 	if err != nil {
 		return err
