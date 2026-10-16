@@ -66,6 +66,20 @@ import (
 // convergence guard the currency probe runs; it only lets them be skipped when
 // nothing they cover has moved.
 //
+// Sanctioned-write induction (v3). A write through applyPreparedOperation or
+// ApplyBatchContext that finds the ledger matching its pre-write snapshot, then
+// folds its delta through the same shared reducer step a full replay uses and
+// runs the store-wide gates over the final state it commits, proves its own
+// delta. Such a write advances the ledger to its post-write identity in its own
+// commit — one BEGIN IMMEDIATE across the pre-check, the fold, the gates, and
+// the advance, so no writer interleaves and a crash leaves both or neither.
+// The advance rewrites only the identity fields (generation, journal_id,
+// journal_digest, tables_digest, shape_id) and leaves verified_count (full
+// verifications) and verified_at (last full verification) alone. Every other
+// writer — AppendTaskEvent, the direct mutators, migration, governed
+// allocation, or any out-of-band DML/DDL — leaves the ledger stale and takes
+// the full path, unchanged.
+//
 // Boundary: the ledger detects *change*, not a deliberate adversary with DDL and
 // DML rights, who could equally forge the ledger row or recreate a dropped
 // trigger. The gates it protects against are partial writes, out-of-band edits
@@ -80,7 +94,11 @@ const (
 	// verifiedLedgerVersion is bumped whenever the ledger's meaning changes, so
 	// a ledger written by an older build is never trusted. It participates in
 	// shapeID. v2 adds the recorded covered-table presence set (tables_digest).
-	verifiedLedgerVersion = "provenance.verified-store.v2"
+	// v3 records the induction: a match now means "verified, and every change
+	// since was itself verified" — a sanctioned write that proved its own delta
+	// advanced the row in its own transaction — so a v2 row fails closed into
+	// the full path once rather than being trusted.
+	verifiedLedgerVersion = "provenance.verified-store.v3"
 	// verifiedTriggerPrefix names the per-table change triggers. Trigger names
 	// are derived from the closed covered-table set, never from caller input.
 	verifiedTriggerPrefix = "provenance_store_generation_on_"
@@ -505,6 +523,58 @@ func (scope *connScope) writeVerifiedLedger() error {
 		verifiedStoreTable, verifiedStoreTable),
 		identity.generation, identity.journalID, identity.digest, shape, identity.tablesDigest, time.Now().UTC().UnixNano()); err != nil {
 		return fmt.Errorf("writeVerifiedLedger: %w", err)
+	}
+	return nil
+}
+
+// verifiedLedgerEligibleForAdvance reports whether the enclosing write
+// transaction may advance the ledger on commit. The caller must invoke it
+// inside its own BEGIN IMMEDIATE before the first fold, so the comparison is
+// over the transaction's pre-write snapshot: a ledger that matches the store
+// as it stands right now, written by this build, over the same covered-table
+// presence set and journal tail. Any read error, absent row, or mismatch —
+// including a store one out-of-band write has poisoned — reports false, which
+// is the fail-closed direction: the write still commits, but the ledger stays
+// stale and the next open takes the full path. An ephemeral store is never
+// eligible: activation skips the ledger there entirely.
+func (scope *connScope) verifiedLedgerEligibleForAdvance() bool {
+	if scope.ephemeralStore {
+		return false
+	}
+	return scope.verifiedLedgerMatches()
+}
+
+// advanceVerifiedLedger records the post-write identity of a sanctioned
+// transaction that just proved its own delta: the fold materialised every
+// effect through the shared reducer step a full replay uses, and the
+// store-wide gates passed over the final state this transaction will commit.
+// The caller must invoke it inside the same BEGIN IMMEDIATE after the fold and
+// gates succeed and before COMMIT, so the advance and the delta commit or roll
+// back together. It rewrites only the identity fields — generation, journal_id,
+// journal_digest, shape_id, tables_digest — and leaves verified_count (which
+// counts only whole-store verifications) and verified_at (the last full
+// verification) alone. It never inserts: an absent ledger stays absent until a
+// full path heals it. It is best-effort by contract: the caller ignores its
+// error and commits anyway, leaving the ledger stale (the fail-closed state)
+// rather than letting an optimisation veto a durable write.
+func (scope *connScope) advanceVerifiedLedger() error {
+	if scope.ephemeralStore {
+		return nil
+	}
+	identity, err := scope.readVerifiedStoreIdentity()
+	if err != nil {
+		return fmt.Errorf("advanceVerifiedLedger: %w", err)
+	}
+	shape := verifiedShapeID()
+	if _, err := scope.conn.ExecContext(scope.ctx, fmt.Sprintf(`UPDATE %s SET
+		generation = ?1,
+		journal_id = ?2,
+		journal_digest = ?3,
+		shape_id = ?4,
+		tables_digest = ?5
+		WHERE id = 1`, verifiedStoreTable),
+		identity.generation, identity.journalID, identity.digest, shape, identity.tablesDigest); err != nil {
+		return fmt.Errorf("advanceVerifiedLedger: %w", err)
 	}
 	return nil
 }

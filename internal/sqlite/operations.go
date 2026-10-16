@@ -501,10 +501,26 @@ func (db *DB) applyPreparedOperation(ctx context.Context, in journal.OperationIn
 	// the loser observes the winner's committed fact and receives ConditionFailure
 	// (not BUSY_SNAPSHOT). Initial BUSY/LOCKED while acquiring this lock is
 	// transient infrastructure — the 5 s busy_timeout (set in Open) retries it.
+	//
+	// The sanctioned-write induction shares this one transaction: the pre-check
+	// below runs before the first fold over the pre-write snapshot, and the
+	// ledger advance runs after the fold and gates succeed over the post-write
+	// state, so no writer can interleave and a crash leaves both or neither.
+	// The advance is best-effort — its failure never fails the write — and it is
+	// skipped for idempotent replays that wrote nothing.
 	if transactionErr := runImmediateTransaction(scope.ctx, scope.conn, func() error {
+		eligible := scope.verifiedLedgerEligibleForAdvance()
 		var foldErr error
 		res, foldErr = scope.foldPreparedOperation(in, prepared, callerMutationDigest, options)
-		return foldErr
+		if foldErr != nil {
+			return foldErr
+		}
+		if eligible && !res.ShortCircuited {
+			// Best-effort by contract: a failed advance leaves the ledger stale,
+			// which is the fail-closed state the next open heals.
+			_ = scope.advanceVerifiedLedger()
+		}
+		return nil
 	}); transactionErr != nil {
 		// Deadline authority for the BEGIN leg lives in runScopedTransaction's
 		// retry loop; this heuristic remains for the fold and COMMIT legs, where
