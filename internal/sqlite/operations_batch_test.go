@@ -420,11 +420,15 @@ func TestApplyBatchInputValidationWritesNothing(t *testing.T) {
 	}
 }
 
-// TestApplyBatchAdvancesCurrencyGenerationAndInvalidatesLedger pins the
-// verified-as-of ledger rule on a file-backed store: the batch's writes advance
-// the generation in the same transaction, so a ledger written before the batch
-// stops matching and the next open runs the full checks rather than trusting it.
-func TestApplyBatchAdvancesCurrencyGenerationAndInvalidatesLedger(t *testing.T) {
+// TestApplyBatchAdvancesCurrencyGenerationAndLedger pins the verified-as-of
+// ledger rule on a file-backed store under the v3 induction: the batch's writes
+// advance the generation in the same transaction, and the sanctioned batch
+// advances the ledger to the post-batch identity in that same transaction — so
+// the ledger still matches and the next open takes the fast path with
+// verified_count untouched. (Under the retired v2 rule the ledger stopped
+// matching here; an out-of-band write still does — see
+// TestOutOfBandWriteStillTakesFullPath.)
+func TestApplyBatchAdvancesCurrencyGenerationAndLedger(t *testing.T) {
 	// Deliberately serial: file-backed store with one path and one ledger row.
 	path := t.TempDir() + "/batch-ledger.db"
 	db, err := Open(path, nil)
@@ -467,8 +471,8 @@ func TestApplyBatchAdvancesCurrencyGenerationAndInvalidatesLedger(t *testing.T) 
 	if after.generation <= before.generation {
 		t.Fatalf("batch did not advance the store generation (%d -> %d); the ledger would falsely still match", before.generation, after.generation)
 	}
-	if scope.verifiedLedgerMatches() {
-		t.Fatal("verified-as-of ledger still matches after the batch; the next open would skip the full checks")
+	if !scope.verifiedLedgerMatches() {
+		t.Fatal("verified-as-of ledger does not match after a sanctioned batch; the advance did not commit with the batch")
 	}
 	// And the batch left the store passing the guards the full path runs.
 	if err := db.VerifyIntegrity(); err != nil {

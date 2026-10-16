@@ -231,8 +231,11 @@ func TestVerifiedLedgerFactContextRelationStillRejectsForeignTriggers(t *testing
 // TestVerifiedLedgerFastPathOnAStoreWithNoJournalRows covers the store shape the
 // ledger has to treat specially: one with no journal rows at all, where the
 // verified identity is the zero journal id and the empty tail digest. A fresh
-// store's second open must still be the fast path, and adding the first journal
-// row must take it back to the full path.
+// store's second open must still be the fast path. Journaling the first row
+// through the sanctioned fold advances the ledger in its own transaction (the
+// v3 induction), so the next open stays on the fast path; an out-of-band first
+// row, which proves nothing, still takes the full path (see
+// TestOutOfBandWriteStillTakesFullPath).
 func TestVerifiedLedgerFastPathOnAStoreWithNoJournalRows(t *testing.T) {
 	path := t.TempDir() + "/empty-journal.db"
 	db, err := Open(path, nil)
@@ -262,8 +265,9 @@ func TestVerifiedLedgerFastPathOnAStoreWithNoJournalRows(t *testing.T) {
 	if after, _ := ledgerRow(t, path); after != count {
 		t.Fatalf("an unchanged empty-journal store's open moved verified_count to %d, want %d", after, count)
 	}
-	// The first journal row makes the tail real and must send the next open back
-	// down the full path.
+	// The first journal row makes the tail real. Journaled through the sanctioned
+	// fold, it advances the ledger in its own transaction, so the next open
+	// stays on the fast path.
 	db, err = Open(path, nil)
 	if err != nil {
 		t.Fatalf("reopen to journal the first row: %v", err)
@@ -276,8 +280,8 @@ func TestVerifiedLedgerFastPathOnAStoreWithNoJournalRows(t *testing.T) {
 	if err := reopenFileBacked(t, path); err != nil {
 		t.Fatalf("open after the first journal row: %v", err)
 	}
-	if after, _ := ledgerRow(t, path); after != count+1 {
-		t.Fatalf("verified_count after the tail became non-empty = %d, want %d; the full path must have run", after, count+1)
+	if after, _ := ledgerRow(t, path); after != count {
+		t.Fatalf("verified_count after a sanctioned first journal row = %d, want %d; the advance must have kept the fast path", after, count)
 	}
 }
 

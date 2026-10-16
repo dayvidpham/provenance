@@ -116,6 +116,14 @@ func (db *DB) ApplyBatchContext(ctx context.Context, inputs []journal.OperationI
 	outcomes := notRecordedBatchRecords(len(inputs))
 	failIndex := -1
 	transactionErr := runImmediateTransaction(scope.ctx, scope.conn, func() error {
+		// The sanctioned-write induction shares this one transaction: the
+		// pre-check runs before the first fold over the pre-write snapshot, and
+		// the ledger advance runs after the last fold and the once-per-batch
+		// store-wide gates succeed over the post-batch state, so no writer can
+		// interleave and a crash leaves both or neither. The advance is
+		// best-effort — its failure never fails the batch.
+		eligible := scope.verifiedLedgerEligibleForAdvance()
+		committedAny := false
 		for i := range prepared {
 			record, foldErr := scope.foldPreparedOperation(prepared[i].in, prepared[i].prepared, prepared[i].callerMutationDigest, foldOptions{deferStoreGates: true})
 			if foldErr != nil {
@@ -132,6 +140,7 @@ func (db *DB) ApplyBatchContext(ctx context.Context, inputs []journal.OperationI
 				continue
 			}
 			outcomes[i] = journal.BatchRecordResult{Outcome: journal.BatchRecordCommitted, Result: record}
+			committedAny = true
 		}
 		// The two store-wide integrity gates run ONCE, over the final state this
 		// transaction will commit, instead of per record. They are whole-journal
@@ -146,6 +155,11 @@ func (db *DB) ApplyBatchContext(ctx context.Context, inputs []journal.OperationI
 		if gateErr := scope.verifyActorPlacement(); gateErr != nil {
 			failIndex = -1
 			return gateErr
+		}
+		if eligible && committedAny {
+			// Best-effort by contract: a failed advance leaves the ledger stale,
+			// which is the fail-closed state the next open heals.
+			_ = scope.advanceVerifiedLedger()
 		}
 		return nil
 	})
