@@ -487,7 +487,7 @@ func prepareApplyInput(in journal.OperationInput) (journal.OperationInput, journ
 // canonical operation entrypoints. foldOptions is package-private; public Apply
 // always supplies the zero value.
 func (db *DB) applyPreparedOperation(ctx context.Context, in journal.OperationInput, prepared journal.CanonicalMutation, callerMutationDigest []byte, options foldOptions) (res journal.CommittedResult, err error) {
-	ctx, timings := sqlTimingOperation(ctx, "Apply")
+	ctx, timings := sqlTimingOperation(ctx, "Apply", db)
 	defer timings.flush()
 	scope, err := db.bindScope(ctx, projectionTargetLive)
 	if err != nil {

@@ -10,7 +10,7 @@ import (
 func TestSQLTimingsDefaultNoop(t *testing.T) {
 	ctx := context.Background()
 	if allocations := testing.AllocsPerRun(10, func() {
-		got, recorder := sqlTimingOperation(ctx, "Apply")
+		got, recorder := sqlTimingOperation(ctx, "Apply", nil)
 		if got != ctx || recorder != nil {
 			t.Fatal("default build enabled timing")
 		}

@@ -3,9 +3,21 @@
 This unpublished lane adds no exported API or default configuration. Build with
 `-tags pasture_experiment` **and** set `PASTURE_EXPERIMENT_SQL_TIMINGS` to an
 absolute private JSONL path. Without either opt-in the helpers do no recording
-or I/O. Use a separate path per process; existing files must be regular and have
-no group/other permission bits. New files are mode 0600. Keep the parent directory
-private. No SQL, payload, domain identity, database path, or error text is emitted.
+or I/O. Also set `PASTURE_EXPERIMENT_SANDBOX` to an existing private directory
+(mode 0700) strictly below `/tmp/opencode`. The artifact must be a direct child
+of its canonical directory. Use a fresh path and separate sandbox per process.
+The first flush creates the file exclusively, mode 0600; **every existing entry**
+is refused, including regular files, hardlinks, symlinks and dangling symlinks.
+Later invocations use the retained handle, never reopen/append an existing path.
+Canonical main-database destinations and SQLite `-wal`, `-shm`, `-journal`
+basenames are refused even when absent or reached through a directory alias.
+Configure both variables before opening a file-backed store: an opt-in-only query
+on its existing activation connection captures its main-file safety identity;
+an unknown identity disables recording with an error, not a guess. Standalone
+stores follow the same rule; no measurement-time lease is added. In-memory
+stores have no physical main file to protect. No SQL, payload, domain identity,
+database path, or error text is emitted
+in JSONL (stderr errors may identify the refused private artifact).
 Do not enable this on an operator/live store.
 
 The normal wrappers have nil hooks; only experiment-tagged package initialization
@@ -54,20 +66,22 @@ the union of its children is the remaining closure work (including ledger work).
 Instrumentation bookkeeping and scheduler time are included; this is not a
 zero-overhead profiler. The BEGIN calls measure driver + SQLite busy handling +
 Go scheduling, not isolated SQLite wait. `transaction_scope` on BEGIN IMMEDIATE
-is an observed upper-bound **proxy** for exclusive SQLite writer reservation,
-not a strict physical-lock-duration measurement: acquisition and any lock
+is an observed transaction-scope interval/proxy, **neither an upper nor a lower
+physical-lock-duration bound**: acquisition and any lock
 residence before BEGIN returns are outside it, while COMMIT can release the lock
 before returning. Neither whole-turn elapsed time nor COMMIT-call elapsed time
 is an fsync attribution. Deferred BEGIN or failed attempts cannot be interpreted
 as acquired writer reservation.
 
 Events accumulate in the synchronous operation's private context recorder.
-JSON encoding, opening and appending occur only after the transaction has
+JSON encoding, exclusive creation and writing occur only after the transaction has
 completed and its connection scope has released. One process-wide mutex protects
 JSONL framing for concurrent daemon callers; it protects no database invariant.
 The synchronous flush can delay API return, but is outside transaction timing.
-Private-artifact I/O failures do not change the operation result, so the lane
-driver must reject missing/truncated operations rather than infer zero latency.
+Destination/creation/write failures latch a sticky process-local error, emit
+`EXPERIMENT_SQL_TIMINGS_ERROR` on stderr once, and stop further artifact writes.
+They do not change the operation result/ACK. The lane driver **must reject the
+stderr marker and missing/truncated operations**, never infer zero latency.
 Interrupted processes can lose their entire buffered invocation. Flush has no
 fsync guarantee. The batch/flush experiment driver and workload accounting remain
 consumer-owned; these events do not change batch sizes, flush delays, retries,

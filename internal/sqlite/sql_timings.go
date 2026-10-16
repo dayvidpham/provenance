@@ -22,12 +22,15 @@ type sqlTimingEvent struct {
 // No recording performs I/O. Only flush, deferred before bindScope so it runs
 // AFTER scope.release, serializes private artifacts across daemon goroutines.
 type sqlTimingRecorder struct {
-	path   string
-	pid    int
-	op     uint64
-	method string
-	origin time.Time
-	events []sqlTimingEvent
+	path         string
+	sandbox      string
+	databasePath string
+	artifact     any
+	pid          int
+	op           uint64
+	method       string
+	origin       time.Time
+	events       []sqlTimingEvent
 }
 
 type sqlTimingSpan struct {
@@ -41,14 +44,22 @@ type sqlTimingSpan struct {
 // experiment-tagged file. Keeping one set of declarations also preserves the
 // SQL architecture guard, which type-checks every source file regardless of
 // build tags. There is no runtime registration or mutable configuration API.
-var sqlTimingNew func(context.Context, string) (context.Context, *sqlTimingRecorder)
+var sqlTimingNew func(context.Context, string, *DB) (context.Context, *sqlTimingRecorder)
 var sqlTimingWrite func(*sqlTimingRecorder)
+var sqlTimingBorrowedPath func(context.Context, sqlQueryer) (string, bool)
 
-func sqlTimingOperation(ctx context.Context, method string) (context.Context, *sqlTimingRecorder) {
+func sqlTimingOperation(ctx context.Context, method string, db *DB) (context.Context, *sqlTimingRecorder) {
 	if sqlTimingNew == nil {
 		return ctx, nil
 	}
-	return sqlTimingNew(ctx, method)
+	return sqlTimingNew(ctx, method, db)
+}
+
+func sqlTimingDatabase(ctx context.Context, conn sqlQueryer) (string, bool) {
+	if sqlTimingBorrowedPath == nil {
+		return "", false
+	}
+	return sqlTimingBorrowedPath(ctx, conn)
 }
 
 func (r *sqlTimingRecorder) flush() {

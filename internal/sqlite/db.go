@@ -54,14 +54,17 @@ func (result *closeResult) do(closeFunc func() error) error {
 // DB is the pooled SQLite database handle and persistence owner. It owns the
 // database/sql lifecycle only; each operation explicitly leases a connScope.
 type DB struct {
-	db           *sql.DB
-	ownsPool     bool
-	foreignKeys  foreignKeyDiscipline
-	lifecycleMu  sync.Mutex
-	closed       bool
-	activeScopes sync.WaitGroup
-	scopeCancels map[*connScope]context.CancelFunc
-	close        closeResult
+	// Timing safety metadata only; no default-build extra SQL or behavior.
+	timingDatabasePath  string
+	timingDatabaseKnown bool
+	db                  *sql.DB
+	ownsPool            bool
+	foreignKeys         foreignKeyDiscipline
+	lifecycleMu         sync.Mutex
+	closed              bool
+	activeScopes        sync.WaitGroup
+	scopeCancels        map[*connScope]context.CancelFunc
+	close               closeResult
 	// factHooks are per-instance test seams; production leaves them nil. See
 	// factQueryTestHooks in facts.go.
 	factHooks factQueryTestHooks
@@ -400,6 +403,7 @@ func OpenBorrowedContext(ctx context.Context, runtime *sql.DB, models []ptypes.M
 		return nil, fmt.Errorf("lease borrowed activation connection: %w", err)
 	}
 	activation := borrowConnScopeContext(ctx, activationConn, projectionTargetLive)
+	timingPath, timingKnown := sqlTimingDatabase(ctx, activationConn)
 	activation.activationPath = config.Path
 	if config.BusyTimeout != 0 && config.BusyTimeout.Milliseconds() < 1 {
 		_ = activationConn.Close()
@@ -431,7 +435,7 @@ func OpenBorrowedContext(ctx context.Context, runtime *sql.DB, models []ptypes.M
 		if err := activationConn.Close(); err != nil {
 			return nil, fmt.Errorf("return borrowed activation connection: %w", err)
 		}
-		return &DB{db: runtime, foreignKeys: foreignKeysPoolBorrowed}, nil
+		return &DB{db: runtime, foreignKeys: foreignKeysPoolBorrowed, timingDatabasePath: timingPath, timingDatabaseKnown: timingKnown}, nil
 	}
 	// Activation rewrites busy_timeout and foreign_keys on this connection, which
 	// belongs to the caller's pool. Snapshot both before the first attempt so the
@@ -457,7 +461,7 @@ func OpenBorrowedContext(ctx context.Context, runtime *sql.DB, models []ptypes.M
 	if closeErr != nil {
 		return nil, fmt.Errorf("return borrowed activation connection: %w", closeErr)
 	}
-	return &DB{db: runtime, foreignKeys: foreignKeysPoolBorrowed}, nil
+	return &DB{db: runtime, foreignKeys: foreignKeysPoolBorrowed, timingDatabasePath: timingPath, timingDatabaseKnown: timingKnown}, nil
 }
 
 type openTarget struct {
@@ -670,7 +674,7 @@ func openInMemory(target openTarget, models []ptypes.ModelEntry) (*DB, error) {
 		_ = runtime.Close()
 		return nil, fmt.Errorf("return in-memory activation connection %q: %w", target.display, err)
 	}
-	return &DB{db: runtime, ownsPool: true}, nil
+	return &DB{db: runtime, ownsPool: true, timingDatabaseKnown: true}, nil
 }
 
 func openFileBacked(target openTarget, existingJournal bool, models []ptypes.ModelEntry) (*DB, error) {
@@ -684,6 +688,7 @@ func openFileBacked(target openTarget, existingJournal bool, models []ptypes.Mod
 		return nil, fmt.Errorf("lease activation connection for %q: %w", target.display, err)
 	}
 	activation := borrowConnScope(activationConn, projectionTargetLive)
+	timingPath, timingKnown := sqlTimingDatabase(context.Background(), activationConn)
 
 	actualExisting, err := activation.tableExists("journal")
 	if err == nil && actualExisting != existingJournal {
@@ -731,7 +736,7 @@ func openFileBacked(target openTarget, existingJournal bool, models []ptypes.Mod
 	if err != nil {
 		return nil, fmt.Errorf("open runtime pool for %q: %w", target.display, err)
 	}
-	return &DB{db: runtime, ownsPool: true}, nil
+	return &DB{db: runtime, ownsPool: true, timingDatabasePath: timingPath, timingDatabaseKnown: timingKnown}, nil
 }
 
 // activationRetryPolicy bounds a contended schema activation. attemptBusyTimeout

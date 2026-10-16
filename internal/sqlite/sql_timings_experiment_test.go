@@ -8,7 +8,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -49,25 +48,57 @@ func timingEvents(t *testing.T, path string) []sqlTimingEvent {
 	return events
 }
 
+func newSQLTimingTestRecorder(t *testing.T, path string) *sqlTimingRecorder {
+	t.Helper()
+	a := &sqlTimingArtifact{}
+	t.Cleanup(func() {
+		if a.file != nil {
+			_ = a.file.Close()
+		}
+	})
+	return &sqlTimingRecorder{path: path, sandbox: filepath.Dir(path), artifact: a, pid: os.Getpid(), op: sqlTimingCounter.Add(1), method: "Apply"}
+}
+
+func sqlTimingTempDir(t *testing.T) string {
+	t.Helper()
+	path, err := os.MkdirTemp("/tmp/opencode", "provenance-sql-timing-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(path); err != nil {
+			t.Error(err)
+		}
+	})
+	return path
+}
+
 // Subprocesses avoid process-global environment mutation while exercising the
 // exact opt-in entry point and public store methods used by the consumer lane.
 func TestSQLTimingsOptIn(t *testing.T) {
-	for _, enabled := range []bool{false, true} {
-		t.Run(fmt.Sprint(enabled), func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "timings.jsonl")
+	for _, kind := range []string{"disabled", "memory", "borrowed", "standalone"} {
+		t.Run(kind, func(t *testing.T) {
+			enabled := kind != "disabled"
+			path := filepath.Join(sqlTimingTempDir(t), "timings.jsonl")
 			binary, err := os.Executable()
 			if err != nil {
 				t.Fatal(err)
 			}
 			cmd := exec.Command(binary, "-test.run=^TestSQLTimingsChild$", "-test.shuffle=on", "-test.fullpath=true", "-test.timeout=20m")
 			for _, value := range os.Environ() {
-				if !strings.HasPrefix(value, "PASTURE_EXPERIMENT_SQL_TIMINGS=") {
+				if !strings.HasPrefix(value, "PASTURE_EXPERIMENT_") && !strings.HasPrefix(value, "PROVENANCE_TIMING_") {
 					cmd.Env = append(cmd.Env, value)
 				}
 			}
 			cmd.Env = append(cmd.Env, "PROVENANCE_TIMING_CHILD=1")
 			if enabled {
-				cmd.Env = append(cmd.Env, "PASTURE_EXPERIMENT_SQL_TIMINGS="+path)
+				cmd.Env = append(cmd.Env, "PASTURE_EXPERIMENT_SQL_TIMINGS="+path, "PASTURE_EXPERIMENT_SANDBOX="+filepath.Dir(path))
+			}
+			if kind == "borrowed" {
+				cmd.Env = append(cmd.Env, "PROVENANCE_TIMING_BORROWED="+filepath.Join(filepath.Dir(path), "borrowed.sqlite"))
+			}
+			if kind == "standalone" {
+				cmd.Env = append(cmd.Env, "PROVENANCE_TIMING_STANDALONE="+filepath.Join(filepath.Dir(path), "standalone.sqlite"))
 			}
 			if output, err := cmd.CombinedOutput(); err != nil {
 				t.Fatalf("child: %v\n%s", err, output)
@@ -145,7 +176,34 @@ func TestSQLTimingsChild(t *testing.T) {
 	if os.Getenv("PROVENANCE_TIMING_CHILD") != "1" {
 		t.Skip("subprocess only")
 	}
-	db := newJournalDB(t)
+	var db *DB
+	if path := os.Getenv("PROVENANCE_TIMING_STANDALONE"); path != "" {
+		var err error
+		db, err = Open(path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+		if !db.timingDatabaseKnown || db.timingDatabasePath == "" {
+			t.Fatal("standalone database safety identity missing")
+		}
+	} else if path := os.Getenv("PROVENANCE_TIMING_BORROWED"); path != "" {
+		pool, err := sql.Open(sqliteDriverName, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = pool.Close() })
+		db, err = OpenBorrowed(pool, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+		if !db.timingDatabaseKnown || db.timingDatabasePath == "" {
+			t.Fatal("borrowed database safety identity missing")
+		}
+	} else {
+		db = newJournalDB(t)
+	}
 	actor := ptypes.ActorID{Namespace: "timing-test", UUID: uuid.New()}
 	seedActor(t, db, actor)
 	authority := genesisBoot(t, db, actor)
@@ -164,7 +222,7 @@ func TestSQLTimingsChild(t *testing.T) {
 	if os.Getenv("PASTURE_EXPERIMENT_SQL_TIMINGS") == "" {
 		ctx := context.Background()
 		if allocations := testing.AllocsPerRun(10, func() {
-			got, r := sqlTimingOperation(ctx, "Apply")
+			got, r := sqlTimingOperation(ctx, "Apply", nil)
 			if got != ctx || r != nil {
 				t.Fatal("no-env enabled")
 			}
@@ -172,6 +230,18 @@ func TestSQLTimingsChild(t *testing.T) {
 			r.flush()
 		}); allocations != 0 {
 			t.Fatalf("no-env allocations: %v", allocations)
+		}
+	}
+	if os.Getenv("PROVENANCE_TIMING_EXPECT_ERROR") == "1" {
+		if sqlTimingOutput.err == nil {
+			t.Fatal("artifact rejection was not sticky")
+		}
+		first := sqlTimingOutput.err
+		if _, err := db.Apply(batchDecisionInput("after-output-error", actor, authority, `{}`)); err != nil {
+			t.Fatalf("artifact failure changed ACK: %v", err)
+		}
+		if sqlTimingOutput.err != first {
+			t.Fatal("sticky failure changed")
 		}
 	}
 }
@@ -197,8 +267,8 @@ func TestSQLTimingsActualOwnerErrors(t *testing.T) {
 	for _, fail := range []string{"BEGIN IMMEDIATE", "body", "COMMIT", "ROLLBACK"} {
 		t.Run(fail, func(t *testing.T) {
 			db := newJournalDB(t)
-			path := filepath.Join(t.TempDir(), "owner.jsonl")
-			r := &sqlTimingRecorder{path: path, pid: os.Getpid(), op: sqlTimingCounter.Add(1), method: "Apply"}
+			path := filepath.Join(sqlTimingTempDir(t), "owner.jsonl")
+			r := newSQLTimingTestRecorder(t, path)
 			ctx := context.WithValue(t.Context(), sqlTimingKey{}, r)
 			scope, err := db.bindScope(ctx, projectionTargetLive)
 			if err != nil {
@@ -252,12 +322,14 @@ func TestSQLTimingsActualOwnerErrors(t *testing.T) {
 }
 
 func TestSQLTimingsConcurrentPrivateArtifact(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "concurrent.jsonl")
+	path := filepath.Join(sqlTimingTempDir(t), "concurrent.jsonl")
+	template := newSQLTimingTestRecorder(t, path)
 	var wg sync.WaitGroup
 	for range 32 {
 		wg.Go(func() {
-			r := &sqlTimingRecorder{path: path, pid: os.Getpid(), op: sqlTimingCounter.Add(1), method: "Apply"}
-			ctx := context.WithValue(context.Background(), sqlTimingKey{}, r)
+			r := *template
+			r.op = sqlTimingCounter.Add(1)
+			ctx := context.WithValue(context.Background(), sqlTimingKey{}, &r)
 			for range 10 {
 				sqlTimingStart(ctx, "body").finish(nil)
 			}
@@ -319,8 +391,8 @@ func TestSQLTimingsBusyRetryAccounting(t *testing.T) {
 	if _, err := holder.conn.ExecContext(t.Context(), "ROLLBACK"); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(t.TempDir(), "retry.jsonl")
-	r := &sqlTimingRecorder{path: path, pid: os.Getpid(), op: sqlTimingCounter.Add(1), method: "Apply"}
+	path := filepath.Join(sqlTimingTempDir(t), "retry.jsonl")
+	r := newSQLTimingTestRecorder(t, path)
 	ctx, cancel := context.WithTimeout(context.WithValue(t.Context(), sqlTimingKey{}, r), 5*time.Second)
 	defer cancel()
 	q := &timingRetryQueryer{sqlQueryer: contender.conn, busy: busy}
@@ -365,8 +437,8 @@ func TestSQLTimingsPoolAcquisitionCanceled(t *testing.T) {
 	db := newJournalDB(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	path := filepath.Join(t.TempDir(), "pool.jsonl")
-	r := &sqlTimingRecorder{path: path, pid: os.Getpid(), op: sqlTimingCounter.Add(1), method: "Apply"}
+	path := filepath.Join(sqlTimingTempDir(t), "pool.jsonl")
+	r := newSQLTimingTestRecorder(t, path)
 	ctx = context.WithValue(ctx, sqlTimingKey{}, r)
 	if scope, err := db.bindScope(ctx, projectionTargetLive); scope != nil || !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled acquisition: scope=%v err=%v", scope, err)
@@ -375,5 +447,196 @@ func TestSQLTimingsPoolAcquisitionCanceled(t *testing.T) {
 	events := timingEvents(t, path)
 	if len(events) != 1 || events[0].Phase != "sql_conn" || events[0].Outcome != "canceled" {
 		t.Fatalf("canceled acquisition accounting: %+v", events)
+	}
+}
+
+func TestSQLTimingsRefusesExistingAndReservedArtifacts(t *testing.T) {
+	for _, kind := range []string{"database", "hardlink", "symlink", "dangling", "wal", "shm", "journal", "directory-alias", "outside"} {
+		t.Run(kind, func(t *testing.T) {
+			sandbox := sqlTimingTempDir(t)
+			main := filepath.Join(sandbox, "main.sqlite")
+			db, err := Open(main, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(main, 0600); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(main)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(sandbox, "timings.jsonl")
+			switch kind {
+			case "database":
+				path = main
+			case "hardlink":
+				if err := os.Link(main, path); err != nil {
+					t.Fatal(err)
+				}
+			case "symlink":
+				if err := os.Symlink(main, path); err != nil {
+					t.Fatal(err)
+				}
+			case "dangling":
+				if err := os.Symlink(filepath.Join(sandbox, "absent.sqlite"), path); err != nil {
+					t.Fatal(err)
+				}
+			case "wal":
+				path = main + "-wal"
+			case "shm":
+				path = main + "-shm"
+			case "journal":
+				path = main + "-journal"
+			case "directory-alias":
+				alias := filepath.Join(sandbox, "alias")
+				if err := os.Symlink(sandbox, alias); err != nil {
+					t.Fatal(err)
+				}
+				path = filepath.Join(alias, "main.sqlite-journal")
+			case "outside":
+				path = filepath.Join(t.TempDir(), "outside.jsonl")
+			}
+			binary, err := os.Executable()
+			if err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command(binary, "-test.run=^TestSQLTimingsChild$", "-test.shuffle=on", "-test.fullpath=true", "-test.timeout=20m")
+			for _, value := range os.Environ() {
+				if !strings.HasPrefix(value, "PASTURE_EXPERIMENT_") && !strings.HasPrefix(value, "PROVENANCE_TIMING_") {
+					cmd.Env = append(cmd.Env, value)
+				}
+			}
+			cmd.Env = append(cmd.Env, "PROVENANCE_TIMING_CHILD=1", "PROVENANCE_TIMING_EXPECT_ERROR=1", "PASTURE_EXPERIMENT_SANDBOX="+sandbox, "PASTURE_EXPERIMENT_SQL_TIMINGS="+path)
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("ACK/error child: %v\n%s", err, output)
+			}
+			if strings.Count(string(output), "EXPERIMENT_SQL_TIMINGS_ERROR:") != 1 {
+				t.Fatalf("missing/duplicated sticky failure signal: %s", output)
+			}
+			after, err := os.ReadFile(main)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(after) != string(before) {
+				t.Fatal("database bytes changed")
+			}
+			if kind != "database" && kind != "hardlink" && kind != "symlink" && kind != "dangling" {
+				if _, err := os.Lstat(path); !os.IsNotExist(err) {
+					t.Fatalf("refused absent destination was created: %v", err)
+				}
+			}
+			if _, err := os.Stat(filepath.Join(sandbox, "absent.sqlite")); !os.IsNotExist(err) {
+				t.Fatalf("dangling target created: %v", err)
+			}
+		})
+	}
+}
+
+func TestSQLTimingsCanonicalDatabaseProtection(t *testing.T) {
+	sandbox := sqlTimingTempDir(t)
+	main := filepath.Join(sandbox, "unusual-name.jsonl")
+	if err := os.WriteFile(main, []byte("database control"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(sandbox, "alias")
+	if err := os.Symlink(sandbox, alias); err != nil {
+		t.Fatal(err)
+	}
+	for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+		r := newSQLTimingTestRecorder(t, filepath.Join(alias, "unusual-name.jsonl"+suffix))
+		r.databasePath = main
+		if _, err := sqlTimingSafeDestination(r); err == nil {
+			t.Fatalf("canonical database/sidecar accepted: %s", suffix)
+		}
+	}
+}
+
+func TestSQLTimingsRetainedHandleAndStickyWriteFailure(t *testing.T) {
+	path := filepath.Join(sqlTimingTempDir(t), "retained.jsonl")
+	r := newSQLTimingTestRecorder(t, path)
+	ctx := context.WithValue(t.Context(), sqlTimingKey{}, r)
+	sqlTimingStart(ctx, "body").finish(nil)
+	r.flush()
+	a := r.artifact.(*sqlTimingArtifact)
+	first := a.file
+	if first == nil || a.err != nil {
+		t.Fatalf("exclusive creation: %v", a.err)
+	}
+	r.flush()
+	if a.file != first || len(timingEvents(t, path)) != 2 {
+		t.Fatal("artifact not reused through retained handle")
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	readOnly, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.file = readOnly // Same owned inode, but Encode must now fail to write.
+	r.flush()
+	if a.err == nil {
+		t.Fatal("write failure not sticky")
+	}
+	firstError := a.err
+	r.path = filepath.Join(filepath.Dir(path), "must-not-recover.jsonl")
+	r.flush()
+	if a.err != firstError {
+		t.Fatal("error changed after failure")
+	}
+	if _, err := os.Stat(r.path); !os.IsNotExist(err) {
+		t.Fatalf("sticky failure created another artifact: %v", err)
+	}
+}
+
+func TestSQLTimingsOwnedArtifactCannotBeReboundOrHardlinked(t *testing.T) {
+	for _, replace := range []bool{false, true} {
+		t.Run(map[bool]string{false: "hardlink", true: "replaced"}[replace], func(t *testing.T) {
+			sandbox := sqlTimingTempDir(t)
+			path := filepath.Join(sandbox, "owned.jsonl")
+			r := newSQLTimingTestRecorder(t, path)
+			ctx := context.WithValue(t.Context(), sqlTimingKey{}, r)
+			sqlTimingStart(ctx, "body").finish(nil)
+			r.flush()
+			if r.artifact.(*sqlTimingArtifact).err != nil {
+				t.Fatal("positive control failed")
+			}
+			victim := filepath.Join(sandbox, "victim.sqlite")
+			if replace {
+				if err := os.WriteFile(victim, []byte("database control"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Rename(path, filepath.Join(sandbox, "original.jsonl")); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Link(victim, path); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := os.Link(path, victim); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before, err := os.ReadFile(victim)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r.flush()
+			if r.artifact.(*sqlTimingArtifact).err == nil {
+				t.Fatal("replacement/hardlink was not rejected")
+			}
+			after, err := os.ReadFile(victim)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(after) != string(before) {
+				t.Fatal("rebound/hardlinked victim changed")
+			}
+		})
 	}
 }
