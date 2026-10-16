@@ -2,6 +2,42 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.10.0 - 2026-10-16
+
+### Added
+
+- **Sanctioned writes advance the verified-as-of ledger in their own
+  transaction.** A write that verified its own delta with the same reducer the
+  full replay uses — `applyPreparedOperation` and `ApplyBatchContext` — now
+  advances the ledger's recorded identity inside the same `BEGIN IMMEDIATE` that
+  runs the pre-check, the fold and the store-wide gates, so the next open
+  matches instead of re-verifying the whole store. Measured on a 94 MB store with
+  a 27,555-row journal: the **first open after a write went from 5,889 ms to
+  31 ms**, with the steady state unchanged at 30–35 ms.
+- The ledger is versioned **v3**. A match now means "verified, and every change
+  since was itself verified", so a ledger written by an older build fails closed
+  into exactly one full path and is then re-persisted as v3.
+  `verified_count`/`verified_at` continue to mean **full verifications only**, so
+  the signal that a whole-store verification genuinely ran is preserved exactly.
+
+### Changed
+
+- The advancing set is deliberately **closed**: only the two fold owners advance.
+  `foldPreparedOperation`/migration, `AppendTaskEvent`, the direct mutators and
+  governed allocation do not, so a write that proves less than the full path
+  cannot claim to have been verified. Extending the set is a separate,
+  evidence-backed change.
+
+### Unchanged
+
+- **Fail closed.** An absent, stale, foreign-shape, `tables_digest`- or
+  journal-tail-mismatched ledger never advances; one out-of-band write poisons
+  the pre-check until a full path heals it (measured: an out-of-band `UPDATE`
+  still takes the full 5,984 ms and increments the full-verification count); the
+  structural half still runs before every skip; and a rollback undoes state and
+  ledger together. The ledger remains a change detector, never a correctness
+  shortcut.
+
 ## v0.9.0 - 2026-10-14
 
 ### Added
