@@ -34,28 +34,20 @@ func seededModelRows(t *testing.T, db *DB) map[string]struct{} {
 	return rows
 }
 
-// TestModelSeedWritesEveryKnownModelOnceAndIgnoresUnknownProviders pins the
-// contract the prepared model-insert must keep. The statement is prepared once
-// and reused across the whole registry, so the properties that used to follow
-// from executing the text per row are asserted here instead: every model with a
-// seeded provider is written exactly once, a model naming a provider that is not
-// in the closed provider lookup is skipped rather than failing the open, and a
-// second activation over the same registry adds nothing.
-func TestModelSeedWritesEveryKnownModelOnceAndIgnoresUnknownProviders(t *testing.T) {
+// Every registry pair is admitted, including providers outside the fixed seeds.
+func TestModelSeedWritesEveryRegistryModelOnce(t *testing.T) {
 	t.Parallel()
 	models := []ptypes.ModelEntry{
 		{Provider: ptypes.ProviderAnthropic, Name: ptypes.ModelID("model-a")},
 		{Provider: ptypes.ProviderAnthropic, Name: ptypes.ModelID("model-b")},
 		{Provider: ptypes.ProviderOpenAI, Name: ptypes.ModelID("model-a")},
 		{Provider: ptypes.ProviderGoogle, Name: ptypes.ModelID("model-c")},
-		// The provider lookup is closed and seeded from the enum, so this entry
-		// has no provider row to resolve. INSERT OR IGNORE must drop it and leave
-		// the open succeeding, exactly as the per-row execution did.
 		{Provider: ptypes.Provider("provider-that-is-not-seeded"), Name: ptypes.ModelID("model-d")},
 	}
 	want := map[string]struct{}{
 		"anthropic/model-a": {}, "anthropic/model-b": {},
 		"openai/model-a": {}, "google/model-c": {},
+		"provider-that-is-not-seeded/model-d": {},
 	}
 
 	// A private file so the same database can be activated a second time, which

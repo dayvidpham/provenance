@@ -1944,27 +1944,26 @@ func (kind referenceSeedKind) selectQuery() string {
 // caller never supplies a provider surrogate key.
 const insertMLModelSQL = "INSERT OR IGNORE INTO ml_models (provider_id, name) VALUES (?1, ?2)"
 
-// seedMLModels writes the caller's model registry.
-//
-// The statement is prepared once and reused for every row. The default registry
-// carries several thousand models, and executing the statement text per row made
-// SQLite parse the same INSERT — and compile its provider subselect — once per
-// model. Parsing was the dominant cost of opening a tracker on the default
-// registry; the rows written, their order, and their idempotence are unchanged,
-// because this reuses one compiled form of the same statement rather than
-// changing what is executed.
+// seedMLModels adds missing registry identities inside the activation transaction.
+// Extra catalog rows and all existing surrogate IDs are retained. One projection
+// and reused prepared inserts avoid per-model lookup queries or SQL compilation.
 func (scope *connScope) seedMLModels(models []ptypes.ModelEntry) (err error) {
-	var existing int
-	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT COUNT(*) FROM ml_models").Scan(&existing); err != nil {
-		return fmt.Errorf("seedMLModels: count existing models: %w", err)
-	}
-	if existing >= len(models) {
-		return nil
-	}
-	providers, err := scope.providerIDsByName()
+	projection, err := scope.modelSeedProjection()
 	if err != nil {
 		return err
 	}
+	if projection.contains(models) {
+		return nil
+	}
+	providerInsert, err := scope.conn.PrepareContext(scope.ctx, "INSERT INTO providers (name) VALUES (?1) RETURNING id")
+	if err != nil {
+		return fmt.Errorf("seedMLModels: prepare missing provider insert: %w", err)
+	}
+	defer func() {
+		if closeErr := providerInsert.Close(); closeErr != nil && err == nil {
+			err = fmt.Errorf("seedMLModels: close prepared provider insert: %w", closeErr)
+		}
+	}()
 	insert, err := scope.conn.PrepareContext(scope.ctx, insertMLModelSQL)
 	if err != nil {
 		return fmt.Errorf("seedMLModels: prepare model insert: %w", err)
@@ -1977,31 +1976,68 @@ func (scope *connScope) seedMLModels(models []ptypes.ModelEntry) (err error) {
 		}
 	}()
 	for _, model := range models {
-		providerID, known := providers[string(model.Provider)]
-		if !known {
+		key := modelSeedKey{model.Provider, model.Name}
+		if _, present := projection.models[key]; present {
 			continue
+		}
+		providerID, known := projection.providers[model.Provider]
+		if !known {
+			if err := providerInsert.QueryRowContext(scope.ctx, string(model.Provider)).Scan(&providerID); err != nil {
+				return fmt.Errorf("seedMLModels: insert missing provider %q during registry reconciliation: %w", model.Provider, err)
+			}
+			projection.providers[model.Provider] = providerID
 		}
 		if _, err := insert.ExecContext(scope.ctx, providerID, string(model.Name)); err != nil {
 			return fmt.Errorf("seedMLModels: insert (%s, %q): %w", model.Provider.String(), model.Name, err)
 		}
+		projection.models[key] = struct{}{}
 	}
 	return nil
 }
 
-func (scope *connScope) providerIDsByName() (map[string]int64, error) {
-	providers := map[string]int64{}
-	if err := scope.queryRows("SELECT id, name FROM providers", nil, func(rows *sql.Rows) error {
+type modelSeedKey struct {
+	provider ptypes.Provider
+	model    ptypes.ModelID
+}
+
+type modelSeedProjection struct {
+	providers map[ptypes.Provider]int64
+	models    map[modelSeedKey]struct{}
+}
+
+func (projection modelSeedProjection) contains(models []ptypes.ModelEntry) bool {
+	for _, model := range models {
+		if _, present := projection.models[modelSeedKey{model.Provider, model.Name}]; !present {
+			return false
+		}
+	}
+	return true
+}
+
+// A left join retains providers with no models. Both seeding and the read-only
+// currency probe use this exact identity set, never a catalog-size heuristic.
+func (scope *connScope) modelSeedProjection() (modelSeedProjection, error) {
+	projection := modelSeedProjection{
+		providers: make(map[ptypes.Provider]int64),
+		models:    make(map[modelSeedKey]struct{}),
+	}
+	if err := scope.queryRows("SELECT p.id, p.name, m.name FROM providers p LEFT JOIN ml_models m ON m.provider_id = p.id", nil, func(rows *sql.Rows) error {
 		var id int64
 		var name string
-		if err := rows.Scan(&id, &name); err != nil {
+		var model sql.NullString
+		if err := rows.Scan(&id, &name, &model); err != nil {
 			return err
 		}
-		providers[name] = id
+		provider := ptypes.Provider(name)
+		projection.providers[provider] = id
+		if model.Valid {
+			projection.models[modelSeedKey{provider, ptypes.ModelID(model.String)}] = struct{}{}
+		}
 		return nil
 	}); err != nil {
-		return nil, fmt.Errorf("seedMLModels: read provider lookup: %w", err)
+		return modelSeedProjection{}, fmt.Errorf("modelSeedProjection: read provider/model identities during activation: %w", err)
 	}
-	return providers, nil
+	return projection, nil
 }
 
 // Scan helpers ---------------------------------------------------------------

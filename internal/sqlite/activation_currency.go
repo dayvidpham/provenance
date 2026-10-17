@@ -371,13 +371,11 @@ func (scope *connScope) seedLookupCurrent(query string, expected []seedRow) (boo
 	return true, nil
 }
 
-// activationMLModelsCurrent mirrors seedMLModels' own short-circuit: it writes
-// nothing when the stored model count already meets or exceeds the caller's
-// registry, so currency holds exactly when that count is at least len(models).
+// activationMLModelsCurrent is read-only and shares seeding's identity rule.
 func (scope *connScope) activationMLModelsCurrent(models []ptypes.ModelEntry) (bool, error) {
-	var existing int
-	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT COUNT(*) FROM ml_models").Scan(&existing); err != nil {
+	projection, err := scope.modelSeedProjection()
+	if err != nil {
 		return false, err
 	}
-	return existing >= len(models), nil
+	return projection.contains(models), nil
 }
