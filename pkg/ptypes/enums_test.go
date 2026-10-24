@@ -542,6 +542,7 @@ func TestRoleRoundTrip(t *testing.T) {
 		ptypes.RoleSupervisor,
 		ptypes.RoleWorker,
 		ptypes.RoleReviewer,
+		ptypes.RoleEpoch,
 	}
 	for _, r := range values {
 		b, err := r.MarshalText()
@@ -568,11 +569,23 @@ func TestRoleStringValues(t *testing.T) {
 		{ptypes.RoleSupervisor, "supervisor"},
 		{ptypes.RoleWorker, "worker"},
 		{ptypes.RoleReviewer, "reviewer"},
+		{ptypes.RoleEpoch, "epoch"},
 	}
 	for _, c := range cases {
 		if got := c.r.String(); got != c.want {
 			t.Errorf("Role(%d).String() = %q, want %q", int(c.r), got, c.want)
 		}
+	}
+}
+
+func TestRoleIsValid(t *testing.T) {
+	for r := ptypes.RoleHuman; r <= ptypes.RoleEpoch; r++ {
+		if !r.IsValid() {
+			t.Errorf("Role(%d).IsValid() = false, want true", int(r))
+		}
+	}
+	if ptypes.Role(ptypes.RoleEpoch + 1).IsValid() {
+		t.Errorf("Role(%d).IsValid() = true, want false", int(ptypes.RoleEpoch)+1)
 	}
 }
 

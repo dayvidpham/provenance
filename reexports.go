@@ -151,6 +151,7 @@ const (
 	RoleSupervisor = ptypes.RoleSupervisor
 	RoleWorker     = ptypes.RoleWorker
 	RoleReviewer   = ptypes.RoleReviewer
+	RoleEpoch      = ptypes.RoleEpoch
 )
 
 // Phase constants

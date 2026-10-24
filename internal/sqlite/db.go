@@ -1833,7 +1833,7 @@ var referenceSeeds = []struct {
 	{seedEdgeKinds, []string{"blocked_by", "derived_from", "supersedes", "discovered_from", "generated_by", "attributed_to"}},
 	{seedAgentKinds, []string{"human", "machine_learning", "software"}},
 	{seedProviders, []string{"anthropic", "google", "openai", "local"}},
-	{seedRoles, []string{"human", "architect", "supervisor", "worker", "reviewer"}},
+	{seedRoles, []string{"human", "architect", "supervisor", "worker", "reviewer", "epoch"}},
 	{seedPhases, []string{"request", "elicit", "propose", "review", "plan_uat", "ratify", "handoff", "impl_plan", "worker_slices", "code_review", "impl_uat", "landing", "unscoped"}},
 	{seedStages, []string{"not_started", "in_progress", "blocked", "complete"}},
 }
