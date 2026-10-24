@@ -361,12 +361,15 @@ func (p Provider) IsValid() bool {
 // Only used by ML agents (agents_ml.role_id).
 type Role int
 
+// Role values are persisted as agents_ml.role_id, so new roles are appended at
+// the end: reordering or inserting would silently rewrite existing agents.
 const (
 	RoleHuman      Role = iota // 0: Human user (conceptual; not stored on agents_ml)
 	RoleArchitect              // 1: Architect agent
 	RoleSupervisor             // 2: Supervisor agent
 	RoleWorker                 // 3: Worker agent
 	RoleReviewer               // 4: Reviewer agent
+	RoleEpoch                  // 5: Epoch orchestrator agent
 )
 
 var roleStrings = [...]string{
@@ -375,6 +378,7 @@ var roleStrings = [...]string{
 	RoleSupervisor: "supervisor",
 	RoleWorker:     "worker",
 	RoleReviewer:   "reviewer",
+	RoleEpoch:      "epoch",
 }
 
 func (r Role) String() string {
@@ -407,7 +411,7 @@ func (r *Role) UnmarshalText(b []byte) error {
 }
 
 func (r Role) IsValid() bool {
-	return r >= RoleHuman && r <= RoleReviewer
+	return r >= RoleHuman && r <= RoleEpoch
 }
 
 // ---------------------------------------------------------------------------
