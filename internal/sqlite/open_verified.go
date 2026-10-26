@@ -545,9 +545,9 @@ func (scope *connScope) verifiedLedgerEligibleForAdvance() bool {
 }
 
 // advanceVerifiedLedger records the post-write identity of a sanctioned
-// transaction that just proved its own delta: the fold materialised every
-// effect through the shared reducer step a full replay uses, and the
-// store-wide gates passed over the final state this transaction will commit.
+// transaction whose caller proved its own delta. The fold materialised every
+// effect through the shared reducer step a full replay uses, and the caller
+// verified that delta before asking for the advance.
 // The caller must invoke it inside the same BEGIN IMMEDIATE after the fold and
 // gates succeed and before COMMIT, so the advance and the delta commit or roll
 // back together. It rewrites only the identity fields — generation, journal_id,

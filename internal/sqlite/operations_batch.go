@@ -148,11 +148,11 @@ func (db *DB) ApplyBatchContext(ctx context.Context, inputs []journal.OperationI
 			outcomes[i] = journal.BatchRecordResult{Outcome: journal.BatchRecordCommitted, Result: record}
 			committedAny = true
 		}
-		// The two store-wide integrity gates run once over the rows this batch
-		// appended when the verified ledger matches the pre-write snapshot. If
-		// the ledger is stale or absent, run the full invariant over the final
-		// transaction state instead. Either way a failure rolls the whole batch
-		// back exactly as a per-record failure would.
+		// When the verified ledger matches the pre-write snapshot, verifyJournalDelta
+		// checks only the journal rows this batch appended. The full subtype and
+		// actor gates run only in the else branch, once over the final state,
+		// when the ledger is stale or absent. Either way a failure rolls the
+		// whole batch back exactly as a per-record failure would.
 		if committedAny {
 			after, tailErr := scope.maxJournalID()
 			if tailErr != nil {

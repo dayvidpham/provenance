@@ -346,17 +346,7 @@ func TestEligibleBatchUsesOneDeltaOverTheAppendedRange(t *testing.T) {
 // the delta rejects it, and the transaction leaves no new row behind.
 func TestEligibleApplyRollsBackADeltaViolation(t *testing.T) {
 	db, actor, boot, seeded := openCurrentLedger(t)
-	scope := takePoolScope(t, db)
-	if _, err := scope.conn.ExecContext(scope.ctx, `
-		CREATE TRIGGER delta_test_cross_subtype AFTER INSERT ON journal_decisions
-		BEGIN
-			INSERT INTO journal_evidence (journal_id, evidence_kind, task_id, content_digest, payload)
-			VALUES (NEW.journal_id, 'pasture.git.commit', NULL, x'78', '{}');
-		END`); err != nil {
-		scope.release()
-		t.Fatalf("install cross-subtype trigger: %v", err)
-	}
-	scope.release()
+	installDeltaCrossSubtypeTrigger(t, db)
 
 	before, _, _ := ledgerSnapshot(t, db)
 	gates := &gateTally{}
@@ -374,6 +364,71 @@ func TestEligibleApplyRollsBackADeltaViolation(t *testing.T) {
 	}
 	if err := db.VerifyIntegrity(); err != nil {
 		t.Fatalf("VerifyIntegrity after rollback: %v", err)
+	}
+}
+
+// installDeltaCrossSubtypeTrigger adds the same journal_decisions trigger the
+// single-write rollback pin uses: every new decision row also lands in
+// journal_evidence, so the delta gate must reject the transaction.
+func installDeltaCrossSubtypeTrigger(t *testing.T, db *DB) {
+	t.Helper()
+	scope := takePoolScope(t, db)
+	defer scope.release()
+	if _, err := scope.conn.ExecContext(scope.ctx, `
+		CREATE TRIGGER delta_test_cross_subtype AFTER INSERT ON journal_decisions
+		BEGIN
+			INSERT INTO journal_evidence (journal_id, evidence_kind, task_id, content_digest, payload)
+			VALUES (NEW.journal_id, 'pasture.git.commit', NULL, x'78', '{}');
+		END`); err != nil {
+		t.Fatalf("install cross-subtype trigger: %v", err)
+	}
+}
+
+// TestEligibleBatchRollsBackADeltaViolation drives ApplyBatchContext's own gate
+// return and rollback reclassification. The first record fires the cross-subtype
+// trigger; the batch gate must reject the whole transaction. Deleting the batch
+// "return gateErr" lets the violating rows commit, so this test goes red.
+func TestEligibleBatchRollsBackADeltaViolation(t *testing.T) {
+	db, actor, boot, seeded := openCurrentLedger(t)
+	installDeltaCrossSubtypeTrigger(t, db)
+
+	before, beforeStore, present := ledgerSnapshot(t, db)
+	if !present || before.identity != beforeStore || before.count != seeded {
+		t.Fatalf("pre-write ledger present=%v count=%d want %d; ledger=%+v store=%+v", present, before.count, seeded, before.identity, beforeStore)
+	}
+	gates := &gateTally{}
+	result, err := db.ApplyBatchContext(gates.context(), []journal.OperationInput{
+		batchDecisionInput("op-delta-batch-cross", actor, boot, `{}`),
+		deltaTaskInput(actor, boot, "op-delta-batch-cross-second"),
+	})
+	if !errors.Is(err, journal.ErrSubtypeIntegrity) {
+		t.Fatalf("cross-subtype batch error = %v, want ErrSubtypeIntegrity", err)
+	}
+	var batchErr *journal.BatchApplyError
+	if !errors.As(err, &batchErr) || batchErr.Index != -1 {
+		t.Fatalf("batch error = %v, want BatchApplyError index -1 from the post-fold gate return", err)
+	}
+	if result.Committed {
+		t.Fatal("cross-subtype batch committed; the batch gate return must roll the transaction back")
+	}
+	if len(result.Records) != 2 {
+		t.Fatalf("batch records = %d, want 2", len(result.Records))
+	}
+	for i, record := range result.Records {
+		if record.Outcome != journal.BatchRecordNotRecorded {
+			t.Fatalf("record %d outcome = %v, want NotRecorded after rollback reclassification", i, record.Outcome)
+		}
+	}
+	assertGateCounts(t, gates, 1, 0, 0)
+	after, identity, present := ledgerSnapshot(t, db)
+	if !present || after.identity != before.identity || after.count != seeded {
+		t.Fatalf("rejected batch moved the ledger from %+v/%d to %+v/%d", before.identity, seeded, after.identity, after.count)
+	}
+	if identity != before.identity {
+		t.Fatalf("rejected batch committed store identity %+v ahead of the pre-write ledger %+v", identity, before.identity)
+	}
+	if err := db.VerifyIntegrity(); err != nil {
+		t.Fatalf("VerifyIntegrity after batch rollback: %v", err)
 	}
 }
 
@@ -482,13 +537,17 @@ func TestIneligibleWriteUsesFullPathOnce(t *testing.T) {
 	})
 
 	t.Run("stale batch runs the full gates once", func(t *testing.T) {
-		db, actor, boot, _ := openCurrentLedger(t)
+		db, actor, boot, seeded := openCurrentLedger(t)
 		scope := takePoolScope(t, db)
 		if _, err := scope.conn.ExecContext(scope.ctx, "UPDATE tasks SET title = title"); err != nil {
 			scope.release()
 			t.Fatalf("out-of-band UPDATE: %v", err)
 		}
 		scope.release()
+		before, _, present := ledgerSnapshot(t, db)
+		if !present {
+			t.Fatal("out-of-band edit removed the ledger before the batch")
+		}
 		gates := &gateTally{}
 		result, err := db.ApplyBatchContext(gates.context(), []journal.OperationInput{
 			deltaTaskInput(actor, boot, "op-delta-stale-batch-a"),
@@ -498,5 +557,12 @@ func TestIneligibleWriteUsesFullPathOnce(t *testing.T) {
 			t.Fatalf("stale batch: committed=%v err=%v", result.Committed, err)
 		}
 		assertGateCounts(t, gates, 0, 1, 1)
+		after, identity, present := ledgerSnapshot(t, db)
+		if !present || after.identity != before.identity || after.count != seeded {
+			t.Fatalf("stale batch advanced the ledger from %+v/%d to %+v/%d", before.identity, seeded, after.identity, after.count)
+		}
+		if after.identity == identity {
+			t.Fatalf("stale batch left the ledger matching the store %+v; the eligible guard must skip the advance", identity)
+		}
 	})
 }
