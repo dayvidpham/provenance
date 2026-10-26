@@ -437,7 +437,11 @@ func (db *DB) JournalIsEmpty() (bool, error) {
 // §9.4 idempotent-replay short-circuit; a new operation then validates genesis
 // discipline (§4.6), inserts its anchor, folds its effects in order with
 // per-effect authorization (§9.3), persists result slots (§3.2), and runs the
-// subtype-integrity and close-ends-assignment gates before commit.
+// close-ends-assignment gate plus one store-wide journal gate before commit.
+// When the verified-as-of ledger matches the pre-write snapshot, that gate is
+// the delta over the rows this transaction appended; otherwise it is the full
+// subtype-integrity and actor-placement check. Open, migration, and
+// VerifyIntegrity keep the full check.
 func (db *DB) Apply(in journal.OperationInput) (res journal.CommittedResult, err error) {
 	return db.ApplyContext(context.Background(), in)
 }
@@ -484,8 +488,9 @@ func prepareApplyInput(in journal.OperationInput) (journal.OperationInput, journ
 }
 
 // applyPreparedOperation owns the BEGIN IMMEDIATE transaction shared by all
-// canonical operation entrypoints. foldOptions is package-private; public Apply
-// always supplies the zero value.
+// canonical operation entrypoints. foldOptions is package-private; the public
+// single-write path defers the store-wide gates to this outer closure so the
+// post-fold verifier can use the verified-as-of ledger's delta path.
 func (db *DB) applyPreparedOperation(ctx context.Context, in journal.OperationInput, prepared journal.CanonicalMutation, callerMutationDigest []byte, options foldOptions) (res journal.CommittedResult, err error) {
 	ctx, timings := sqlTimingOperation(ctx, "Apply", db)
 	defer timings.flush()
@@ -512,10 +517,38 @@ func (db *DB) applyPreparedOperation(ctx context.Context, in journal.OperationIn
 	// skipped for idempotent replays that wrote nothing.
 	if transactionErr := runImmediateTransaction(scope.ctx, scope.conn, func() error {
 		eligible := scope.verifiedLedgerEligibleForAdvance()
+		before, err := scope.maxJournalID()
+		if err != nil {
+			return err
+		}
+		// Defer the two store-wide gates to the outer transaction closure:
+		// when the verified ledger matches, only the rows this fold appends
+		// need verification; otherwise the full gates run once over the
+		// post-write state.
+		foldOpts := options
+		foldOpts.deferStoreGates = true
 		var foldErr error
-		res, foldErr = scope.foldPreparedOperation(in, prepared, callerMutationDigest, options)
+		res, foldErr = scope.foldPreparedOperation(in, prepared, callerMutationDigest, foldOpts)
 		if foldErr != nil {
 			return foldErr
+		}
+		if !res.ShortCircuited {
+			after, err := scope.maxJournalID()
+			if err != nil {
+				return err
+			}
+			if eligible {
+				if err := scope.verifyJournalDelta(before, after); err != nil {
+					return err
+				}
+			} else {
+				if err := scope.verifySubtypeIntegrity(); err != nil {
+					return err
+				}
+				if err := scope.verifyActorPlacement(); err != nil {
+					return err
+				}
+			}
 		}
 		if eligible && !res.ShortCircuited {
 			// Best-effort by contract: a failed advance leaves the ledger stale,
@@ -742,11 +775,12 @@ func (scope *connScope) foldPreparedOperation(in journal.OperationInput, prepare
 
 	// Post-fold gates: subtype integrity (§10 rule 8), anchor-only actor placement
 	// (§2.1, §10 rule 5), and close-ends-assignment (§8.1 / owner_responsibility
-	// regression c). The first two are STORE-WIDE invariants; the batch path
-	// defers them (options.deferStoreGates) and runs them once over the final
-	// transaction state, which is the same invariant over the same committed
-	// state at the transaction's natural scope. The close-ends-assignment gate is
-	// per-operation and always runs here.
+	// regression c). The first two are STORE-WIDE invariants; the single-write
+	// and batch paths defer them (options.deferStoreGates) to their outer
+	// transaction closure, which verifies only the rows this transaction
+	// appended when the verified-as-of ledger matches, or the full invariant
+	// when it does not. The close-ends-assignment gate is per-operation and
+	// always runs here.
 	if !options.deferStoreGates {
 		if txErr = scope.verifySubtypeIntegrity(); txErr != nil {
 			return journal.CommittedResult{}, txErr

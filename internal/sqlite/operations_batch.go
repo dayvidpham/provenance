@@ -17,14 +17,14 @@ import (
 // §11 conflict classification, the per-effect authorization, the close-ends
 // gate, and the result-slot reconstruction are exactly those of a single Apply.
 //
-// The one deliberate scope change is the two STORE-WIDE integrity gates
-// (verifySubtypeIntegrity and verifyActorPlacement). They are whole-journal
-// invariants, so their natural scope is the transaction: the batch runs them
-// ONCE over the final state it will commit, after the last record, instead of
-// once per record. That is the same invariant over the same committed state, and
-// a failure still rolls the whole batch back. Running them per record would make
-// the batch O(records x journal) and erase the throughput the batch exists to
-// deliver. Every PER-RECORD check is unchanged.
+// The two STORE-WIDE integrity gates (verifySubtypeIntegrity and
+// verifyActorPlacement) are deferred to the transaction's outer closure. When
+// the verified-as-of ledger matches, the closure verifies only the journal rows
+// this batch appended (verifyJournalDelta); when the ledger is stale or absent,
+// it runs the full invariant over the final state. A failure still rolls the
+// whole batch back. Running the full gates per record would make the batch
+// O(records x journal) and erase the throughput the batch exists to deliver.
+// Every PER-RECORD check is unchanged.
 
 // preparedBatchOperation is one canonicalized batch record, ready to fold. The
 // inputs are all prepared BEFORE write ownership is taken, mirroring
@@ -125,6 +125,10 @@ func (db *DB) ApplyBatchContext(ctx context.Context, inputs []journal.OperationI
 		// interleave and a crash leaves both or neither. The advance is
 		// best-effort — its failure never fails the batch.
 		eligible := scope.verifiedLedgerEligibleForAdvance()
+		before, err := scope.maxJournalID()
+		if err != nil {
+			return err
+		}
 		committedAny := false
 		for i := range prepared {
 			record, foldErr := scope.foldPreparedOperation(prepared[i].in, prepared[i].prepared, prepared[i].callerMutationDigest, foldOptions{deferStoreGates: true})
@@ -144,19 +148,32 @@ func (db *DB) ApplyBatchContext(ctx context.Context, inputs []journal.OperationI
 			outcomes[i] = journal.BatchRecordResult{Outcome: journal.BatchRecordCommitted, Result: record}
 			committedAny = true
 		}
-		// The two store-wide integrity gates run ONCE, over the final state this
-		// transaction will commit, instead of per record. They are whole-journal
-		// invariants: the batch is one transaction, so the transaction is their
-		// natural scope, and a failure here rolls the whole batch back exactly as a
-		// per-record failure would. Every per-record check already ran inside the
-		// fold above.
-		if gateErr := scope.verifySubtypeIntegrity(); gateErr != nil {
-			failIndex = -1
-			return gateErr
-		}
-		if gateErr := scope.verifyActorPlacement(); gateErr != nil {
-			failIndex = -1
-			return gateErr
+		// When the verified ledger matches the pre-write snapshot, verifyJournalDelta
+		// checks only the journal rows this batch appended. The full subtype and
+		// actor gates run only in the else branch, once over the final state,
+		// when the ledger is stale or absent. Either way a failure rolls the
+		// whole batch back exactly as a per-record failure would.
+		if committedAny {
+			after, tailErr := scope.maxJournalID()
+			if tailErr != nil {
+				failIndex = -1
+				return tailErr
+			}
+			if eligible {
+				if gateErr := scope.verifyJournalDelta(before, after); gateErr != nil {
+					failIndex = -1
+					return gateErr
+				}
+			} else {
+				if gateErr := scope.verifySubtypeIntegrity(); gateErr != nil {
+					failIndex = -1
+					return gateErr
+				}
+				if gateErr := scope.verifyActorPlacement(); gateErr != nil {
+					failIndex = -1
+					return gateErr
+				}
+			}
 		}
 		if eligible && committedAny {
 			// Best-effort by contract: a failed advance leaves the ledger stale,

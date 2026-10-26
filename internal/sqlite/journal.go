@@ -401,6 +401,7 @@ func (scope *connScope) verifyWatermarkPresence() error {
 // this, and is the §15 convergence tool's placement guard. Returns
 // journal.ErrActorPlacement on any violation.
 func (scope *connScope) verifyActorPlacement() (timingErr error) {
+	observeJournalGate(scope.ctx, journalGateActor)
 	timing := sqlTimingStart(scope.ctx, "gate_actor_placement")
 	defer func() { timing.finish(timingErr) }()
 	var (
@@ -534,6 +535,37 @@ func (table subtypeTable) discriminatorQuery() string {
 	}
 }
 
+// rowExistsQuery is the pre-built point lookup the delta verifier uses for one
+// new journal id. Identifiers are compile-time literals; the delta path must
+// not assemble SQL from a label at call time.
+func (table subtypeTable) rowExistsQuery() string {
+	switch table {
+	case subtypeOperations:
+		return "SELECT 1 FROM journal_operations WHERE journal_id=?1"
+	case subtypeTaskEvents:
+		return "SELECT 1 FROM journal_task_events WHERE journal_id=?1"
+	case subtypeAuthorities:
+		return "SELECT 1 FROM journal_authorities WHERE journal_id=?1"
+	case subtypeDecisions:
+		return "SELECT 1 FROM journal_decisions WHERE journal_id=?1"
+	case subtypeEvidence:
+		return "SELECT 1 FROM journal_evidence WHERE journal_id=?1"
+	default:
+		panic("unknown subtype table")
+	}
+}
+
+// subtypeCheckOrder is the closed kind order the delta verifier walks so a
+// cross-subtype failure names the same foreign table on every run. It is the
+// subtypeAllTables key set, not a second map of tables.
+var subtypeCheckOrder = []journal.JournalKind{
+	journal.JournalKindOperation,
+	journal.JournalKindTaskEvent,
+	journal.JournalKindAuthority,
+	journal.JournalKindDecision,
+	journal.JournalKindEvidence,
+}
+
 // subtypeExclusivityPair is one pre-built cross-subtype exclusivity probe (§10 rule 8):
 // a JournalID may appear in at most one subtype table. All C(5,2) pairs over the closed
 // subtypeAllTables set are built once at package init, in deterministic kind order.
@@ -616,7 +648,194 @@ func (scope *connScope) subtypeTablesPresent() (map[journal.JournalKind]subtypeT
 	return present, nil
 }
 
+// journalGateDelta, journalGateSubtype, and journalGateActor name the
+// store-wide gates a write may run. withJournalGateProbe attaches an observer
+// tests use to count which gate ran; production callers leave it unset, and a
+// nil probe does not change control flow or which rows are read.
+const (
+	journalGateDelta   = "journal_delta"
+	journalGateSubtype = "subtype_integrity"
+	journalGateActor   = "actor_placement"
+)
+
+type journalGateProbeKey struct{}
+
+func withJournalGateProbe(ctx context.Context, probe func(string)) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, journalGateProbeKey{}, probe)
+}
+
+func observeJournalGate(ctx context.Context, name string) {
+	if ctx == nil {
+		return
+	}
+	probe, _ := ctx.Value(journalGateProbeKey{}).(func(string))
+	if probe != nil {
+		probe(name)
+	}
+}
+
+// maxJournalID returns the current journal tail. It is the cheap boundary the
+// delta verifier uses to identify exactly the rows this transaction appended.
+func (scope *connScope) maxJournalID() (int64, error) {
+	var tail sql.NullInt64
+	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT MAX(journal_id) FROM journal").Scan(&tail); err != nil {
+		return 0, fmt.Errorf("maxJournalID: %w", err)
+	}
+	if !tail.Valid {
+		return 0, nil
+	}
+	return tail.Int64, nil
+}
+
+// verifyJournalDelta proves the two store-wide journal invariants over only the
+// rows this transaction appended: (after, through]. It is the induction step
+// used when the verified-as-of ledger matches the transaction's pre-write
+// snapshot. The full verifySubtypeIntegrity and verifyActorPlacement functions
+// remain the base case and recovery/audit path.
+//
+// The journal is append-only, so an old row cannot change between the ledger's
+// full verification and this write. A new row is checked for:
+//   - exactly one subtype row, selected by journal.kind_id;
+//   - no second subtype table carrying the same journal_id;
+//   - actor placement (anchor has actor, subordinate does not).
+//
+// Authority detail rows are checked with the existing authority-level verifier
+// because that table is small and the check is not journal-sized.
+func (scope *connScope) verifyJournalDelta(after, through int64) (err error) {
+	if through <= after {
+		return nil
+	}
+	observeJournalGate(scope.ctx, journalGateDelta)
+	timing := sqlTimingStart(scope.ctx, "gate_journal_delta")
+	defer func() { timing.finish(err) }()
+	tables, err := scope.subtypeTablesPresent()
+	if err != nil {
+		return err
+	}
+	rows, err := scope.conn.QueryContext(scope.ctx, `
+		SELECT journal_id, kind_id, actor_id, produced_by_operation_journal_id
+		FROM journal
+		WHERE journal_id > ?1 AND journal_id <= ?2
+		ORDER BY journal_id`, after, through)
+	if err != nil {
+		return fmt.Errorf("verifyJournalDelta: read new journal rows: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var (
+			journalID int64
+			kind      int64
+			actor     sql.NullString
+			producer  sql.NullInt64
+		)
+		if err := rows.Scan(&journalID, &kind, &actor, &producer); err != nil {
+			return fmt.Errorf("verifyJournalDelta: scan journal row: %w", err)
+		}
+		if actor.Valid == producer.Valid {
+			if producer.Valid {
+				return fmt.Errorf(
+					"%w: subordinate journal row %d (produced by an operation) carries a stored "+
+						"actor_id — where: actor-placement delta gate; when: before commit; "+
+						"impact: the write is rolled back; fix: derive the actor from the anchor",
+					journal.ErrActorPlacement, journalID)
+			}
+			return fmt.Errorf(
+				"%w: anchor journal row %d is missing its actor_id — where: actor-placement "+
+					"delta gate; when: before commit; impact: the write is rolled back; "+
+					"fix: an anchor row must carry the committing actor",
+				journal.ErrActorPlacement, journalID)
+		}
+		if err := scope.verifyDeltaSubtypeRow(tables, journalID, journal.JournalKind(kind)); err != nil {
+			return err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("verifyJournalDelta: iterate new journal rows: %w", err)
+	}
+	// Authority detail is not journal-sized. Re-checking the whole small table
+	// keeps the second inheritance level exact without scanning the journal.
+	return scope.verifyAuthorityDetailIntegrity()
+}
+
+// verifyDeltaSubtypeRow checks one newly appended journal row for exactly one
+// subtype row in the table selected by its kind, and none in any other present
+// subtype table. A kind whose table is absent is not a totality failure — the
+// full path does not invent that check either — but a row that still appears in
+// another present subtype table is the discriminator violation the full path
+// would reject.
+func (scope *connScope) verifyDeltaSubtypeRow(tables map[journal.JournalKind]subtypeTable, journalID int64, kind journal.JournalKind) error {
+	expected, present := tables[kind]
+	subtypeRows := 0
+	expectedPresent := false
+	var foreign subtypeTable
+	for _, checkKind := range subtypeCheckOrder {
+		table, ok := tables[checkKind]
+		if !ok {
+			continue
+		}
+		found, err := scope.subtypeRowExists(table, journalID)
+		if err != nil {
+			return fmt.Errorf("verifyJournalDelta: inspect %s for journal %d: %w", table.label(), journalID, err)
+		}
+		if !found {
+			continue
+		}
+		subtypeRows++
+		if present && table == expected {
+			expectedPresent = true
+			continue
+		}
+		if foreign == 0 {
+			foreign = table
+		}
+	}
+	if !present {
+		if subtypeRows == 0 {
+			return nil
+		}
+		return fmt.Errorf(
+			"%w: new journal row %d has kind %s but carries a %s subtype row, and that kind has "+
+				"no matching subtype table in this schema — where: subtype-integrity delta gate; "+
+				"when: before commit; impact: the write is rolled back; fix: the subtype table "+
+				"must agree with journal.kind_id",
+			journal.ErrSubtypeIntegrity, journalID, kind, foreign.label())
+	}
+	if !expectedPresent {
+		return fmt.Errorf(
+			"%w: new journal row %d has kind %s but no matching %s subtype row — "+
+				"where: subtype-integrity delta gate; when: before commit; impact: the "+
+				"write is rolled back because class-table inheritance requires exactly "+
+				"one subtype row per new journal row; fix: write the %s row in the same "+
+				"transaction as its journal row",
+			journal.ErrSubtypeIntegrity, journalID, kind, expected.label(), expected.label())
+	}
+	if subtypeRows != 1 {
+		return fmt.Errorf(
+			"%w: new journal row %d appears in %s and %s — where: subtype-integrity delta "+
+				"gate; when: before commit; impact: the write is rolled back; fix: a journal "+
+				"row must have exactly one subtype row selected by its JournalKind",
+			journal.ErrSubtypeIntegrity, journalID, expected.label(), foreign.label())
+	}
+	return nil
+}
+
+func (scope *connScope) subtypeRowExists(table subtypeTable, journalID int64) (bool, error) {
+	var found int
+	err := scope.conn.QueryRowContext(scope.ctx, table.rowExistsQuery(), journalID).Scan(&found)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (scope *connScope) verifySubtypeIntegrity() (err error) {
+	observeJournalGate(scope.ctx, journalGateSubtype)
 	timing := sqlTimingStart(scope.ctx, "gate_subtype_integrity")
 	defer func() { timing.finish(err) }()
 	tables, err := scope.subtypeTablesPresent()

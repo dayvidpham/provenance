@@ -12,17 +12,15 @@ type foldOptions struct {
 	faultHook          func(effectIndex int) error
 	assignmentTransfer *assignmentTransferLease
 	// deferStoreGates tells foldPreparedOperation to skip the two STORE-WIDE
-	// integrity gates (verifySubtypeIntegrity and verifyActorPlacement) and let
-	// the caller run them ONCE over the final transaction state instead. It is set
-	// only by the batch path (ApplyBatchContext), where one transaction folds many
-	// records: the gates are whole-journal invariants whose natural scope is the
-	// transaction, so running them once after the last record is the same
-	// invariant over the same final state, while re-running them per record is
-	// O(journal) per record and makes the batch O(records x journal). The
-	// per-record path (public Apply, migration, transfer) always passes the zero
-	// value, so its behavior is unchanged. Every PER-RECORD check — conditions,
-	// authorization, per-effect fold, result slots, and close-ends-assignment —
-	// still runs per record inside the fold.
+	// integrity gates (verifySubtypeIntegrity and verifyActorPlacement). The
+	// single-write path (applyPreparedOperation, including assignment transfer)
+	// and the batch path (ApplyBatchContext) set it and run one gate in the
+	// outer transaction: verifyJournalDelta over the appended range when the
+	// verified-as-of ledger matches the pre-write snapshot, otherwise the full
+	// gates once over the final state. Migration, replay, and foldOperation
+	// leave it false, so each of those folds still runs the full gates. Every
+	// PER-RECORD check — conditions, authorization, per-effect fold, result
+	// slots, and close-ends-assignment — still runs inside the fold.
 	deferStoreGates bool
 }
 
