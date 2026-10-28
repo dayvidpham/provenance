@@ -14,6 +14,22 @@ import (
 // and manifest entry. Exact existing rows are an idempotent success; drift is
 // rejected before any write.
 func (db *DB) RegisterFixedSoftwareAgent(reg journal.FixedSoftwareAgentRegistration) (ptypes.SoftwareAgent, error) {
+	return db.RegisterFixedSoftwareAgentContext(context.Background(), reg)
+}
+
+// RegisterFixedSoftwareAgentContext runs one atomic registration under ctx.
+func (db *DB) RegisterFixedSoftwareAgentContext(ctx context.Context, reg journal.FixedSoftwareAgentRegistration) (result ptypes.SoftwareAgent, resultErr error) {
+	if ctx == nil {
+		return ptypes.SoftwareAgent{}, errors.New("sqlite.RegisterFixedSoftwareAgentContext: nil context; registration not attempted; fix: supply a live context")
+	}
+	defer func() {
+		if resultErr != nil && ctx.Err() != nil {
+			resultErr = errors.Join(resultErr, ctx.Err(), context.Cause(ctx))
+		}
+	}()
+	if err := ctx.Err(); err != nil {
+		return ptypes.SoftwareAgent{}, fmt.Errorf("sqlite.RegisterFixedSoftwareAgentContext: context ended before registration; fix: supply a live context: %w", err)
+	}
 	if err := reg.Validate(); err != nil {
 		return ptypes.SoftwareAgent{}, err
 	}
@@ -24,17 +40,23 @@ func (db *DB) RegisterFixedSoftwareAgent(reg journal.FixedSoftwareAgentRegistrat
 	id := ptypes.AgentID(reg.Entry.ActorID)
 	agent := ptypes.SoftwareAgent{Agent: ptypes.Agent{ID: id, Kind: ptypes.AgentKindSoftware}, Name: reg.AgentName, Version: reg.Version, Source: reg.Source}
 
-	scope, err := db.bindScope(context.Background(), projectionTargetLive)
+	scope, err := db.bindScope(ctx, projectionTargetLive)
 	if err != nil {
 		return ptypes.SoftwareAgent{}, fixedAgentActivationError(fixedAgentLeaseError{cause: err}, "the activation transaction could not start", "a database/sql connection could not be leased", "DB.RegisterFixedSoftwareAgent transaction setup", "before preflight reads or writes", "no activation rows were changed", "release outstanding scopes or reopen the database, then retry")
 	}
-	defer scope.release()
+	defer func() {
+		if err := scope.restoreBorrowedPragmas(); err != nil {
+			result = ptypes.SoftwareAgent{}
+			resultErr = errors.Join(resultErr, err)
+		}
+		scope.release()
+	}()
 	var operationErr error
-	if transactionErr := runImmediateTransaction(scope.ctx, scope.conn, func() (callbackErr error) {
+	if transactionErr := runRegistrationTransaction(scope, func() (callbackErr error) {
 		defer func() { operationErr = callbackErr }()
 		claims, err := loadNamespaceClaims(scope.ctx, scope.conn)
 		if err != nil {
-			return fixedAgentActivationError(err, "existing namespace claims could not be loaded", "the preflight query failed", "DB.RegisterFixedSoftwareAgent namespace preflight", "after the transaction began and before any writes", "the activation is aborted and its transaction is rolled back", "repair database access or schema integrity, then retry")
+			return fixedAgentActivationError(err, "existing namespace claims could not be loaded", "the preflight query failed", "DB.RegisterFixedSoftwareAgent namespace preflight", "after the transaction began and before any writes", "the activation is aborted and rollback is attempted", "repair database access or schema integrity, then retry")
 		}
 		claimFound := false
 		for _, existing := range claims {
@@ -75,20 +97,20 @@ func (db *DB) RegisterFixedSoftwareAgent(reg journal.FixedSoftwareAgentRegistrat
 
 		if !claimFound {
 			if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO actor_namespace_claims (namespace, claimant_id, range_min, range_max, codec) VALUES (?1, ?2, ?3, ?4, ?5)", reg.Claim.Namespace, reg.Claim.ClaimantID, reg.Claim.Range.Min[:], reg.Claim.Range.Max[:], reg.Claim.Codec); err != nil {
-				return fixedAgentActivationError(err, "the namespace claim could not be written", "SQLite rejected the actor_namespace_claims insert", "DB.RegisterFixedSoftwareAgent namespace write", "during the activation transaction", "the activation is aborted and all writes are rolled back", "resolve the reported constraint, schema, storage, or lock error and retry the complete activation")
+				return fixedAgentActivationError(err, "the namespace claim could not be written", "SQLite rejected the actor_namespace_claims insert", "DB.RegisterFixedSoftwareAgent namespace write", "during the activation transaction", "the activation is aborted and rollback is attempted", "resolve the reported constraint, schema, storage, or lock error and retry the complete activation")
 			}
 		}
 		if !agentFound {
 			if _, err := scope.conn.ExecContext(scope.ctx, insertAgentSQL, id.String(), int(ptypes.AgentKindSoftware)); err != nil {
-				return fixedAgentActivationError(err, "the base agent could not be written", "SQLite rejected the agents insert", "DB.RegisterFixedSoftwareAgent base-agent write", "during the activation transaction", "the activation is aborted and all writes are rolled back", "resolve the reported constraint, schema, storage, or lock error and retry the complete activation")
+				return fixedAgentActivationError(err, "the base agent could not be written", "SQLite rejected the agents insert", "DB.RegisterFixedSoftwareAgent base-agent write", "during the activation transaction", "the activation is aborted and rollback is attempted", "resolve the reported constraint, schema, storage, or lock error and retry the complete activation")
 			}
 			if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO agents_software (agent_id, name, version, source) VALUES (?1, ?2, ?3, ?4)", id.String(), reg.AgentName, reg.Version, reg.Source); err != nil {
-				return fixedAgentActivationError(err, "the software-agent detail could not be written", "SQLite rejected the agents_software insert", "DB.RegisterFixedSoftwareAgent software-agent write", "during the activation transaction", "the activation is aborted and all writes are rolled back", "resolve the reported constraint, schema, storage, or lock error and retry the complete activation")
+				return fixedAgentActivationError(err, "the software-agent detail could not be written", "SQLite rejected the agents_software insert", "DB.RegisterFixedSoftwareAgent software-agent write", "during the activation transaction", "the activation is aborted and rollback is attempted", "resolve the reported constraint, schema, storage, or lock error and retry the complete activation")
 			}
 		}
 		if entryMatch == fixedActorEntryAbsent {
 			if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO fixed_actor_manifest_entries (actor_id, namespace, kind_id, name, metadata) VALUES (?1, ?2, ?3, ?4, ?5)", id.String(), reg.Entry.Namespace, int(reg.Entry.ActorKind), reg.Entry.Name, metadata); err != nil {
-				return fixedAgentActivationError(err, "the fixed-actor manifest entry could not be written", "SQLite rejected the fixed_actor_manifest_entries insert", "DB.RegisterFixedSoftwareAgent manifest write", "during the activation transaction", "the activation is aborted and all writes are rolled back", "resolve the reported constraint, schema, storage, or lock error and retry the complete activation")
+				return fixedAgentActivationError(err, "the fixed-actor manifest entry could not be written", "SQLite rejected the fixed_actor_manifest_entries insert", "DB.RegisterFixedSoftwareAgent manifest write", "during the activation transaction", "the activation is aborted and rollback is attempted", "resolve the reported constraint, schema, storage, or lock error and retry the complete activation")
 			}
 		}
 		return nil
@@ -98,7 +120,7 @@ func (db *DB) RegisterFixedSoftwareAgent(reg journal.FixedSoftwareAgentRegistrat
 		// produce two competing actionable narratives. Only BEGIN/COMMIT failures
 		// that occurred outside the callback need the transaction-level envelope.
 		if operationErr != nil {
-			return ptypes.SoftwareAgent{}, operationErr
+			return ptypes.SoftwareAgent{}, transactionErr
 		}
 		return ptypes.SoftwareAgent{}, fixedAgentActivationError(transactionErr, "the activation transaction could not commit", "SQLite rejected BEGIN IMMEDIATE, COMMIT, or a required activation operation", "DB.RegisterFixedSoftwareAgent transaction", "during activation", "no agent is returned and the transaction was rolled back where possible", "inspect the reported database error, reopen if necessary, and retry")
 	}

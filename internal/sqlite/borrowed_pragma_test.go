@@ -229,7 +229,10 @@ func TestBorrowedReleaseRetiresConnectionWhenRestoreCannotLand(t *testing.T) {
 		t.Fatalf("foreign_keys after the unverified restore = %d, want 1: this test no longer reproduces the no-op restore it guards", afterNaiveRestore)
 	}
 
-	scope.restoreBorrowedPragmas()
+	if err := scope.restoreBorrowedPragmas(); err == nil {
+		scope.release()
+		t.Fatal("unverified restore did not report an error")
+	}
 	if !scope.discarded {
 		scope.release()
 		t.Fatal("connection was returned to the caller's pool with Provenance's foreign_keys=ON; an unprovable restore must retire the connection")

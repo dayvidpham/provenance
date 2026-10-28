@@ -14,6 +14,12 @@ rollbackCases:
   - {name: software-agent-insert-fails, boundary: software}
   - {name: manifest-insert-fails, boundary: manifest}
 
+cancellationCases:
+  - {name: cancel-after-claim, boundary: claim}
+  - {name: cancel-after-base-agent, boundary: agent}
+  - {name: cancel-after-software-agent, boundary: software}
+  - {name: cancel-after-manifest, boundary: manifest}
+
 actionableErrorCases:
   - {name: validation, mode: validation, wantError: invalid-id, wantWhere: FixedSoftwareAgentRegistration.Validate, wantWhen: before the activation transaction}
   - {name: range-validation, mode: range, wantError: entry-range, wantWhere: fixed-actor manifest registration, wantWhen: before commit}

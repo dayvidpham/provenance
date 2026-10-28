@@ -266,7 +266,11 @@ func (t *sqliteTracker) RegisterSoftwareAgentContext(ctx context.Context, namesp
 }
 
 func (t *sqliteTracker) RegisterFixedSoftwareAgent(reg FixedSoftwareAgentRegistration) (SoftwareAgent, error) {
-	sa, err := t.db.RegisterFixedSoftwareAgent(reg)
+	return t.RegisterFixedSoftwareAgentContext(context.Background(), reg)
+}
+
+func (t *sqliteTracker) RegisterFixedSoftwareAgentContext(ctx context.Context, reg FixedSoftwareAgentRegistration) (SoftwareAgent, error) {
+	sa, err := t.db.RegisterFixedSoftwareAgentContext(ctx, reg)
 	if err != nil {
 		return SoftwareAgent{}, fmt.Errorf("provenance.Tracker.RegisterFixedSoftwareAgent: %w", err)
 	}
