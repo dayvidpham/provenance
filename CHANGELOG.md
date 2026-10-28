@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Added
+
+- `FixedSoftwareAgentRegistrarContext` adds context-aware atomic fixed software
+  registration without changing `Tracker`. Memory, SQLite and borrowed SQLite
+  trackers implement it; the existing method remains compatible and uses the
+  same algorithm. The caller context covers preflight, leasing and operation SQL;
+  registration makes one transaction attempt and waits for commit and cleanup to
+  settle. Cancellation does not prove rollback: a commit can succeed, and an
+  unprovable cleanup is reported with connection retirement. No registration work
+  continues after return. Borrowed connection creation remains the pool owner's
+  responsibility, including whether its connector honors the setup context.
+
 ## v0.10.1 - 2026-10-16
 
 ### Fixed
