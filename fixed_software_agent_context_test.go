@@ -18,17 +18,18 @@ import (
 
 // innerLeaseConnector observes actual driver BEGIN calls, not registration logic.
 type innerLeaseConnector struct {
-	dsn          string
-	begin        atomic.Int64
-	beginSuccess atomic.Int64
-	beginEntered atomic.Pointer[chan struct{}]
-	bodyReads    atomic.Int64
-	cancelInsert atomic.Pointer[fixedInsertCancellation]
-	rollbacks    atomic.Int64
-	commitGate   atomic.Pointer[fixedCommitGate]
-	cleanupFault atomic.Pointer[fixedCleanupFault]
-	opens        atomic.Int64
-	closes       atomic.Int64
+	dsn               string
+	begin             atomic.Int64
+	beginSuccess      atomic.Int64
+	beginEntered      atomic.Pointer[chan struct{}]
+	bodyReads         atomic.Int64
+	observeWriterWait bool
+	cancelInsert      atomic.Pointer[fixedInsertCancellation]
+	rollbacks         atomic.Int64
+	commitGate        atomic.Pointer[fixedCommitGate]
+	cleanupFault      atomic.Pointer[fixedCleanupFault]
+	opens             atomic.Int64
+	closes            atomic.Int64
 }
 
 type fixedCleanupFault struct {
@@ -92,7 +93,13 @@ func (c *innerLeaseConn) ExecContext(ctx context.Context, query string, args []d
 			<-gate.release
 		}
 	}
-	result, err := c.Conn.(driver.ExecerContext).ExecContext(ctx, query, args)
+	var result driver.Result
+	var err error
+	if c.owner.observeWriterWait && query == "BEGIN IMMEDIATE" {
+		result, err = fixedRegistrationWriterWaitMarker(c.Conn.(driver.ExecerContext), ctx, query, args)
+	} else {
+		result, err = c.Conn.(driver.ExecerContext).ExecContext(ctx, query, args)
+	}
 	if gate != nil {
 		gate.result <- err
 		if gate.after {
@@ -113,6 +120,70 @@ func (c *innerLeaseConn) ExecContext(ctx context.Context, query string, args []d
 		}
 	}
 	return result, err
+}
+
+//go:noinline
+func fixedRegistrationWriterWaitMarker(exec driver.ExecerContext, ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	return exec.ExecContext(ctx, query, args)
+}
+
+// The callback names are from the pinned modernc SQLite driver. They must occur
+// on the same stack as the unique registration marker, not another writer's.
+// StackRecord has a bounded PC array: a truncated record cannot yield a match
+// unless it actually contains all required frames, and times out otherwise.
+func fixedWriterWaitFramesMatch(names []string) bool {
+	want := []string{"modernc.org/sqlite/lib._sqliteDefaultBusyCallback", "modernc.org/sqlite/lib._sqlite3InvokeBusyHandler", "modernc.org/sqlite/lib._btreeBeginTrans", "github.com/dayvidpham/provenance.fixedRegistrationWriterWaitMarker"}
+	i := 0
+	for _, name := range names {
+		if name == want[i] {
+			i++
+			if i == len(want) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func fixedWriterWaitObserved() bool {
+	n, _ := runtime.GoroutineProfile(nil)
+	records := make([]runtime.StackRecord, n+32)
+	n, ok := runtime.GoroutineProfile(records)
+	if !ok {
+		return false
+	}
+	for _, record := range records[:n] {
+		frames := runtime.CallersFrames(record.Stack())
+		var names []string
+		for {
+			frame, more := frames.Next()
+			names = append(names, frame.Function)
+			if !more {
+				break
+			}
+		}
+		if fixedWriterWaitFramesMatch(names) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestFixedWriterWaitFrameAttribution(t *testing.T) {
+	t.Parallel()
+	valid := []string{"modernc.org/sqlite/lib._sqliteDefaultBusyCallback", "modernc.org/sqlite/lib._sqlite3InvokeBusyHandler", "modernc.org/sqlite/lib._btreeBeginTrans", "github.com/dayvidpham/provenance.fixedRegistrationWriterWaitMarker"}
+	if !fixedWriterWaitFramesMatch(valid) {
+		t.Fatal("matching stack rejected")
+	}
+	if fixedWriterWaitFramesMatch(valid[:3]) {
+		t.Fatal("unrelated busy stack accepted")
+	}
+	if fixedWriterWaitFramesMatch(valid[3:]) {
+		t.Fatal("marker without busy handler accepted")
+	}
+	if fixedWriterWaitFramesMatch([]string{valid[3], valid[0], valid[1], valid[2]}) {
+		t.Fatal("incorrect frame ordering accepted")
+	}
 }
 
 func (c *innerLeaseConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
@@ -626,6 +697,7 @@ func TestFixedSoftwareAgentContextWriterLockCancellation(t *testing.T) {
 	t.Cleanup(func() { cancel(cause); release(); <-finished })
 	entered := make(chan struct{})
 	connector.beginEntered.Store(&entered)
+	connector.observeWriterWait = true
 	beginBefore, successBefore, readsBefore := connector.begin.Load(), connector.beginSuccess.Load(), connector.bodyReads.Load()
 	reg := testFixedSoftwareAgentRegistration()
 	go func() {
@@ -641,6 +713,18 @@ func TestFixedSoftwareAgentContextWriterLockCancellation(t *testing.T) {
 		t.Fatalf("registration returned before writer attempt: %v", err)
 	case <-ceiling.C:
 		t.Fatal("registration did not reach writer attempt")
+	}
+	// Driver entry alone is not evidence that SQLite waited. Observe the real
+	// pinned-driver busy callback on the unique contender stack before canceling.
+	for !fixedWriterWaitObserved() {
+		select {
+		case got := <-result:
+			t.Fatalf("contender returned before observed SQLite busy wait: %v", got)
+		case <-ceiling.C:
+			t.Fatal("did not observe the contender inside the SQLite busy handler")
+		default:
+			runtime.Gosched()
+		}
 	}
 	// Keep the independent writer locked until the contender settles. SQLite's
 	// own busy policy may finish the attempt after cancellation; no latency is
