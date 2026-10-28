@@ -1100,6 +1100,14 @@ const singleRegistrationAttempt = true
 // even when a caller has a longer deadline. Other transaction callers retain
 // their existing deadline-driven policy.
 func runScopedTransactionWithPolicy(ctx context.Context, conn sqlQueryer, begin string, operation func() error, singleAttempt bool, activation ...*connScope) (err error) {
+	return runScopedTransactionWithCleanup(ctx, conn, begin, operation, singleAttempt, nil, activation...)
+}
+
+func runRegistrationTransaction(scope *connScope, operation func() error) error {
+	return runScopedTransactionWithCleanup(scope.ctx, scope.conn, "BEGIN IMMEDIATE", operation, singleRegistrationAttempt, scope)
+}
+
+func runScopedTransactionWithCleanup(ctx context.Context, conn sqlQueryer, begin string, operation func() error, singleAttempt bool, registrationScope *connScope, activation ...*connScope) (err error) {
 	var activationScope *connScope
 	if len(activation) != 0 {
 		activationScope = activation[0]
@@ -1112,10 +1120,18 @@ func runScopedTransactionWithPolicy(ctx context.Context, conn sqlQueryer, begin 
 		rearmBusyTimeout, restoreBusyTimeout, probeContention, err = limitTransactionBusyTimeout(ctx, conn)
 	}
 	if err != nil {
+		if registrationScope != nil {
+			registrationScope.markBad()
+			err = fmt.Errorf("registration connection setup failed; connection retired because its state may be uncertain; inspect the store before retrying: %w", err)
+		}
 		return err
 	}
 	defer func() {
 		if restoreErr := restoreBusyTimeout(); restoreErr != nil {
+			if registrationScope != nil {
+				registrationScope.markBad()
+				restoreErr = fmt.Errorf("registration connection state uncertain; connection retired; inspect the store before retrying: %w", restoreErr)
+			}
 			if err == nil {
 				err = restoreErr
 			} else {
@@ -1169,6 +1185,10 @@ func runScopedTransactionWithPolicy(ctx context.Context, conn sqlQueryer, begin 
 		_, rollbackErr := conn.ExecContext(rollbackCtx, "ROLLBACK")
 		rollbackTiming.finish(rollbackErr)
 		cancel()
+		if registrationScope != nil && rollbackErr != nil && !strings.Contains(rollbackErr.Error(), "no transaction is active") {
+			registrationScope.markBad()
+			return errors.Join(err, fmt.Errorf("registration BEGIN outcome uncertain; rollback failed and connection retired; inspect the store before retrying: %w", rollbackErr))
+		}
 		if !isBusyError(err) {
 			if singleAttempt {
 				// Registration never re-enters BEGIN, even for the otherwise
@@ -1272,6 +1292,10 @@ func runScopedTransactionWithPolicy(ctx context.Context, conn sqlQueryer, begin 
 			outcome = "commit_error_rolled_back"
 		}
 		if rollbackErr != nil {
+			if registrationScope != nil {
+				registrationScope.markBad()
+				rollbackErr = fmt.Errorf("registration transaction outcome uncertain; connection retired; inspect the store before retrying: %w", rollbackErr)
+			}
 			outcome = "rollback_error"
 		}
 		transactionTiming.outcome(outcome)
@@ -1555,9 +1579,9 @@ func (scope *connScope) armForeignKeys(discipline foreignKeyDiscipline) error {
 // with exactly the connection-local PRAGMA state it arrived with. If the restore
 // cannot be proven, the connection is retired instead of returned, so the caller
 // can never draw a connection this package silently reconfigured.
-func (scope *connScope) restoreBorrowedPragmas() {
+func (scope *connScope) restoreBorrowedPragmas() error {
 	if scope == nil || scope.conn == nil || scope.discarded || !scope.restoreForeignKeysOff {
-		return
+		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), pragmaControlTimeout)
 	defer cancel()
@@ -1567,9 +1591,10 @@ func (scope *connScope) restoreBorrowedPragmas() {
 	// still on. The read-back is what turns that silent hole into a retirement.
 	if err := setPragmaVerified(ctx, scope.conn, foreignKeysOff); err != nil {
 		scope.markBad()
-		return
+		return fmt.Errorf("restore borrowed connection foreign-key state: %w; connection retired; registration may have committed; inspect the store before retrying", err)
 	}
 	scope.restoreForeignKeysOff = false
+	return nil
 }
 
 // pauseForeignKeys turns connection-local foreign-key enforcement off for a

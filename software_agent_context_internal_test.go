@@ -24,3 +24,18 @@ func TestSoftwareAgentContextMissingCapability(t *testing.T) {
 		t.Fatalf("missing capability: %v", err)
 	}
 }
+
+func TestFixedSoftwareAgentContextMissingCapability(t *testing.T) {
+	t.Parallel()
+	pool, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	b := &borrowedTracker{inner: legacyRegistrationTracker{}, sentinel: pool}
+	_, err = b.RegisterFixedSoftwareAgentContext(context.Background(), testFixedSoftwareAgentRegistration())
+	missing, ok := AsStoreUnavailable(err)
+	if !ok || missing.Operation != "RegisterFixedSoftwareAgentContext" || missing.Stage != "capability check before registration" {
+		t.Fatalf("missing capability: %v", err)
+	}
+}

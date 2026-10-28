@@ -14,6 +14,22 @@ import (
 // and manifest entry. Exact existing rows are an idempotent success; drift is
 // rejected before any write.
 func (db *DB) RegisterFixedSoftwareAgent(reg journal.FixedSoftwareAgentRegistration) (ptypes.SoftwareAgent, error) {
+	return db.RegisterFixedSoftwareAgentContext(context.Background(), reg)
+}
+
+// RegisterFixedSoftwareAgentContext runs one atomic registration under ctx.
+func (db *DB) RegisterFixedSoftwareAgentContext(ctx context.Context, reg journal.FixedSoftwareAgentRegistration) (result ptypes.SoftwareAgent, resultErr error) {
+	if ctx == nil {
+		return ptypes.SoftwareAgent{}, errors.New("sqlite.RegisterFixedSoftwareAgentContext: nil context; registration not attempted; fix: supply a live context")
+	}
+	defer func() {
+		if resultErr != nil && ctx.Err() != nil {
+			resultErr = errors.Join(resultErr, ctx.Err(), context.Cause(ctx))
+		}
+	}()
+	if err := ctx.Err(); err != nil {
+		return ptypes.SoftwareAgent{}, fmt.Errorf("sqlite.RegisterFixedSoftwareAgentContext: context ended before registration; fix: supply a live context: %w", err)
+	}
 	if err := reg.Validate(); err != nil {
 		return ptypes.SoftwareAgent{}, err
 	}
@@ -24,13 +40,19 @@ func (db *DB) RegisterFixedSoftwareAgent(reg journal.FixedSoftwareAgentRegistrat
 	id := ptypes.AgentID(reg.Entry.ActorID)
 	agent := ptypes.SoftwareAgent{Agent: ptypes.Agent{ID: id, Kind: ptypes.AgentKindSoftware}, Name: reg.AgentName, Version: reg.Version, Source: reg.Source}
 
-	scope, err := db.bindScope(context.Background(), projectionTargetLive)
+	scope, err := db.bindScope(ctx, projectionTargetLive)
 	if err != nil {
 		return ptypes.SoftwareAgent{}, fixedAgentActivationError(fixedAgentLeaseError{cause: err}, "the activation transaction could not start", "a database/sql connection could not be leased", "DB.RegisterFixedSoftwareAgent transaction setup", "before preflight reads or writes", "no activation rows were changed", "release outstanding scopes or reopen the database, then retry")
 	}
-	defer scope.release()
+	defer func() {
+		if err := scope.restoreBorrowedPragmas(); err != nil {
+			result = ptypes.SoftwareAgent{}
+			resultErr = errors.Join(resultErr, err)
+		}
+		scope.release()
+	}()
 	var operationErr error
-	if transactionErr := runImmediateTransaction(scope.ctx, scope.conn, func() (callbackErr error) {
+	if transactionErr := runRegistrationTransaction(scope, func() (callbackErr error) {
 		defer func() { operationErr = callbackErr }()
 		claims, err := loadNamespaceClaims(scope.ctx, scope.conn)
 		if err != nil {
@@ -98,7 +120,7 @@ func (db *DB) RegisterFixedSoftwareAgent(reg journal.FixedSoftwareAgentRegistrat
 		// produce two competing actionable narratives. Only BEGIN/COMMIT failures
 		// that occurred outside the callback need the transaction-level envelope.
 		if operationErr != nil {
-			return ptypes.SoftwareAgent{}, operationErr
+			return ptypes.SoftwareAgent{}, transactionErr
 		}
 		return ptypes.SoftwareAgent{}, fixedAgentActivationError(transactionErr, "the activation transaction could not commit", "SQLite rejected BEGIN IMMEDIATE, COMMIT, or a required activation operation", "DB.RegisterFixedSoftwareAgent transaction", "during activation", "no agent is returned and the transaction was rolled back where possible", "inspect the reported database error, reopen if necessary, and retry")
 	}

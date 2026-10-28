@@ -133,6 +133,9 @@ type borrowedTracker struct {
 	// journalApplyFault is an internal dependency fault hook. Production leaves
 	// it nil; tests inject one failure for each borrowed Journal.Apply call.
 	journalApplyFault func() error
+	// fixedRegistrationAfterPreflight is a per-tracker test seam. Production
+	// leaves it nil; it orders a pool lease between preflight and registration.
+	fixedRegistrationAfterPreflight func()
 }
 
 // available checks the borrowed handle's liveness before a public operation,
@@ -302,10 +305,27 @@ func (b *borrowedTracker) registerSoftwareAgentContext(ctx context.Context, oper
 }
 
 func (b *borrowedTracker) RegisterFixedSoftwareAgent(reg FixedSoftwareAgentRegistration) (SoftwareAgent, error) {
-	if err := b.available("RegisterFixedSoftwareAgent"); err != nil {
+	return b.RegisterFixedSoftwareAgentContext(context.Background(), reg)
+}
+
+func (b *borrowedTracker) RegisterFixedSoftwareAgentContext(ctx context.Context, reg FixedSoftwareAgentRegistration) (SoftwareAgent, error) {
+	if ctx == nil {
+		return SoftwareAgent{}, fmt.Errorf("provenance.RegisterFixedSoftwareAgentContext: nil context; registration not attempted; fix: supply a live context")
+	}
+	if err := ctx.Err(); err != nil {
+		return SoftwareAgent{}, fmt.Errorf("provenance.RegisterFixedSoftwareAgentContext: context ended before registration; fix: supply a live context: %w", registrationContextError(ctx, err))
+	}
+	if err := b.availableContext(ctx, "RegisterFixedSoftwareAgentContext"); err != nil {
 		return SoftwareAgent{}, err
 	}
-	return b.inner.RegisterFixedSoftwareAgent(reg)
+	if b.fixedRegistrationAfterPreflight != nil {
+		b.fixedRegistrationAfterPreflight()
+	}
+	api, ok := b.inner.(FixedSoftwareAgentRegistrarContext)
+	if !ok {
+		return SoftwareAgent{}, &StoreUnavailableError{Operation: "RegisterFixedSoftwareAgentContext", Store: "borrowed SQLite tracker", Stage: "capability check before registration", Impact: "the inner tracker lacks context-aware fixed registration; no registration attempted", Fix: "use a SQLite-backed tracker that implements FixedSoftwareAgentRegistrarContext"}
+	}
+	return api.RegisterFixedSoftwareAgentContext(ctx, reg)
 }
 
 func (b *borrowedTracker) Agent(id AgentID) (Agent, error) {

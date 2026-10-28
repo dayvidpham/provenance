@@ -1,7 +1,10 @@
 package provenance
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,6 +25,10 @@ type fixedAgentFixture struct {
 		Name     string `yaml:"name"`
 		Boundary string `yaml:"boundary"`
 	} `yaml:"rollbackCases"`
+	CancellationCases []struct {
+		Name     string `yaml:"name"`
+		Boundary string `yaml:"boundary"`
+	} `yaml:"cancellationCases"`
 	ActionableErrorCases []struct {
 		Name      string `yaml:"name"`
 		Mode      string `yaml:"mode"`
@@ -31,14 +38,74 @@ type fixedAgentFixture struct {
 	} `yaml:"actionableErrorCases"`
 }
 
+func decodeFixedAgentFixture(b []byte) (fixedAgentFixture, error) {
+	var fixture fixedAgentFixture
+	dec := yaml.NewDecoder(bytes.NewReader(b))
+	dec.KnownFields(true)
+	if err := dec.Decode(&fixture); err != nil {
+		return fixture, err
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			err = errors.New("multiple YAML documents")
+		}
+		return fixture, err
+	}
+	seen := make(map[string]bool)
+	checkName := func(name string) error {
+		if name == "" || seen[name] {
+			return fmt.Errorf("missing or duplicate case name %q", name)
+		}
+		seen[name] = true
+		return nil
+	}
+	for _, tc := range fixture.ValidationCases {
+		if err := checkName(tc.Name); err != nil {
+			return fixture, err
+		}
+	}
+	for _, tc := range fixture.RollbackCases {
+		if err := checkName(tc.Name); err != nil {
+			return fixture, err
+		}
+	}
+	for _, tc := range fixture.ActionableErrorCases {
+		if err := checkName(tc.Name); err != nil {
+			return fixture, err
+		}
+	}
+	boundaries := map[string]bool{"claim": false, "agent": false, "software": false, "manifest": false}
+	identities := map[string]string{"cancel-after-claim": "claim", "cancel-after-base-agent": "agent", "cancel-after-software-agent": "software", "cancel-after-manifest": "manifest"}
+	for _, tc := range fixture.CancellationCases {
+		if err := checkName(tc.Name); err != nil {
+			return fixture, err
+		}
+		if want, ok := identities[tc.Name]; !ok || want != tc.Boundary {
+			return fixture, fmt.Errorf("unknown cancellation case or mismatched boundary %q/%q", tc.Name, tc.Boundary)
+		}
+		present, known := boundaries[tc.Boundary]
+		if !known || present {
+			return fixture, fmt.Errorf("unknown or duplicate cancellation boundary %q", tc.Boundary)
+		}
+		boundaries[tc.Boundary] = true
+	}
+	for boundary, present := range boundaries {
+		if !present {
+			return fixture, fmt.Errorf("missing cancellation boundary %q", boundary)
+		}
+	}
+	return fixture, nil
+}
+
 func loadFixedAgentFixture(t *testing.T) fixedAgentFixture {
 	t.Helper()
 	b, err := os.ReadFile("testdata/fixed_software_agent.yaml")
 	if err != nil {
 		t.Fatalf("read fixed software-agent fixture: %v", err)
 	}
-	var fixture fixedAgentFixture
-	if err := yaml.Unmarshal(b, &fixture); err != nil {
+	fixture, err := decodeFixedAgentFixture(b)
+	if err != nil {
 		t.Fatalf("decode fixed software-agent fixture: %v", err)
 	}
 	if len(fixture.ValidationCases) < 8 || len(fixture.RollbackCases) != 4 || len(fixture.ActionableErrorCases) != 5 {
@@ -46,6 +113,30 @@ func loadFixedAgentFixture(t *testing.T) fixedAgentFixture {
 			len(fixture.ValidationCases), len(fixture.RollbackCases), len(fixture.ActionableErrorCases))
 	}
 	return fixture
+}
+
+func TestFixedAgentFixtureRejectsInvalidCorpus(t *testing.T) {
+	t.Parallel()
+	b, err := os.ReadFile("testdata/fixed_software_agent.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(b)
+	if _, err := decodeFixedAgentFixture(b); err != nil {
+		t.Fatalf("valid fixture: %v", err)
+	}
+	if _, err := decodeFixedAgentFixture([]byte(source + "\nunknownField: true\n")); err == nil {
+		t.Error("accepted unknown field")
+	}
+	if _, err := decodeFixedAgentFixture([]byte(source + "\n---\n{}\n")); err == nil {
+		t.Error("accepted multiple documents")
+	}
+	if _, err := decodeFixedAgentFixture([]byte(strings.Replace(source, "name: cancel-after-base-agent", "name: cancel-after-claim", 1))); err == nil {
+		t.Error("accepted duplicate cancellation name")
+	}
+	if _, err := decodeFixedAgentFixture([]byte(strings.Replace(source, "boundary: manifest}\n\nactionableErrorCases", "boundary: claim}\n\nactionableErrorCases", 1))); err == nil {
+		t.Error("accepted duplicate and missing cancellation boundary")
+	}
 }
 
 func testFixedSoftwareAgentRegistration() FixedSoftwareAgentRegistration {
