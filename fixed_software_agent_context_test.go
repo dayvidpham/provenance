@@ -230,6 +230,9 @@ func testFixedCleanupFailure(t *testing.T, busy, failOperation, failRollback boo
 			if !strings.Contains(got.err.Error(), "uncertain") {
 				t.Fatalf("failed rollback did not report uncertainty: %v", got.err)
 			}
+			if strings.Contains(got.err.Error(), "rolled back") {
+				t.Fatalf("failed rollback falsely claims a confirmed rollback: %v", got.err)
+			}
 		}
 		if injection.completed.Load() != 1 || connector.rollbacks.Load()-beforeRollback != wantRollbacks || !errors.Is(got.err, operationCause) || !errors.Is(got.err, context.Canceled) {
 			t.Fatalf("operation failure or rollback outcome lost: %v", got.err)

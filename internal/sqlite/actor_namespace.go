@@ -56,7 +56,7 @@ func (db *DB) RegisterFixedSoftwareAgentContext(ctx context.Context, reg journal
 		defer func() { operationErr = callbackErr }()
 		claims, err := loadNamespaceClaims(scope.ctx, scope.conn)
 		if err != nil {
-			return fixedAgentActivationError(err, "existing namespace claims could not be loaded", "the preflight query failed", "DB.RegisterFixedSoftwareAgent namespace preflight", "after the transaction began and before any writes", "the activation is aborted and its transaction is rolled back", "repair database access or schema integrity, then retry")
+			return fixedAgentActivationError(err, "existing namespace claims could not be loaded", "the preflight query failed", "DB.RegisterFixedSoftwareAgent namespace preflight", "after the transaction began and before any writes", "the activation is aborted and rollback is attempted", "repair database access or schema integrity, then retry")
 		}
 		claimFound := false
 		for _, existing := range claims {
@@ -97,20 +97,20 @@ func (db *DB) RegisterFixedSoftwareAgentContext(ctx context.Context, reg journal
 
 		if !claimFound {
 			if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO actor_namespace_claims (namespace, claimant_id, range_min, range_max, codec) VALUES (?1, ?2, ?3, ?4, ?5)", reg.Claim.Namespace, reg.Claim.ClaimantID, reg.Claim.Range.Min[:], reg.Claim.Range.Max[:], reg.Claim.Codec); err != nil {
-				return fixedAgentActivationError(err, "the namespace claim could not be written", "SQLite rejected the actor_namespace_claims insert", "DB.RegisterFixedSoftwareAgent namespace write", "during the activation transaction", "the activation is aborted and all writes are rolled back", "resolve the reported constraint, schema, storage, or lock error and retry the complete activation")
+				return fixedAgentActivationError(err, "the namespace claim could not be written", "SQLite rejected the actor_namespace_claims insert", "DB.RegisterFixedSoftwareAgent namespace write", "during the activation transaction", "the activation is aborted and rollback is attempted", "resolve the reported constraint, schema, storage, or lock error and retry the complete activation")
 			}
 		}
 		if !agentFound {
 			if _, err := scope.conn.ExecContext(scope.ctx, insertAgentSQL, id.String(), int(ptypes.AgentKindSoftware)); err != nil {
-				return fixedAgentActivationError(err, "the base agent could not be written", "SQLite rejected the agents insert", "DB.RegisterFixedSoftwareAgent base-agent write", "during the activation transaction", "the activation is aborted and all writes are rolled back", "resolve the reported constraint, schema, storage, or lock error and retry the complete activation")
+				return fixedAgentActivationError(err, "the base agent could not be written", "SQLite rejected the agents insert", "DB.RegisterFixedSoftwareAgent base-agent write", "during the activation transaction", "the activation is aborted and rollback is attempted", "resolve the reported constraint, schema, storage, or lock error and retry the complete activation")
 			}
 			if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO agents_software (agent_id, name, version, source) VALUES (?1, ?2, ?3, ?4)", id.String(), reg.AgentName, reg.Version, reg.Source); err != nil {
-				return fixedAgentActivationError(err, "the software-agent detail could not be written", "SQLite rejected the agents_software insert", "DB.RegisterFixedSoftwareAgent software-agent write", "during the activation transaction", "the activation is aborted and all writes are rolled back", "resolve the reported constraint, schema, storage, or lock error and retry the complete activation")
+				return fixedAgentActivationError(err, "the software-agent detail could not be written", "SQLite rejected the agents_software insert", "DB.RegisterFixedSoftwareAgent software-agent write", "during the activation transaction", "the activation is aborted and rollback is attempted", "resolve the reported constraint, schema, storage, or lock error and retry the complete activation")
 			}
 		}
 		if entryMatch == fixedActorEntryAbsent {
 			if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO fixed_actor_manifest_entries (actor_id, namespace, kind_id, name, metadata) VALUES (?1, ?2, ?3, ?4, ?5)", id.String(), reg.Entry.Namespace, int(reg.Entry.ActorKind), reg.Entry.Name, metadata); err != nil {
-				return fixedAgentActivationError(err, "the fixed-actor manifest entry could not be written", "SQLite rejected the fixed_actor_manifest_entries insert", "DB.RegisterFixedSoftwareAgent manifest write", "during the activation transaction", "the activation is aborted and all writes are rolled back", "resolve the reported constraint, schema, storage, or lock error and retry the complete activation")
+				return fixedAgentActivationError(err, "the fixed-actor manifest entry could not be written", "SQLite rejected the fixed_actor_manifest_entries insert", "DB.RegisterFixedSoftwareAgent manifest write", "during the activation transaction", "the activation is aborted and rollback is attempted", "resolve the reported constraint, schema, storage, or lock error and retry the complete activation")
 			}
 		}
 		return nil
