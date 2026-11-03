@@ -8,6 +8,52 @@ measurement, see [TESTING.md](TESTING.md).
 Before changing test fixtures, scheduling, or CI flags, read the measured
 [test-performance regression traps](docs/test-performance.md#regression-traps-what-made-the-suite-roughly-four-times-slower).
 
+## Worktrees
+
+Develop every change in a dedicated worktree and branch, never directly on a
+long-lived checkout. Naming and placement follow the shared
+[`../AGENTS.md`](../AGENTS.md): `<repo>-<issue>--<type>--<description>` under the
+repository's `worktree/` directory.
+
+A worktree is temporary. Once its branch is merged into upstream, clean it up in
+the same session that verifies the merge, from the repository that owns it:
+
+```bash
+git fetch origin
+# merged: either the branch is an ancestor of the integration branch, or (for a
+# squash/rebase merge) its commits are only patch-equivalent to it.
+git merge-base --is-ancestor "$BRANCH" origin/main
+
+# Any output here is unlanded work: stop and report it.
+git -C "$WORKTREE" status --porcelain
+
+git worktree remove "$WORKTREE"
+git branch -d "$BRANCH"
+git push origin --delete "$BRANCH"   # merged remote branches only
+git worktree prune                    # drop registrations whose dirs are gone
+```
+
+Rules:
+
+- Remove only merged, clean worktrees. Uncommitted or untracked changes are
+  work: report them, and never pass `--force` to discard them.
+- Never delete an unmerged branch without explicit user approval. When an
+  abandoned branch is approved for deletion, record its tip SHA in tracker
+  evidence first; the branch may be the only reference.
+- `git branch -d` compares against the current `HEAD`. In a base checkout that
+  is detached at an older release, confirm with
+  `git branch --merged <integration>` first and use `git branch -D` only on
+  that evidence.
+- Delete a remote branch under the same approval rule as any push. A merged
+  branch is safe to delete; an unmerged one is not, regardless of age.
+- A worktree whose git metadata is gone cannot be removed with
+  `git worktree remove`, and must not be removed with `rm -rf`. Move it aside or
+  ask.
+- Leave long-lived checkouts (`main`, `develop`) and any worktree that hosts
+  unmerged nested worktrees in place.
+- Cleanup does not replace landing evidence: record the merge and cleanup in the
+  tracker before the worktree is gone.
+
 ## Quality Gates
 
 - Every test invocation — local, focused, CI-readiness, and landing — uses the
