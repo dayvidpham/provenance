@@ -77,7 +77,7 @@ func (reader *TransactionEvidenceReader) QueryEvidence(q journal.EvidenceQuery) 
 // and selected-fact owner verifier. Close page rows before fetching contexts so
 // the supplied transaction needs only its one pinned connection.
 func readFactPageInTransaction(ctx context.Context, reader sqlQueryer, binding factMatchBinding) ([]factPageRow, error) {
-	result, err := reader.QueryContext(ctx, binding.kind.pageMatchSQL(), binding.args...)
+	result, err := reader.QueryContext(ctx, binding.kind.pageMatchSQL(len(binding.pageKinds)), binding.args...)
 	if err != nil {
 		return nil, fmt.Errorf("bounded fact page SQL: %w", err)
 	}
