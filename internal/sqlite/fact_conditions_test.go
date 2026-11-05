@@ -616,7 +616,10 @@ func TestFactMatcherLookupFailureRollsBackCleanly(t *testing.T) {
 	if _, err := scope.conn.ExecContext(scope.ctx, "BEGIN IMMEDIATE"); err != nil {
 		t.Fatalf("begin lookup-failure transaction: %v", err)
 	}
-	if _, err := scope.conn.ExecContext(scope.ctx, "DROP VIEW journal_attributed"); err != nil {
+	// The matcher no longer reads the journal_attributed view (it inlines it so
+	// SQLite does not materialize the view per page), so the injected failure
+	// drops a table the statement still reads.
+	if _, err := scope.conn.ExecContext(scope.ctx, "DROP TABLE journal_decisions"); err != nil {
 		t.Fatalf("drop matcher dependency in transaction: %v", err)
 	}
 	_, _, lookupErr := evaluateExactFactSelector(scope, sel, 1)

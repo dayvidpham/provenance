@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## v0.10.2 - 2026-11-05
+
 ### Added
 
 - `FixedSoftwareAgentRegistrarContext` adds context-aware atomic fixed software
@@ -15,6 +17,16 @@ All notable changes to this project will be documented in this file.
   unprovable cleanup is reported with connection retirement. No registration work
   continues after return. Borrowed connection creation remains the pool owner's
   responsibility, including whether its connector honors the setup context.
+
+### Fixed
+
+- Bounded fact pages no longer join the `journal_attributed` view. SQLite
+  materialized that view over the whole journal for every page, so a 256-row
+  page paid a full journal scan: measured at 6.25s per page on a 1.8M-row
+  journal, and a full session replay needs 1,743 pages. The page statement now
+  joins the journal row directly and computes `effective_actor_id` exactly as
+  the view does, keeping primary-key lookups and dropping the per-page
+  materialization. Measured after the change: 0.2-1.2s per page.
 
 ## v0.10.1 - 2026-10-16
 
