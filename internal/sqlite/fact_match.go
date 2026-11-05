@@ -68,13 +68,14 @@ func (k factSelectorKind) pageMatchSQL() string {
 		return `WITH candidates AS (
  SELECT d.journal_id
  FROM journal_decisions d
- LEFT JOIN journal_attributed ja ON ja.journal_id = d.journal_id
+ LEFT JOIN journal ja ON ja.journal_id = d.journal_id
+ LEFT JOIN journal ja_anchor ON ja_anchor.journal_id = ja.produced_by_operation_journal_id
  LEFT JOIN journal_operations jo ON jo.journal_id = ja.produced_by_operation_journal_id
  WHERE d.journal_id <= ?1
    AND d.journal_id > ?2
    AND d.decision_kind IN (SELECT value FROM json_each(?3))
    AND (NOT ?4 OR d.task_id IS ?5)
-   AND (NOT ?6 OR ja.effective_actor_id IN (SELECT value FROM json_each(?7)) OR ja.journal_id IS ?15 OR ja.effective_actor_id IS ?15)
+   AND (NOT ?6 OR COALESCE(ja.actor_id, ja_anchor.actor_id) IN (SELECT value FROM json_each(?7)) OR ja.journal_id IS ?15 OR COALESCE(ja.actor_id, ja_anchor.actor_id) IS ?15)
    AND (NOT ?8 OR jo.operation_id IN (SELECT value FROM json_each(?9)) OR ja.journal_id IS ?15 OR jo.journal_id IS ?15 OR jo.operation_id IS ?15)
    AND (NOT ?10 OR (SELECT COUNT(*) FROM json_each(?11) f
         WHERE EXISTS (SELECT ?10 FROM journal_decision_contexts c
@@ -85,16 +86,17 @@ func (k factSelectorKind) pageMatchSQL() string {
  LIMIT ?14
 )
 SELECT d.journal_id, j.recorded_at, d.task_id, d.decision_kind,
-       d.payload, ja.effective_actor_id, jo.operation_id,
+       d.payload, COALESCE(ja.actor_id, ja_anchor.actor_id), jo.operation_id,
        ja.produced_by_operation_journal_id,
        j.journal_id, j.kind_id, j.produced_by_operation_journal_id,
-       ja.journal_id, ja.kind_id, ja.effective_actor_id,
+       ja.journal_id, ja.kind_id, COALESCE(ja.actor_id, ja_anchor.actor_id),
        ja.produced_by_operation_journal_id,
        jo.journal_id, jo.operation_id, opj.kind_id
 FROM candidates c
 JOIN journal_decisions d ON d.journal_id = c.journal_id
 LEFT JOIN journal j ON j.journal_id = d.journal_id
-LEFT JOIN journal_attributed ja ON ja.journal_id = d.journal_id
+LEFT JOIN journal ja ON ja.journal_id = d.journal_id
+ LEFT JOIN journal ja_anchor ON ja_anchor.journal_id = ja.produced_by_operation_journal_id
 LEFT JOIN journal_operations jo ON jo.journal_id = j.produced_by_operation_journal_id
 LEFT JOIN journal opj ON opj.journal_id = jo.journal_id
 ORDER BY d.journal_id ASC`
@@ -102,13 +104,14 @@ ORDER BY d.journal_id ASC`
 		return `WITH candidates AS (
  SELECT e.journal_id
  FROM journal_evidence e
- LEFT JOIN journal_attributed ja ON ja.journal_id = e.journal_id
+ LEFT JOIN journal ja ON ja.journal_id = e.journal_id
+ LEFT JOIN journal ja_anchor ON ja_anchor.journal_id = ja.produced_by_operation_journal_id
  LEFT JOIN journal_operations jo ON jo.journal_id = ja.produced_by_operation_journal_id
  WHERE e.journal_id <= ?1
    AND e.journal_id > ?2
    AND e.evidence_kind IN (SELECT value FROM json_each(?3))
    AND (NOT ?4 OR e.task_id IS ?5)
-   AND (NOT ?6 OR ja.effective_actor_id IN (SELECT value FROM json_each(?7)) OR ja.journal_id IS ?15 OR ja.effective_actor_id IS ?15)
+   AND (NOT ?6 OR COALESCE(ja.actor_id, ja_anchor.actor_id) IN (SELECT value FROM json_each(?7)) OR ja.journal_id IS ?15 OR COALESCE(ja.actor_id, ja_anchor.actor_id) IS ?15)
    AND (NOT ?8 OR jo.operation_id IN (SELECT value FROM json_each(?9)) OR ja.journal_id IS ?15 OR jo.journal_id IS ?15 OR jo.operation_id IS ?15)
    AND (NOT ?10 OR (SELECT COUNT(*) FROM json_each(?11) f
         WHERE EXISTS (SELECT ?10 FROM journal_evidence_contexts c
@@ -119,16 +122,17 @@ ORDER BY d.journal_id ASC`
  LIMIT ?14
 )
 SELECT e.journal_id, j.recorded_at, e.task_id, e.evidence_kind,
-       e.content_digest, e.payload, ja.effective_actor_id, jo.operation_id,
+       e.content_digest, e.payload, COALESCE(ja.actor_id, ja_anchor.actor_id), jo.operation_id,
        ja.produced_by_operation_journal_id,
        j.journal_id, j.kind_id, j.produced_by_operation_journal_id,
-       ja.journal_id, ja.kind_id, ja.effective_actor_id,
+       ja.journal_id, ja.kind_id, COALESCE(ja.actor_id, ja_anchor.actor_id),
        ja.produced_by_operation_journal_id,
        jo.journal_id, jo.operation_id, opj.kind_id
 FROM candidates c
 JOIN journal_evidence e ON e.journal_id = c.journal_id
 LEFT JOIN journal j ON j.journal_id = e.journal_id
-LEFT JOIN journal_attributed ja ON ja.journal_id = e.journal_id
+LEFT JOIN journal ja ON ja.journal_id = e.journal_id
+ LEFT JOIN journal ja_anchor ON ja_anchor.journal_id = ja.produced_by_operation_journal_id
 LEFT JOIN journal_operations jo ON jo.journal_id = j.produced_by_operation_journal_id
 LEFT JOIN journal opj ON opj.journal_id = jo.journal_id
 ORDER BY e.journal_id ASC`
@@ -154,12 +158,13 @@ func (k factSelectorKind) latestMatchSQL() string {
 	switch k {
 	case factSelectorDecision:
 		return `SELECT MAX(d.journal_id) FROM journal_decisions d
-			JOIN journal_attributed ja ON ja.journal_id = d.journal_id
+			JOIN journal ja ON ja.journal_id = d.journal_id
+			JOIN journal ja_anchor ON ja_anchor.journal_id = ja.produced_by_operation_journal_id
 			JOIN journal_operations jo ON jo.journal_id = ja.produced_by_operation_journal_id
 			WHERE d.decision_kind = ?10
 			  AND (NOT ?1 OR d.journal_id <= ?1)
 			  AND (NOT ?2 OR d.task_id IS ?3)
-			  AND (NOT ?4 OR ja.effective_actor_id IN (SELECT value FROM json_each(?5)))
+			  AND (NOT ?4 OR COALESCE(ja.actor_id, ja_anchor.actor_id) IN (SELECT value FROM json_each(?5)))
 			  AND (NOT ?6 OR jo.operation_id IN (SELECT value FROM json_each(?7)))
 			  AND ((NOT ?8) OR (SELECT COUNT(*) FROM json_each(?9) f
 			       WHERE EXISTS (SELECT ?8 FROM journal_decision_contexts c
@@ -168,12 +173,13 @@ func (k factSelectorKind) latestMatchSQL() string {
 			                       AND c.context_identity = json_extract(f.value,?12))) = ?8)`
 	case factSelectorEvidence:
 		return `SELECT MAX(e.journal_id) FROM journal_evidence e
-			JOIN journal_attributed ja ON ja.journal_id = e.journal_id
+			JOIN journal ja ON ja.journal_id = e.journal_id
+			JOIN journal ja_anchor ON ja_anchor.journal_id = ja.produced_by_operation_journal_id
 			JOIN journal_operations jo ON jo.journal_id = ja.produced_by_operation_journal_id
 			WHERE e.evidence_kind = ?10
 			  AND (NOT ?1 OR e.journal_id <= ?1)
 			  AND (NOT ?2 OR e.task_id IS ?3)
-			  AND (NOT ?4 OR ja.effective_actor_id IN (SELECT value FROM json_each(?5)))
+			  AND (NOT ?4 OR COALESCE(ja.actor_id, ja_anchor.actor_id) IN (SELECT value FROM json_each(?5)))
 			  AND (NOT ?6 OR jo.operation_id IN (SELECT value FROM json_each(?7)))
 			  AND ((NOT ?8) OR (SELECT COUNT(*) FROM json_each(?9) f
 			       WHERE EXISTS (SELECT ?8 FROM journal_evidence_contexts c
@@ -192,12 +198,13 @@ func (k factSelectorKind) exactMatchSQL() string {
 	switch k {
 	case factSelectorDecision:
 		return `SELECT d.journal_id FROM journal_decisions d
-			JOIN journal_attributed ja ON ja.journal_id = d.journal_id
+			JOIN journal ja ON ja.journal_id = d.journal_id
+			JOIN journal ja_anchor ON ja_anchor.journal_id = ja.produced_by_operation_journal_id
 			JOIN journal_operations jo ON jo.journal_id = ja.produced_by_operation_journal_id
 			WHERE d.journal_id = ?13
 			  AND d.decision_kind = ?10
 			  AND (NOT ?2 OR d.task_id IS ?3)
-			  AND (NOT ?4 OR ja.effective_actor_id IN (SELECT value FROM json_each(?5)))
+			  AND (NOT ?4 OR COALESCE(ja.actor_id, ja_anchor.actor_id) IN (SELECT value FROM json_each(?5)))
 			  AND (NOT ?6 OR jo.operation_id IN (SELECT value FROM json_each(?7)))
 			  AND ((NOT ?8) OR (SELECT COUNT(*) FROM json_each(?9) f
 			       WHERE EXISTS (SELECT ?8 FROM journal_decision_contexts c
@@ -206,12 +213,13 @@ func (k factSelectorKind) exactMatchSQL() string {
 			                       AND c.context_identity = json_extract(f.value,?12))) = ?8)`
 	case factSelectorEvidence:
 		return `SELECT e.journal_id FROM journal_evidence e
-			JOIN journal_attributed ja ON ja.journal_id = e.journal_id
+			JOIN journal ja ON ja.journal_id = e.journal_id
+			JOIN journal ja_anchor ON ja_anchor.journal_id = ja.produced_by_operation_journal_id
 			JOIN journal_operations jo ON jo.journal_id = ja.produced_by_operation_journal_id
 			WHERE e.journal_id = ?13
 			  AND e.evidence_kind = ?10
 			  AND (NOT ?2 OR e.task_id IS ?3)
-			  AND (NOT ?4 OR ja.effective_actor_id IN (SELECT value FROM json_each(?5)))
+			  AND (NOT ?4 OR COALESCE(ja.actor_id, ja_anchor.actor_id) IN (SELECT value FROM json_each(?5)))
 			  AND (NOT ?6 OR jo.operation_id IN (SELECT value FROM json_each(?7)))
 			  AND ((NOT ?8) OR (SELECT COUNT(*) FROM json_each(?9) f
 			       WHERE EXISTS (SELECT ?8 FROM journal_evidence_contexts c
