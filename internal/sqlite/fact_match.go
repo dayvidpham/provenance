@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/dayvidpham/provenance/internal/journal"
 )
@@ -58,22 +59,59 @@ type factMatchBinding struct {
 	args         []any
 }
 
-// pageMatchSQL is the bounded multi-kind form of the shared matcher. The
-// subtype and context relation come only from the closed enum; kind values are
-// data in a bounded JSON array. The result shape is the page-row shape that the
-// .1.4 query layer can scan without reimplementing predicates or bindings.
-func (k factSelectorKind) pageMatchSQL() string {
+// pageMatchSQL is the bounded multi-kind form of the shared matcher. It emits
+// ONE branch per requested kind, combined with UNION ALL.
+//
+// WHY NOT `kind IN (...)`: a multi-kind IN cannot produce a stream ordered by
+// journal_id, so SQLite adds a temp B-tree and consumes the whole remaining
+// journal range before it can apply the LIMIT. A page then costs
+// O(remaining journal) and a full replay is quadratic: measured 0.2-1.2s per
+// page over 1,743 pages on a 1.8M-row store. A single-kind equality is ordered
+// by the (kind, journal_id) index, so each branch stops after its own LIMIT and
+// the union merges at most kinds*limit rows.
+//
+// THE PAGE AND ITS CURSOR ARE UNCHANGED. The first N rows of a union of ordered
+// streams are always contained in the first N rows of each stream, so merging
+// the per-kind heads yields exactly the same global first N. Duplicate kinds are
+// removed before this is called, because IN de-duplicates and UNION ALL would
+// not.
+func (k factSelectorKind) pageMatchSQL(kindSlots int) string {
+	if kindSlots < 1 {
+		panic("fact matcher: page SQL needs at least one kind slot")
+	}
+	branch := k.pageBranchSQL()
+	var statement strings.Builder
+	statement.WriteString("WITH candidates AS (\n")
+	for i := 0; i < kindSlots; i++ {
+		if i > 0 {
+			statement.WriteString("\n UNION ALL\n")
+		}
+		statement.WriteString(" SELECT journal_id FROM (\n")
+		statement.WriteString(strings.ReplaceAll(branch, "?KIND", fmt.Sprintf("?%d", firstPageKindParam+i)))
+		statement.WriteString("\n )")
+	}
+	statement.WriteString("\n)\n")
+	statement.WriteString(k.pageOuterSQL())
+	return statement.String()
+}
+
+// firstPageKindParam is the first parameter slot after the shared page
+// predicate (?1..?15). One kind value is bound per branch here.
+const firstPageKindParam = 16
+
+// pageBranchSQL is one kind's bounded candidate scan. ?KIND is replaced with
+// that branch's parameter slot.
+func (k factSelectorKind) pageBranchSQL() string {
 	switch k {
 	case factSelectorDecision:
-		return `WITH candidates AS (
- SELECT d.journal_id
+		return `SELECT d.journal_id
  FROM journal_decisions d
  LEFT JOIN journal ja ON ja.journal_id = d.journal_id
  LEFT JOIN journal ja_anchor ON ja_anchor.journal_id = ja.produced_by_operation_journal_id
  LEFT JOIN journal_operations jo ON jo.journal_id = ja.produced_by_operation_journal_id
  WHERE d.journal_id <= ?1
    AND d.journal_id > ?2
-   AND d.decision_kind IN (SELECT value FROM json_each(?3))
+   AND d.decision_kind = ?KIND
    AND (NOT ?4 OR d.task_id IS ?5)
    AND (NOT ?6 OR COALESCE(ja.actor_id, ja_anchor.actor_id) IN (SELECT value FROM json_each(?7)) OR ja.journal_id IS ?15 OR COALESCE(ja.actor_id, ja_anchor.actor_id) IS ?15)
    AND (NOT ?8 OR jo.operation_id IN (SELECT value FROM json_each(?9)) OR ja.journal_id IS ?15 OR jo.journal_id IS ?15 OR jo.operation_id IS ?15)
@@ -83,9 +121,36 @@ func (k factSelectorKind) pageMatchSQL() string {
                         AND c.context_kind = json_extract(f.value,?12)
                         AND c.context_identity = json_extract(f.value,?13))) = ?10)
  ORDER BY d.journal_id ASC
- LIMIT ?14
-)
-SELECT d.journal_id, j.recorded_at, d.task_id, d.decision_kind,
+ LIMIT ?14`
+	case factSelectorEvidence:
+		return `SELECT e.journal_id
+ FROM journal_evidence e
+ LEFT JOIN journal ja ON ja.journal_id = e.journal_id
+ LEFT JOIN journal ja_anchor ON ja_anchor.journal_id = ja.produced_by_operation_journal_id
+ LEFT JOIN journal_operations jo ON jo.journal_id = ja.produced_by_operation_journal_id
+ WHERE e.journal_id <= ?1
+   AND e.journal_id > ?2
+   AND e.evidence_kind = ?KIND
+   AND (NOT ?4 OR e.task_id IS ?5)
+   AND (NOT ?6 OR COALESCE(ja.actor_id, ja_anchor.actor_id) IN (SELECT value FROM json_each(?7)) OR ja.journal_id IS ?15 OR COALESCE(ja.actor_id, ja_anchor.actor_id) IS ?15)
+   AND (NOT ?8 OR jo.operation_id IN (SELECT value FROM json_each(?9)) OR ja.journal_id IS ?15 OR jo.journal_id IS ?15 OR jo.operation_id IS ?15)
+   AND (NOT ?10 OR (SELECT COUNT(*) FROM json_each(?11) f
+        WHERE EXISTS (SELECT ?10 FROM journal_evidence_contexts c
+                      WHERE c.evidence_journal_id = e.journal_id
+                        AND c.context_kind = json_extract(f.value,?12)
+                        AND c.context_identity = json_extract(f.value,?13))) = ?10)
+ ORDER BY e.journal_id ASC
+ LIMIT ?14`
+	default:
+		panic("unknown factSelectorKind")
+	}
+}
+
+// pageOuterSQL projects the page rows for the merged candidate page.
+func (k factSelectorKind) pageOuterSQL() string {
+	switch k {
+	case factSelectorDecision:
+		return `SELECT d.journal_id, j.recorded_at, d.task_id, d.decision_kind,
        d.payload, COALESCE(ja.actor_id, ja_anchor.actor_id), jo.operation_id,
        ja.produced_by_operation_journal_id,
        j.journal_id, j.kind_id, j.produced_by_operation_journal_id,
@@ -99,29 +164,10 @@ LEFT JOIN journal ja ON ja.journal_id = d.journal_id
  LEFT JOIN journal ja_anchor ON ja_anchor.journal_id = ja.produced_by_operation_journal_id
 LEFT JOIN journal_operations jo ON jo.journal_id = j.produced_by_operation_journal_id
 LEFT JOIN journal opj ON opj.journal_id = jo.journal_id
-ORDER BY d.journal_id ASC`
+ORDER BY c.journal_id ASC
+LIMIT ?14`
 	case factSelectorEvidence:
-		return `WITH candidates AS (
- SELECT e.journal_id
- FROM journal_evidence e
- LEFT JOIN journal ja ON ja.journal_id = e.journal_id
- LEFT JOIN journal ja_anchor ON ja_anchor.journal_id = ja.produced_by_operation_journal_id
- LEFT JOIN journal_operations jo ON jo.journal_id = ja.produced_by_operation_journal_id
- WHERE e.journal_id <= ?1
-   AND e.journal_id > ?2
-   AND e.evidence_kind IN (SELECT value FROM json_each(?3))
-   AND (NOT ?4 OR e.task_id IS ?5)
-   AND (NOT ?6 OR COALESCE(ja.actor_id, ja_anchor.actor_id) IN (SELECT value FROM json_each(?7)) OR ja.journal_id IS ?15 OR COALESCE(ja.actor_id, ja_anchor.actor_id) IS ?15)
-   AND (NOT ?8 OR jo.operation_id IN (SELECT value FROM json_each(?9)) OR ja.journal_id IS ?15 OR jo.journal_id IS ?15 OR jo.operation_id IS ?15)
-   AND (NOT ?10 OR (SELECT COUNT(*) FROM json_each(?11) f
-        WHERE EXISTS (SELECT ?10 FROM journal_evidence_contexts c
-                      WHERE c.evidence_journal_id = e.journal_id
-                        AND c.context_kind = json_extract(f.value,?12)
-                        AND c.context_identity = json_extract(f.value,?13))) = ?10)
- ORDER BY e.journal_id ASC
- LIMIT ?14
-)
-SELECT e.journal_id, j.recorded_at, e.task_id, e.evidence_kind,
+		return `SELECT e.journal_id, j.recorded_at, e.task_id, e.evidence_kind,
        e.content_digest, e.payload, COALESCE(ja.actor_id, ja_anchor.actor_id), jo.operation_id,
        ja.produced_by_operation_journal_id,
        j.journal_id, j.kind_id, j.produced_by_operation_journal_id,
@@ -135,7 +181,8 @@ LEFT JOIN journal ja ON ja.journal_id = e.journal_id
  LEFT JOIN journal ja_anchor ON ja_anchor.journal_id = ja.produced_by_operation_journal_id
 LEFT JOIN journal_operations jo ON jo.journal_id = j.produced_by_operation_journal_id
 LEFT JOIN journal opj ON opj.journal_id = jo.journal_id
-ORDER BY e.journal_id ASC`
+ORDER BY c.journal_id ASC
+LIMIT ?14`
 	default:
 		panic("unknown factSelectorKind")
 	}
@@ -496,6 +543,20 @@ func buildFactMatchBinding(sel journal.FactSelector, snapshotMax, afterJournal j
 // are: snapshot, exclusive cursor, kind JSON, then the normalized filter slots
 // shared with buildSelectorArgs, followed by LIMIT and a NULL sentinel used by
 // the fail-closed LEFT JOIN guards.
+// dedupeFactPageKinds removes repeated kinds while keeping the caller's order.
+func dedupeFactPageKinds(kinds []string) []string {
+	seen := make(map[string]struct{}, len(kinds))
+	unique := make([]string, 0, len(kinds))
+	for _, kind := range kinds {
+		if _, ok := seen[kind]; ok {
+			continue
+		}
+		seen[kind] = struct{}{}
+		unique = append(unique, kind)
+	}
+	return unique
+}
+
 func buildFactPageMatchBinding(kind factSelectorKind, page journal.FactPageRequest, filter journal.FactFilter, kinds []string) (factMatchBinding, error) {
 	if kind != factSelectorDecision && kind != factSelectorEvidence {
 		return factMatchBinding{}, fmt.Errorf("fact matcher: unknown page subtype %d — where: page binding; when: dispatch; impact: no page was queried; fix: use the closed decision or evidence subtype", kind)
@@ -525,15 +586,20 @@ func buildFactPageMatchBinding(kind factSelectorKind, page journal.FactPageReque
 	if err != nil {
 		return factMatchBinding{}, err
 	}
-	kindJSON, err := json.Marshal(kinds)
-	if err != nil {
-		return factMatchBinding{}, fmt.Errorf("fact matcher: encode page kind set: %w", err)
-	}
-	args := []any{singleArgs[0], int64(page.AfterJournalID), string(kindJSON)}
+	// IN de-duplicates a repeated kind; UNION ALL would return the row once per
+	// branch, so the duplicates are removed here and the page shape is unchanged.
+	kinds = dedupeFactPageKinds(kinds)
+	// ?3 carried the kind JSON for the old IN predicate and is now unused. It is
+	// still bound (nil) so the shared ?1..?15 layout stays stable; the kind values
+	// follow at ?16.. one per branch.
+	args := []any{singleArgs[0], int64(page.AfterJournalID), nil}
 	args = append(args, singleArgs[1:9]...)
 	args = append(args, singleArgs[10:]...)
 	args = append(args, page.Limit+1)
 	args = append(args, nil)
+	for _, kindValue := range kinds {
+		args = append(args, kindValue)
+	}
 	return factMatchBinding{
 		form: factMatchPage, kind: kind, contexts: kind.contextRelation(), snapshotMax: page.SnapshotMaxJournalID,
 		afterJournal: page.AfterJournalID, pageKinds: append([]string(nil), kinds...), pageLimit: page.Limit + 1,

@@ -18,7 +18,7 @@ import (
 // statement text is checked directly.
 func TestFactPageSQLNeverJoinsTheAttributedView(t *testing.T) {
 	for _, kind := range []factSelectorKind{factSelectorDecision, factSelectorEvidence} {
-		statement := kind.pageMatchSQL()
+		statement := kind.pageMatchSQL(3)
 		if strings.Contains(statement, "journal_attributed") {
 			t.Fatalf("page SQL for selector %d joins journal_attributed again: SQLite materializes that view over the whole journal for every page. Join journal directly and compute effective_actor_id with COALESCE", kind)
 		}

@@ -701,8 +701,9 @@ func TestFactQueryPaginationTraversesJournalIDSnapshotExactlyOnce(t *testing.T) 
 func TestFactPageSQLKeepsTopologyValidationBoundedToCandidatePage(t *testing.T) {
 	t.Parallel()
 	for _, kind := range []factSelectorKind{factSelectorDecision, factSelectorEvidence} {
-		sql := kind.pageMatchSQL()
-		if !strings.Contains(sql, "WITH candidates AS") || strings.Count(sql, "LIMIT ?14") != 1 || !strings.Contains(sql, "LEFT JOIN journal ja") || !strings.Contains(sql, "LEFT JOIN journal_operations") {
+		const kinds = 3
+		sql := kind.pageMatchSQL(kinds)
+		if !strings.Contains(sql, "WITH candidates AS") || strings.Count(sql, "LIMIT ?14") != kinds+1 || !strings.Contains(sql, "UNION ALL") || !strings.Contains(sql, "LEFT JOIN journal ja") || !strings.Contains(sql, "LEFT JOIN journal_operations") {
 			t.Errorf("fact subtype %d page SQL is not candidate/page bounded diagnostics: %q", kind, sql)
 		}
 		if strings.Contains(sql, "WHERE d.journal_id <= ?1\nORDER BY") || strings.Contains(sql, "WHERE e.journal_id <= ?1\nORDER BY") {

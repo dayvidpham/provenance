@@ -785,7 +785,7 @@ func TestFactConditionsRequireSubtypeOwnedContexts(t *testing.T) {
 }
 
 func factPageBindingIDs(scope *connScope, binding factMatchBinding) ([]journal.JournalID, error) {
-	rows, err := scope.conn.QueryContext(scope.ctx, binding.kind.pageMatchSQL(), binding.args...)
+	rows, err := scope.conn.QueryContext(scope.ctx, binding.kind.pageMatchSQL(len(binding.pageKinds)), binding.args...)
 	if err != nil {
 		return nil, err
 	}

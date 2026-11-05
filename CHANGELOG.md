@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## v0.10.3 - 2026-11-05
+
+### Changed
+
+- Bounded fact pages emit one UNION ALL branch per requested kind instead of a
+  multi-kind `IN`. A multi-kind IN cannot produce a journal_id-ordered stream, so
+  SQLite added a temp B-tree and consumed the whole remaining journal range for
+  every page; a replay was quadratic. Each branch is now a single-kind equality
+  that stops after its own LIMIT, and the union merges at most kinds*limit rows.
+  Measured on a 1.8M-row store: 1049ms -> 7.4ms per page at the start of the
+  journal and 12.6ms -> 4.7ms at the end, with identical rows and cursor.
+  Repeated kinds are de-duplicated because `IN` did that and `UNION ALL` would
+  not.
+
 ## v0.10.2 - 2026-11-05
 
 ### Added
