@@ -939,6 +939,16 @@ func activateSchema(scope *connScope, models []ptypes.ModelEntry, policy activat
 		if err := scope.ensureSchema(models); err != nil {
 			return fmt.Errorf("apply schema: %w", err)
 		}
+		// ensureSchema installed the per-table vector tables and this build's
+		// trigger bodies. If the ledger still proves the store as it stands — the
+		// ordinary case for a v3 store being upgraded, and for a structural repair
+		// that changed no data — adopt that proof instead of re-verifying the whole
+		// journal. Adoption never advances verified_count or verified_at.
+		if adopted, err := scope.adoptCurrentVerifiedLedger(); err != nil {
+			return err
+		} else if adopted {
+			return nil
+		}
 		if err := scope.verifyIntegrity(); err != nil {
 			return fmt.Errorf("whole-journal integrity: %w", err)
 		}
@@ -2210,10 +2220,35 @@ func preflightExistingReadOnly(target openTarget, models []ptypes.ModelEntry) (b
 			if current, err := preflight.verifiedLedgerCurrent(); err == nil {
 				ledgerCurrent = current
 			}
+			if !ledgerCurrent {
+				// A current v3 ledger predates the per-table vector. Activation
+				// creates the vector tables and adopts that proof in place, so the
+				// preflight can skip the whole-store checks and the clone. If
+				// adoption fails inside activation, activation still runs the full
+				// path there.
+				if adoptable, err := preflight.adoptableVerifiedLedger(); err == nil && adoptable {
+					ledgerCurrent = true
+				}
+			}
+			if !ledgerCurrent {
+				// A stale ledger whose journal tail is unchanged and whose moved
+				// tables all have table-local coverage is verified by the same
+				// partial checks activation will repeat and persist. Running the
+				// read-only checks here keeps the preflight's clone skip; a
+				// concurrent write, a torn vector, or any journal/projection change
+				// still falls through to the whole-store path below.
+				if before, err := preflight.readVerifiedStoreIdentity(); err == nil {
+					if _, eligible := preflight.partialLedgerEligible(before, models); eligible {
+						ledgerCurrent = true
+					}
+				}
+			}
 			// A current ledger alone does not prove the schema is one activation
 			// would accept: the isolated clone below stays the gate for a schema
 			// whose object names collide, so the clone may be skipped only for a
-			// schema that is exactly this build's object set.
+			// schema that is exactly this build's object set. The adoption branch
+			// above is the one exception: a v3 store is missing the ledger's own
+			// vector tables, and activation creates them before adopting.
 			if ledgerCurrent {
 				if pristine, err := preflight.activationSchemaIsPristine(); err != nil || !pristine {
 					ledgerCurrent = false

@@ -112,7 +112,7 @@ func advanceStoreState(t *testing.T, path string) (generation, journalID int64) 
 			t.Errorf("close store reader: %v", err)
 		}
 	}()
-	if err := raw.QueryRow("SELECT generation FROM " + storeGenerationTable + " WHERE id = 1").Scan(&generation); err != nil {
+	if err := raw.QueryRow("SELECT COALESCE(SUM(generation), 0) FROM " + verifiedTableGenerationTable).Scan(&generation); err != nil {
 		t.Fatalf("read store generation from %q: %v", path, err)
 	}
 	if err := raw.QueryRow("SELECT COALESCE(MAX(journal_id), 0) FROM journal").Scan(&journalID); err != nil {

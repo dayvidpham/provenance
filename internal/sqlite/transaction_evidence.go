@@ -1,9 +1,11 @@
 package sqlite
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"fmt"
+	"slices"
 
 	"github.com/dayvidpham/provenance/internal/fusedtx"
 	"github.com/dayvidpham/provenance/internal/journal"
@@ -74,16 +76,53 @@ func (reader *TransactionEvidenceReader) QueryEvidence(q journal.EvidenceQuery) 
 }
 
 // Both ordinary and transaction-bound pages use this same row topology scanner
-// and selected-fact owner verifier. Close page rows before fetching contexts so
+// and selected-fact owner verifier. A multi-kind page runs the static
+// single-kind statement once per kind and merges the bounded heads here; every
+// stream is ordered by journal_id and cut to the page bound, so the merge
+// contains the global first page. Close page rows before fetching contexts so
 // the supplied transaction needs only its one pinned connection.
 func readFactPageInTransaction(ctx context.Context, reader sqlQueryer, binding factMatchBinding) ([]factPageRow, error) {
-	result, err := reader.QueryContext(ctx, binding.kind.pageMatchSQL(len(binding.pageKinds)), binding.args...)
+	statement := binding.kind.singleKindPageSQL()
+	shared := binding.args[:firstPageKindParam-1]
+	rows := make([]factPageRow, 0, binding.pageLimit)
+	for _, kind := range binding.pageKinds {
+		args := append(append([]any{}, shared...), kind)
+		kindRows, err := readSingleKindFactPage(ctx, reader, statement, args, binding.kind)
+		if err != nil {
+			return nil, err
+		}
+		rows = append(rows, kindRows...)
+	}
+	// Every per-kind stream is ordered by journal_id and bounded to pageLimit.
+	// Merging the heads therefore contains the global first pageLimit rows; the
+	// sort only orders the merge. Kinds are de-duplicated before the binding is
+	// built, so the same fact cannot appear twice.
+	if len(binding.pageKinds) > 1 {
+		slices.SortFunc(rows, func(a, b factPageRow) int { return cmp.Compare(a.journalID, b.journalID) })
+	}
+	if len(rows) > binding.pageLimit {
+		rows = rows[:binding.pageLimit]
+	}
+	for i := range rows {
+		contexts, err := verifySelectedFactContextInTransaction(ctx, transactionFactReader{reader: reader}, binding.contexts, int64(rows[i].journalID))
+		if err != nil {
+			return nil, err
+		}
+		rows[i].contexts = contexts
+	}
+	return rows, nil
+}
+
+// readSingleKindFactPage executes the static single-kind page query and scans
+// its bounded rows. Contexts are loaded once after the merged page is cut.
+func readSingleKindFactPage(ctx context.Context, reader sqlQueryer, statement string, args []any, kind factSelectorKind) ([]factPageRow, error) {
+	result, err := reader.QueryContext(ctx, statement, args...)
 	if err != nil {
 		return nil, fmt.Errorf("bounded fact page SQL: %w", err)
 	}
 	var rows []factPageRow
 	for result.Next() {
-		row, scanErr := scanFactPageRow(result, binding.kind)
+		row, scanErr := scanFactPageRow(result, kind)
 		if scanErr != nil {
 			_ = result.Close()
 			return nil, scanErr
@@ -97,13 +136,6 @@ func readFactPageInTransaction(ctx context.Context, reader sqlQueryer, binding f
 	}
 	if closeErr != nil {
 		return nil, fmt.Errorf("bounded fact page SQL: close rows: %w", closeErr)
-	}
-	for i := range rows {
-		contexts, err := verifySelectedFactContextInTransaction(ctx, transactionFactReader{reader: reader}, binding.contexts, int64(rows[i].journalID))
-		if err != nil {
-			return nil, err
-		}
-		rows[i].contexts = contexts
 	}
 	return rows, nil
 }

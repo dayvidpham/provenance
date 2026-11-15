@@ -123,7 +123,8 @@ func activationSnapshot(t *testing.T, pool *sql.DB) []string {
 		if err := rows.Scan(&name, &ddl); err != nil {
 			t.Fatal(err)
 		}
-		if name == storeGenerationTable || name == verifiedStoreTable {
+		if name == storeGenerationTable || name == verifiedStoreTable ||
+			name == verifiedTableGenerationTable || name == verifiedTableProofTable {
 			continue
 		}
 		names = append(names, name)

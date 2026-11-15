@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## v0.10.4 - 2026-11-15
+
+### Changed
+
+- The verified-as-of ledger now records an auxiliary per-table generation
+  vector (`provenance_table_generation`) and its verified mirror
+  (`provenance_verified_table`). The recorded generation is the sum of a
+  baseline row and one counter per covered table, so existing v3 ledgers stay
+  valid and a current one is adopted during the upgrade activation without a
+  whole-store rerun.
+- When a ledger is stale but the journal tail is unchanged, the open verifies
+  only the covered tables that moved and whose whole-store coverage is
+  table-local (agent registry, closed seeds, identity format, model registry,
+  actor claims). Journal- and projection-derived table changes still take the
+  full path. Measured on an 18 GB store: the stale case after a direct
+  `RegisterSoftwareAgent` opens in about 3.8 s instead of exceeding 30 minutes,
+  and the unchanged v3 upgrade adopts in 52 ms. The 3.8 s includes the indexed
+  orphan probes over the 9.5M-row journal that keep a deleted agent from being
+  blessed; an insert-only registration has no cheaper proof without a
+  change log. Trigger cost is 1.7 us per DML versus 1.5 us for the previous
+  single counter.
+- Trigger coverage now compares trigger bodies, not only names, so a same-name
+  no-op replacement is repaired by activation instead of silently disabling
+  change detection.
+
+### Fixed
+
+- Bounded fact pages execute one static single-kind statement per requested kind
+  and merge the per-kind heads in Go. The previous statement was assembled from a
+  runtime kind count with a UNION ALL, which the SQL architecture guard correctly
+  rejected; the per-kind form keeps the index-ordered, LIMIT-bounded scan and
+  restores `TestProductionSQLTextIsDecidableFromSource`.
+
 ## v0.10.3 - 2026-11-05
 
 ### Changed

@@ -63,8 +63,8 @@ func bumpStoreGeneration(t *testing.T, path string) {
 			t.Errorf("close generation bumper: %v", err)
 		}
 	}()
-	if _, err := raw.Exec("UPDATE " + storeGenerationTable + " SET generation = generation + 1 WHERE id = 1"); err != nil {
-		t.Fatalf("bump store generation: %v", err)
+	if _, err := raw.Exec("UPDATE "+verifiedTableGenerationTable+" SET generation = generation + 1 WHERE table_id = ?1", verifiedTableID("tasks")); err != nil {
+		t.Fatalf("bump table generation: %v", err)
 	}
 }
 
@@ -95,7 +95,14 @@ func dropVerifiedLedger(t *testing.T, path string) {
 // verified_count at that point, which only a whole-store verification advances.
 func seedLedgerStore(t *testing.T, path string) (ptypes.TaskID, int64) {
 	t.Helper()
-	db, err := Open(path, nil)
+	return seedLedgerStoreWithModels(t, path, nil)
+}
+
+// seedLedgerStoreWithModels is seedLedgerStore with an explicit model registry,
+// so a test can exercise the model branch of the partial path.
+func seedLedgerStoreWithModels(t *testing.T, path string, models []ptypes.ModelEntry) (ptypes.TaskID, int64) {
+	t.Helper()
+	db, err := Open(path, models)
 	if err != nil {
 		t.Fatalf("activate ledger store on %q: %v", path, err)
 	}
@@ -125,7 +132,7 @@ func seedLedgerStore(t *testing.T, path string) (ptypes.TaskID, int64) {
 	}
 	// The seeding writes made the ledger stale, so this reopen runs the full path
 	// once and re-persists the ledger for the state the store is left in.
-	if err := reopenFileBacked(t, path); err != nil {
+	if err := reopenWithModels(t, path, models); err != nil {
 		t.Fatalf("reopen to establish a current ledger: %v", err)
 	}
 	count, present := ledgerRow(t, path)
@@ -168,13 +175,15 @@ func reopenFileBacked(t *testing.T, path string) error {
 }
 
 // TestVerifiedLedgerCoveredTablesMatchActivationObjects pins the ledger's covered
-// table list to the tables this build's activation is expected to create. The
-// list is written out as literals (every statement this package executes must be
-// decidable from source), so this test is what keeps it from drifting away from
-// expectedActivationObjects: a table activation creates but the ledger does not
-// cover would let a change to that table pass the fast path unnoticed, and a
-// table the ledger covers that activation does not create would make a fresh
-// store look permanently stale.
+// table list to the data tables this build's activation is expected to create.
+// The list is written out as literals (every statement this package executes must
+// be decidable from source), so this test is what keeps it from drifting away
+// from expectedActivationObjects: a data table activation creates but the ledger
+// does not cover would let a change to that table pass the fast path unnoticed,
+// and a table the ledger covers that activation does not create would make a
+// fresh store look permanently stale. The ledger's own vector tables are
+// deliberately outside both lists: they are ledger machinery, checked by
+// verifiedLedgerObjects and the vector validation instead.
 func TestVerifiedLedgerCoveredTablesMatchActivationObjects(t *testing.T) {
 	want := make([]string, 0, len(expectedActivationObjects))
 	for _, object := range expectedActivationObjects {

@@ -210,23 +210,39 @@ digest of the covered-table presence set it was written under, and the shape id 
 this build's closed schema contract (the expected activation objects, the
 covered-table trigger set, the seed definitions, and the identity format).
 
+The generation is the sum of a baseline row and one counter per covered table
+(`provenance_table_generation`). Every covered table that exists carries one write
+trigger per DML verb, and each trigger advances that table's counter, so any write
+at all — a projection edit, a migration, an out-of-band update by another tool —
+makes the ledger stale. The baseline carries the previous build's single counter
+into the first vector build; a current v3 ledger therefore upgrades in place, and
+activation adopts it without re-running the whole-store checks.
+
 The ledger is written where the state it describes is made true, in the same
 transaction: at the end of activation's write transaction, after activation's own
 integrity and replay checks, and — when the currency probe runs those checks on an
 already-active store — under a compare-and-set inside `BEGIN IMMEDIATE` that
 refuses to record a store which moved while the read-only checks ran.
 
-Opening reads the ledger in O(1) — one row, one `INTEGER PRIMARY KEY` maximum, one
-row by primary key — and skips `VerifyIntegrity` and `ReplayProjections` only while
-it still describes the store as it stands. That skip takes no write lock. Every
-covered table that exists carries one write trigger per DML verb, and each trigger
-advances the store generation, so any write at all — a projection edit, a
-migration, an out-of-band update by another tool — makes the ledger stale and
-sends the next open down the full path. A crash between a write and its ledger
-update leaves the generation ahead of the ledger, which is the same mismatch, and
-never a skip. The structural half of the currency probe, including the
-journal-spine shape preflight and the trigger-coverage check, always runs, so DDL
-damage is refused on the fast path exactly as before.
+Opening reads the ledger in time bounded by the closed schema — one row, the
+per-table vector (`provenance_table_generation` and its
+`provenance_verified_table` mirror), one `INTEGER PRIMARY KEY` maximum, one row by
+primary key — and skips `VerifyIntegrity` and `ReplayProjections` only while it
+still describes the store as it stands. That skip takes no write lock.
+
+When the ledger is stale but the journal tail still matches, the vector names the
+tables that moved. If every moved table's whole-store coverage is table-local —
+the agent registry, the closed seed lookups, the identity format, the model
+registry, the actor claim relations — the open verifies exactly those tables and
+records the same proof for the new identity. That is the common case after a
+direct mutator such as `RegisterSoftwareAgent`, which writes `agents` and
+`agents_software` without touching the journal. Any journal- or projection-derived
+table in the moved set, any changed table presence set, and any torn vector take
+the full path. A crash between a write and its ledger update leaves the generation
+ahead of the ledger, which is the same mismatch, and never a skip. The structural
+half of the currency probe, including the journal-spine shape preflight and the
+trigger-coverage check (which compares trigger bodies, not only names), always
+runs, so DDL damage is refused on the fast path exactly as before.
 
 DDL advances no generation, so the ledger carries its own schema-shape guard: it
 records the digest of the covered-table presence set it was written under, and a
@@ -240,16 +256,17 @@ table's return fails the ledger's own presence digest and the currency probe's
 expected-object check.
 
 A store whose ledger is absent, unreadable, of another build's shape, or
-mismatched takes the unchanged full path, and its ledger is re-persisted only
-after those checks pass — one row in a bounded write transaction, which is the
-open path's only write, and only when the row does not already record exactly the
-state the checks just covered, so an open of a store whose activation changes
-nothing still rewrites nothing.
+mismatched takes the full path (or the table-local partial path above), and its
+ledger is re-persisted only after those checks pass — the ledger row plus the
+changed vector rows in a bounded write transaction, which is the open path's only
+write, and only when the row does not already record exactly the state the checks
+just covered, so an open of a store whose activation changes nothing still
+rewrites nothing.
 
 The two immutable fact-context relations stay static foreign-key relations with
 no triggers of their own beyond the ledger's, whose bodies only advance the
-generation; any other trigger on them is still refused by the fact-context shape
-classifier.
+per-table counters; any other trigger on them is still refused by the fact-context
+shape classifier.
 
 ## Dependency Graph
 
