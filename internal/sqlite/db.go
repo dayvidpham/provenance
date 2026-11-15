@@ -2230,6 +2230,19 @@ func preflightExistingReadOnly(target openTarget, models []ptypes.ModelEntry) (b
 					ledgerCurrent = true
 				}
 			}
+			if !ledgerCurrent {
+				// A stale ledger whose journal tail is unchanged and whose moved
+				// tables all have table-local coverage is verified by the same
+				// partial checks activation will repeat and persist. Running the
+				// read-only checks here keeps the preflight's clone skip; a
+				// concurrent write, a torn vector, or any journal/projection change
+				// still falls through to the whole-store path below.
+				if before, err := preflight.readVerifiedStoreIdentity(); err == nil {
+					if _, eligible := preflight.partialLedgerEligible(before, models); eligible {
+						ledgerCurrent = true
+					}
+				}
+			}
 			// A current ledger alone does not prove the schema is one activation
 			// would accept: the isolated clone below stays the gate for a schema
 			// whose object names collide, so the clone may be skipped only for a

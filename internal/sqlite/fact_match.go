@@ -557,8 +557,8 @@ func buildFactPageMatchBinding(kind factSelectorKind, page journal.FactPageReque
 	// branch, so the duplicates are removed here and the page shape is unchanged.
 	kinds = dedupeFactPageKinds(kinds)
 	// ?3 carried the kind JSON for the old IN predicate and is now unused. It is
-	// still bound (nil) so the shared ?1..?15 layout stays stable; the kind values
-	// follow at ?16.. one per branch.
+	// still bound (nil) so the shared ?1..?15 layout stays stable; each single-kind
+	// execution binds its one kind at ?16.
 	args := []any{singleArgs[0], int64(page.AfterJournalID), nil}
 	args = append(args, singleArgs[1:9]...)
 	args = append(args, singleArgs[10:]...)

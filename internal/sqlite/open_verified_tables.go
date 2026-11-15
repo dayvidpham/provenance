@@ -53,6 +53,45 @@ var verifiedLedgerObjects = []activationSchemaObject{
 // verifiedVectorLength is the baseline row plus one row per covered table.
 func verifiedVectorLength() int { return len(verifiedCoveredTableNames) + 1 }
 
+// verifiedVectorLayoutDrifted reports whether the generation table's rows no
+// longer line up with this build's closed covered-table list. An empty table is
+// a first build, not drift. Any other count, an out-of-range id, or a name that
+// belongs to a different id is drift. Activation deletes the whole vector and
+// reseeds it on drift, which is collision-free even when a covered table was
+// removed and the ids shifted left; the changed sum then sends the next open
+// down the full path exactly once.
+func (scope *connScope) verifiedVectorLayoutDrifted() (bool, error) {
+	drift := false
+	seen := 0
+	err := scope.queryRows("SELECT table_id, table_name FROM "+verifiedTableGenerationTable+" ORDER BY table_id", nil, func(rows *sql.Rows) error {
+		var id int64
+		var name string
+		if err := rows.Scan(&id, &name); err != nil {
+			return err
+		}
+		seen++
+		if id < 0 || id > int64(len(verifiedCoveredTableNames)) {
+			drift = true
+			return nil
+		}
+		want := verifiedBaselineName
+		if id > 0 {
+			want = verifiedTableName(int(id))
+		}
+		if name != want {
+			drift = true
+		}
+		return nil
+	})
+	if err != nil {
+		return false, fmt.Errorf("inspect generation vector layout: %w", err)
+	}
+	if seen != 0 && seen != verifiedVectorLength() {
+		drift = true
+	}
+	return drift, nil
+}
+
 // verifiedTableID maps a covered table to its vector row. It returns 0 for an
 // unknown name; callers derive names only from verifiedCoveredTableNames.
 func verifiedTableID(table string) int {
@@ -214,10 +253,18 @@ func (scope *connScope) advanceVerifiedTableVector(current, verified []int64) er
 		if current[id] == verified[id] {
 			continue
 		}
-		if _, err := scope.conn.ExecContext(scope.ctx,
+		result, err := scope.conn.ExecContext(scope.ctx,
 			"UPDATE "+verifiedTableProofTable+" SET generation = ?1 WHERE table_id = ?2",
-			current[id], int64(id)); err != nil {
+			current[id], int64(id))
+		if err != nil {
 			return fmt.Errorf("advance verified table row %d: %w", id, err)
+		}
+		rows, rowsErr := result.RowsAffected()
+		if rowsErr != nil {
+			return fmt.Errorf("advance verified table row %d: read affected rows: %w — where: verified-as-of mirror; when: advancing a sanctioned write; impact: the ledger is not advanced and the next open verifies fully; fix: retry the open", id, rowsErr)
+		}
+		if rows != 1 {
+			return fmt.Errorf("advance verified table row %d affected %d rows, want exactly one — where: verified-as-of mirror; when: advancing a sanctioned write; impact: the mirror is torn and the ledger is not advanced; fix: the next open runs the full path and rewrites the mirror", id, rows)
 		}
 	}
 	return nil
@@ -268,16 +315,13 @@ func migrationIdentityMatches(ledger, now verifiedStoreIdentity) bool {
 // metadataChecksFor returns the table-local checks that cover every changed
 // row, or false when any changed table needs the whole-store path. Only tables
 // whose whole-store coverage is exactly a local check belong here; every
-// journal- or projection-derived table deliberately falls through. The seed
-// names below mirror referenceSeeds in db.go: a new seed lookup must be added
-// here too or it silently deopts to the full path.
+// journal- or projection-derived table deliberately falls through. Closed seed
+// lookup changes also fall through: the seed-presence check alone does not cover
+// the foreign keys from their dependent tables.
 func (scope *connScope) metadataChecksFor(changed []int, models []ptypes.ModelEntry) ([]func() error, bool) {
-	var needSeeds, needAgents, needClaims, needModels, needIDFormat bool
+	var needAgents, needClaims, needModels, needIDFormat bool
 	for _, id := range changed {
 		switch verifiedTableName(id) {
-		case "statuses", "priorities", "task_types", "edge_kinds", "agent_kinds", "providers", "roles", "phases", "stages",
-			"journal_kinds", "authority_kinds", "assignment_slots", "assignment_transitions":
-			needSeeds = true
 		case "agents", "agents_human", "agents_ml", "agents_software":
 			needAgents = true
 		case "actor_namespace_claims", "fixed_actor_manifest_entries":
@@ -287,15 +331,14 @@ func (scope *connScope) metadataChecksFor(changed []int, models []ptypes.ModelEn
 		case "provenance_id_format":
 			needIDFormat = true
 		default:
+			// Closed seed lookups fall through deliberately: their dependent
+			// tables need a foreign-key check the seed-presence test does not
+			// provide, and seed changes are rare enough that the whole-store path
+			// is the right authority.
 			return nil, false
 		}
 	}
-	checks := make([]func() error, 0, 5)
-	if needSeeds {
-		checks = append(checks, func() error {
-			return scope.requireActivationCheck("reference seeds", scope.activationReferenceSeedsCurrent)
-		})
-	}
+	checks := make([]func() error, 0, 4)
 	if needAgents {
 		checks = append(checks, scope.verifyAgentRegistryIntegrity)
 	}
@@ -328,9 +371,11 @@ func (scope *connScope) requireActivationCheck(label string, check func() (bool,
 // verifyAgentRegistryIntegrity is the table-local coverage for the agent
 // registry: every agent has exactly one subtype row of its kind, every subtype
 // row agrees with its supertype, no agent appears in two subtypes, and every
-// relation that references an agent still finds it. The whole-store path runs
-// the subtype probes through verifyIntegrityMode and covers the references with
-// its global foreign-key check; the partial path runs both halves here.
+// relation that references an agent still finds it. The whole-store path covers
+// the references with its global foreign-key check but deliberately does not run
+// the subtype probes: adding them there would tighten the proof behind an
+// existing v3 ledger without a version bump. The partial path is therefore
+// stricter for a changed agent registry, which is the fail-closed direction.
 func (scope *connScope) verifyAgentRegistryIntegrity() error {
 	if err := scope.verifyAgentRegistryForeignKeys(); err != nil {
 		return err
@@ -566,8 +611,11 @@ func (scope *connScope) adoptableVerifiedLedger() (bool, error) {
 	if !ok || ledger.shapeID != verifiedShapeID() {
 		return false, nil
 	}
-	count, err := scope.verifiedTableVectorCount()
+	exists, err := scope.tableExists(verifiedTableProofTable)
 	if err != nil {
+		return false, err
+	}
+	if !exists {
 		// The vector tables do not exist yet: the v3 upgrade shape. Compare the
 		// old global identity.
 		legacy, err := scope.readVerifiedStoreIdentityLegacy()
@@ -575,6 +623,10 @@ func (scope *connScope) adoptableVerifiedLedger() (bool, error) {
 			return false, err
 		}
 		return migrationIdentityMatches(ledger.identity, legacy), nil
+	}
+	count, err := scope.verifiedTableVectorCount()
+	if err != nil {
+		return false, err
 	}
 	if count != 0 {
 		// A complete mirror is the normal verifiedLedgerCurrent check's job; a

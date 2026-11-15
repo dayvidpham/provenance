@@ -313,15 +313,6 @@ func (scope *connScope) verifyIntegrityMode(allowLegacyFactContexts bool) (err e
 	if err := scope.verifyActorPlacement(); err != nil {
 		return err
 	}
-	// Agent subtype invariants are not foreign keys, so the global foreign-key
-	// check above cannot see them. Run the same probes the table-local partial
-	// path runs, making "verified" mean one thing on both paths. The legacy e66
-	// compatibility pass predates the full agent schema and skips them.
-	if !allowLegacyFactContexts {
-		if err := scope.verifyAgentRegistryProbes(); err != nil {
-			return err
-		}
-	}
 	// Watermark presence is checked LAST: it is the §8.1 tightening (no un-journaled
 	// task row), a whole-database invariant a converged/native database satisfies,
 	// whereas the subtype and placement checks above localise a specific injected

@@ -95,7 +95,14 @@ func dropVerifiedLedger(t *testing.T, path string) {
 // verified_count at that point, which only a whole-store verification advances.
 func seedLedgerStore(t *testing.T, path string) (ptypes.TaskID, int64) {
 	t.Helper()
-	db, err := Open(path, nil)
+	return seedLedgerStoreWithModels(t, path, nil)
+}
+
+// seedLedgerStoreWithModels is seedLedgerStore with an explicit model registry,
+// so a test can exercise the model branch of the partial path.
+func seedLedgerStoreWithModels(t *testing.T, path string, models []ptypes.ModelEntry) (ptypes.TaskID, int64) {
+	t.Helper()
+	db, err := Open(path, models)
 	if err != nil {
 		t.Fatalf("activate ledger store on %q: %v", path, err)
 	}
@@ -125,7 +132,7 @@ func seedLedgerStore(t *testing.T, path string) (ptypes.TaskID, int64) {
 	}
 	// The seeding writes made the ledger stale, so this reopen runs the full path
 	// once and re-persists the ledger for the state the store is left in.
-	if err := reopenFileBacked(t, path); err != nil {
+	if err := reopenWithModels(t, path, models); err != nil {
 		t.Fatalf("reopen to establish a current ledger: %v", err)
 	}
 	count, present := ledgerRow(t, path)

@@ -298,6 +298,22 @@ func (scope *connScope) ensureVerifiedLedgerSchema() error {
 	if err := scope.ensureVerifiedLedgerColumns(); err != nil {
 		return err
 	}
+	// A layout drift — a removed covered table shifts the id-to-name map — is
+	// repaired by clearing the whole vector and rebuilding it. Renaming rows in
+	// place would collide with the UNIQUE table_name of a row that has not moved
+	// yet, and renaming is not enough: the recorded sum must change so the next
+	// open takes the full path exactly once.
+	drift, err := scope.verifiedVectorLayoutDrifted()
+	if err != nil {
+		return err
+	}
+	if drift {
+		for _, table := range []string{verifiedTableGenerationTable, verifiedTableProofTable} {
+			if _, err := scope.conn.ExecContext(scope.ctx, "DELETE FROM "+table); err != nil {
+				return fmt.Errorf("ensureVerifiedLedgerSchema: clear drifted vector %s: %w", table, err)
+			}
+		}
+	}
 	// The baseline and table rows are reconciled by name, not only by id. A
 	// covered table inserted or removed in the middle of the closed list shifts
 	// the id-to-name mapping; the upsert then renames the row and resets its
@@ -320,6 +336,11 @@ func (scope *connScope) ensureVerifiedLedgerSchema() error {
 		"DELETE FROM "+verifiedTableGenerationTable+" WHERE table_id < 0 OR table_id > ?1",
 		len(verifiedCoveredTableNames)); err != nil {
 		return fmt.Errorf("ensureVerifiedLedgerSchema: remove out-of-range generation rows: %w", err)
+	}
+	if _, err := scope.conn.ExecContext(scope.ctx,
+		"DELETE FROM "+verifiedTableProofTable+" WHERE table_id < 0 OR table_id > ?1",
+		len(verifiedCoveredTableNames)); err != nil {
+		return fmt.Errorf("ensureVerifiedLedgerSchema: remove out-of-range verified rows: %w", err)
 	}
 	present, err := scope.verifiedCoveredTablesPresent()
 	if err != nil {
@@ -762,7 +783,7 @@ func (scope *connScope) persistVerifiedLedgerIfUnchanged(before verifiedStoreIde
 // verified_at (a partial check is not a whole-store verification). The
 // compare-and-set is the same one the full path uses: a store that moved during
 // the checks is never recorded.
-func (scope *connScope) persistVerifiedChangedTablesIfUnchanged(before verifiedStoreIdentity, changed []int) bool {
+func (scope *connScope) persistVerifiedChangedTablesIfUnchanged(before verifiedStoreIdentity) bool {
 	err := runImmediateTransaction(scope.ctx, scope.conn, func() error {
 		now, err := scope.readVerifiedStoreIdentity()
 		if err != nil {
@@ -771,23 +792,12 @@ func (scope *connScope) persistVerifiedChangedTablesIfUnchanged(before verifiedS
 		if !identityEqual(now, before) {
 			return errVerifiedStoreMovedDuringVerification
 		}
-		for _, id := range changed {
-			if id < 0 || id >= len(now.generations) {
-				return fmt.Errorf("persist partial verification: table id %d is outside the closed vector", id)
-			}
-			result, err := scope.conn.ExecContext(scope.ctx,
-				"UPDATE "+verifiedTableProofTable+" SET generation = ?1 WHERE table_id = ?2",
-				now.generations[id], int64(id))
-			if err != nil {
-				return fmt.Errorf("persist partial verification: advance table row %d: %w", id, err)
-			}
-			rows, rowsErr := result.RowsAffected()
-			if rowsErr != nil {
-				return fmt.Errorf("persist partial verification: read affected rows for table row %d: %w — where: verified-as-of mirror; when: recording a table-local recovery; impact: the partial proof is not recorded; fix: retry the open, then let the full path heal a missing mirror row", id, rowsErr)
-			}
-			if rows != 1 {
-				return fmt.Errorf("persist partial verification: update table row %d affected %d rows, want exactly one — where: verified-as-of mirror; when: recording a table-local recovery; impact: the mirror is torn and the ledger is not advanced; fix: the next open runs the full path and rewrites the mirror", id, rows)
-			}
+		ledger, ok := scope.readVerifiedLedger()
+		if !ok {
+			return errVerifiedStoreMovedDuringVerification
+		}
+		if err := scope.advanceVerifiedTableVector(now.generations, ledger.identity.generations); err != nil {
+			return fmt.Errorf("persist partial verification: %w", err)
 		}
 		shape := verifiedShapeID()
 		if _, err := scope.conn.ExecContext(scope.ctx, fmt.Sprintf(`UPDATE %s SET

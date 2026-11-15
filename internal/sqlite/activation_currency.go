@@ -233,21 +233,8 @@ func (scope *connScope) activationConvergenceVerified(models []ptypes.ModelEntry
 	// exactly those tables and record the same proof for the new identity. Any
 	// journal- or projection-derived change, any torn vector, and any table
 	// without local coverage falls through to the whole-store path.
-	if ledger, ok := scope.readVerifiedLedger(); ok &&
-		ledger.shapeID == verifiedShapeID() &&
-		ledger.identity.tablesDigest == before.tablesDigest &&
-		journalIdentityEqual(ledger.identity, before) {
-		changed := changedTableIDs(ledger.identity.generations, before.generations)
-		if len(changed) > 0 {
-			if checks, local := scope.metadataChecksFor(changed, models); local {
-				for _, check := range checks {
-					if err := check(); err != nil {
-						return false, nil
-					}
-				}
-				return scope.persistVerifiedChangedTablesIfUnchanged(before, changed), nil
-			}
-		}
+	if scope.partialLedgerChecks(before, models) {
+		return scope.persistVerifiedChangedTablesIfUnchanged(before), nil
 	}
 	if err := scope.verifyIntegrity(); err != nil {
 		return false, nil
@@ -256,6 +243,50 @@ func (scope *connScope) activationConvergenceVerified(models []ptypes.ModelEntry
 		return false, nil
 	}
 	return scope.persistVerifiedLedgerIfUnchanged(before), nil
+}
+
+// partialLedgerChecks runs the table-local checks for a stale ledger whose
+// journal tail, covered-table presence set, and build shape still match. It
+// returns true only when every changed table has local coverage and every check
+// passed. The caller owns the write that records the proof; the read-only
+// preflight uses this to skip the whole-store verification and the activation
+// clone, and activation then repeats it before persisting.
+func (scope *connScope) partialLedgerChecks(before verifiedStoreIdentity, models []ptypes.ModelEntry) bool {
+	checks, ok := scope.partialLedgerEligible(before, models)
+	if !ok {
+		return false
+	}
+	for _, check := range checks {
+		if err := check(); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// partialLedgerEligible is the routing half of the partial path: it proves the
+// journal tail, presence set, and shape still match and that every moved table
+// has local coverage, without running the checks. The read-only preflight uses
+// it to skip the whole-store verification and the activation clone; activation
+// then runs partialLedgerChecks and persists. If the checks fail there,
+// activation still falls through to the whole-store path on the real store.
+func (scope *connScope) partialLedgerEligible(before verifiedStoreIdentity, models []ptypes.ModelEntry) ([]func() error, bool) {
+	ledger, ok := scope.readVerifiedLedger()
+	if !ok ||
+		ledger.shapeID != verifiedShapeID() ||
+		ledger.identity.tablesDigest != before.tablesDigest ||
+		!journalIdentityEqual(ledger.identity, before) {
+		return nil, false
+	}
+	changed := changedTableIDs(ledger.identity.generations, before.generations)
+	if len(changed) == 0 {
+		return nil, false
+	}
+	checks, local := scope.metadataChecksFor(changed, models)
+	if !local {
+		return nil, false
+	}
+	return checks, true
 }
 
 // activationSchemaObjectsCurrent verifies every object activation creates exists

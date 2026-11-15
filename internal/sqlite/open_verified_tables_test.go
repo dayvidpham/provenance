@@ -4,9 +4,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/dayvidpham/provenance/internal/journal"
+	"github.com/dayvidpham/provenance/pkg/ptypes"
 )
 
 // TestVerifiedShapeIDMatchesReleasedV3 pins the ledger shape to the value a
@@ -228,7 +230,7 @@ func TestVerifiedLedgerPartialPersistRefusesMovedStore(t *testing.T) {
 		verifiedTableID("tasks")); err != nil {
 		t.Fatalf("move the store: %v", err)
 	}
-	if scope.persistVerifiedChangedTablesIfUnchanged(before, []int{verifiedTableID("tasks")}) {
+	if scope.persistVerifiedChangedTablesIfUnchanged(before) {
 		t.Fatal("partial persist recorded a store that moved after the checks")
 	}
 }
@@ -417,4 +419,193 @@ func TestVerifiedTriggerActivationMatchesHelper(t *testing.T) {
 			}
 		}
 	}
+}
+
+// partialCoveredTableNames is the closed set of tables whose whole-store
+// coverage is table-local. TestPartialCoveredTablesMatchRouting pins it to
+// metadataChecksFor, and TestVerifiedLedgerNonLocalTablesTakeFullPath uses it
+// to prove every other covered table still takes the whole-store path.
+var partialCoveredTableNames = []string{
+	"agents", "agents_human", "agents_ml", "agents_software",
+	"actor_namespace_claims", "fixed_actor_manifest_entries",
+	"ml_models", "provenance_id_format",
+}
+
+func TestPartialCoveredTablesMatchRouting(t *testing.T) {
+	scope := &connScope{}
+	for _, table := range verifiedCoveredTableNames {
+		_, local := scope.metadataChecksFor([]int{verifiedTableID(table)}, nil)
+		want := slices.Contains(partialCoveredTableNames, table)
+		if local != want {
+			t.Fatalf("metadataChecksFor(%q) local=%v, want %v", table, local, want)
+		}
+	}
+}
+
+// TestVerifiedLedgerBorrowedPartialPath exercises the borrowed open, which has
+// no read-only preflight: the partial path is the only gate. It also proves the
+// partial path refuses a dangling agent reference.
+func TestVerifiedLedgerBorrowedPartialPath(t *testing.T) {
+	path := t.TempDir() + "/borrowed-partial.db"
+	_, seeded := seedLedgerStore(t, path)
+	pool := borrowedPool(t, path)
+	db, err := OpenBorrowed(pool, nil)
+	if err != nil {
+		t.Fatalf("borrowed open before the direct write: %v", err)
+	}
+	if _, err := db.RegisterSoftwareAgent("verified", "borrowed-writer", "0", "open_verified_tables_test"); err != nil {
+		t.Fatalf("register the direct agent: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close after the direct write: %v", err)
+	}
+	db, err = OpenBorrowed(pool, nil)
+	if err != nil {
+		t.Fatalf("borrowed open after the direct write: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close after the partial recovery: %v", err)
+	}
+	if _, count := readLedgerGeneration(t, path); count != seeded {
+		t.Fatalf("borrowed partial recovery moved verified_count to %d, want %d", count, seeded)
+	}
+
+	// Corrupt the fixture writer's references out of band, then prove the
+	// borrowed open reaches the partial path and refuses it.
+	raw := openVerifiedTablesTestDB(t, path)
+	if _, err := raw.Exec("PRAGMA foreign_keys=OFF"); err != nil {
+		t.Fatalf("disable foreign keys: %v", err)
+	}
+	var agentID string
+	if err := raw.QueryRow("SELECT agent_id FROM agents_software WHERE name='writer'").Scan(&agentID); err != nil {
+		t.Fatalf("read the fixture writer: %v", err)
+	}
+	if _, err := raw.Exec("DELETE FROM agents_software WHERE agent_id=?1", agentID); err != nil {
+		t.Fatalf("delete the writer subtype: %v", err)
+	}
+	if _, err := raw.Exec("DELETE FROM agents WHERE id=?1", agentID); err != nil {
+		t.Fatalf("delete the writer agent: %v", err)
+	}
+	if _, err := OpenBorrowed(pool, nil); !errors.Is(err, journal.ErrSubtypeIntegrity) {
+		t.Fatalf("borrowed open with a dangling journal actor = %v, want ErrSubtypeIntegrity", err)
+	}
+	if _, count := readLedgerGeneration(t, path); count != seeded {
+		t.Fatalf("refused borrowed open advanced verified_count to %d, want %d", count, seeded)
+	}
+}
+
+// TestVerifiedLedgerNonLocalTablesTakeFullPath pins the fall-through list: every
+// covered table outside the table-local set must force the whole-store path.
+func TestVerifiedLedgerNonLocalTablesTakeFullPath(t *testing.T) {
+	for _, table := range verifiedCoveredTableNames {
+		if slices.Contains(partialCoveredTableNames, table) {
+			continue
+		}
+		t.Run(table, func(t *testing.T) {
+			path := t.TempDir() + "/full-" + table + ".db"
+			_, seeded := seedLedgerStore(t, path)
+			db := openVerifiedTablesTestDB(t, path)
+			if _, err := db.Exec("UPDATE provenance_table_generation SET generation = generation + 1 WHERE table_id = ?1", verifiedTableID(table)); err != nil {
+				t.Fatalf("bump %s: %v", table, err)
+			}
+			if err := reopenFileBacked(t, path); err != nil {
+				t.Fatalf("open after bumping %s: %v", table, err)
+			}
+			if _, count := readLedgerGeneration(t, path); count != seeded+1 {
+				t.Fatalf("%s took the table-local path (verified_count %d, want %d); it must take the whole-store path", table, count, seeded+1)
+			}
+		})
+	}
+}
+
+// TestVerifiedLedgerRepairsTornMirror proves a missing as-of row is not a
+// permanent failure: the full path rewrites the mirror.
+func TestVerifiedLedgerRepairsTornMirror(t *testing.T) {
+	path := t.TempDir() + "/torn-mirror.db"
+	_, seeded := seedLedgerStore(t, path)
+	db := openVerifiedTablesTestDB(t, path)
+	if _, err := db.Exec("DELETE FROM provenance_verified_table WHERE table_id = ?1", verifiedTableID("tasks")); err != nil {
+		t.Fatalf("delete the tasks mirror row: %v", err)
+	}
+	if err := reopenFileBacked(t, path); err != nil {
+		t.Fatalf("open with a torn mirror: %v", err)
+	}
+	if _, count := readLedgerGeneration(t, path); count != seeded+1 {
+		t.Fatalf("verified_count after a torn mirror = %d, want %d; the full path did not run exactly once", count, seeded+1)
+	}
+	var rows int
+	if err := db.QueryRow("SELECT COUNT(*) FROM provenance_verified_table").Scan(&rows); err != nil {
+		t.Fatalf("count the mirror: %v", err)
+	}
+	if rows != verifiedVectorLength() {
+		t.Fatalf("mirror rows after repair = %d, want %d", rows, verifiedVectorLength())
+	}
+}
+
+// TestVerifiedLedgerRepairsVectorLayoutDrift proves a missing generation row and
+// an out-of-range mirror row are repaired by clearing and reseeding, not by an
+// in-place rename that could collide on the UNIQUE table_name.
+func TestVerifiedLedgerRepairsVectorLayoutDrift(t *testing.T) {
+	path := t.TempDir() + "/vector-layout.db"
+	_, seeded := seedLedgerStore(t, path)
+	db := openVerifiedTablesTestDB(t, path)
+	if _, err := db.Exec("DELETE FROM provenance_table_generation WHERE table_id = 2"); err != nil {
+		t.Fatalf("delete a generation row: %v", err)
+	}
+	if _, err := db.Exec("INSERT INTO provenance_verified_table(table_id, generation) VALUES (?1, 0)", verifiedVectorLength()); err != nil {
+		t.Fatalf("insert an out-of-range mirror row: %v", err)
+	}
+	if err := reopenFileBacked(t, path); err != nil {
+		t.Fatalf("open after vector layout drift: %v", err)
+	}
+	if _, count := readLedgerGeneration(t, path); count != seeded+1 {
+		t.Fatalf("verified_count after layout drift = %d, want %d; the full path did not run exactly once", count, seeded+1)
+	}
+	var generationRows, mirrorRows int
+	if err := db.QueryRow("SELECT COUNT(*) FROM provenance_table_generation").Scan(&generationRows); err != nil {
+		t.Fatalf("count generation rows: %v", err)
+	}
+	if err := db.QueryRow("SELECT COUNT(*) FROM provenance_verified_table").Scan(&mirrorRows); err != nil {
+		t.Fatalf("count mirror rows: %v", err)
+	}
+	if generationRows != verifiedVectorLength() || mirrorRows != verifiedVectorLength() {
+		t.Fatalf("repaired rows = generation %d / mirror %d, want %d", generationRows, mirrorRows, verifiedVectorLength())
+	}
+}
+
+// TestVerifiedLedgerPartialPathHealsMissingModel covers the model-registry
+// branch: the caller's registry notices a missing seeded model, so the full path
+// runs and activation re-seeds it.
+func TestVerifiedLedgerPartialPathHealsMissingModel(t *testing.T) {
+	path := t.TempDir() + "/missing-model.db"
+	models := []ptypes.ModelEntry{{Provider: "openai", Name: "gpt-test", DisplayName: "GPT Test"}}
+	seedLedgerStoreWithModels(t, path, models)
+	db := openVerifiedTablesTestDB(t, path)
+	providerName, modelName := "openai", "gpt-test"
+	_, seeded := readLedgerGeneration(t, path)
+	if _, err := db.Exec("DELETE FROM ml_models WHERE name=?1 AND provider_id=(SELECT id FROM providers WHERE name=?2)", modelName, providerName); err != nil {
+		t.Fatalf("delete the seeded model: %v", err)
+	}
+	if err := reopenWithModels(t, path, models); err != nil {
+		t.Fatalf("open after deleting the model: %v", err)
+	}
+	if _, count := readLedgerGeneration(t, path); count != seeded+1 {
+		t.Fatalf("verified_count after a missing model = %d, want %d; the full path did not run exactly once", count, seeded+1)
+	}
+	var restored int
+	if err := db.QueryRow("SELECT COUNT(*) FROM ml_models WHERE name=?1 AND provider_id=(SELECT id FROM providers WHERE name=?2)", modelName, providerName).Scan(&restored); err != nil {
+		t.Fatalf("count the restored model: %v", err)
+	}
+	if restored != 1 {
+		t.Fatalf("restored model rows = %d, want 1", restored)
+	}
+}
+
+func reopenWithModels(t *testing.T, path string, models []ptypes.ModelEntry) error {
+	t.Helper()
+	db, err := Open(path, models)
+	if err != nil {
+		return err
+	}
+	return db.Close()
 }
