@@ -108,7 +108,7 @@ func TestExactReplayProofFallback(t *testing.T) {
 		reject       bool
 	}{
 		{"absent-ledger", "DELETE FROM provenance_verified_store", false},
-		{"stale-ledger", "UPDATE provenance_store_generation SET generation=generation+1", false},
+		{"stale-ledger", "UPDATE provenance_table_generation SET generation=generation+1 WHERE table_name='tasks'", false},
 		{"unrelated-context-damage", "DELETE FROM journal_decision_contexts", true},
 		{"nonfact-canonical-damage", "UPDATE journal_operations SET canonical_mutation=x'00' WHERE operation_id != 'replay-verified'", true},
 		{"missing-trigger", "DROP TRIGGER provenance_store_generation_on_journal_operations_UPDATE", false},

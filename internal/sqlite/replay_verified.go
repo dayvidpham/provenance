@@ -2,7 +2,6 @@ package sqlite
 
 import (
 	"database/sql"
-	"fmt"
 	"strings"
 )
 
@@ -51,15 +50,19 @@ func (scope *connScope) exactReplayLedgerDefinitionsCurrent() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	for table, ddl := range map[string]string{storeGenerationTable: verifiedGenerationTableDDL, verifiedStoreTable: verifiedLedgerTableDDL} {
+	for table, ddl := range map[string]string{
+		storeGenerationTable:         verifiedGenerationTableDDL,
+		verifiedStoreTable:           verifiedLedgerTableDDL,
+		verifiedTableGenerationTable: verifiedTableGenerationDDL,
+		verifiedTableProofTable:      verifiedTableProofDDL,
+	} {
 		if definitions[table] != strings.Replace(ddl, "IF NOT EXISTS ", "", 1) {
 			return false, nil
 		}
 	}
 	for _, table := range verifiedCoveredTableNames {
 		for _, event := range verifiedTriggerEvents {
-			expected := fmt.Sprintf("CREATE TRIGGER provenance_store_generation_on_%s_%s AFTER %s ON %s BEGIN UPDATE provenance_store_generation SET generation = generation + 1 WHERE id = 1; END", table, event, event, table)
-			if definitions[verifiedTriggerName(table, event)] != expected {
+			if definitions[verifiedTriggerName(table, event)] != verifiedTriggerDDL(table, event) {
 				return false, nil
 			}
 		}

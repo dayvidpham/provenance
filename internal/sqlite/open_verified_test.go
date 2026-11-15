@@ -63,8 +63,8 @@ func bumpStoreGeneration(t *testing.T, path string) {
 			t.Errorf("close generation bumper: %v", err)
 		}
 	}()
-	if _, err := raw.Exec("UPDATE " + storeGenerationTable + " SET generation = generation + 1 WHERE id = 1"); err != nil {
-		t.Fatalf("bump store generation: %v", err)
+	if _, err := raw.Exec("UPDATE "+verifiedTableGenerationTable+" SET generation = generation + 1 WHERE table_id = ?1", verifiedTableID("tasks")); err != nil {
+		t.Fatalf("bump table generation: %v", err)
 	}
 }
 
@@ -168,13 +168,15 @@ func reopenFileBacked(t *testing.T, path string) error {
 }
 
 // TestVerifiedLedgerCoveredTablesMatchActivationObjects pins the ledger's covered
-// table list to the tables this build's activation is expected to create. The
-// list is written out as literals (every statement this package executes must be
-// decidable from source), so this test is what keeps it from drifting away from
-// expectedActivationObjects: a table activation creates but the ledger does not
-// cover would let a change to that table pass the fast path unnoticed, and a
-// table the ledger covers that activation does not create would make a fresh
-// store look permanently stale.
+// table list to the data tables this build's activation is expected to create.
+// The list is written out as literals (every statement this package executes must
+// be decidable from source), so this test is what keeps it from drifting away
+// from expectedActivationObjects: a data table activation creates but the ledger
+// does not cover would let a change to that table pass the fast path unnoticed,
+// and a table the ledger covers that activation does not create would make a
+// fresh store look permanently stale. The ledger's own vector tables are
+// deliberately outside both lists: they are ledger machinery, checked by
+// verifiedLedgerObjects and the vector validation instead.
 func TestVerifiedLedgerCoveredTablesMatchActivationObjects(t *testing.T) {
 	want := make([]string, 0, len(expectedActivationObjects))
 	for _, object := range expectedActivationObjects {

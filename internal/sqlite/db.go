@@ -939,6 +939,16 @@ func activateSchema(scope *connScope, models []ptypes.ModelEntry, policy activat
 		if err := scope.ensureSchema(models); err != nil {
 			return fmt.Errorf("apply schema: %w", err)
 		}
+		// ensureSchema installed the per-table vector tables and this build's
+		// trigger bodies. If the ledger still proves the store as it stands — the
+		// ordinary case for a v3 store being upgraded, and for a structural repair
+		// that changed no data — adopt that proof instead of re-verifying the whole
+		// journal. Adoption never advances verified_count or verified_at.
+		if adopted, err := scope.adoptCurrentVerifiedLedger(); err != nil {
+			return err
+		} else if adopted {
+			return nil
+		}
 		if err := scope.verifyIntegrity(); err != nil {
 			return fmt.Errorf("whole-journal integrity: %w", err)
 		}
@@ -2209,6 +2219,16 @@ func preflightExistingReadOnly(target openTarget, models []ptypes.ModelEntry) (b
 			}
 			if current, err := preflight.verifiedLedgerCurrent(); err == nil {
 				ledgerCurrent = current
+			}
+			if !ledgerCurrent {
+				// A current v3 ledger predates the per-table vector. Activation
+				// creates the vector tables and adopts that proof in place, so the
+				// preflight can skip the whole-store checks and the clone. If
+				// adoption fails inside activation, activation still runs the full
+				// path there.
+				if adoptable, err := preflight.adoptableVerifiedLedger(); err == nil && adoptable {
+					ledgerCurrent = true
+				}
 			}
 			// A current ledger alone does not prove the schema is one activation
 			// would accept: the isolated clone below stays the gate for a schema

@@ -297,7 +297,7 @@ func TestEligibleApplyUsesOneDeltaAndAdvances(t *testing.T) {
 	}
 	assertGateCounts(t, gates, 1, 0, 0)
 	ledger, identity, present := ledgerSnapshot(t, db)
-	if !present || ledger.identity != identity || ledger.shapeID != verifiedShapeID() {
+	if !present || !identityEqual(ledger.identity, identity) || ledger.shapeID != verifiedShapeID() {
 		t.Fatalf("eligible Apply did not advance the ledger to the post-write identity (present=%v ledger=%+v store=%+v shape=%q)", present, ledger.identity, identity, ledger.shapeID)
 	}
 	if ledger.count != seeded {
@@ -314,7 +314,7 @@ func TestEligibleApplyUsesOneDeltaAndAdvances(t *testing.T) {
 	}
 	assertGateCounts(t, replay, 0, 0, 0)
 	after, _, _ := ledgerSnapshot(t, db)
-	if after.identity != ledger.identity || after.count != seeded {
+	if !identityEqual(after.identity, ledger.identity) || after.count != seeded {
 		t.Fatalf("short-circuit moved the ledger from %+v/%d to %+v/%d", ledger.identity, seeded, after.identity, after.count)
 	}
 }
@@ -336,7 +336,7 @@ func TestEligibleBatchUsesOneDeltaOverTheAppendedRange(t *testing.T) {
 	}
 	assertGateCounts(t, gates, 1, 0, 0)
 	ledger, identity, present := ledgerSnapshot(t, db)
-	if !present || ledger.identity != identity || ledger.count != seeded {
+	if !present || !identityEqual(ledger.identity, identity) || ledger.count != seeded {
 		t.Fatalf("batch ledger present=%v count=%d want %d; ledger=%+v store=%+v", present, ledger.count, seeded, ledger.identity, identity)
 	}
 }
@@ -356,10 +356,10 @@ func TestEligibleApplyRollsBackADeltaViolation(t *testing.T) {
 	}
 	assertGateCounts(t, gates, 1, 0, 0)
 	after, identity, present := ledgerSnapshot(t, db)
-	if !present || after.identity != before.identity || after.count != seeded {
+	if !present || !identityEqual(after.identity, before.identity) || after.count != seeded {
 		t.Fatalf("rejected delta moved the ledger from %+v to %+v (store %+v, count %d)", before.identity, after.identity, identity, after.count)
 	}
-	if after.identity != identity {
+	if !identityEqual(after.identity, identity) {
 		t.Fatalf("rejected delta committed store identity %+v ahead of ledger %+v", identity, after.identity)
 	}
 	if err := db.VerifyIntegrity(); err != nil {
@@ -393,7 +393,7 @@ func TestEligibleBatchRollsBackADeltaViolation(t *testing.T) {
 	installDeltaCrossSubtypeTrigger(t, db)
 
 	before, beforeStore, present := ledgerSnapshot(t, db)
-	if !present || before.identity != beforeStore || before.count != seeded {
+	if !present || !identityEqual(before.identity, beforeStore) || before.count != seeded {
 		t.Fatalf("pre-write ledger present=%v count=%d want %d; ledger=%+v store=%+v", present, before.count, seeded, before.identity, beforeStore)
 	}
 	gates := &gateTally{}
@@ -421,10 +421,10 @@ func TestEligibleBatchRollsBackADeltaViolation(t *testing.T) {
 	}
 	assertGateCounts(t, gates, 1, 0, 0)
 	after, identity, present := ledgerSnapshot(t, db)
-	if !present || after.identity != before.identity || after.count != seeded {
+	if !present || !identityEqual(after.identity, before.identity) || after.count != seeded {
 		t.Fatalf("rejected batch moved the ledger from %+v/%d to %+v/%d", before.identity, seeded, after.identity, after.count)
 	}
-	if identity != before.identity {
+	if !identityEqual(identity, before.identity) {
 		t.Fatalf("rejected batch committed store identity %+v ahead of the pre-write ledger %+v", identity, before.identity)
 	}
 	if err := db.VerifyIntegrity(); err != nil {
@@ -452,10 +452,10 @@ func TestIneligibleWriteUsesFullPathOnce(t *testing.T) {
 		}
 		assertGateCounts(t, gates, 0, 1, 1)
 		after, identity, present := ledgerSnapshot(t, db)
-		if !present || after.identity != before.identity || after.count != seeded {
+		if !present || !identityEqual(after.identity, before.identity) || after.count != seeded {
 			t.Fatalf("stale write advanced the ledger from %+v/%d to %+v/%d", before.identity, seeded, after.identity, after.count)
 		}
-		if after.identity == identity {
+		if identityEqual(after.identity, identity) {
 			t.Fatalf("stale write left the ledger matching the store %+v; the full path must not advance", identity)
 		}
 	})
@@ -558,10 +558,10 @@ func TestIneligibleWriteUsesFullPathOnce(t *testing.T) {
 		}
 		assertGateCounts(t, gates, 0, 1, 1)
 		after, identity, present := ledgerSnapshot(t, db)
-		if !present || after.identity != before.identity || after.count != seeded {
+		if !present || !identityEqual(after.identity, before.identity) || after.count != seeded {
 			t.Fatalf("stale batch advanced the ledger from %+v/%d to %+v/%d", before.identity, seeded, after.identity, after.count)
 		}
-		if after.identity == identity {
+		if identityEqual(after.identity, identity) {
 			t.Fatalf("stale batch left the ledger matching the store %+v; the eligible guard must skip the advance", identity)
 		}
 	})

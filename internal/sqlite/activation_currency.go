@@ -14,16 +14,23 @@ type activationSchemaObject struct {
 	name string
 }
 
-// expectedActivationObjects is the closed set of schema objects this build's
-// activation creates. It is deliberately explicit rather than derived: the
-// currency probe compares a live store against this list using reads only, and a
-// store is treated as current only when every object activation would create is
-// already present. TestActivationCurrencyMatchesFreshActivation asserts this set
-// equals a freshly activated store's object set exactly, so activation's DDL
-// cannot grow, shrink, or rename an object without failing that test and forcing
-// this list to move with it. Extra unrelated objects a caller may add to a
-// borrowed file are ignored: activation only ever runs CREATE ... IF NOT EXISTS
-// for the objects below, so unrelated objects cannot make it change anything.
+// expectedActivationObjects is the closed set of data-contract schema objects
+// this build's activation creates. It is deliberately explicit rather than
+// derived: the currency probe compares a live store against this list using
+// reads only, and a store is treated as current only when every object
+// activation would create is already present. TestActivationCurrencyMatchesFreshActivation
+// asserts the activated set equals this list plus the ledger-owned objects, so
+// activation's DDL cannot grow, shrink, or rename an object without failing that
+// test and forcing this list to move with it. Extra unrelated objects a caller
+// may add to a borrowed file are ignored: activation only ever runs CREATE ...
+// IF NOT EXISTS for the objects below, so unrelated objects cannot make it
+// change anything.
+//
+// The verified-as-of ledger's per-table vector tables are deliberately NOT in
+// this list. They are ledger machinery, not part of the data contract, so adding
+// them must not move verifiedShapeID and invalidate every existing ledger.
+// activationSchemaObjectsCurrent requires them through verifiedLedgerObjects
+// instead, and activationSchemaIsPristine allows them as ledger-owned extras.
 var expectedActivationObjects = []activationSchemaObject{
 	// ensureSchema reference and domain relations.
 	{"table", "statuses"},
@@ -103,10 +110,11 @@ var expectedActivationObjects = []activationSchemaObject{
 	{"table", "governed_composed_supplement_owners"},
 	// initializeEmptyIDFormat store-wide identity marker.
 	{"table", "provenance_id_format"},
-	// ensureVerifiedLedgerSchema verified-as-of ledger: the DML change counter, the
-	// verified-as-of row, and (checked separately by activationLedgerCoverageCurrent,
-	// because their names are derived rather than listed) one change trigger per
-	// covered table. See open_verified.go.
+	// ensureVerifiedLedgerSchema verified-as-of ledger: the legacy single counter
+	// (kept as the vector baseline seed), the verified-as-of row, and (checked
+	// separately because their names are derived rather than listed) one change
+	// trigger per covered table plus the per-table vector tables. See
+	// open_verified.go and open_verified_tables.go.
 	{"table", storeGenerationTable},
 	{"table", verifiedStoreTable},
 }
@@ -173,8 +181,9 @@ func (scope *connScope) activationWouldChangeNothing(models []ptypes.ModelEntry)
 		// Last, and only reached by a structurally-current store: this is the
 		// most expensive probe and the one activation's own convergence
 		// comparison lives in. It is skipped outright when the verified-as-of
-		// ledger still describes the store as it stands.
-		scope.activationConvergenceVerified,
+		// ledger still describes the store as it stands, and reduced to the
+		// changed tables' local checks when the journal tail is unchanged.
+		func() (bool, error) { return scope.activationConvergenceVerified(models) },
 	}
 	for _, check := range checks {
 		current, err := check()
@@ -203,13 +212,34 @@ func (scope *connScope) activationWouldChangeNothing(models []ptypes.ModelEntry)
 // Any failure — divergence, damaged journal, unreadable store, or a moved store —
 // reports not-current. The activation path then re-runs the same checks inside its
 // write transaction and surfaces the canonical error, so nothing is masked.
-func (scope *connScope) activationConvergenceVerified() (bool, error) {
+func (scope *connScope) activationConvergenceVerified(models []ptypes.ModelEntry) (bool, error) {
 	if current, err := scope.verifiedLedgerCurrent(); err == nil && current {
 		return true, nil
 	}
 	before, err := scope.readVerifiedStoreIdentity()
 	if err != nil {
 		return false, nil
+	}
+	// Partial path: the ledger is stale, but the immutable journal prefix is
+	// unchanged and every table that moved has table-local coverage. Verify
+	// exactly those tables and record the same proof for the new identity. Any
+	// journal- or projection-derived change, any torn vector, and any table
+	// without local coverage falls through to the whole-store path.
+	if ledger, ok := scope.readVerifiedLedger(); ok &&
+		ledger.shapeID == verifiedShapeID() &&
+		ledger.identity.tablesDigest == before.tablesDigest &&
+		journalIdentityEqual(ledger.identity, before) {
+		changed := changedTableIDs(ledger.identity.generations, before.generations)
+		if len(changed) > 0 {
+			if checks, local := scope.metadataChecksFor(changed, models); local {
+				for _, check := range checks {
+					if err := check(); err != nil {
+						return false, nil
+					}
+				}
+				return scope.persistVerifiedChangedTablesIfUnchanged(before, changed), nil
+			}
+		}
 	}
 	if err := scope.verifyIntegrity(); err != nil {
 		return false, nil
@@ -236,6 +266,16 @@ func (scope *connScope) activationSchemaObjectsCurrent() (bool, error) {
 		return false, err
 	}
 	for _, want := range expectedActivationObjects {
+		if _, ok := present[want.kind+"\x00"+want.name]; !ok {
+			return false, nil
+		}
+	}
+	// The verified-as-of ledger owns its per-table vector tables. They are
+	// excluded from expectedActivationObjects (and therefore from the ledger
+	// shape), so a v3 store that predates them passes the data-contract check
+	// above and is upgraded in place by activation; a store missing them is not
+	// current and must run activation.
+	for _, want := range verifiedLedgerObjects {
 		if _, ok := present[want.kind+"\x00"+want.name]; !ok {
 			return false, nil
 		}

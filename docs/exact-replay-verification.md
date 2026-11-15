@@ -10,7 +10,10 @@ fact-context gate, `exactReplayFactContextsVerified` may reuse the durable proof
 only within the caller's current SQLite transaction snapshot:
 
 - Generation, journal tail identity, covered-table presence and build shape must
-  match the persisted verified ledger. Missing/unreadable/stale proof falls back.
+  match the persisted verified ledger. The generation is the sum of the
+  per-table vector's baseline and counters, and the verified mirror must match it
+  row for row, so a table that moved without moving the sum still falls back.
+  Missing/unreadable/stale proof falls back.
 - Structural activation probes, exact ledger/context-table definitions and the
   actual SQL of every generation trigger must still match. Trigger names alone
   cannot prove that a same-name no-op replacement detects writes.

@@ -512,8 +512,13 @@ func TestActivationCurrencyMatchesFreshActivation(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("enumerate activated schema objects: %v", err)
 	}
-	want := make(map[string]struct{}, len(expectedActivationObjects))
+	want := make(map[string]struct{}, len(expectedActivationObjects)+len(verifiedLedgerObjects))
 	for _, object := range expectedActivationObjects {
+		want[object.kind+"\x00"+object.name] = struct{}{}
+	}
+	// The verified-as-of ledger owns its per-table vector tables; they are
+	// activation-created but deliberately outside the data-contract list.
+	for _, object := range verifiedLedgerObjects {
 		want[object.kind+"\x00"+object.name] = struct{}{}
 	}
 	// activation's last step installs the verified-as-of ledger: one change
