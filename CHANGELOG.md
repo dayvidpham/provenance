@@ -17,9 +17,12 @@ All notable changes to this project will be documented in this file.
   table-local (agent registry, closed seeds, identity format, model registry,
   actor claims). Journal- and projection-derived table changes still take the
   full path. Measured on an 18 GB store: the stale case after a direct
-  `RegisterSoftwareAgent` opens in 186 ms instead of exceeding 30 minutes, and
-  the unchanged v3 upgrade adopts in 52 ms. Trigger cost is 1.7 us per DML
-  versus 1.5 us for the previous single counter.
+  `RegisterSoftwareAgent` opens in about 3.8 s instead of exceeding 30 minutes,
+  and the unchanged v3 upgrade adopts in 52 ms. The 3.8 s includes the indexed
+  orphan probes over the 9.5M-row journal that keep a deleted agent from being
+  blessed; an insert-only registration has no cheaper proof without a
+  change log. Trigger cost is 1.7 us per DML versus 1.5 us for the previous
+  single counter.
 - Trigger coverage now compares trigger bodies, not only names, so a same-name
   no-op replacement is repaired by activation instead of silently disabling
   change detection.

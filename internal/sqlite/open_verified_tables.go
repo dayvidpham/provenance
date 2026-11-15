@@ -72,12 +72,18 @@ func verifiedTableName(id int) string {
 	return verifiedCoveredTableNames[id-1]
 }
 
+// verifiedTriggerSQLFormat is the stored form verifiedTriggerDDL compares
+// against. Activation's own create statement must stay an inline literal: the
+// SQL architecture guard only decides a format string written at the sink, so
+// the two sites are pinned to each other by
+// TestVerifiedTriggerActivationMatchesHelper.
+const verifiedTriggerSQLFormat = "CREATE TRIGGER %s AFTER %s ON %s BEGIN UPDATE %s SET generation = generation + 1 WHERE table_id = %d; END"
+
 // verifiedTriggerDDL is the stored form of one change trigger. The trigger name
 // keeps the v3 prefix so the ledger shape (which hashes names, not bodies) is
 // unchanged; the body now advances the table's own counter.
 func verifiedTriggerDDL(table, event string) string {
-	return fmt.Sprintf("CREATE TRIGGER %s AFTER %s ON %s BEGIN UPDATE %s SET generation = generation + 1 WHERE table_id = %d; END",
-		verifiedTriggerName(table, event), event, table, verifiedTableGenerationTable, verifiedTableID(table))
+	return fmt.Sprintf(verifiedTriggerSQLFormat, verifiedTriggerName(table, event), event, table, verifiedTableGenerationTable, verifiedTableID(table))
 }
 
 // readTableGenerationVector reads the current per-table counters, baseline row
@@ -93,17 +99,17 @@ func (scope *connScope) readTableGenerationVector() ([]int64, error) {
 			return err
 		}
 		if id < 0 || id >= int64(len(vector)) {
-			return fmt.Errorf("table generation row id %d is outside the closed vector", id)
+			return fmt.Errorf("table generation row id %d is outside the closed vector — where: verified-as-of vector; when: reading the store identity; impact: the ledger is not trusted and the full verification runs; fix: let activation reconcile the vector", id)
 		}
 		if seen[id] {
-			return fmt.Errorf("duplicate table generation row id %d", id)
+			return fmt.Errorf("duplicate table generation row id %d — where: verified-as-of vector; when: reading the store identity; impact: the ledger is not trusted and the full verification runs; fix: let activation reconcile the vector", id)
 		}
 		want := verifiedBaselineName
 		if id > 0 {
 			want = verifiedTableName(int(id))
 		}
 		if name != want {
-			return fmt.Errorf("table generation row id %d names %q, want %q", id, name, want)
+			return fmt.Errorf("table generation row id %d names %q, want %q — where: verified-as-of vector; when: reading the store identity; impact: the ledger is not trusted and the full verification runs; fix: let activation reconcile the row name and counter", id, name, want)
 		}
 		vector[id] = generation
 		seen[id] = true
@@ -114,7 +120,7 @@ func (scope *connScope) readTableGenerationVector() ([]int64, error) {
 	}
 	for id, ok := range seen {
 		if !ok {
-			return nil, fmt.Errorf("table generation vector is missing row id %d", id)
+			return nil, fmt.Errorf("table generation vector is missing row id %d — where: verified-as-of vector; when: reading the store identity; impact: the ledger is not trusted and the full verification runs; fix: let activation reseed the missing row", id)
 		}
 	}
 	return vector, nil
@@ -132,10 +138,10 @@ func (scope *connScope) readVerifiedTableVector() ([]int64, error) {
 			return err
 		}
 		if id < 0 || id >= int64(len(vector)) {
-			return fmt.Errorf("verified table row id %d is outside the closed vector", id)
+			return fmt.Errorf("verified table row id %d is outside the closed vector — where: verified-as-of mirror; when: reading the ledger; impact: the ledger is not trusted and the full verification runs; fix: the full path rewrites the mirror", id)
 		}
 		if seen[id] {
-			return fmt.Errorf("duplicate verified table row id %d", id)
+			return fmt.Errorf("duplicate verified table row id %d — where: verified-as-of mirror; when: reading the ledger; impact: the ledger is not trusted and the full verification runs; fix: the full path rewrites the mirror", id)
 		}
 		vector[id] = generation
 		seen[id] = true
@@ -146,7 +152,7 @@ func (scope *connScope) readVerifiedTableVector() ([]int64, error) {
 	}
 	for id, ok := range seen {
 		if !ok {
-			return nil, fmt.Errorf("verified table vector is missing row id %d", id)
+			return nil, fmt.Errorf("verified table vector is missing row id %d — where: verified-as-of mirror; when: reading the ledger; impact: the ledger is not trusted and the full verification runs; fix: the full path rewrites the mirror", id)
 		}
 	}
 	return vector, nil
@@ -177,7 +183,7 @@ func verifiedGenerationSum(vector []int64) int64 {
 // caller's transaction.
 func (scope *connScope) writeVerifiedTableVector(vector []int64) error {
 	if len(vector) != verifiedVectorLength() {
-		return fmt.Errorf("write verified table vector: got %d rows, want %d", len(vector), verifiedVectorLength())
+		return fmt.Errorf("write verified table vector: got %d rows, want %d — where: verified-as-of mirror; when: recording a verification; impact: nothing is written and the store stays stale; fix: rebuild the vector from the closed covered-table set", len(vector), verifiedVectorLength())
 	}
 	for id, generation := range vector {
 		if _, err := scope.conn.ExecContext(scope.ctx,
@@ -195,7 +201,7 @@ func (scope *connScope) writeVerifiedTableVector(vector []int64) error {
 // proven change.
 func (scope *connScope) advanceVerifiedTableVector(current, verified []int64) error {
 	if len(current) != verifiedVectorLength() || len(verified) != verifiedVectorLength() {
-		return fmt.Errorf("advance verified table vector: got %d current / %d verified rows, want %d", len(current), len(verified), verifiedVectorLength())
+		return fmt.Errorf("advance verified table vector: got %d current / %d verified rows, want %d — where: verified-as-of mirror; when: advancing a sanctioned write; impact: the ledger is not advanced and the next open verifies fully; fix: restore the vector to the closed covered-table set", len(current), len(verified), verifiedVectorLength())
 	}
 	for id := range current {
 		if current[id] < verified[id] {
@@ -203,7 +209,7 @@ func (scope *connScope) advanceVerifiedTableVector(current, verified []int64) er
 			if id > 0 {
 				label = verifiedTableName(id)
 			}
-			return fmt.Errorf("advance verified table vector: %s counter moved backwards from %d to %d", label, verified[id], current[id])
+			return fmt.Errorf("advance verified table vector: %s counter moved backwards from %d to %d — where: verified-as-of vector; when: advancing a sanctioned write; impact: the ledger is not advanced and the next open verifies fully; fix: restore the counter or let the full path rebuild the vector", label, verified[id], current[id])
 		}
 		if current[id] == verified[id] {
 			continue
@@ -247,10 +253,24 @@ func journalIdentityEqual(a, b verifiedStoreIdentity) bool {
 	return a.journalID == b.journalID && a.digest == b.digest
 }
 
+// migrationIdentityMatches is the pre-vector identity comparison: the ledger's
+// four persisted identity fields against the store as it stands. The per-table
+// vector is compared separately by identityEqual. Both adoption paths call this
+// one predicate so a future identity field cannot be added to one and missed in
+// the other.
+func migrationIdentityMatches(ledger, now verifiedStoreIdentity) bool {
+	return ledger.generation == now.generation &&
+		ledger.journalID == now.journalID &&
+		ledger.digest == now.digest &&
+		ledger.tablesDigest == now.tablesDigest
+}
+
 // metadataChecksFor returns the table-local checks that cover every changed
 // row, or false when any changed table needs the whole-store path. Only tables
 // whose whole-store coverage is exactly a local check belong here; every
-// journal- or projection-derived table deliberately falls through.
+// journal- or projection-derived table deliberately falls through. The seed
+// names below mirror referenceSeeds in db.go: a new seed lookup must be added
+// here too or it silently deopts to the full path.
 func (scope *connScope) metadataChecksFor(changed []int, models []ptypes.ModelEntry) ([]func() error, bool) {
 	var needSeeds, needAgents, needClaims, needModels, needIDFormat bool
 	for _, id := range changed {
@@ -305,11 +325,25 @@ func (scope *connScope) requireActivationCheck(label string, check func() (bool,
 	return nil
 }
 
-// verifyAgentRegistryIntegrity is the whole-store coverage for the agent
+// verifyAgentRegistryIntegrity is the table-local coverage for the agent
 // registry: every agent has exactly one subtype row of its kind, every subtype
-// row agrees with its supertype, no agent appears in two subtypes, and the
-// foreign keys from the registry and its dependent tables hold.
+// row agrees with its supertype, no agent appears in two subtypes, and every
+// relation that references an agent still finds it. The whole-store path runs
+// the subtype probes through verifyIntegrityMode and covers the references with
+// its global foreign-key check; the partial path runs both halves here.
 func (scope *connScope) verifyAgentRegistryIntegrity() error {
+	if err := scope.verifyAgentRegistryForeignKeys(); err != nil {
+		return err
+	}
+	return scope.verifyAgentRegistryProbes()
+}
+
+// verifyAgentRegistryForeignKeys covers the relations that reference agents.
+// The small relations use a plain foreign-key check. The three large ones use
+// an indexed orphan probe instead of a full foreign-key scan: journal.actor_id
+// and task_attributions.actor_id are indexed, and the orphan probe asks only
+// whether any non-null reference has no parent.
+func (scope *connScope) verifyAgentRegistryForeignKeys() error {
 	for _, statement := range []string{
 		"PRAGMA foreign_key_check(agents)",
 		"PRAGMA foreign_key_check(agents_human)",
@@ -325,6 +359,22 @@ func (scope *connScope) verifyAgentRegistryIntegrity() error {
 			return err
 		}
 	}
+	for _, probe := range agentOrphanProbes {
+		var bad string
+		err := scope.conn.QueryRowContext(scope.ctx, probe.query()).Scan(&bad)
+		if err == nil {
+			return fmt.Errorf("agent registry %s: %q", probe.label(), bad)
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("agent registry %s: %w", probe.label(), err)
+		}
+	}
+	return nil
+}
+
+// verifyAgentRegistryProbes covers the subtype invariants that no foreign key
+// expresses.
+func (scope *connScope) verifyAgentRegistryProbes() error {
 	for _, probe := range agentRegistryProbes {
 		var bad string
 		err := scope.conn.QueryRowContext(scope.ctx, probe.query()).Scan(&bad)
@@ -336,6 +386,48 @@ func (scope *connScope) verifyAgentRegistryIntegrity() error {
 		}
 	}
 	return nil
+}
+
+// agentOrphanProbe is the closed set of indexed references to agents that are
+// too large for a plain per-table foreign-key scan in the partial path.
+type agentOrphanProbe uint8
+
+const (
+	agentOrphanJournalAnchor agentOrphanProbe = iota + 1
+	agentOrphanTaskAttribution
+	agentOrphanAssignmentEpisode
+)
+
+var agentOrphanProbes = []agentOrphanProbe{
+	agentOrphanJournalAnchor,
+	agentOrphanTaskAttribution,
+	agentOrphanAssignmentEpisode,
+}
+
+func (probe agentOrphanProbe) label() string {
+	switch probe {
+	case agentOrphanJournalAnchor:
+		return "journal anchor actor"
+	case agentOrphanTaskAttribution:
+		return "task attribution actor"
+	case agentOrphanAssignmentEpisode:
+		return "assignment episode actor"
+	default:
+		panic("unknown agent orphan probe")
+	}
+}
+
+func (probe agentOrphanProbe) query() string {
+	switch probe {
+	case agentOrphanJournalAnchor:
+		return "SELECT CAST(journal_id AS TEXT) FROM journal WHERE actor_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM agents WHERE agents.id = journal.actor_id) LIMIT 1"
+	case agentOrphanTaskAttribution:
+		return "SELECT task_id FROM task_attributions WHERE NOT EXISTS (SELECT 1 FROM agents WHERE agents.id = task_attributions.actor_id) LIMIT 1"
+	case agentOrphanAssignmentEpisode:
+		return "SELECT assignment_id FROM journal_authority_assignment_episodes WHERE NOT EXISTS (SELECT 1 FROM agents WHERE agents.id = journal_authority_assignment_episodes.actor_id) LIMIT 1"
+	default:
+		panic("unknown agent orphan probe")
+	}
 }
 
 // agentRegistryProbe is the closed set of table-local agent-registry checks.
@@ -455,10 +547,7 @@ func (scope *connScope) adoptCurrentVerifiedLedger() (bool, error) {
 			return false, nil
 		}
 	}
-	if ledgerRow.identity.generation != now.generation ||
-		ledgerRow.identity.journalID != now.journalID ||
-		ledgerRow.identity.digest != now.digest ||
-		ledgerRow.identity.tablesDigest != now.tablesDigest {
+	if !migrationIdentityMatches(ledgerRow.identity, now) {
 		return false, nil
 	}
 	if err := scope.writeVerifiedTableVector(now.generations); err != nil {
@@ -485,10 +574,7 @@ func (scope *connScope) adoptableVerifiedLedger() (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		return ledger.identity.generation == legacy.generation &&
-			ledger.identity.journalID == legacy.journalID &&
-			ledger.identity.digest == legacy.digest &&
-			ledger.identity.tablesDigest == legacy.tablesDigest, nil
+		return migrationIdentityMatches(ledger.identity, legacy), nil
 	}
 	if count != 0 {
 		// A complete mirror is the normal verifiedLedgerCurrent check's job; a
@@ -504,10 +590,7 @@ func (scope *connScope) adoptableVerifiedLedger() (bool, error) {
 			return false, nil
 		}
 	}
-	return ledger.identity.generation == now.generation &&
-		ledger.identity.journalID == now.journalID &&
-		ledger.identity.digest == now.digest &&
-		ledger.identity.tablesDigest == now.tablesDigest, nil
+	return migrationIdentityMatches(ledger.identity, now), nil
 }
 
 // verifyModelRegistryIntegrity is the whole-store coverage for ml_models: the

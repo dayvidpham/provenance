@@ -2233,7 +2233,9 @@ func preflightExistingReadOnly(target openTarget, models []ptypes.ModelEntry) (b
 			// A current ledger alone does not prove the schema is one activation
 			// would accept: the isolated clone below stays the gate for a schema
 			// whose object names collide, so the clone may be skipped only for a
-			// schema that is exactly this build's object set.
+			// schema that is exactly this build's object set. The adoption branch
+			// above is the one exception: a v3 store is missing the ledger's own
+			// vector tables, and activation creates them before adopting.
 			if ledgerCurrent {
 				if pristine, err := preflight.activationSchemaIsPristine(); err != nil || !pristine {
 					ledgerCurrent = false

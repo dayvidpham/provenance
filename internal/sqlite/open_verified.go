@@ -21,8 +21,9 @@ import (
 // set. On a multi-hundred-megabyte store that costs seconds, which is longer
 // than a host lifecycle hook's whole invocation deadline, so a store that has
 // not changed since it was last verified must not pay for the verification
-// again. This ledger is the durable "verified as of" marker that makes the open
-// path O(1) in that case.
+// again. This ledger is the durable "verified as of" marker that makes an
+// unchanged store's open read time bounded by the closed schema instead of the
+// journal.
 //
 // It exists only where it can pay off: a durable store that is opened more than
 // once. Activation of a process-unique in-memory database skips it entirely
@@ -231,12 +232,13 @@ const (
 	verifiedLedgerTablesDigestColumnDDL = `ALTER TABLE provenance_verified_store ADD COLUMN tables_digest TEXT NOT NULL DEFAULT ''`
 )
 
-// verifiedStoreIdentity is the O(1) identity of the store as it stands: the DML
-// generation, the journal tail id, a digest of that tail row, and the digest of
-// the covered-table presence set. The presence digest is what makes the ledger
-// self-contained about schema shape: a covered table that appears or disappears
-// after the row was written changes this identity, even though DDL advances no
-// generation.
+// verifiedStoreIdentity is the closed-schema identity of the store as it stands:
+// the global generation, the per-table counter vector, the journal tail id, a
+// digest of that tail row, and the digest of the covered-table presence set. The
+// vector distinguishes two tables moving in opposite directions; the presence
+// digest is what makes the ledger self-contained about schema shape, so a
+// covered table that appears or disappears after the row was written changes the
+// identity even though DDL advances no generation.
 type verifiedStoreIdentity struct {
 	generation   int64
 	generations  []int64
@@ -296,17 +298,28 @@ func (scope *connScope) ensureVerifiedLedgerSchema() error {
 	if err := scope.ensureVerifiedLedgerColumns(); err != nil {
 		return err
 	}
+	// The baseline and table rows are reconciled by name, not only by id. A
+	// covered table inserted or removed in the middle of the closed list shifts
+	// the id-to-name mapping; the upsert then renames the row and resets its
+	// counter, which makes the recorded sum disagree with the ledger and sends
+	// the next open down the full path exactly once. Resetting is what lets
+	// activation repair a drifted vector instead of failing every open.
 	if _, err := scope.conn.ExecContext(scope.ctx,
-		"INSERT INTO "+verifiedTableGenerationTable+" (table_id, table_name, generation) SELECT ?1, ?2, generation FROM "+storeGenerationTable+" WHERE id = 1 AND NOT EXISTS (SELECT 1 FROM "+verifiedTableGenerationTable+")",
+		"INSERT INTO "+verifiedTableGenerationTable+" (table_id, table_name, generation) VALUES (?1, ?2, COALESCE((SELECT generation FROM "+storeGenerationTable+" WHERE id = 1), 0)) ON CONFLICT(table_id) DO UPDATE SET table_name = excluded.table_name, generation = CASE WHEN "+verifiedTableGenerationTable+".table_name = excluded.table_name THEN "+verifiedTableGenerationTable+".generation ELSE excluded.generation END",
 		verifiedBaselineTableID, verifiedBaselineName); err != nil {
 		return fmt.Errorf("ensureVerifiedLedgerSchema: seed generation baseline: %w", err)
 	}
 	for i, table := range verifiedCoveredTableNames {
 		if _, err := scope.conn.ExecContext(scope.ctx,
-			"INSERT OR IGNORE INTO "+verifiedTableGenerationTable+" (table_id, table_name, generation) VALUES (?1, ?2, 0)",
+			"INSERT INTO "+verifiedTableGenerationTable+" (table_id, table_name, generation) VALUES (?1, ?2, 0) ON CONFLICT(table_id) DO UPDATE SET table_name = excluded.table_name, generation = CASE WHEN "+verifiedTableGenerationTable+".table_name = excluded.table_name THEN "+verifiedTableGenerationTable+".generation ELSE 0 END",
 			int64(i+1), table); err != nil {
 			return fmt.Errorf("ensureVerifiedLedgerSchema: seed generation row for %s: %w", table, err)
 		}
+	}
+	if _, err := scope.conn.ExecContext(scope.ctx,
+		"DELETE FROM "+verifiedTableGenerationTable+" WHERE table_id < 0 OR table_id > ?1",
+		len(verifiedCoveredTableNames)); err != nil {
+		return fmt.Errorf("ensureVerifiedLedgerSchema: remove out-of-range generation rows: %w", err)
 	}
 	present, err := scope.verifiedCoveredTablesPresent()
 	if err != nil {
@@ -768,8 +781,12 @@ func (scope *connScope) persistVerifiedChangedTablesIfUnchanged(before verifiedS
 			if err != nil {
 				return fmt.Errorf("persist partial verification: advance table row %d: %w", id, err)
 			}
-			if rows, err := result.RowsAffected(); err != nil || rows != 1 {
-				return fmt.Errorf("persist partial verification: advance table row %d affected %d rows (err=%v), want exactly one", id, rows, err)
+			rows, rowsErr := result.RowsAffected()
+			if rowsErr != nil {
+				return fmt.Errorf("persist partial verification: read affected rows for table row %d: %w — where: verified-as-of mirror; when: recording a table-local recovery; impact: the partial proof is not recorded; fix: retry the open, then let the full path heal a missing mirror row", id, rowsErr)
+			}
+			if rows != 1 {
+				return fmt.Errorf("persist partial verification: update table row %d affected %d rows, want exactly one — where: verified-as-of mirror; when: recording a table-local recovery; impact: the mirror is torn and the ledger is not advanced; fix: the next open runs the full path and rewrites the mirror", id, rows)
 			}
 		}
 		shape := verifiedShapeID()
@@ -790,7 +807,7 @@ func (scope *connScope) persistVerifiedChangedTablesIfUnchanged(before verifiedS
 
 // activationSchemaIsPristine reports whether the live schema carries exactly the
 // objects activation creates: none missing, none extra apart from the ledger's own
-// change triggers. The currency probe itself tolerates extra objects, because a
+// vector tables and change triggers. The currency probe itself tolerates extra objects, because a
 // borrowed file may carry tables the host added. The file-backed read-only
 // preflight needs the stricter form: the isolated activation clone it may skip is
 // what catches a schema whose NAMES collide (an expected index name re-used by a

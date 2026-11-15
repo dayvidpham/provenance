@@ -296,3 +296,125 @@ func simulateV3Ledger(t *testing.T, path string, generation int64) error {
 	}
 	return nil
 }
+
+// TestVerifiedLedgerPartialPathRefusesDanglingAgentReference is the blocking
+// regression from the elegance review: deleting an agent and its subtype out of
+// band leaves the journal anchors and task attributions pointing at a missing
+// agent. The partial path must check the referencing side, take the full path,
+// and let the whole-store foreign-key check refuse the store.
+func TestVerifiedLedgerPartialPathRefusesDanglingAgentReference(t *testing.T) {
+	path := t.TempDir() + "/dangling-agent.db"
+	_, seeded := seedLedgerStore(t, path)
+	db := openVerifiedTablesTestDB(t, path)
+	if _, err := db.Exec("PRAGMA foreign_keys=OFF"); err != nil {
+		t.Fatalf("disable foreign keys: %v", err)
+	}
+	var agentID string
+	if err := db.QueryRow("SELECT agent_id FROM agents_software WHERE name='writer'").Scan(&agentID); err != nil {
+		t.Fatalf("read the fixture writer agent: %v", err)
+	}
+	if _, err := db.Exec("DELETE FROM agents_software WHERE agent_id=?1", agentID); err != nil {
+		t.Fatalf("delete the writer subtype row: %v", err)
+	}
+	if _, err := db.Exec("DELETE FROM agents WHERE id=?1", agentID); err != nil {
+		t.Fatalf("delete the writer agent row: %v", err)
+	}
+	err := reopenFileBacked(t, path)
+	if !errors.Is(err, journal.ErrSubtypeIntegrity) {
+		t.Fatalf("opening a store with a dangling journal actor = %v, want ErrSubtypeIntegrity", err)
+	}
+	if _, count := readLedgerGeneration(t, path); count != seeded {
+		t.Fatalf("a refused open advanced verified_count to %d, want %d", count, seeded)
+	}
+}
+
+// TestVerifiedLedgerPartialPathRefusesDanglingFixedActor covers the actor-claim
+// branch: a fixed-actor manifest row pointing at a missing agent/namespace must
+// not be blessed by the table-local path.
+func TestVerifiedLedgerPartialPathRefusesDanglingFixedActor(t *testing.T) {
+	path := t.TempDir() + "/dangling-fixed-actor.db"
+	_, seeded := seedLedgerStore(t, path)
+	db := openVerifiedTablesTestDB(t, path)
+	if _, err := db.Exec("PRAGMA foreign_keys=OFF"); err != nil {
+		t.Fatalf("disable foreign keys: %v", err)
+	}
+	if _, err := db.Exec("INSERT INTO fixed_actor_manifest_entries(actor_id, namespace, kind_id, name, metadata) VALUES ('https://example.test/missing', 'missing', 2, 'missing', '{}')"); err != nil {
+		t.Fatalf("insert the dangling fixed actor: %v", err)
+	}
+	err := reopenFileBacked(t, path)
+	if !errors.Is(err, journal.ErrSubtypeIntegrity) {
+		t.Fatalf("opening a store with a dangling fixed actor = %v, want ErrSubtypeIntegrity", err)
+	}
+	if _, count := readLedgerGeneration(t, path); count != seeded {
+		t.Fatalf("a refused open advanced verified_count to %d, want %d", count, seeded)
+	}
+}
+
+// TestVerifiedLedgerPartialPathRefusesMissingSeed covers the seed branch: a
+// deleted closed-lookup row forces the full path, which re-seeds it.
+func TestVerifiedLedgerPartialPathRefusesMissingSeed(t *testing.T) {
+	path := t.TempDir() + "/missing-seed.db"
+	_, seeded := seedLedgerStore(t, path)
+	db := openVerifiedTablesTestDB(t, path)
+	if _, err := db.Exec("DELETE FROM priorities WHERE id=4"); err != nil {
+		t.Fatalf("delete the backlog priority: %v", err)
+	}
+	if err := reopenFileBacked(t, path); err != nil {
+		t.Fatalf("open after deleting a seed row: %v", err)
+	}
+	if _, count := readLedgerGeneration(t, path); count != seeded+1 {
+		t.Fatalf("verified_count after a missing seed = %d, want %d; the full path did not run exactly once", count, seeded+1)
+	}
+	var name string
+	if err := db.QueryRow("SELECT name FROM priorities WHERE id=4").Scan(&name); err != nil {
+		t.Fatalf("read the re-seeded priority: %v", err)
+	}
+	if name != "backlog" {
+		t.Fatalf("re-seeded priority = %q, want backlog", name)
+	}
+}
+
+// TestVerifiedLedgerRepairsVectorNameDrift proves the id-to-name map is movable:
+// activation repairs a drifted row and resets its counter, the changed sum sends
+// the open down the full path once, and the next open is current again.
+func TestVerifiedLedgerRepairsVectorNameDrift(t *testing.T) {
+	path := t.TempDir() + "/vector-drift.db"
+	_, seeded := seedLedgerStore(t, path)
+	db := openVerifiedTablesTestDB(t, path)
+	if _, err := db.Exec("UPDATE provenance_table_generation SET table_name='drifted', generation=7 WHERE table_id=?1", verifiedTableID("tasks")); err != nil {
+		t.Fatalf("drift the tasks vector row: %v", err)
+	}
+	if err := reopenFileBacked(t, path); err != nil {
+		t.Fatalf("open after vector name drift: %v", err)
+	}
+	if _, count := readLedgerGeneration(t, path); count != seeded+1 {
+		t.Fatalf("verified_count after vector drift = %d, want %d; the full path did not run exactly once", count, seeded+1)
+	}
+	var name string
+	var generation int64
+	if err := db.QueryRow("SELECT table_name, generation FROM provenance_table_generation WHERE table_id=?1", verifiedTableID("tasks")).Scan(&name, &generation); err != nil {
+		t.Fatalf("read the repaired vector row: %v", err)
+	}
+	if name != "tasks" || generation != 0 {
+		t.Fatalf("repaired vector row = (%q,%d), want (tasks,0)", name, generation)
+	}
+}
+
+// TestVerifiedTriggerActivationMatchesHelper pins activation's inline trigger
+// literal to the helper the coverage check and exact replay compare against.
+func TestVerifiedTriggerActivationMatchesHelper(t *testing.T) {
+	path := t.TempDir() + "/trigger-match.db"
+	seedLedgerStore(t, path)
+	db := openVerifiedTablesTestDB(t, path)
+	for _, table := range verifiedCoveredTableNames {
+		for _, event := range verifiedTriggerEvents {
+			var stored string
+			if err := db.QueryRow("SELECT COALESCE(sql, '') FROM sqlite_master WHERE type='trigger' AND name=?1", verifiedTriggerName(table, event)).Scan(&stored); err != nil {
+				t.Fatalf("read trigger %s on %s: %v", event, table, err)
+			}
+			if stored != verifiedTriggerDDL(table, event) {
+				t.Fatalf("stored trigger %s on %s = %q, want the helper form %q", event, table, stored, verifiedTriggerDDL(table, event))
+			}
+		}
+	}
+}

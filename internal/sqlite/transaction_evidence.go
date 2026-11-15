@@ -1,10 +1,11 @@
 package sqlite
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"fmt"
-	"sort"
+	"slices"
 
 	"github.com/dayvidpham/provenance/internal/fusedtx"
 	"github.com/dayvidpham/provenance/internal/journal"
@@ -83,7 +84,7 @@ func (reader *TransactionEvidenceReader) QueryEvidence(q journal.EvidenceQuery) 
 func readFactPageInTransaction(ctx context.Context, reader sqlQueryer, binding factMatchBinding) ([]factPageRow, error) {
 	statement := binding.kind.singleKindPageSQL()
 	shared := binding.args[:firstPageKindParam-1]
-	rows := make([]factPageRow, 0, binding.pageLimit*len(binding.pageKinds))
+	rows := make([]factPageRow, 0, binding.pageLimit)
 	for _, kind := range binding.pageKinds {
 		args := append(append([]any{}, shared...), kind)
 		kindRows, err := readSingleKindFactPage(ctx, reader, statement, args, binding.kind)
@@ -97,7 +98,7 @@ func readFactPageInTransaction(ctx context.Context, reader sqlQueryer, binding f
 	// sort only orders the merge. Kinds are de-duplicated before the binding is
 	// built, so the same fact cannot appear twice.
 	if len(binding.pageKinds) > 1 {
-		sort.SliceStable(rows, func(i, j int) bool { return rows[i].journalID < rows[j].journalID })
+		slices.SortFunc(rows, func(a, b factPageRow) int { return cmp.Compare(a.journalID, b.journalID) })
 	}
 	if len(rows) > binding.pageLimit {
 		rows = rows[:binding.pageLimit]

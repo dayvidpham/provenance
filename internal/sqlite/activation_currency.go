@@ -199,8 +199,16 @@ func (scope *connScope) activationWouldChangeNothing(models []ptypes.ModelEntry)
 //
 // Fast path: the durable verified-as-of ledger still describes the store as it
 // stands, so nothing VerifyIntegrity or ReplayProjections cover has moved since
-// the last time both passed. That read is O(1) — one ledger row, one INTEGER
-// PRIMARY KEY maximum, one row by primary key — and it takes no write lock.
+// the last time both passed. That read is bounded by the closed schema — one
+// ledger row, the per-table vector, one INTEGER PRIMARY KEY maximum, one row by
+// primary key — and it takes no write lock.
+//
+// Partial path: the ledger is stale but the journal tail, covered-table presence
+// set, and build shape still match. The per-table vector names the tables that
+// moved; if every one has table-local coverage (agent registry, closed seeds,
+// identity format, model registry, actor claims), run exactly those checks and
+// persist the same proof for the new identity. Any journal- or projection-derived
+// table, any torn vector, and any unknown table fall through to the slow path.
 //
 // Slow path: run the same read-only pair activation runs, in the same order, and
 // then persist the ledger for the state the checks covered. Persisting is a

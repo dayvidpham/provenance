@@ -257,10 +257,11 @@ expected-object check.
 
 A store whose ledger is absent, unreadable, of another build's shape, or
 mismatched takes the full path (or the table-local partial path above), and its
-ledger is re-persisted only after those checks pass — one row plus the vector in a
-bounded write transaction, which is the open path's only write, and only when the
-row does not already record exactly the state the checks just covered, so an open
-of a store whose activation changes nothing still rewrites nothing.
+ledger is re-persisted only after those checks pass — the ledger row plus the
+changed vector rows in a bounded write transaction, which is the open path's only
+write, and only when the row does not already record exactly the state the checks
+just covered, so an open of a store whose activation changes nothing still
+rewrites nothing.
 
 The two immutable fact-context relations stay static foreign-key relations with
 no triggers of their own beyond the ledger's, whose bodies only advance the
