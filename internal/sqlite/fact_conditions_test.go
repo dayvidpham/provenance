@@ -785,21 +785,13 @@ func TestFactConditionsRequireSubtypeOwnedContexts(t *testing.T) {
 }
 
 func factPageBindingIDs(scope *connScope, binding factMatchBinding) ([]journal.JournalID, error) {
-	rows, err := scope.conn.QueryContext(scope.ctx, binding.kind.pageMatchSQL(len(binding.pageKinds)), binding.args...)
+	rows, err := readFactPageInTransaction(scope.ctx, scope.conn, binding)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	ids := make([]journal.JournalID, 0)
-	for rows.Next() {
-		row, err := scanFactPageRow(rows, binding.kind)
-		if err != nil {
-			return nil, err
-		}
+	ids := make([]journal.JournalID, 0, len(rows))
+	for _, row := range rows {
 		ids = append(ids, row.journalID)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
 	}
 	return ids, nil
 }

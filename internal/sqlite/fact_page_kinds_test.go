@@ -21,14 +21,13 @@ func TestFactPageBindingDedupesRepeatedKinds(t *testing.T) {
 	if got, want := len(binding.pageKinds), 2; got != want {
 		t.Fatalf("page kinds = %v, want %d de-duplicated values", binding.pageKinds, want)
 	}
-	if got := strings.Count(binding.kind.pageMatchSQL(len(binding.pageKinds)), "UNION ALL"); got != 1 {
-		t.Fatalf("page SQL has %d UNION ALL separators, want one per extra kind (1)", got)
-	}
-	// The shared predicate ends at ?15 and each branch binds one kind after it.
-	if got := strings.Count(binding.kind.pageMatchSQL(len(binding.pageKinds)), "= ?16"); got != 1 {
+	// Each requested kind is executed as its own static single-kind page query,
+	// so the shared predicate ends at ?15 and the one bound kind is ?16.
+	statement := binding.kind.singleKindPageSQL()
+	if got := strings.Count(statement, "= ?16"); got != 1 {
 		t.Fatalf("page SQL has %d ?16 kind slots, want 1", got)
 	}
-	if got := strings.Count(binding.kind.pageMatchSQL(len(binding.pageKinds)), "= ?17"); got != 1 {
-		t.Fatalf("page SQL has %d ?17 kind slots, want 1", got)
+	if strings.Contains(statement, "UNION ALL") {
+		t.Fatal("single-kind page SQL still carries a UNION ALL")
 	}
 }
