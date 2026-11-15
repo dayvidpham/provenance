@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## v0.10.4 - 2026-11-15
+
 ### Changed
 
 - The verified-as-of ledger now records an auxiliary per-table generation
