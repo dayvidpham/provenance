@@ -44,6 +44,48 @@ func readLedgerGeneration(t *testing.T, path string) (generation, count int64) {
 	return generation, count
 }
 
+// orderedAgentIDs reads one ordered agent-id column. A nil result becomes an
+// empty slice so a missing set compares equal to a missing registry.
+func orderedAgentIDs(t *testing.T, db *sql.DB, query string) []string {
+	t.Helper()
+	rows, err := db.Query(query)
+	if err != nil {
+		t.Fatalf("read agent ids %q: %v", query, err)
+	}
+	defer func() { _ = rows.Close() }()
+	ids := make([]string, 0)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("scan agent id from %q: %v", query, err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read agent ids %q: %v", query, err)
+	}
+	return ids
+}
+
+// requireVerifiedAgentSetEqualsRegistry fails unless the persisted proof names
+// exactly the current registry, with the recorded cardinality matching both.
+func requireVerifiedAgentSetEqualsRegistry(t *testing.T, db *sql.DB) (registry []string) {
+	t.Helper()
+	registry = orderedAgentIDs(t, db, "SELECT id FROM agents ORDER BY id")
+	verified := orderedAgentIDs(t, db, "SELECT agent_id FROM "+verifiedAgentProofTable+" ORDER BY agent_id")
+	if !slices.Equal(registry, verified) {
+		t.Fatalf("verified agent set = %v, want the registry %v", verified, registry)
+	}
+	var recorded int64
+	if err := db.QueryRow("SELECT agent_count FROM " + verifiedAgentMetaTable + " WHERE id = 1").Scan(&recorded); err != nil {
+		t.Fatalf("read verified agent count: %v", err)
+	}
+	if recorded != int64(len(verified)) {
+		t.Fatalf("verified agent count = %d, want %d", recorded, len(verified))
+	}
+	return registry
+}
+
 // readVectorSum reads the current global generation from the per-table vector.
 func readVectorSum(t *testing.T, path string) int64 {
 	t.Helper()
@@ -195,13 +237,31 @@ func TestVerifiedLedgerAdoptsCurrentV3Ledger(t *testing.T) {
 	if _, countAgain := readLedgerGeneration(t, path); countAgain != seeded {
 		t.Fatalf("verified_count moved to %d after adoption; the adopted ledger is not current", countAgain)
 	}
-	// Adoption seeds the verified agent set from the current registry.
-	var verifiedAgents int
-	if err := openVerifiedTablesTestDB(t, path).QueryRow("SELECT COUNT(*) FROM " + verifiedAgentProofTable).Scan(&verifiedAgents); err != nil {
-		t.Fatalf("count the adopted verified agent set: %v", err)
+	// Adoption seeds the verified agent set from the current registry, exactly.
+	raw := openVerifiedTablesTestDB(t, path)
+	registry := requireVerifiedAgentSetEqualsRegistry(t, raw)
+	if len(registry) == 0 {
+		t.Fatal("adoption seeded an empty verified agent set")
 	}
-	if verifiedAgents == 0 {
-		t.Fatal("adoption did not seed the verified agent set")
+	var agentID string
+	if err := raw.QueryRow("SELECT agent_id FROM agents_software WHERE name='writer'").Scan(&agentID); err != nil {
+		t.Fatalf("read the adopted writer agent: %v", err)
+	}
+	if _, err := raw.Exec("PRAGMA foreign_keys=OFF"); err != nil {
+		t.Fatalf("disable foreign keys: %v", err)
+	}
+	if _, err := raw.Exec("DELETE FROM agents_software WHERE agent_id=?1", agentID); err != nil {
+		t.Fatalf("delete the adopted writer subtype: %v", err)
+	}
+	if _, err := raw.Exec("DELETE FROM agents WHERE id=?1", agentID); err != nil {
+		t.Fatalf("delete the adopted writer agent: %v", err)
+	}
+	err := reopenFileBacked(t, path)
+	if !errors.Is(err, journal.ErrSubtypeIntegrity) {
+		t.Fatalf("opening an adopted store after deleting a verified agent = %v, want ErrSubtypeIntegrity", err)
+	}
+	if _, countAfterDelete := readLedgerGeneration(t, path); countAfterDelete != seeded {
+		t.Fatalf("a refused open advanced verified_count to %d, want %d", countAfterDelete, seeded)
 	}
 }
 
@@ -282,13 +342,15 @@ func TestVerifiedLedgerCoverageRepairsAlteredTriggerBody(t *testing.T) {
 	}
 }
 
-// simulateV3Ledger restores the pre-vector shape: it drops the two vector
-// tables, sets the singleton counter to the given generation, and recreates the
-// singleton-advancing trigger bodies.
+// simulateV3Ledger restores the pre-vector shape: it drops the vector tables,
+// the verified agent set, and the agent-set cardinality row, sets the singleton
+// counter to the given generation, and recreates the singleton-advancing
+// trigger bodies.
 func simulateV3Ledger(t *testing.T, path string, generation int64) error {
 	t.Helper()
 	db := openVerifiedTablesTestDB(t, path)
 	for _, statement := range []string{
+		"DROP TABLE " + verifiedAgentMetaTable,
 		"DROP TABLE " + verifiedAgentProofTable,
 		"DROP TABLE " + verifiedTableProofTable,
 		"DROP TABLE " + verifiedTableGenerationTable,
@@ -655,12 +717,13 @@ func TestVerifiedLedgerAgentSetTornFallsBack(t *testing.T) {
 	if _, count := readLedgerGeneration(t, path); count != seeded {
 		t.Fatalf("verified_count after a torn-set recovery = %d, want %d", count, seeded)
 	}
-	var verifiedAgents int
-	if err := db.QueryRow("SELECT COUNT(*) FROM " + verifiedAgentProofTable).Scan(&verifiedAgents); err != nil {
-		t.Fatalf("count the rewritten verified agent set: %v", err)
+	registry := requireVerifiedAgentSetEqualsRegistry(t, db)
+	var named int
+	if err := db.QueryRow("SELECT COUNT(*) FROM agents_software s JOIN " + verifiedAgentProofTable + " v ON v.agent_id = s.agent_id WHERE s.name='torn-set-agent'").Scan(&named); err != nil {
+		t.Fatalf("read torn-set-agent in the rewritten set: %v", err)
 	}
-	if verifiedAgents == 0 {
-		t.Fatal("the torn-set recovery did not rewrite the verified agent set")
+	if named != 1 {
+		t.Fatalf("rewritten verified set does not contain torn-set-agent (found=%d); registry=%v", named, registry)
 	}
 }
 
@@ -687,9 +750,112 @@ func TestVerifiedLedgerAgentSetTornRefusesDanglingReference(t *testing.T) {
 	if _, err := db.Exec("DELETE FROM " + verifiedAgentProofTable); err != nil {
 		t.Fatalf("clear the verified agent set: %v", err)
 	}
+	var recordedCount int64
+	if err := db.QueryRow("SELECT agent_count FROM " + verifiedAgentMetaTable + " WHERE id = 1").Scan(&recordedCount); err != nil {
+		t.Fatalf("read the verified agent count before the refused open: %v", err)
+	}
 	err := reopenFileBacked(t, path)
 	if !errors.Is(err, journal.ErrSubtypeIntegrity) {
 		t.Fatalf("opening a torn-set store with a dangling journal actor = %v, want ErrSubtypeIntegrity", err)
+	}
+	if _, count := readLedgerGeneration(t, path); count != seeded {
+		t.Fatalf("a refused open advanced verified_count to %d, want %d", count, seeded)
+	}
+	var stillPresent int
+	if err := db.QueryRow("SELECT COUNT(*) FROM agents WHERE id=?1", agentID).Scan(&stillPresent); err != nil {
+		t.Fatalf("read the deleted agent after the refused open: %v", err)
+	}
+	if stillPresent != 0 {
+		t.Fatalf("refused open restored deleted agent %s", agentID)
+	}
+	var proofRows int
+	if err := db.QueryRow("SELECT COUNT(*) FROM " + verifiedAgentProofTable).Scan(&proofRows); err != nil {
+		t.Fatalf("count the verified agent set after the refused open: %v", err)
+	}
+	if proofRows != 0 {
+		t.Fatalf("refused open replaced the empty verified set with %d rows", proofRows)
+	}
+	var proofHit int
+	if err := db.QueryRow("SELECT COUNT(*) FROM "+verifiedAgentProofTable+" WHERE agent_id=?1", agentID).Scan(&proofHit); err != nil {
+		t.Fatalf("read the deleted agent in the verified set: %v", err)
+	}
+	if proofHit != 0 {
+		t.Fatalf("refused open recorded deleted agent %s in the verified set", agentID)
+	}
+	var countAfter int64
+	if err := db.QueryRow("SELECT agent_count FROM " + verifiedAgentMetaTable + " WHERE id = 1").Scan(&countAfter); err != nil {
+		t.Fatalf("read the verified agent count after the refused open: %v", err)
+	}
+	if countAfter != recordedCount {
+		t.Fatalf("refused open rewrote verified agent count %d -> %d", recordedCount, countAfter)
+	}
+	err = reopenFileBacked(t, path)
+	if !errors.Is(err, journal.ErrSubtypeIntegrity) {
+		t.Fatalf("second open of a torn-set store with a dangling journal actor = %v, want ErrSubtypeIntegrity", err)
+	}
+	if _, count := readLedgerGeneration(t, path); count != seeded {
+		t.Fatalf("second refused open advanced verified_count to %d, want %d", count, seeded)
+	}
+}
+
+// TestVerifiedLedgerAgentSetCountMismatchForcesFullProbes is the partial-set
+// regression: deleting one agent and only its proof row, while other proof rows
+// remain, must not be trusted as a smaller verified registry. The recorded
+// cardinality no longer matches, so the open runs the full orphan probes and
+// refuses the dangling journal actor without advancing verified_count.
+func TestVerifiedLedgerAgentSetCountMismatchForcesFullProbes(t *testing.T) {
+	path := t.TempDir() + "/agent-count-mismatch.db"
+	_, seeded := seedLedgerStore(t, path)
+	store, err := Open(path, nil)
+	if err != nil {
+		t.Fatalf("reopen before the second registration: %v", err)
+	}
+	if _, err := store.RegisterSoftwareAgent("verified", "kept-agent", "0", "open_verified_tables_test"); err != nil {
+		t.Fatalf("register the second agent: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close after the second registration: %v", err)
+	}
+	if err := reopenFileBacked(t, path); err != nil {
+		t.Fatalf("open to persist the two-agent set: %v", err)
+	}
+
+	db := openVerifiedTablesTestDB(t, path)
+	registry := requireVerifiedAgentSetEqualsRegistry(t, db)
+	if len(registry) < 2 {
+		t.Fatalf("verified agent set = %v, want at least two agents", registry)
+	}
+	var agentID string
+	if err := db.QueryRow("SELECT agent_id FROM agents_software WHERE name='writer'").Scan(&agentID); err != nil {
+		t.Fatalf("read the fixture writer agent: %v", err)
+	}
+	if _, err := db.Exec("PRAGMA foreign_keys=OFF"); err != nil {
+		t.Fatalf("disable foreign keys: %v", err)
+	}
+	if _, err := db.Exec("DELETE FROM agents_software WHERE agent_id=?1", agentID); err != nil {
+		t.Fatalf("delete the writer subtype row: %v", err)
+	}
+	if _, err := db.Exec("DELETE FROM agents WHERE id=?1", agentID); err != nil {
+		t.Fatalf("delete the writer agent row: %v", err)
+	}
+	if _, err := db.Exec("DELETE FROM "+verifiedAgentProofTable+" WHERE agent_id=?1", agentID); err != nil {
+		t.Fatalf("delete only the writer proof row: %v", err)
+	}
+	remaining := orderedAgentIDs(t, db, "SELECT agent_id FROM "+verifiedAgentProofTable+" ORDER BY agent_id")
+	if len(remaining) == 0 || slices.Contains(remaining, agentID) {
+		t.Fatalf("remaining proof rows = %v, want the other agents and not %s", remaining, agentID)
+	}
+	var recorded int64
+	if err := db.QueryRow("SELECT agent_count FROM " + verifiedAgentMetaTable + " WHERE id = 1").Scan(&recorded); err != nil {
+		t.Fatalf("read the unchanged verified agent count: %v", err)
+	}
+	if recorded == int64(len(remaining)) {
+		t.Fatalf("verified agent count %d matches the torn proof set; the mismatch precondition did not hold", recorded)
+	}
+
+	err = reopenFileBacked(t, path)
+	if !errors.Is(err, journal.ErrSubtypeIntegrity) {
+		t.Fatalf("opening a count-mismatched set with a dangling journal actor = %v, want ErrSubtypeIntegrity", err)
 	}
 	if _, count := readLedgerGeneration(t, path); count != seeded {
 		t.Fatalf("a refused open advanced verified_count to %d, want %d", count, seeded)

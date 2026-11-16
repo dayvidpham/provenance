@@ -289,7 +289,7 @@ func (scope *connScope) ensureVerifiedLedgerSchema() error {
 	}
 	for _, statement := range []string{
 		verifiedGenerationTableDDL, verifiedGenerationSeedDDL, verifiedLedgerTableDDL,
-		verifiedTableGenerationDDL, verifiedTableProofDDL, verifiedAgentProofDDL,
+		verifiedTableGenerationDDL, verifiedTableProofDDL, verifiedAgentProofDDL, verifiedAgentMetaDDL,
 	} {
 		if _, err := scope.conn.ExecContext(scope.ctx, statement); err != nil {
 			return fmt.Errorf("ensureVerifiedLedgerSchema: %q: %w", statement, err)

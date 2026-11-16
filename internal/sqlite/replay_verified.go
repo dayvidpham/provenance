@@ -56,6 +56,7 @@ func (scope *connScope) exactReplayLedgerDefinitionsCurrent() (bool, error) {
 		verifiedTableGenerationTable: verifiedTableGenerationDDL,
 		verifiedTableProofTable:      verifiedTableProofDDL,
 		verifiedAgentProofTable:      verifiedAgentProofDDL,
+		verifiedAgentMetaTable:       verifiedAgentMetaDDL,
 	} {
 		if definitions[table] != strings.Replace(ddl, "IF NOT EXISTS ", "", 1) {
 			return false, nil

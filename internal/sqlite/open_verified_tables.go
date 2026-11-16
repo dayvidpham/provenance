@@ -26,6 +26,7 @@ const (
 	verifiedTableGenerationTable = "provenance_table_generation"
 	verifiedTableProofTable      = "provenance_verified_table"
 	verifiedAgentProofTable      = "provenance_verified_agent"
+	verifiedAgentMetaTable       = "provenance_verified_agent_meta"
 	verifiedBaselineTableID      = 0
 	verifiedBaselineName         = "__verified_baseline__"
 )
@@ -40,6 +41,11 @@ const (
 		generation INTEGER NOT NULL) STRICT`
 	verifiedAgentProofDDL = `CREATE TABLE IF NOT EXISTS provenance_verified_agent (
 		agent_id TEXT PRIMARY KEY) STRICT, WITHOUT ROWID`
+	// verifiedAgentMetaDDL is the singleton cardinality of the verified agent
+	// set. The set alone cannot tell a partial out-of-band delete of proof rows
+	// from a smaller registry, so the count is written in the same transaction
+	// and a missing or mismatched row refuses the diff.
+	verifiedAgentMetaDDL = `CREATE TABLE IF NOT EXISTS provenance_verified_agent_meta (id INTEGER PRIMARY KEY CHECK (id = 1), agent_count INTEGER NOT NULL) STRICT`
 )
 
 // verifiedLedgerObjects are the schema objects the verified-as-of ledger owns
@@ -52,6 +58,7 @@ var verifiedLedgerObjects = []activationSchemaObject{
 	{"table", verifiedTableGenerationTable},
 	{"table", verifiedTableProofTable},
 	{"table", verifiedAgentProofTable},
+	{"table", verifiedAgentMetaTable},
 }
 
 // verifiedVectorLength is the baseline row plus one row per covered table.
@@ -407,9 +414,10 @@ func (scope *connScope) verifiedAgentIDs() ([]string, error) {
 	return ids, nil
 }
 
-// writeVerifiedAgentSet records the current registry as verified. It runs in
-// the caller's transaction alongside the ledger identity, so the set and the
-// proof commit or roll back together.
+// writeVerifiedAgentSet records the current registry and its cardinality as
+// verified. It runs in the caller's transaction alongside the ledger identity,
+// so the set and the count commit or roll back together. A later open trusts
+// the set only when the surviving proof rows still equal that count.
 func (scope *connScope) writeVerifiedAgentSet() error {
 	ids, err := scope.currentAgentIDs()
 	if err != nil {
@@ -424,15 +432,38 @@ func (scope *connScope) writeVerifiedAgentSet() error {
 			return fmt.Errorf("record verified agent %q: %w", id, err)
 		}
 	}
+	if _, err := scope.conn.ExecContext(scope.ctx,
+		"INSERT INTO "+verifiedAgentMetaTable+" (id, agent_count) VALUES (1, ?1) ON CONFLICT(id) DO UPDATE SET agent_count = excluded.agent_count",
+		int64(len(ids))); err != nil {
+		return fmt.Errorf("record verified agent count: %w", err)
+	}
 	return nil
 }
 
+// verifiedAgentCount reads the singleton cardinality written with the verified
+// set. ok is false when the row is missing: a set without its count is not a
+// proof, and the caller must run the full orphan probes.
+func (scope *connScope) verifiedAgentCount() (count int64, ok bool, err error) {
+	err = scope.conn.QueryRowContext(scope.ctx,
+		"SELECT agent_count FROM "+verifiedAgentMetaTable+" WHERE id = 1").Scan(&count)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("read verified agent count: %w", err)
+	}
+	return count, true, nil
+}
+
 // removedVerifiedAgents diffs the verified set against the current registry.
-// known is false when the set is empty: an empty set is indistinguishable from
-// a set whose rows were deleted along with the agents they named, so the caller
-// must run the full orphan probes rather than assume no agent was removed. The
-// probes are cheap on a store that never had agents and are the only fail-safe
-// on one whose registry was emptied out of band.
+// known is false when the set is empty, the cardinality row is missing, or the
+// surviving proof rows do not equal the recorded count. An empty set is
+// indistinguishable from a set whose rows were deleted along with the agents
+// they named, and a partial delete of proof rows would otherwise look like a
+// smaller verified registry. Either case must run the full orphan probes rather
+// than assume no agent was removed. The probes are cheap on a store that never
+// had agents and are the only fail-safe on one whose registry was emptied, or
+// whose proof was torn, out of band.
 func (scope *connScope) removedVerifiedAgents() (removed []string, known bool, err error) {
 	current, err := scope.currentAgentIDs()
 	if err != nil {
@@ -442,7 +473,11 @@ func (scope *connScope) removedVerifiedAgents() (removed []string, known bool, e
 	if err != nil {
 		return nil, false, err
 	}
-	if len(verified) == 0 {
+	count, countOK, err := scope.verifiedAgentCount()
+	if err != nil {
+		return nil, false, err
+	}
+	if len(verified) == 0 || !countOK || int64(len(verified)) != count {
 		return nil, false, nil
 	}
 	currentSet := make(map[string]struct{}, len(current))
@@ -498,31 +533,36 @@ func (scope *connScope) verifyAgentRegistryForeignKeys() error {
 		return err
 	}
 	if !known {
-		// No verified set (migration or torn): run the full probes rather than
+		// No trusted set (empty, missing cardinality, or a count that does not
+		// match the surviving proof rows): run the full probes rather than
 		// assume an insert-only change.
 		for _, probe := range agentOrphanProbes {
-			var bad string
-			err := scope.conn.QueryRowContext(scope.ctx, probe.query()).Scan(&bad)
-			if err == nil {
-				return fmt.Errorf("agent registry %s: %q", probe.label(), bad)
-			}
-			if !errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("agent registry %s: %w", probe.label(), err)
+			if err := scope.scanAgentOrphan(probe.query(), probe.label()); err != nil {
+				return err
 			}
 		}
 		return nil
 	}
 	for _, id := range removed {
 		for _, probe := range agentOrphanProbes {
-			var bad string
-			err := scope.conn.QueryRowContext(scope.ctx, probe.removedQuery(), id).Scan(&bad)
-			if err == nil {
-				return fmt.Errorf("agent registry %s: %q", probe.label(), bad)
-			}
-			if !errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("agent registry %s: %w", probe.label(), err)
+			if err := scope.scanAgentOrphan(probe.removedQuery(), probe.label(), id); err != nil {
+				return err
 			}
 		}
+	}
+	return nil
+}
+
+// scanAgentOrphan runs one orphan probe. A returned row is a labeled integrity
+// failure; ErrNoRows is clean; any other error fails closed with the same label.
+func (scope *connScope) scanAgentOrphan(query, label string, args ...any) error {
+	var bad string
+	err := scope.conn.QueryRowContext(scope.ctx, query, args...).Scan(&bad)
+	if err == nil {
+		return fmt.Errorf("agent registry %s: %q", label, bad)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("agent registry %s: %w", label, err)
 	}
 	return nil
 }
@@ -673,7 +713,9 @@ func (probe agentRegistryProbe) query() string {
 // trigger bodies, and it acts only when the ledger row still proves the store as
 // it stands:
 //
-//   - a complete mirror means the ordinary current comparison is authoritative;
+//   - a complete mirror means the ordinary current comparison is authoritative,
+//     and a match also seeds the verified agent set and its cardinality from
+//     the current registry; the branch is not only an identity comparison;
 //   - an empty mirror on a store whose covered-table counters are all still zero
 //     is the first vector build. The baseline row was seeded from the old
 //     singleton counter, so the ledger's global generation must match it, and

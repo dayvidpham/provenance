@@ -392,7 +392,7 @@ func (scope *connScope) producedFactRows(anchor int64) ([]int64, error) {
 
 // producedJournalRowsByOperation reads every produced journal row once and
 // groups it by the operation that owns it. The journal is append-only, so this
-// one ordered scan replaces one lookup per canonical operation; the single-row
+// one ordered scan replaces one lookup per canonical operation; the per-anchor
 // helper above remains for the legacy backfill.
 func (scope *connScope) producedJournalRowsByOperation() (map[int64][]int64, error) {
 	byOperation := make(map[int64][]int64)
@@ -835,7 +835,7 @@ func (scope *connScope) validateCanonicalFactContextSets() error {
 		for i, effect := range effects {
 			relation, ok := factContextRelationForEffect(effect)
 			if ok {
-				if err := scope.validateCanonicalFactContextSetIndexed(operation.anchor, rows[i], effect.Contexts, contexts[relation][rows[i]]); err != nil {
+				if err := validateLoadedCanonicalFactContextSet(operation.anchor, rows[i], effect.Contexts, contexts[relation][rows[i]]); err != nil {
 					return err
 				}
 			}
@@ -845,18 +845,14 @@ func (scope *connScope) validateCanonicalFactContextSets() error {
 }
 
 func (scope *connScope) validateCanonicalFactContextSet(anchor, journalID int64, relation factContextRelation, expectedInput []journal.EventContext) error {
-	expected, err := journal.CanonicalEventContexts(expectedInput)
-	if err != nil {
-		return factContextIntegrityError("canonical contexts for journal "+strconv.FormatInt(journalID, 10)+" are invalid", "canonical fact-context comparison", "restore the operation's canonical mutation: "+err.Error())
-	}
 	actual, err := scope.loadFactContextsFromRelation(relation, journalID)
 	if err != nil {
 		return err
 	}
-	return compareFactContextSets(anchor, journalID, expected, actual)
+	return validateLoadedCanonicalFactContextSet(anchor, journalID, expectedInput, actual)
 }
 
-func (scope *connScope) validateCanonicalFactContextSetIndexed(anchor, journalID int64, expectedInput, actual []journal.EventContext) error {
+func validateLoadedCanonicalFactContextSet(anchor, journalID int64, expectedInput, actual []journal.EventContext) error {
 	expected, err := journal.CanonicalEventContexts(expectedInput)
 	if err != nil {
 		return factContextIntegrityError("canonical contexts for journal "+strconv.FormatInt(journalID, 10)+" are invalid", "canonical fact-context comparison", "restore the operation's canonical mutation: "+err.Error())
