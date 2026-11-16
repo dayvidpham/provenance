@@ -25,6 +25,7 @@ import (
 const (
 	verifiedTableGenerationTable = "provenance_table_generation"
 	verifiedTableProofTable      = "provenance_verified_table"
+	verifiedAgentProofTable      = "provenance_verified_agent"
 	verifiedBaselineTableID      = 0
 	verifiedBaselineName         = "__verified_baseline__"
 )
@@ -37,6 +38,8 @@ const (
 	verifiedTableProofDDL = `CREATE TABLE IF NOT EXISTS provenance_verified_table (
 		table_id INTEGER PRIMARY KEY,
 		generation INTEGER NOT NULL) STRICT`
+	verifiedAgentProofDDL = `CREATE TABLE IF NOT EXISTS provenance_verified_agent (
+		agent_id TEXT PRIMARY KEY) STRICT, WITHOUT ROWID`
 )
 
 // verifiedLedgerObjects are the schema objects the verified-as-of ledger owns
@@ -48,6 +51,7 @@ const (
 var verifiedLedgerObjects = []activationSchemaObject{
 	{"table", verifiedTableGenerationTable},
 	{"table", verifiedTableProofTable},
+	{"table", verifiedAgentProofTable},
 }
 
 // verifiedVectorLength is the baseline row plus one row per covered table.
@@ -368,6 +372,91 @@ func (scope *connScope) requireActivationCheck(label string, check func() (bool,
 	return nil
 }
 
+// currentAgentIDs reads every registered agent id. The agents table is the
+// registry; order is only for deterministic writes and tests.
+func (scope *connScope) currentAgentIDs() ([]string, error) {
+	ids := make([]string, 0)
+	err := scope.queryRows("SELECT id FROM agents ORDER BY id", nil, func(rows *sql.Rows) error {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		ids = append(ids, id)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("enumerate current agents: %w", err)
+	}
+	return ids, nil
+}
+
+// verifiedAgentIDs reads the ledger's verified agent set.
+func (scope *connScope) verifiedAgentIDs() ([]string, error) {
+	ids := make([]string, 0)
+	err := scope.queryRows("SELECT agent_id FROM "+verifiedAgentProofTable+" ORDER BY agent_id", nil, func(rows *sql.Rows) error {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		ids = append(ids, id)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("enumerate verified agents: %w", err)
+	}
+	return ids, nil
+}
+
+// writeVerifiedAgentSet records the current registry as verified. It runs in
+// the caller's transaction alongside the ledger identity, so the set and the
+// proof commit or roll back together.
+func (scope *connScope) writeVerifiedAgentSet() error {
+	ids, err := scope.currentAgentIDs()
+	if err != nil {
+		return err
+	}
+	if _, err := scope.conn.ExecContext(scope.ctx, "DELETE FROM "+verifiedAgentProofTable); err != nil {
+		return fmt.Errorf("clear verified agent set: %w", err)
+	}
+	for _, id := range ids {
+		if _, err := scope.conn.ExecContext(scope.ctx,
+			"INSERT INTO "+verifiedAgentProofTable+" (agent_id) VALUES (?1)", id); err != nil {
+			return fmt.Errorf("record verified agent %q: %w", id, err)
+		}
+	}
+	return nil
+}
+
+// removedVerifiedAgents diffs the verified set against the current registry.
+// known is false when the set is empty: an empty set is indistinguishable from
+// a set whose rows were deleted along with the agents they named, so the caller
+// must run the full orphan probes rather than assume no agent was removed. The
+// probes are cheap on a store that never had agents and are the only fail-safe
+// on one whose registry was emptied out of band.
+func (scope *connScope) removedVerifiedAgents() (removed []string, known bool, err error) {
+	current, err := scope.currentAgentIDs()
+	if err != nil {
+		return nil, false, err
+	}
+	verified, err := scope.verifiedAgentIDs()
+	if err != nil {
+		return nil, false, err
+	}
+	if len(verified) == 0 {
+		return nil, false, nil
+	}
+	currentSet := make(map[string]struct{}, len(current))
+	for _, id := range current {
+		currentSet[id] = struct{}{}
+	}
+	for _, id := range verified {
+		if _, ok := currentSet[id]; !ok {
+			removed = append(removed, id)
+		}
+	}
+	return removed, true, nil
+}
+
 // verifyAgentRegistryIntegrity is the table-local coverage for the agent
 // registry: every agent has exactly one subtype row of its kind, every subtype
 // row agrees with its supertype, no agent appears in two subtypes, and every
@@ -404,14 +493,35 @@ func (scope *connScope) verifyAgentRegistryForeignKeys() error {
 			return err
 		}
 	}
-	for _, probe := range agentOrphanProbes {
-		var bad string
-		err := scope.conn.QueryRowContext(scope.ctx, probe.query()).Scan(&bad)
-		if err == nil {
-			return fmt.Errorf("agent registry %s: %q", probe.label(), bad)
+	removed, known, err := scope.removedVerifiedAgents()
+	if err != nil {
+		return err
+	}
+	if !known {
+		// No verified set (migration or torn): run the full probes rather than
+		// assume an insert-only change.
+		for _, probe := range agentOrphanProbes {
+			var bad string
+			err := scope.conn.QueryRowContext(scope.ctx, probe.query()).Scan(&bad)
+			if err == nil {
+				return fmt.Errorf("agent registry %s: %q", probe.label(), bad)
+			}
+			if !errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("agent registry %s: %w", probe.label(), err)
+			}
 		}
-		if !errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("agent registry %s: %w", probe.label(), err)
+		return nil
+	}
+	for _, id := range removed {
+		for _, probe := range agentOrphanProbes {
+			var bad string
+			err := scope.conn.QueryRowContext(scope.ctx, probe.removedQuery(), id).Scan(&bad)
+			if err == nil {
+				return fmt.Errorf("agent registry %s: %q", probe.label(), bad)
+			}
+			if !errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("agent registry %s: %w", probe.label(), err)
+			}
 		}
 	}
 	return nil
@@ -470,6 +580,21 @@ func (probe agentOrphanProbe) query() string {
 		return "SELECT task_id FROM task_attributions WHERE NOT EXISTS (SELECT 1 FROM agents WHERE agents.id = task_attributions.actor_id) LIMIT 1"
 	case agentOrphanAssignmentEpisode:
 		return "SELECT assignment_id FROM journal_authority_assignment_episodes WHERE NOT EXISTS (SELECT 1 FROM agents WHERE agents.id = journal_authority_assignment_episodes.actor_id) LIMIT 1"
+	default:
+		panic("unknown agent orphan probe")
+	}
+}
+
+// removedQuery is the indexed per-removed-agent form. The journal probe uses
+// idx_journal_actor; the other two relations are small.
+func (probe agentOrphanProbe) removedQuery() string {
+	switch probe {
+	case agentOrphanJournalAnchor:
+		return "SELECT CAST(journal_id AS TEXT) FROM journal WHERE actor_id = ?1 LIMIT 1"
+	case agentOrphanTaskAttribution:
+		return "SELECT task_id FROM task_attributions WHERE actor_id = ?1 LIMIT 1"
+	case agentOrphanAssignmentEpisode:
+		return "SELECT assignment_id FROM journal_authority_assignment_episodes WHERE actor_id = ?1 LIMIT 1"
 	default:
 		panic("unknown agent orphan probe")
 	}
@@ -578,7 +703,13 @@ func (scope *connScope) adoptCurrentVerifiedLedger() (bool, error) {
 		if err != nil {
 			return false, nil
 		}
-		return identityEqual(ledger.identity, now), nil
+		if !identityEqual(ledger.identity, now) {
+			return false, nil
+		}
+		if err := scope.writeVerifiedAgentSet(); err != nil {
+			return false, err
+		}
+		return true, nil
 	}
 	if count != 0 {
 		return false, nil
@@ -596,6 +727,9 @@ func (scope *connScope) adoptCurrentVerifiedLedger() (bool, error) {
 		return false, nil
 	}
 	if err := scope.writeVerifiedTableVector(now.generations); err != nil {
+		return false, err
+	}
+	if err := scope.writeVerifiedAgentSet(); err != nil {
 		return false, err
 	}
 	return true, nil

@@ -289,7 +289,7 @@ func (scope *connScope) ensureVerifiedLedgerSchema() error {
 	}
 	for _, statement := range []string{
 		verifiedGenerationTableDDL, verifiedGenerationSeedDDL, verifiedLedgerTableDDL,
-		verifiedTableGenerationDDL, verifiedTableProofDDL,
+		verifiedTableGenerationDDL, verifiedTableProofDDL, verifiedAgentProofDDL,
 	} {
 		if _, err := scope.conn.ExecContext(scope.ctx, statement); err != nil {
 			return fmt.Errorf("ensureVerifiedLedgerSchema: %q: %w", statement, err)
@@ -673,6 +673,9 @@ func (scope *connScope) writeVerifiedLedger() error {
 	if err := scope.writeVerifiedTableVector(identity.generations); err != nil {
 		return fmt.Errorf("writeVerifiedLedger: %w", err)
 	}
+	if err := scope.writeVerifiedAgentSet(); err != nil {
+		return fmt.Errorf("writeVerifiedLedger: %w", err)
+	}
 	if _, err := scope.conn.ExecContext(scope.ctx, fmt.Sprintf(`INSERT INTO %s
 		(id, generation, journal_id, journal_digest, shape_id, tables_digest, verified_count, verified_at)
 		VALUES (1, ?1, ?2, ?3, ?4, ?5, 1, ?6)
@@ -797,6 +800,9 @@ func (scope *connScope) persistVerifiedChangedTablesIfUnchanged(before verifiedS
 			return errVerifiedStoreMovedDuringVerification
 		}
 		if err := scope.advanceVerifiedTableVector(now.generations, ledger.identity.generations); err != nil {
+			return fmt.Errorf("persist partial verification: %w", err)
+		}
+		if err := scope.writeVerifiedAgentSet(); err != nil {
 			return fmt.Errorf("persist partial verification: %w", err)
 		}
 		shape := verifiedShapeID()

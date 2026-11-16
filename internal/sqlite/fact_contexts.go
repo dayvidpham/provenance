@@ -150,6 +150,20 @@ func (relation factContextRelation) loadSQL() string {
 	}
 }
 
+// contextIndexSQL enumerates every context row once, in parent-journal order.
+// Fact-context validation uses it to build one index per relation instead of
+// issuing a query per fact row.
+func (relation factContextRelation) contextIndexSQL() string {
+	switch relation {
+	case factContextDecision:
+		return "SELECT decision_journal_id,context_kind,context_identity FROM journal_decision_contexts ORDER BY decision_journal_id,context_kind,context_identity"
+	case factContextEvidence:
+		return "SELECT evidence_journal_id,context_kind,context_identity FROM journal_evidence_contexts ORDER BY evidence_journal_id,context_kind,context_identity"
+	default:
+		panic("unknown factContextRelation")
+	}
+}
+
 func (relation factContextRelation) parentIntegritySQL() string {
 	switch relation {
 	case factContextDecision:
@@ -374,6 +388,26 @@ func (scope *connScope) producedFactRows(anchor int64) ([]int64, error) {
 		return nil
 	})
 	return rows, err
+}
+
+// producedJournalRowsByOperation reads every produced journal row once and
+// groups it by the operation that owns it. The journal is append-only, so this
+// one ordered scan replaces one lookup per canonical operation; the single-row
+// helper above remains for the legacy backfill.
+func (scope *connScope) producedJournalRowsByOperation() (map[int64][]int64, error) {
+	byOperation := make(map[int64][]int64)
+	err := forEachFactContextRow(scope, "SELECT produced_by_operation_journal_id,journal_id FROM journal WHERE produced_by_operation_journal_id IS NOT NULL ORDER BY produced_by_operation_journal_id,journal_id", nil, func(row *sql.Rows) error {
+		var anchor, journalID int64
+		if err := row.Scan(&anchor, &journalID); err != nil {
+			return err
+		}
+		byOperation[anchor] = append(byOperation[anchor], journalID)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("enumerate produced journal rows by operation: %w", err)
+	}
+	return byOperation, nil
 }
 
 // backfillLegacyFactContexts derives rows only from canonical operation bytes.
@@ -663,6 +697,31 @@ func (scope *connScope) loadFactContextsFromRelation(relation factContextRelatio
 	return contexts, nil
 }
 
+// loadFactContextIndex reads every context row for one relation once, grouped
+// by its parent journal id. The context relations are append-only too; a single
+// ordered scan replaces one lookup per fact row and costs nothing when the
+// relation is empty.
+func (scope *connScope) loadFactContextIndex(relation factContextRelation) (map[int64][]journal.EventContext, error) {
+	index := make(map[int64][]journal.EventContext)
+	err := forEachFactContextRow(scope, relation.contextIndexSQL(), nil, func(row *sql.Rows) error {
+		var journalID int64
+		var kind, identity string
+		if err := row.Scan(&journalID, &kind, &identity); err != nil {
+			return err
+		}
+		context, err := journal.DecodeStoredEventContext(journal.EventContextKind(kind), identity)
+		if err != nil {
+			return factContextIntegrityError("malformed "+relation.tableName()+" row for journal "+strconv.FormatInt(journalID, 10), "verified fact-context load", "restore a canonical context kind and identity: "+err.Error())
+		}
+		index[journalID] = append(index[journalID], context)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("index %s contexts: %w", relation.tableName(), err)
+	}
+	return index, nil
+}
+
 func (scope *connScope) verifyFactContextIntegrity() error {
 	return scope.verifyFactContextIntegrityMode(false)
 }
@@ -751,23 +810,32 @@ func (scope *connScope) validateCanonicalFactContextSets() error {
 	if err != nil {
 		return err
 	}
+	produced, err := scope.producedJournalRowsByOperation()
+	if err != nil {
+		return err
+	}
+	contexts := make(map[factContextRelation]map[int64][]journal.EventContext, 2)
+	for _, relation := range []factContextRelation{factContextDecision, factContextEvidence} {
+		index, err := scope.loadFactContextIndex(relation)
+		if err != nil {
+			return err
+		}
+		contexts[relation] = index
+	}
 	for _, operation := range operations {
 		prepared, err := journal.DecodeCanonicalMutation(operation.wire)
 		if err != nil {
 			return fmt.Errorf("decode canonical operation %d for fact-context validation: %w — where: validateCanonicalFactContextSets; when: startup fact-context validation over stored canonical operations; impact: the open fails closed and no fact-context set is accepted; fix: %s", operation.anchor, err, unsupportedPreV004DatabaseFix)
 		}
 		effects := prepared.NormalizedEffects()
-		rows, err := scope.producedFactRows(operation.anchor)
-		if err != nil {
-			return err
-		}
+		rows := produced[operation.anchor]
 		if len(rows) != len(effects) {
 			continue
 		}
 		for i, effect := range effects {
 			relation, ok := factContextRelationForEffect(effect)
 			if ok {
-				if err := scope.validateCanonicalFactContextSet(operation.anchor, rows[i], relation, effect.Contexts); err != nil {
+				if err := scope.validateCanonicalFactContextSetIndexed(operation.anchor, rows[i], effect.Contexts, contexts[relation][rows[i]]); err != nil {
 					return err
 				}
 			}
@@ -784,6 +852,14 @@ func (scope *connScope) validateCanonicalFactContextSet(anchor, journalID int64,
 	actual, err := scope.loadFactContextsFromRelation(relation, journalID)
 	if err != nil {
 		return err
+	}
+	return compareFactContextSets(anchor, journalID, expected, actual)
+}
+
+func (scope *connScope) validateCanonicalFactContextSetIndexed(anchor, journalID int64, expectedInput, actual []journal.EventContext) error {
+	expected, err := journal.CanonicalEventContexts(expectedInput)
+	if err != nil {
+		return factContextIntegrityError("canonical contexts for journal "+strconv.FormatInt(journalID, 10)+" are invalid", "canonical fact-context comparison", "restore the operation's canonical mutation: "+err.Error())
 	}
 	return compareFactContextSets(anchor, journalID, expected, actual)
 }

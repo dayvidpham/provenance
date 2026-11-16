@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Performance
+
+- Full-path ledger validation reads the journal and both fact-context
+  relations once and indexes them, instead of issuing one journal query per
+  canonical operation and one context query per fact row. On an 18 GB store
+  this removes 2.4M per-operation lookups from
+  `validateCanonicalOperations` and `validateCanonicalFactContextSets`.
+- The verified agent-ID set is persisted beside the ledger. Agent-registry
+  recovery diffs the current registry against it and probes the journal only
+  for removed IDs, so an insert-only registration skips the 9.5M-row orphan
+  scan (101 ms versus 770 ms warm on the same copy; the previous cold figure
+  was 3.8 s). An empty set still runs the full probes, and adoption seeds the
+  set from the current registry.
+
 ## v0.10.4 - 2026-11-15
 
 ### Changed
