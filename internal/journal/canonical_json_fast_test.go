@@ -104,7 +104,8 @@ func TestPayloadWireIsCanonicalAgreesWithCanonicalJSON(t *testing.T) {
 		{"leading-zero", []byte(`01`)},
 		{"unsorted-key-at-length-limit", unsortedLongKey(canonicalJSONMaxKey)},
 		{"unsorted-key-past-length-limit", unsortedLongKey(canonicalJSONMaxKey + 1)},
-		{"unsorted-past-depth-limit", nestedObject(canonicalJSONMaxDepth, []byte(`{"b":1,"a":2}`))},
+		{"unsorted-nested", nestedObject(canonicalJSONMaxDepth, []byte(`{"b":1,"a":2}`))},
+		{"past-depth-limit", nestedObject(canonicalJSONMaxDepth+1, []byte(`1`))},
 	}
 	for _, test := range notFast {
 		t.Run(test.name, func(t *testing.T) {
@@ -190,6 +191,13 @@ func TestPayloadWireIsCanonicalAgreesWithCanonicalJSON(t *testing.T) {
 		t.Run("decode-"+test.name, func(t *testing.T) {
 			wire := replaceEffectPayload(t, prepared.CanonicalBytes(), test.raw)
 			_, err := DecodeCanonicalMutation(wire)
+			canon, canonErr := mutationV1Codec.canonicalJSON(test.raw)
+			if canonErr == nil && bytes.Equal(canon, test.raw) {
+				if err != nil {
+					t.Fatalf("canonical value past the scanner limit rejected by fallback: %v", err)
+				}
+				return
+			}
 			want := expectedPayloadRejection(test.raw)
 			if err == nil || err.Error() != want || !errors.Is(err, ErrCanonicalMutation) {
 				t.Fatalf("error = %q; want %q", err, want)
@@ -202,14 +210,8 @@ func assertCanonicalPayloadWire(t *testing.T, raw []byte) {
 	t.Helper()
 	got := canonicalPayloadWire(raw)
 	want, err := mutationV1Codec.canonicalJSON(raw)
-	if err != nil {
-		if got != nil {
-			t.Fatalf("canonicalPayloadWire(%q) = %q; want nil from ignored canonicalJSON error %v", raw, got, err)
-		}
-		return
-	}
 	if !bytes.Equal(got, want) {
-		t.Fatalf("canonicalPayloadWire(%q) = %q; canonicalJSON = %q", raw, got, want)
+		t.Fatalf("canonicalPayloadWire(%q) = %q; canonicalJSON = %q (err=%v)", raw, got, want, err)
 	}
 }
 
