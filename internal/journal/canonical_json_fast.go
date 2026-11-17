@@ -12,8 +12,11 @@ import (
 // non-canonical payload during verification.
 //
 // The scanner is deliberately narrower than encoding/json. Strings with an
-// escape it does not prove canonical, keys longer than canonicalJSONMaxKey, and
-// values nested deeper than canonicalJSONMaxDepth return false.
+// escape it does not prove canonical, a key longer than canonicalJSONMaxKey,
+// and values nested deeper than canonicalJSONMaxDepth return false. Each key
+// is limited on its own: the previous key and the key being decoded are stored
+// separately, so a later key is not rejected just because the two together
+// exceed canonicalJSONMaxKey.
 func payloadWireIsCanonical(raw []byte) bool {
 	if len(raw) == 0 {
 		return false
@@ -79,13 +82,19 @@ var (
 )
 
 func scanCanonicalJSONValue(s []byte, depth int) (int, bool) {
-	if depth <= 0 || len(s) == 0 {
+	if len(s) == 0 {
 		return 0, false
 	}
 	switch s[0] {
-	case '{':
-		return scanCanonicalJSONObject(s, depth)
-	case '[':
+	case '{', '[':
+		// Depth counts containers. A scalar leaf does not consume a level, so
+		// canonicalJSONMaxDepth nested objects around a number still hit.
+		if depth <= 0 {
+			return 0, false
+		}
+		if s[0] == '{' {
+			return scanCanonicalJSONObject(s, depth)
+		}
 		return scanCanonicalJSONArray(s, depth)
 	case '"':
 		n, _, ok := scanCanonicalJSONString(s, nil)
@@ -117,29 +126,28 @@ func scanCanonicalJSONObject(s []byte, depth int) (int, bool) {
 	if s[1] == '}' {
 		return 2, true
 	}
-	var prev [canonicalJSONMaxKey]byte
+	// Separate arrays so an empty previous key still has a seen key to compare,
+	// and so each key may use the full canonicalJSONMaxKey budget.
+	var prev, cur [canonicalJSONMaxKey]byte
 	prevLen := 0
+	seen := false
 	i := 1
 	for {
 		if i >= len(s) || s[i] != '"' {
 			return 0, false
 		}
-		// Zero length, remaining cap: append must write into prev, not allocate.
-		n, key, ok := scanCanonicalJSONString(s[i:], prev[prevLen:prevLen])
+		n, decoded, ok := scanCanonicalJSONString(s[i:], cur[:0])
 		if !ok {
 			return 0, false
 		}
-		// scanCanonicalJSONString appends into the spare tail. Move the decoded
-		// key to the front of prev only after the order check, which still needs
-		// the previous key in prev[:prevLen].
-		decoded := key
-		if prevLen > 0 && bytes.Compare(decoded, prev[:prevLen]) <= 0 {
+		if seen && bytes.Compare(decoded, prev[:prevLen]) <= 0 {
 			return 0, false
 		}
 		if copy(prev[:], decoded) != len(decoded) {
 			return 0, false
 		}
 		prevLen = len(decoded)
+		seen = true
 		i += n
 		if i >= len(s) || s[i] != ':' {
 			return 0, false
