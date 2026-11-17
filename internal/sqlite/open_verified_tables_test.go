@@ -952,20 +952,66 @@ func assertVerifiedAgentProofUnchanged(t *testing.T, db *sql.DB, proofBefore []s
 	}
 }
 
+// countEraStaleAgentID is a proof id that seedLedgerStore never registers.
+// A repair that leaves the set untouched still contains it; a rewrite does not.
+const countEraStaleAgentID = "https://example.test/count-era-stale"
+
 // TestVerifiedLedgerCountEraAgentProofIsDroppedAndReseeded proves a store
 // written by the development commit that stored agent_count is repaired on
 // open. CREATE TABLE IF NOT EXISTS would leave that table, and SELECT
 // agent_digest would fail the open with "no such column: agent_digest". The
-// repair drops both proof tables and recreates the digest shape. A current
-// ledger keeps verified_count, and the proof is either re-seeded from the
-// registry or empty — never a stale set.
+// repair drops both proof tables and recreates the digest shape. The fixture
+// registry is non-empty, so a successful open must re-seed that registry: an
+// empty proof is a failed repair, not an acceptable one. A planted id that is
+// not in the registry must be gone, which is what shows the set was rewritten
+// rather than left matching by coincidence. A current ledger keeps
+// verified_count. A stale ledger still opens without a SQL error and re-seeds
+// on the full path.
 func TestVerifiedLedgerCountEraAgentProofIsDroppedAndReseeded(t *testing.T) {
-	path := t.TempDir() + "/count-era-agent-proof.db"
-	_, seeded := seedLedgerStore(t, path)
-	db := openVerifiedTablesTestDB(t, path)
-	registryBefore := orderedAgentIDs(t, db, "SELECT id FROM agents ORDER BY id")
-	if len(registryBefore) == 0 {
+	t.Run("current", func(t *testing.T) {
+		path := t.TempDir() + "/count-era-agent-proof.db"
+		_, seeded := seedLedgerStore(t, path)
+		db := openVerifiedTablesTestDB(t, path)
+		installCountEraAgentProof(t, db)
+
+		if err := reopenFileBacked(t, path); err != nil {
+			t.Fatalf("open a count-era agent proof = %v, want no error (the unrepaired table returns no such column: agent_digest)", err)
+		}
+		if _, count := readLedgerGeneration(t, path); count != seeded {
+			t.Fatalf("verified_count after repairing a current count-era proof = %d, want %d", count, seeded)
+		}
+		assertCountEraDigestReplacedCount(t, db)
+		assertCountEraProofReseeded(t, db)
+	})
+	t.Run("stale", func(t *testing.T) {
+		path := t.TempDir() + "/count-era-stale-ledger.db"
+		_, seeded := seedLedgerStore(t, path)
+		db := openVerifiedTablesTestDB(t, path)
+		installCountEraAgentProof(t, db)
+		bumpStoreGeneration(t, path)
+
+		if err := reopenFileBacked(t, path); err != nil {
+			t.Fatalf("open a count-era proof on a stale ledger = %v, want no SQL error and a re-seeded proof", err)
+		}
+		if _, count := readLedgerGeneration(t, path); count != seeded+1 {
+			t.Fatalf("verified_count after a stale count-era open = %d, want %d; the full path did not re-seed", count, seeded+1)
+		}
+		assertCountEraDigestReplacedCount(t, db)
+		assertCountEraProofReseeded(t, db)
+	})
+}
+
+// installCountEraAgentProof replaces the digest meta row with the count-era
+// shape and plants a proof id the registry does not contain. The open must
+// drop that row; leaving the set untouched would still contain it.
+func installCountEraAgentProof(t *testing.T, db *sql.DB) {
+	t.Helper()
+	registry := orderedAgentIDs(t, db, "SELECT id FROM agents ORDER BY id")
+	if len(registry) == 0 {
 		t.Fatal("seeded registry is empty; a re-seeded proof would be indistinguishable from an empty one")
+	}
+	if slices.Contains(registry, countEraStaleAgentID) {
+		t.Fatalf("planted id %q is already in the registry; a surviving row would not prove a rewrite", countEraStaleAgentID)
 	}
 	for _, statement := range []string{
 		"DROP TABLE " + verifiedAgentMetaTable,
@@ -975,16 +1021,26 @@ func TestVerifiedLedgerCountEraAgentProofIsDroppedAndReseeded(t *testing.T) {
 			t.Fatalf("install count-era meta %q: %v", statement, err)
 		}
 	}
-	if _, err := db.Exec("INSERT INTO "+verifiedAgentMetaTable+" (id, agent_count) VALUES (1, ?1)", len(registryBefore)); err != nil {
+	if _, err := db.Exec("INSERT INTO "+verifiedAgentMetaTable+" (id, agent_count) VALUES (1, ?1)", len(registry)); err != nil {
 		t.Fatalf("insert count-era cardinality: %v", err)
 	}
+	if _, err := db.Exec("INSERT INTO "+verifiedAgentProofTable+" (agent_id) VALUES (?1)", countEraStaleAgentID); err != nil {
+		t.Fatalf("plant count-era stale proof id: %v", err)
+	}
+	var planted int
+	if err := db.QueryRow("SELECT COUNT(*) FROM "+verifiedAgentProofTable+" WHERE agent_id=?1", countEraStaleAgentID).Scan(&planted); err != nil {
+		t.Fatalf("read planted count-era proof id: %v", err)
+	}
+	if planted != 1 {
+		t.Fatalf("planted count-era proof id %q count = %d, want 1 before the open", countEraStaleAgentID, planted)
+	}
+}
 
-	if err := reopenFileBacked(t, path); err != nil {
-		t.Fatalf("open a count-era agent proof = %v, want no error (the unrepaired table returns no such column: agent_digest)", err)
-	}
-	if _, count := readLedgerGeneration(t, path); count != seeded {
-		t.Fatalf("verified_count after repairing a current count-era proof = %d, want %d", count, seeded)
-	}
+// assertCountEraDigestReplacedCount fails unless the count-era meta table was
+// dropped and recreated with agent_digest. Altering agent_count in place would
+// leave that column.
+func assertCountEraDigestReplacedCount(t *testing.T, db *sql.DB) {
+	t.Helper()
 	var digestColumn, countColumn int
 	if err := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = 'agent_digest'", verifiedAgentMetaTable).Scan(&digestColumn); err != nil {
 		t.Fatalf("probe agent_digest column: %v", err)
@@ -998,28 +1054,23 @@ func TestVerifiedLedgerCountEraAgentProofIsDroppedAndReseeded(t *testing.T) {
 	if countColumn != 0 {
 		t.Fatalf("agent_count column still present; the count was altered instead of dropped")
 	}
+}
 
-	registry := orderedAgentIDs(t, db, "SELECT id FROM agents ORDER BY id")
+// assertCountEraProofReseeded fails unless the planted id is gone and the
+// proof equals the registry. The fixture registry is non-empty, so an empty
+// set — with or without the empty-set digest — is not a successful repair.
+func assertCountEraProofReseeded(t *testing.T, db *sql.DB) {
+	t.Helper()
+	var stale int
+	if err := db.QueryRow("SELECT COUNT(*) FROM "+verifiedAgentProofTable+" WHERE agent_id=?1", countEraStaleAgentID).Scan(&stale); err != nil {
+		t.Fatalf("probe planted count-era proof id after open: %v", err)
+	}
+	if stale != 0 {
+		t.Fatalf("planted count-era proof id %q survived the open; the set was not rewritten", countEraStaleAgentID)
+	}
 	verified := orderedAgentIDs(t, db, "SELECT agent_id FROM "+verifiedAgentProofTable+" ORDER BY agent_id")
 	if len(verified) == 0 {
-		var digestRows int
-		if err := db.QueryRow("SELECT COUNT(*) FROM " + verifiedAgentMetaTable).Scan(&digestRows); err != nil {
-			t.Fatalf("count digest rows on the empty proof: %v", err)
-		}
-		if digestRows == 0 {
-			return
-		}
-		var recorded string
-		if err := db.QueryRow("SELECT agent_digest FROM " + verifiedAgentMetaTable + " WHERE id = 1").Scan(&recorded); err != nil {
-			t.Fatalf("read digest on the empty proof: %v", err)
-		}
-		if recorded != verifiedAgentSetDigest(nil) {
-			t.Fatalf("empty proof digest = %q, want the empty-set digest or no row; a stale digest survived", recorded)
-		}
-		return
-	}
-	if !slices.Equal(verified, registry) {
-		t.Fatalf("repaired proof set = %v, want the current registry %v or empty; a stale set survived the repair", verified, registry)
+		t.Fatal("repaired proof set is empty; a non-empty registry on a successful open must be re-seeded")
 	}
 	requireVerifiedAgentSetEqualsRegistry(t, db)
 }

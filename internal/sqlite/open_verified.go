@@ -422,11 +422,11 @@ func (scope *connScope) dropCountEraVerifiedAgentProof() error {
 	if !legacy {
 		return nil
 	}
-	if _, err := scope.conn.ExecContext(scope.ctx, "DROP TABLE provenance_verified_agent"); err != nil {
-		return fmt.Errorf("ensureVerifiedLedgerSchema: drop count-era provenance_verified_agent: %w", err)
+	if _, err := scope.conn.ExecContext(scope.ctx, "DROP TABLE "+verifiedAgentProofTable); err != nil {
+		return fmt.Errorf("ensureVerifiedLedgerSchema: drop count-era %s: %w", verifiedAgentProofTable, err)
 	}
-	if _, err := scope.conn.ExecContext(scope.ctx, "DROP TABLE provenance_verified_agent_meta"); err != nil {
-		return fmt.Errorf("ensureVerifiedLedgerSchema: drop count-era provenance_verified_agent_meta: %w", err)
+	if _, err := scope.conn.ExecContext(scope.ctx, "DROP TABLE "+verifiedAgentMetaTable); err != nil {
+		return fmt.Errorf("ensureVerifiedLedgerSchema: drop count-era %s: %w", verifiedAgentMetaTable, err)
 	}
 	return nil
 }
