@@ -253,8 +253,7 @@ func (codec canonicalV1Codec) encodeEffect(w *canonicalWriter, e Effect, index i
 		}
 	}
 	payload := func() {
-		p, _ := codec.canonicalJSON(e.Payload)
-		w.rawField(effectWireName(index, "payload"), p)
+		w.rawField(effectWireName(index, "payload"), canonicalPayloadWire(e.Payload))
 	}
 	switch e.Sort {
 	case EffectTaskCreate, EffectTaskCreateAllocated:
@@ -658,10 +657,8 @@ func (codec canonicalV1Codec) decodeEffect(r *canonicalReader, index int) (Effec
 
 func (codec canonicalV1Codec) normalizeEffect(e Effect, index int) (Effect, error) {
 	// Treat representational empty values as the zero value before shape checking.
-	if len(e.Payload) > 0 {
-		if payload, err := codec.canonicalJSON(e.Payload); err == nil && string(payload) == "{}" {
-			e.Payload = nil
-		}
+	if len(e.Payload) > 0 && payloadCollapsesToEmptyObject(e.Payload) {
+		e.Payload = nil
 	}
 	if len(e.Contexts) == 0 {
 		e.Contexts = nil
@@ -826,7 +823,7 @@ func (codec canonicalV1Codec) normalizeEffect(e Effect, index int) (Effect, erro
 	} else {
 		n.Contexts = nil
 	}
-	if len(n.Payload) > 0 {
+	if len(n.Payload) > 0 && !payloadWireIsCanonical(n.Payload) {
 		if _, err := codec.canonicalJSON(n.Payload); err != nil {
 			return Effect{}, canonicalMutationError(effectWireName(index, "payload"), err.Error(), "supply one strict JSON value without duplicate fields")
 		}
