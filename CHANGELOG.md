@@ -21,7 +21,8 @@ All notable changes to this project will be documented in this file.
   probes, and adoption seeds the set and its digest from the current
   registry. A count would miss a same-cardinality substitution; the digest
   catches it. The digest is not tamper-proof against a writer who rewrites
-  both the set and the digest.
+  both the set and the digest. A count-era proof table from the development
+  branch is dropped and re-seeded, not altered.
 
 ## v0.10.4 - 2026-11-15
 

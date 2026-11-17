@@ -283,9 +283,17 @@ func verifiedTriggerNamesFor(table string) []string {
 // old singleton counter into the first vector build, which is what keeps an
 // existing v3 ledger valid across the upgrade; a half-seeded vector must fail
 // closed instead of jumping by the old value.
+//
+// A count-era proof table from this development branch is dropped here, before
+// the digest DDL. CREATE TABLE IF NOT EXISTS would leave agent_count in place,
+// and a later SELECT agent_digest would fail the open instead of falling back
+// to the full probes. The count is not altered into a digest.
 func (scope *connScope) ensureVerifiedLedgerSchema() error {
 	if scope.ephemeralStore {
 		return nil
+	}
+	if err := scope.dropCountEraVerifiedAgentProof(); err != nil {
+		return err
 	}
 	for _, statement := range []string{
 		verifiedGenerationTableDDL, verifiedGenerationSeedDDL, verifiedLedgerTableDDL,
@@ -398,6 +406,57 @@ func (scope *connScope) ensureVerifiedLedgerSchema() error {
 		}
 	}
 	return nil
+}
+
+// dropCountEraVerifiedAgentProof removes the development-branch proof tables
+// that stored agent_count instead of agent_digest. Both tables go: the set and
+// its cardinality were one proof, and a surviving set must not be paired with
+// a digest it was not written under. The DDL loop recreates both. Adoption may
+// then re-seed them from the current registry; an empty set forces the full
+// orphan probes. A released store never has this shape.
+func (scope *connScope) dropCountEraVerifiedAgentProof() error {
+	legacy, err := scope.countEraVerifiedAgentProof()
+	if err != nil {
+		return fmt.Errorf("ensureVerifiedLedgerSchema: inspect verified agent proof: %w", err)
+	}
+	if !legacy {
+		return nil
+	}
+	if _, err := scope.conn.ExecContext(scope.ctx, "DROP TABLE provenance_verified_agent"); err != nil {
+		return fmt.Errorf("ensureVerifiedLedgerSchema: drop count-era provenance_verified_agent: %w", err)
+	}
+	if _, err := scope.conn.ExecContext(scope.ctx, "DROP TABLE provenance_verified_agent_meta"); err != nil {
+		return fmt.Errorf("ensureVerifiedLedgerSchema: drop count-era provenance_verified_agent_meta: %w", err)
+	}
+	return nil
+}
+
+// countEraVerifiedAgentProof reports whether provenance_verified_agent_meta
+// exists without an agent_digest column. A missing table is not this shape:
+// activationSchemaObjectsCurrent already refuses it.
+func (scope *connScope) countEraVerifiedAgentProof() (bool, error) {
+	exists, err := scope.tableExists(verifiedAgentMetaTable)
+	if err != nil || !exists {
+		return false, err
+	}
+	columns, err := scope.tableColumns(verifiedAgentMetaTable)
+	if err != nil {
+		return false, err
+	}
+	_, digest := columns["agent_digest"]
+	return !digest, nil
+}
+
+// activationVerifiedAgentProofCurrent reports whether the verified-agent proof
+// is this build's digest shape. It returns false for the count-era development
+// table so activation runs and dropCountEraVerifiedAgentProof can replace it.
+// A missing table is already not current through verifiedLedgerObjects.
+func (scope *connScope) activationVerifiedAgentProofCurrent() (bool, error) {
+	legacy, err := scope.countEraVerifiedAgentProof()
+	if err != nil {
+		return false, fmt.Errorf("activationVerifiedAgentProofCurrent: %w", err)
+	}
+	return !legacy, nil
 }
 
 // ensureVerifiedLedgerColumns adds the presence-digest column to a ledger table

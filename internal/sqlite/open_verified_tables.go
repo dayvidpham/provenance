@@ -48,8 +48,8 @@ const (
 	// The set alone cannot tell a partial out-of-band delete, or a
 	// same-cardinality substitution, of proof rows from a different registry,
 	// so the digest is written in the same transaction and a missing or
-	// mismatched row refuses the diff. The digest is not tamper-proof against
-	// a writer who rewrites both the set and the digest.
+	// mismatched row refuses the diff. What that digest covers, and what it
+	// does not, is verifiedAgentSetDigest.
 	verifiedAgentMetaDDL = `CREATE TABLE IF NOT EXISTS provenance_verified_agent_meta (id INTEGER PRIMARY KEY CHECK (id = 1), agent_digest TEXT NOT NULL) STRICT`
 )
 
@@ -485,8 +485,8 @@ func (scope *connScope) verifiedAgentDigest() (digest string, ok bool, err error
 // must run the full orphan probes rather than assume no agent was removed. The
 // probes are cheap on a store that never had agents and are the only
 // fail-safe on one whose registry was emptied, or whose proof was torn, out
-// of band. The digest is not tamper-proof against a writer who rewrites both
-// the set and the digest.
+// of band. What the digest covers, and what it does not, is
+// verifiedAgentSetDigest.
 func (scope *connScope) removedVerifiedAgents() (removed []string, known bool, err error) {
 	current, err := scope.currentAgentIDs()
 	if err != nil {

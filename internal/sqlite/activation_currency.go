@@ -178,6 +178,10 @@ func (scope *connScope) activationWouldChangeNothing(models []ptypes.ModelEntry)
 		// Every covered table must still carry its change trigger, or the
 		// generation would stop tracking that table's writes.
 		scope.activationLedgerCoverageCurrent,
+		// A count-era proof table has no agent_digest column. This must run
+		// before the convergence probe, which selects that column: an error
+		// there would fail the open instead of repairing the table.
+		scope.activationVerifiedAgentProofCurrent,
 		// Last, and only reached by a structurally-current store: this is the
 		// most expensive probe and the one activation's own convergence
 		// comparison lives in. It is skipped outright when the verified-as-of
