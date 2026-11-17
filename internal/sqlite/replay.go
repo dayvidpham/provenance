@@ -607,6 +607,10 @@ func (scope *connScope) validateCanonicalOperations() error {
 	}); err != nil {
 		return fmt.Errorf("startup canonical validation: enumerate operations: %w", err)
 	}
+	produced, err := scope.producedJournalRowsByOperation()
+	if err != nil {
+		return fmt.Errorf("startup canonical validation: %w", err)
+	}
 	for _, op := range operations {
 		if op.versionSet != op.wireSet {
 			return canonicalCorruption(op.anchor, "encoding columns", op.version, fmt.Sprintf("%d bytes", len(op.wire)))
@@ -628,17 +632,7 @@ func (scope *connScope) validateCanonicalOperations() error {
 			return canonicalCorruption(op.anchor, "mutation digest", fmt.Sprintf("%x", op.digest), fmt.Sprintf("%x", prepared.DerivedDigest()))
 		}
 		effects := prepared.NormalizedEffects()
-		var rows []int64
-		if err := scope.queryRows("SELECT journal_id FROM journal WHERE produced_by_operation_journal_id=?1 ORDER BY journal_id", []any{op.anchor}, func(sqlRows *sql.Rows) error {
-			var journalID int64
-			if err := sqlRows.Scan(&journalID); err != nil {
-				return err
-			}
-			rows = append(rows, journalID)
-			return nil
-		}); err != nil {
-			return err
-		}
+		rows := produced[op.anchor]
 		if len(rows) != len(effects) {
 			field := "effect row count"
 			for _, effect := range effects {

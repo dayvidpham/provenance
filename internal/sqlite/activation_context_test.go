@@ -106,10 +106,11 @@ func activationConnectionIdentity(t *testing.T, pool *sql.DB) any {
 
 // activationSnapshot captures the store's schema and every table's content, so a
 // test can assert that an activation attempt (or a reopen) changed nothing that
-// was already committed. The verified-as-of ledger's two tables are excluded:
-// they are the open path's own verification bookkeeping (open_verified.go), not
-// schema, history, or projection, and a slow-path open legitimately re-persists
-// the ledger row after it re-verifies the store.
+// was already committed. The verified-as-of ledger tables, including the agent
+// set and its digest row, are excluded: they are the open path's own
+// verification bookkeeping (open_verified.go), not schema, history, or
+// projection, and a slow-path open legitimately re-persists the ledger row
+// after it re-verifies the store.
 func activationSnapshot(t *testing.T, pool *sql.DB) []string {
 	t.Helper()
 	rows, err := pool.Query("SELECT name, sql FROM sqlite_schema WHERE type='table' ORDER BY name")
@@ -124,7 +125,8 @@ func activationSnapshot(t *testing.T, pool *sql.DB) []string {
 			t.Fatal(err)
 		}
 		if name == storeGenerationTable || name == verifiedStoreTable ||
-			name == verifiedTableGenerationTable || name == verifiedTableProofTable {
+			name == verifiedTableGenerationTable || name == verifiedTableProofTable ||
+			name == verifiedAgentProofTable || name == verifiedAgentMetaTable {
 			continue
 		}
 		names = append(names, name)
