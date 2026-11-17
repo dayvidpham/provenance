@@ -107,7 +107,7 @@ func activationConnectionIdentity(t *testing.T, pool *sql.DB) any {
 // activationSnapshot captures the store's schema and every table's content, so a
 // test can assert that an activation attempt (or a reopen) changed nothing that
 // was already committed. The verified-as-of ledger tables, including the agent
-// set and its cardinality row, are excluded: they are the open path's own
+// set and its digest row, are excluded: they are the open path's own
 // verification bookkeeping (open_verified.go), not schema, history, or
 // projection, and a slow-path open legitimately re-persists the ledger row
 // after it re-verifies the store.

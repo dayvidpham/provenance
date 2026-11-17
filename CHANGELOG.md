@@ -12,13 +12,16 @@ All notable changes to this project will be documented in this file.
   this removes 2.4M per-operation lookups from
   `validateCanonicalOperations` and `validateCanonicalFactContextSets`.
 - The verified agent-ID set is persisted beside the ledger, bound to a
-  singleton cardinality row written in the same transaction. Agent-registry
-  recovery diffs the current registry against it and probes the journal only
-  for removed IDs, so an insert-only registration skips the 9.5M-row orphan
-  scan (101 ms versus 770 ms warm on the same copy; the previous cold figure
-  was 3.8 s). An empty set, a missing cardinality row, or a count that does
-  not match the surviving proof rows still runs the full probes, and adoption
-  seeds the set and its count from the current registry.
+  singleton digest of the sorted agent IDs written in the same transaction.
+  Agent-registry recovery diffs the current registry against it and probes the
+  journal only for removed IDs, so an insert-only registration skips the
+  9.5M-row orphan scan (101 ms versus 770 ms warm on the same copy; the
+  previous cold figure was 3.8 s). An empty set, a missing digest row, or a
+  digest that does not match the surviving proof rows still runs the full
+  probes, and adoption seeds the set and its digest from the current
+  registry. A count would miss a same-cardinality substitution; the digest
+  catches it. The digest is not tamper-proof against a writer who rewrites
+  both the set and the digest.
 
 ## v0.10.4 - 2026-11-15
 

@@ -1,10 +1,13 @@
 package sqlite
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"slices"
+	"sort"
 
 	"github.com/dayvidpham/provenance/pkg/ptypes"
 )
@@ -41,11 +44,13 @@ const (
 		generation INTEGER NOT NULL) STRICT`
 	verifiedAgentProofDDL = `CREATE TABLE IF NOT EXISTS provenance_verified_agent (
 		agent_id TEXT PRIMARY KEY) STRICT, WITHOUT ROWID`
-	// verifiedAgentMetaDDL is the singleton cardinality of the verified agent
-	// set. The set alone cannot tell a partial out-of-band delete of proof rows
-	// from a smaller registry, so the count is written in the same transaction
-	// and a missing or mismatched row refuses the diff.
-	verifiedAgentMetaDDL = `CREATE TABLE IF NOT EXISTS provenance_verified_agent_meta (id INTEGER PRIMARY KEY CHECK (id = 1), agent_count INTEGER NOT NULL) STRICT`
+	// verifiedAgentMetaDDL is the singleton digest of the verified agent set.
+	// The set alone cannot tell a partial out-of-band delete, or a
+	// same-cardinality substitution, of proof rows from a different registry,
+	// so the digest is written in the same transaction and a missing or
+	// mismatched row refuses the diff. The digest is not tamper-proof against
+	// a writer who rewrites both the set and the digest.
+	verifiedAgentMetaDDL = `CREATE TABLE IF NOT EXISTS provenance_verified_agent_meta (id INTEGER PRIMARY KEY CHECK (id = 1), agent_digest TEXT NOT NULL) STRICT`
 )
 
 // verifiedLedgerObjects are the schema objects the verified-as-of ledger owns
@@ -414,10 +419,26 @@ func (scope *connScope) verifiedAgentIDs() ([]string, error) {
 	return ids, nil
 }
 
-// writeVerifiedAgentSet records the current registry and its cardinality as
+// verifiedAgentSetDigest is the content digest of one verified agent set. The
+// IDs are copied and sorted, then each is written as a length-prefixed record,
+// so the value depends only on the set and two different sets cannot collide
+// by concatenation. A count would miss a same-cardinality substitution. The
+// digest is not tamper-proof against a writer who rewrites both the set and
+// the digest.
+func verifiedAgentSetDigest(ids []string) string {
+	sorted := append([]string(nil), ids...)
+	sort.Strings(sorted)
+	sum := sha256.New()
+	for _, id := range sorted {
+		fmt.Fprintf(sum, "%d\x00%s\n", len(id), id)
+	}
+	return hex.EncodeToString(sum.Sum(nil))
+}
+
+// writeVerifiedAgentSet records the current registry and its digest as
 // verified. It runs in the caller's transaction alongside the ledger identity,
-// so the set and the count commit or roll back together. A later open trusts
-// the set only when the surviving proof rows still equal that count.
+// so the set and the digest commit or roll back together. A later open trusts
+// the set only when the surviving proof rows still digest to that value.
 func (scope *connScope) writeVerifiedAgentSet() error {
 	ids, err := scope.currentAgentIDs()
 	if err != nil {
@@ -433,37 +454,39 @@ func (scope *connScope) writeVerifiedAgentSet() error {
 		}
 	}
 	if _, err := scope.conn.ExecContext(scope.ctx,
-		"INSERT INTO "+verifiedAgentMetaTable+" (id, agent_count) VALUES (1, ?1) ON CONFLICT(id) DO UPDATE SET agent_count = excluded.agent_count",
-		int64(len(ids))); err != nil {
-		return fmt.Errorf("record verified agent count: %w", err)
+		"INSERT INTO "+verifiedAgentMetaTable+" (id, agent_digest) VALUES (1, ?1) ON CONFLICT(id) DO UPDATE SET agent_digest = excluded.agent_digest",
+		verifiedAgentSetDigest(ids)); err != nil {
+		return fmt.Errorf("record verified agent digest: %w", err)
 	}
 	return nil
 }
 
-// verifiedAgentCount reads the singleton cardinality written with the verified
-// set. ok is false when the row is missing: a set without its count is not a
+// verifiedAgentDigest reads the singleton digest written with the verified
+// set. ok is false when the row is missing: a set without its digest is not a
 // proof, and the caller must run the full orphan probes.
-func (scope *connScope) verifiedAgentCount() (count int64, ok bool, err error) {
+func (scope *connScope) verifiedAgentDigest() (digest string, ok bool, err error) {
 	err = scope.conn.QueryRowContext(scope.ctx,
-		"SELECT agent_count FROM "+verifiedAgentMetaTable+" WHERE id = 1").Scan(&count)
+		"SELECT agent_digest FROM "+verifiedAgentMetaTable+" WHERE id = 1").Scan(&digest)
 	if errors.Is(err, sql.ErrNoRows) {
-		return 0, false, nil
+		return "", false, nil
 	}
 	if err != nil {
-		return 0, false, fmt.Errorf("read verified agent count: %w", err)
+		return "", false, fmt.Errorf("read verified agent digest: %w", err)
 	}
-	return count, true, nil
+	return digest, true, nil
 }
 
 // removedVerifiedAgents diffs the verified set against the current registry.
-// known is false when the set is empty, the cardinality row is missing, or the
-// surviving proof rows do not equal the recorded count. An empty set is
+// known is false when the set is empty, the digest row is missing, or the
+// surviving proof rows do not digest to the recorded value. An empty set is
 // indistinguishable from a set whose rows were deleted along with the agents
-// they named, and a partial delete of proof rows would otherwise look like a
-// smaller verified registry. Either case must run the full orphan probes rather
-// than assume no agent was removed. The probes are cheap on a store that never
-// had agents and are the only fail-safe on one whose registry was emptied, or
-// whose proof was torn, out of band.
+// they named, and a partial delete or same-cardinality substitution of proof
+// rows would otherwise look like a different verified registry. Either case
+// must run the full orphan probes rather than assume no agent was removed. The
+// probes are cheap on a store that never had agents and are the only
+// fail-safe on one whose registry was emptied, or whose proof was torn, out
+// of band. The digest is not tamper-proof against a writer who rewrites both
+// the set and the digest.
 func (scope *connScope) removedVerifiedAgents() (removed []string, known bool, err error) {
 	current, err := scope.currentAgentIDs()
 	if err != nil {
@@ -473,11 +496,11 @@ func (scope *connScope) removedVerifiedAgents() (removed []string, known bool, e
 	if err != nil {
 		return nil, false, err
 	}
-	count, countOK, err := scope.verifiedAgentCount()
+	digest, digestOK, err := scope.verifiedAgentDigest()
 	if err != nil {
 		return nil, false, err
 	}
-	if len(verified) == 0 || !countOK || int64(len(verified)) != count {
+	if len(verified) == 0 || !digestOK || verifiedAgentSetDigest(verified) != digest {
 		return nil, false, nil
 	}
 	currentSet := make(map[string]struct{}, len(current))
@@ -533,7 +556,7 @@ func (scope *connScope) verifyAgentRegistryForeignKeys() error {
 		return err
 	}
 	if !known {
-		// No trusted set (empty, missing cardinality, or a count that does not
+		// No trusted set (empty, missing digest, or a digest that does not
 		// match the surviving proof rows): run the full probes rather than
 		// assume an insert-only change.
 		for _, probe := range agentOrphanProbes {
@@ -714,7 +737,7 @@ func (probe agentRegistryProbe) query() string {
 // it stands:
 //
 //   - a complete mirror means the ordinary current comparison is authoritative,
-//     and a match also seeds the verified agent set and its cardinality from
+//     and a match also seeds the verified agent set and its digest from
 //     the current registry; the branch is not only an identity comparison;
 //   - an empty mirror on a store whose covered-table counters are all still zero
 //     is the first vector build. The baseline row was seeded from the old
