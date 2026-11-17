@@ -56,6 +56,8 @@ const (
 	identityDecisionContext
 	identityEvidenceContext
 	identityEventContext
+	// identityVerifiedAgent is appended so existing selector values do not shift.
+	identityVerifiedAgent
 )
 
 func (field identityColumnSQL) readSQL() string {
@@ -116,6 +118,8 @@ func (field identityColumnSQL) readSQL() string {
 		return `SELECT DISTINCT context_kind,context_identity FROM "journal_evidence_contexts"`
 	case identityEventContext:
 		return `SELECT DISTINCT context_kind,context_identity FROM "journal_task_event_contexts"`
+	case identityVerifiedAgent:
+		return `SELECT DISTINCT "agent_id" FROM "provenance_verified_agent" WHERE "agent_id" IS NOT NULL`
 	default:
 		panic("invalid identity conversion column")
 	}
@@ -179,6 +183,8 @@ func (field identityColumnSQL) updateSQL() string {
 		return `UPDATE "journal_evidence_contexts" SET "context_identity"=? WHERE "context_identity"=?`
 	case identityEventContext:
 		return `UPDATE "journal_task_event_contexts" SET "context_identity"=? WHERE "context_identity"=?`
+	case identityVerifiedAgent:
+		return `UPDATE "provenance_verified_agent" SET "agent_id"=? WHERE "agent_id"=?`
 	default:
 		panic("invalid identity conversion column")
 	}
@@ -284,6 +290,13 @@ var ownedIdentityColumns = []identityColumn{
 	{"journal_evidence", "task_id", identityEvidenceTask, identityReference("tasks.id")},
 	{"journal_task_events", "task_id", identityEventTask, identityReference("tasks.id")},
 	{"governed_allocation_operations", "actor_id", identityAllocationActor, identityReference("agents.id")},
+	// The verified agent proof copies agents.id. It is ledger machinery, not a
+	// foreign key: a proof row may name an agent the registry no longer holds
+	// (substitution and deletion detection), so the DDL cannot declare
+	// REFERENCES agents(id). Conversion still owns the column and rewrites it
+	// with the agent identity codec. The digest is left stale on purpose; the
+	// next open re-verifies and re-seeds it.
+	{"provenance_verified_agent", "agent_id", identityVerifiedAgent, identityModelType("ptypes.ActorID")},
 }
 
 // ownedContextIdentityColumns is the declared membership for the kind/identity

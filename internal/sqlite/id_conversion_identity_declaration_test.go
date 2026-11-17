@@ -113,6 +113,17 @@ func declaredReferenceTarget(t *testing.T, declaration identityDeclaration) (str
 func TestOwnedIdentityColumnsMatchDeclaredSchema(t *testing.T) {
 	ctx := context.Background()
 	db := newJournalDB(t)
+	// Ephemeral opens skip the verified ledger, so the gate would otherwise
+	// never see provenance_verified_agent. Create the production DDL here.
+	// It has no foreign key: a proof row may name an agent the registry no
+	// longer holds. The owned declaration is therefore a model type, not an
+	// identityReference, and this fixture must stay the production shape.
+	if strings.Contains(verifiedAgentProofDDL, "REFERENCES") {
+		t.Fatal("verified agent proof DDL gained a foreign key; cite that reference in ownedIdentityColumns instead of a model type")
+	}
+	if _, err := db.db.ExecContext(ctx, verifiedAgentProofDDL); err != nil {
+		t.Fatalf("create verified agent proof fixture: %v", err)
+	}
 	columns, references := readSchema(t, ctx, db)
 
 	columnSet := map[string]schemaColumn{}
@@ -162,6 +173,10 @@ func TestOwnedIdentityColumnsMatchDeclaredSchema(t *testing.T) {
 	}
 	if _, ok := opaqueSet["actor_namespace_claims.claimant_id"]; !ok {
 		t.Fatal("actor_namespace_claims.claimant_id is not recorded as a preserved-opaque label")
+	}
+	proof, owned := memberSet["provenance_verified_agent.agent_id"]
+	if !owned || proof.selector != identityVerifiedAgent || proof.declaration.kind != identityFromModelType || proof.declaration.ownerType != "ptypes.ActorID" {
+		t.Fatalf("provenance_verified_agent.agent_id declaration = %+v, want owned model-typed ptypes.ActorID", proof)
 	}
 
 	// Direction A: every member carries a satisfied identity declaration. An
