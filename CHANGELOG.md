@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.10.6 - 2026-11-17
+
+### Fixed
+
+- ID format conversion now rewrites `provenance_verified_agent.agent_id`
+  with the agent identity set. A legacy migration no longer leaves the
+  verified agent proof holding retired IDs; the stale digest makes the
+  next open re-verify and re-seed the proof.
+
 ## v0.10.5 - 2026-11-17
 
 ### Performance
