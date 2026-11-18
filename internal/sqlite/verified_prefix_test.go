@@ -620,6 +620,72 @@ func TestVerifiedPrefixVersionIsPinnedAndForcesFullPath(t *testing.T) {
 // Tail validation, counts, and boundary
 // ---------------------------------------------------------------------------
 
+func TestVerifiedPrefixBehindLedgerOpenFastAndPartial(t *testing.T) {
+	for _, partial := range []bool{false, true} {
+		name := "current"
+		if partial {
+			name = "partial"
+		}
+		t.Run(name, func(t *testing.T) {
+			fixture := buildPrefixFixture(t)
+			db, err := Open(fixture.path, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			applyPrefixFacts(t, db, fixture.actor, fixture.task, fixture.boot, "behind-open-"+name)
+			if partial {
+				if _, err := db.RegisterSoftwareAgent("verified", "behind-partial-agent", "0", "verified_prefix_test"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			scope := takePoolScope(t, db)
+			through, digests, ok := scope.readVerifiedPrefix()
+			ledger, ledgerOK := scope.readVerifiedLedger()
+			if !ok || !ledgerOK || through >= ledger.identity.journalID {
+				t.Fatalf("expected prefix behind ledger: through=%d ledger=%+v", through, ledger)
+			}
+			if partial {
+				before, err := scope.readVerifiedStoreIdentity()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, eligible := scope.partialLedgerEligible(before, nil); !eligible {
+					t.Fatal("fixture is not eligible for the partial path")
+				}
+				if scope.verifiedLedgerMatches() {
+					t.Fatal("partial fixture unexpectedly has a current ledger")
+				}
+			} else if !scope.verifiedLedgerMatches() {
+				t.Fatal("fast-path fixture does not have a current ledger")
+			}
+			scope.release()
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			_, countBefore := readLedgerGeneration(t, fixture.path)
+			db, err = Open(fixture.path, nil)
+			if err != nil {
+				t.Fatalf("production Open: %v", err)
+			}
+			scope = takePoolScope(t, db)
+			if !scope.verifiedLedgerMatches() {
+				t.Fatal("ledger is not current after Open")
+			}
+			afterThrough, afterDigests, afterOK := scope.readVerifiedPrefix()
+			if !afterOK || afterThrough != through || afterDigests != digests {
+				t.Fatalf("Open did not carry prefix: %d %+v -> %d %+v", through, digests, afterThrough, afterDigests)
+			}
+			scope.release()
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if _, countAfter := readLedgerGeneration(t, fixture.path); countAfter != countBefore {
+				t.Fatalf("Open ran whole-store verification: count %d -> %d", countBefore, countAfter)
+			}
+		})
+	}
+}
+
 func TestVerifiedPrefixBehindLedgerFastPathButNotFullTrust(t *testing.T) {
 	fixture := buildPrefixFixture(t)
 	db, err := Open(fixture.path, nil)

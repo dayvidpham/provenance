@@ -512,8 +512,9 @@ func (scope *connScope) verifiedPrefixVersionCurrent() bool {
 }
 
 // verifiedPrefixUsableForLedger permits a sanctioned write to advance the
-// ledger without rehashing the prefix. It never arms prefix trust: a full
-// validation requires the exact boundary in verifiedPrefixRowCurrent.
+// ledger without rehashing the prefix. Fast and partial paths can carry this
+// behind prefix; full-path trust requires the exact boundary. Consequently, the
+// next stale full path decodes the whole journal once and renews the prefix.
 func (scope *connScope) verifiedPrefixUsableForLedger(through int64) bool {
 	recorded, digests, ok := scope.readVerifiedPrefix()
 	return ok && recorded <= through && prefixDigestCurrent(digests.journal) && prefixDigestCurrent(digests.contexts)
