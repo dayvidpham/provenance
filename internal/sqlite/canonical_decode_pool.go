@@ -50,6 +50,15 @@ func canonicalDecodeWorkers() int {
 // shared mutable state, because later indexes may be produced (and discarded)
 // after an earlier index fails.
 //
+// produce must not panic: it runs on a pool goroutine, so a panic there would
+// crash the process instead of unwinding through the caller. Both call sites
+// decode and return errors as values, so no recovery is added here.
+//
+// Cancellation: when consume returns an error, forEachOrdered signals the
+// workers and then waits for every worker to exit, so an early return waits for
+// the chunks already in flight to finish producing. That wait is bounded by at
+// most workers chunks of pure decode work; no goroutine outlives the call.
+//
 // Memory: indexes are claimed in contiguous chunks and at most
 // workers*canonicalDecodeWindowPerWorker chunks are in flight, so only that
 // many results exist at once. The input slice is indexed, never copied.

@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"runtime"
 	"strconv"
 	"testing"
 
@@ -105,7 +106,7 @@ func loadCanonicalDecodeSample(b *testing.B, want int) [][]byte {
 
 // BenchmarkCanonicalDecodeParallel measures the startup walk's decode phase
 // (decode, digest, effect normalization) over the sampled spread on the same
-// worker pool the validators use, at 1, 2, 4, 8, and 16 workers. One iteration
+// worker pool the validators use, at 1, 2, 3, 4, 8, and 16 workers. One iteration
 // is one walk over the whole sample, so ns/op is the wall time of the decode
 // loop; ns/operation is reported alongside. It reads the store read-only and
 // does not copy it.
@@ -119,7 +120,8 @@ func BenchmarkCanonicalDecodeParallel(b *testing.B) {
 		size = n
 	}
 	samples := loadCanonicalDecodeSample(b, size)
-	for _, workers := range []int{1, 2, 4, 8, 16} {
+	b.Logf("GOMAXPROCS=%d NumCPU=%d sample=%d", runtime.GOMAXPROCS(0), runtime.NumCPU(), len(samples))
+	for _, workers := range []int{1, 2, 3, 4, 8, 16} {
 		b.Run(fmt.Sprintf("workers-%d", workers), func(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()

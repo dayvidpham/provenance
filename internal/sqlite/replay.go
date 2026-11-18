@@ -517,6 +517,13 @@ type canonicalStoredOperation struct {
 	wireSet      bool
 }
 
+// hasWellFormedEncoding reports whether both canonical columns are present and
+// non-empty. Anything else is skipped (no columns) or rejected (a one-sided or
+// empty pair) by the in-order consumer, so the pool never decodes it.
+func (op canonicalStoredOperation) hasWellFormedEncoding() bool {
+	return op.versionSet && op.wireSet && op.version != "" && len(op.wire) > 0
+}
+
 type canonicalColumnShape uint8
 
 const (
@@ -615,17 +622,17 @@ func (scope *connScope) validateCanonicalOperations() error {
 	// they run on a bounded pool ahead of this loop. Every database read and
 	// every check below stays on this goroutine, in anchor order, so the first
 	// error reported is the first in anchor order exactly as in a sequential walk.
-	return forEachOrdered(len(operations), canonicalDecodeWorkers(), func(i int) decodedCanonicalOperation {
-		return decodeStoredCanonicalOperation(operations[i])
-	}, func(i int, decoded decodedCanonicalOperation) error {
-		op := operations[i]
-		if op.versionSet != op.wireSet {
-			return canonicalCorruption(op.anchor, "encoding columns", op.version, fmt.Sprintf("%d bytes", len(op.wire)))
+	//
+	// The producer must stay free of database access and must not panic (see
+	// forEachOrdered); decoding reports failure as a value.
+	return forEachOrdered(len(operations), canonicalDecodeWorkers(), func(opIndex int) decodedCanonicalOperation {
+		return decodeStoredCanonicalOperation(operations[opIndex])
+	}, func(opIndex int, decoded decodedCanonicalOperation) error {
+		op := operations[opIndex]
+		if !op.versionSet && !op.wireSet {
+			return nil // a legacy operation without canonical columns has nothing to decode
 		}
-		if !op.versionSet {
-			return nil
-		}
-		if op.version == "" || len(op.wire) == 0 {
+		if !op.hasWellFormedEncoding() {
 			return canonicalCorruption(op.anchor, "encoding columns", op.version, fmt.Sprintf("%d bytes", len(op.wire)))
 		}
 		if decoded.err != nil {
@@ -724,7 +731,7 @@ type decodedCanonicalOperation struct {
 // well-formed version/bytes pair. Operations the sequential checks reject or skip
 // are left undecoded; the in-order consumer reports them before reading the result.
 func decodeStoredCanonicalOperation(op canonicalStoredOperation) decodedCanonicalOperation {
-	if !op.versionSet || !op.wireSet || op.version == "" || len(op.wire) == 0 {
+	if !op.hasWellFormedEncoding() {
 		return decodedCanonicalOperation{}
 	}
 	prepared, err := journal.DecodeCanonicalMutation(op.wire)

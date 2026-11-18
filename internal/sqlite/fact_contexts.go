@@ -825,14 +825,17 @@ func (scope *connScope) validateCanonicalFactContextSets() error {
 	// Decode and effect normalization are pure, so they run on a bounded pool;
 	// the context comparison runs here in anchor order, which keeps the reported
 	// error the first one in anchor order.
-	return forEachOrdered(len(operations), canonicalDecodeWorkers(), func(i int) decodedCanonicalOperation {
-		prepared, err := journal.DecodeCanonicalMutation(operations[i].wire)
+	//
+	// The producer must stay free of database access and must not panic (see
+	// forEachOrdered); decoding reports failure as a value.
+	return forEachOrdered(len(operations), canonicalDecodeWorkers(), func(opIndex int) decodedCanonicalOperation {
+		prepared, err := journal.DecodeCanonicalMutation(operations[opIndex].wire)
 		if err != nil {
 			return decodedCanonicalOperation{err: err}
 		}
 		return decodedCanonicalOperation{prepared: prepared, effects: prepared.NormalizedEffects()}
-	}, func(i int, decoded decodedCanonicalOperation) error {
-		operation := operations[i]
+	}, func(opIndex int, decoded decodedCanonicalOperation) error {
+		operation := operations[opIndex]
 		if decoded.err != nil {
 			return fmt.Errorf("decode canonical operation %d for fact-context validation: %w — where: validateCanonicalFactContextSets; when: startup fact-context validation over stored canonical operations; impact: the open fails closed and no fact-context set is accepted; fix: %s", operation.anchor, decoded.err, unsupportedPreV004DatabaseFix)
 		}
