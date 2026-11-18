@@ -611,27 +611,34 @@ func (scope *connScope) validateCanonicalOperations() error {
 	if err != nil {
 		return fmt.Errorf("startup canonical validation: %w", err)
 	}
-	for _, op := range operations {
+	// Decode, digest, and effect normalization are pure per-operation work, so
+	// they run on a bounded pool ahead of this loop. Every database read and
+	// every check below stays on this goroutine, in anchor order, so the first
+	// error reported is the first in anchor order exactly as in a sequential walk.
+	return forEachOrdered(len(operations), canonicalDecodeWorkers(), func(i int) decodedCanonicalOperation {
+		return decodeStoredCanonicalOperation(operations[i])
+	}, func(i int, decoded decodedCanonicalOperation) error {
+		op := operations[i]
 		if op.versionSet != op.wireSet {
 			return canonicalCorruption(op.anchor, "encoding columns", op.version, fmt.Sprintf("%d bytes", len(op.wire)))
 		}
 		if !op.versionSet {
-			continue
+			return nil
 		}
 		if op.version == "" || len(op.wire) == 0 {
 			return canonicalCorruption(op.anchor, "encoding columns", op.version, fmt.Sprintf("%d bytes", len(op.wire)))
 		}
-		prepared, err := journal.DecodeCanonicalMutation(op.wire)
-		if err != nil {
-			return fmt.Errorf("startup canonical validation operation %d: %w — where: startup canonical validation; when: decoding stored canonical operation bytes before the database is accepted; impact: the open fails closed and nothing is written; fix: %s", op.anchor, err, unsupportedPreV004DatabaseFix)
+		if decoded.err != nil {
+			return fmt.Errorf("startup canonical validation operation %d: %w — where: startup canonical validation; when: decoding stored canonical operation bytes before the database is accepted; impact: the open fails closed and nothing is written; fix: %s", op.anchor, decoded.err, unsupportedPreV004DatabaseFix)
 		}
+		prepared := decoded.prepared
 		if op.version != prepared.EncodingVersion().String() {
 			return canonicalCorruption(op.anchor, "encoding version", op.version, prepared.EncodingVersion().String())
 		}
-		if !bytes.Equal(op.digest, prepared.DerivedDigest()) {
-			return canonicalCorruption(op.anchor, "mutation digest", fmt.Sprintf("%x", op.digest), fmt.Sprintf("%x", prepared.DerivedDigest()))
+		if !bytes.Equal(op.digest, decoded.digest) {
+			return canonicalCorruption(op.anchor, "mutation digest", fmt.Sprintf("%x", op.digest), fmt.Sprintf("%x", decoded.digest))
 		}
-		effects := prepared.NormalizedEffects()
+		effects := decoded.effects
 		rows := produced[op.anchor]
 		if len(rows) != len(effects) {
 			field := "effect row count"
@@ -700,8 +707,31 @@ func (scope *connScope) validateCanonicalOperations() error {
 				return fmt.Errorf("operation %d effect %d: %w", op.anchor, i, err)
 			}
 		}
+		return nil
+	})
+}
+
+// decodedCanonicalOperation is the pure, database-free product of decoding one
+// stored operation. It is computed on a pool worker and consumed in anchor order.
+type decodedCanonicalOperation struct {
+	prepared journal.CanonicalMutation
+	digest   []byte
+	effects  []journal.Effect
+	err      error
+}
+
+// decodeStoredCanonicalOperation decodes one stored operation when it carries a
+// well-formed version/bytes pair. Operations the sequential checks reject or skip
+// are left undecoded; the in-order consumer reports them before reading the result.
+func decodeStoredCanonicalOperation(op canonicalStoredOperation) decodedCanonicalOperation {
+	if !op.versionSet || !op.wireSet || op.version == "" || len(op.wire) == 0 {
+		return decodedCanonicalOperation{}
 	}
-	return nil
+	prepared, err := journal.DecodeCanonicalMutation(op.wire)
+	if err != nil {
+		return decodedCanonicalOperation{err: err}
+	}
+	return decodedCanonicalOperation{prepared: prepared, digest: prepared.DerivedDigest(), effects: prepared.NormalizedEffects()}
 }
 
 func (scope *connScope) validateCanonicalResultSlots(anchor int64, rows []int64, effects []journal.Effect) error {
