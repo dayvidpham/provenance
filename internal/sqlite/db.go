@@ -2255,7 +2255,7 @@ func preflightExistingReadOnly(target openTarget, models []ptypes.ModelEntry) (b
 				// read-only checks here keeps the preflight's clone skip; a
 				// concurrent write, a torn vector, or any journal/projection change
 				// still falls through to the whole-store path below.
-				if before, err := preflight.readVerifiedStoreIdentity(); err == nil {
+				if before, err := preflight.readVerifiedStoreIdentity(); err == nil && preflight.verifiedPrefixVersionCurrent() {
 					if _, eligible := preflight.partialLedgerEligible(before, models); eligible {
 						ledgerCurrent = true
 					}

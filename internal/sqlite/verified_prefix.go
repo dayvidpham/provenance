@@ -64,7 +64,12 @@ func prefixDigestRecorded(sum string) string { return verifiedPrefixValidatorVer
 // prefixDigestCurrent reports whether a recorded digest carries this build's
 // validator version.
 func prefixDigestCurrent(recorded string) bool {
-	return strings.HasPrefix(recorded, verifiedPrefixValidatorVersion+":")
+	prefix := verifiedPrefixValidatorVersion + ":"
+	if !strings.HasPrefix(recorded, prefix) || len(recorded) != len(prefix)+sha256.Size*2 {
+		return false
+	}
+	_, err := hex.DecodeString(recorded[len(prefix):])
+	return err == nil
 }
 
 // verifiedPrefixDigests are the two prefix digests. They are separate so a change
@@ -487,11 +492,20 @@ func (scope *connScope) clearVerifiedPrefix() error {
 // seedVerifiedPrefixIfAbsent is the adoption seed. The ledger already proves the
 // store at through, so the digests are recorded with a hash-only pass and no
 // decode. A usable row for exactly this through is left alone.
-func (scope *connScope) seedVerifiedPrefixIfAbsent(through int64) error {
-	if scope.verifiedPrefixRowCurrent(through) {
-		return nil
+func (scope *connScope) seedVerifiedPrefixIfAbsent(through int64) (bool, error) {
+	var exists bool
+	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT EXISTS(SELECT 1 FROM provenance_verified_prefix WHERE id = 1)").Scan(&exists); err != nil {
+		return false, err
 	}
-	return scope.writeVerifiedPrefix(through, nil)
+	if exists {
+		return scope.verifiedPrefixRowCurrent(through), nil
+	}
+	return true, scope.writeVerifiedPrefix(through, nil)
+}
+
+func (scope *connScope) verifiedPrefixVersionCurrent() bool {
+	_, digests, ok := scope.readVerifiedPrefix()
+	return ok && prefixDigestCurrent(digests.journal) && prefixDigestCurrent(digests.contexts)
 }
 
 // verifiedPrefixRowCurrent reports whether the recorded row is usable, is for

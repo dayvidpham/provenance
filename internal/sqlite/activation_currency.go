@@ -236,7 +236,7 @@ func (scope *connScope) activationConvergenceVerified(models []ptypes.ModelEntry
 	// exactly those tables and record the same proof for the new identity. Any
 	// journal- or projection-derived change, any torn vector, and any table
 	// without local coverage falls through to the whole-store path.
-	if scope.partialLedgerChecks(before, models) {
+	if scope.verifiedPrefixVersionCurrent() && scope.partialLedgerChecks(before, models) {
 		return scope.persistVerifiedChangedTablesIfUnchanged(before), nil
 	}
 	releasePrefix := scope.trustVerifiedPrefix()

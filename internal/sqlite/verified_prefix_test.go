@@ -548,6 +548,27 @@ func init() {
 // Validator and decoder version
 // ---------------------------------------------------------------------------
 
+func TestPrefixDigestCurrentEncoding(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		value   string
+		current bool
+	}{
+		{"valid", prefixDigestRecorded(strings.Repeat("ab", 32)), true},
+		{"empty", prefixDigestRecorded(""), false},
+		{"short", prefixDigestRecorded(strings.Repeat("a", 63)), false},
+		{"long", prefixDigestRecorded(strings.Repeat("a", 65)), false},
+		{"non-hex", prefixDigestRecorded(strings.Repeat("z", 64)), false},
+		{"old-version", "old:" + strings.Repeat("a", 64), false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := prefixDigestCurrent(test.value); got != test.current {
+				t.Fatalf("prefixDigestCurrent(%q) = %v, want %v", test.value, got, test.current)
+			}
+		})
+	}
+}
+
 func TestVerifiedPrefixVersionIsPinnedAndForcesFullPath(t *testing.T) {
 	// Pinned on purpose: change this together with verifiedPrefixValidatorVersion
 	// when the canonical decoder or validators change.
@@ -569,17 +590,17 @@ func TestVerifiedPrefixVersionIsPinnedAndForcesFullPath(t *testing.T) {
 	if _, err := openVerifiedTablesTestDB(t, fixture.path).Exec("UPDATE "+verifiedPrefixTable+" SET journal_digest=?1", other); err != nil {
 		t.Fatal(err)
 	}
-	db, err := Open(fixture.path, nil)
+	raw := openVerifiedTablesTestDB(t, fixture.path)
+	conn, err := raw.Conn(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	scope := takePoolScope(t, db)
+	scope := borrowConnScope(conn, projectionTargetLive)
 	markLedgerStale(t, scope)
 	if trust := scope.resolveVerifiedPrefix(); trust != (verifiedPrefixTrust{}) {
 		t.Fatalf("trust = %+v for a prefix recorded under another validator version, want none", trust)
 	}
-	scope.release()
-	if err := db.Close(); err != nil {
+	if err := conn.Close(); err != nil {
 		t.Fatal(err)
 	}
 	_, countBefore := readLedgerGeneration(t, fixture.path)
@@ -830,18 +851,17 @@ func TestVerifiedPrefixTrustDoesNotBypassRegistryChecks(t *testing.T) {
 
 			// The prefix digests only the journal families, so the prefix itself
 			// stays trusted: the protection comes from the separate checks.
-			func() {
-				db, err := Open(fixture.path, nil)
-				if err == nil {
-					defer db.Close()
-					scope := takePoolScope(t, db)
-					defer scope.release()
-					if trust := scope.resolveVerifiedPrefix(); !trust.journal || !trust.contexts {
-						t.Fatalf("trust = %+v, want the journal prefix still trusted", trust)
-					}
-					return
-				}
-			}()
+			conn, err := openVerifiedTablesTestDB(t, fixture.path).Conn(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			scope := borrowConnScope(conn, projectionTargetLive)
+			if trust := scope.resolveVerifiedPrefix(); !trust.journal || !trust.contexts {
+				t.Fatalf("trust = %+v, want the journal prefix still trusted", trust)
+			}
+			if err := conn.Close(); err != nil {
+				t.Fatal(err)
+			}
 			db, err := Open(fixture.path, nil)
 			if err == nil {
 				_ = db.Close()
@@ -904,8 +924,7 @@ func TestVerifiedPrefixOldRowMutationIsNotTrusted(t *testing.T) {
 // TestVerifiedPrefixGenerationShortcutSkipsWithoutAHash proves the "stale ledger,
 // unchanged generations" rule directly: with the prefix tables' counters equal
 // to the ledger's, the prefix is trusted even though the recorded digest is
-// unusable for a comparison; once a prefix table's counter moves, only a
-// matching digest can trust it.
+// syntactically valid but mismatched; malformed digests are never trusted.
 func TestVerifiedPrefixGenerationShortcutSkipsWithoutAHash(t *testing.T) {
 	fixture := buildPrefixFixture(t)
 	db, err := Open(fixture.path, nil)
@@ -920,12 +939,21 @@ func TestVerifiedPrefixGenerationShortcutSkipsWithoutAHash(t *testing.T) {
 	if scope.verifiedLedgerMatches() {
 		t.Fatal("the ledger should be stale")
 	}
-	bogus := prefixDigestRecorded("not-a-digest")
+	bogus := prefixDigestRecorded(strings.Repeat("0", 64))
 	if _, err := scope.conn.ExecContext(scope.ctx, "UPDATE "+verifiedPrefixTable+" SET journal_digest=?1, contexts_digest=?1", bogus); err != nil {
 		t.Fatal(err)
 	}
 	if trust := scope.resolveVerifiedPrefix(); !trust.journal || !trust.contexts {
 		t.Fatalf("trust = %+v, want both families skipped on unchanged generations without comparing the digest", trust)
+	}
+	if _, err := scope.conn.ExecContext(scope.ctx, "UPDATE "+verifiedPrefixTable+" SET journal_digest=?1", prefixDigestRecorded("not-a-digest")); err != nil {
+		t.Fatal(err)
+	}
+	if trust := scope.resolveVerifiedPrefix(); trust != (verifiedPrefixTrust{}) {
+		t.Fatalf("trust = %+v for malformed digest, want none", trust)
+	}
+	if _, err := scope.conn.ExecContext(scope.ctx, "UPDATE "+verifiedPrefixTable+" SET journal_digest=?1", bogus); err != nil {
+		t.Fatal(err)
 	}
 
 	// A prefix table moves: the shortcut no longer applies and the bogus digest
@@ -1046,6 +1074,87 @@ func TestVerifiedPrefixAdoptionSeedsWithoutADecode(t *testing.T) {
 	fresh, err := scope.computeVerifiedPrefixDigests(through)
 	if err != nil || fresh != recorded {
 		t.Fatalf("seeded digests %+v, fresh %+v (%v)", recorded, fresh, err)
+	}
+}
+
+// A forged old proof must not hide an invalid canonical operation or be
+// renewed on a failed open, even when the other ledger identities still match.
+func TestVerifiedPrefixVersionEnforcedByOpen(t *testing.T) {
+	for _, route := range []string{"current", "adoption", "partial", "malformed", "missing"} {
+		t.Run(route, func(t *testing.T) {
+			fixture := buildPrefixFixture(t)
+			through, original := mustReadPrefixRow(t, fixture.path)
+			raw := openVerifiedTablesTestDB(t, fixture.path)
+			if route == "adoption" {
+				generation, _ := readLedgerGeneration(t, fixture.path)
+				if err := simulateV3Ledger(t, fixture.path, generation); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := raw.Exec(verifiedPrefixDDL); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := raw.Exec("INSERT INTO "+verifiedPrefixTable+" VALUES (1, ?1, ?2, ?3)", through, original.journal, original.contexts); err != nil {
+					t.Fatal(err)
+				}
+			}
+			old := strings.Replace(original.journal, verifiedPrefixValidatorVersion, "old-validator", 1)
+			if route == "malformed" {
+				old = prefixDigestRecorded(strings.Repeat("z", 64))
+			}
+			if route == "missing" {
+				if _, err := raw.Exec("DELETE FROM " + verifiedPrefixTable); err != nil {
+					t.Fatal(err)
+				}
+			} else if _, err := raw.Exec("UPDATE "+verifiedPrefixTable+" SET journal_digest=?1", old); err != nil {
+				t.Fatal(err)
+			}
+			if route == "partial" {
+				if _, err := raw.Exec("UPDATE "+verifiedTableGenerationTable+" SET generation=generation+1 WHERE table_id=?1", verifiedTableID("agents")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var digest []byte
+			if err := raw.QueryRow("SELECT mutation_digest FROM journal_operations WHERE journal_id=?1", fixture.anchor).Scan(&digest); err != nil {
+				t.Fatal(err)
+			}
+			adjust := "UPDATE " + verifiedTableGenerationTable + " SET generation=generation-1 WHERE table_id=?1"
+			args := []any{verifiedTableID("journal_operations")}
+			if route == "adoption" {
+				adjust = "UPDATE " + storeGenerationTable + " SET generation=generation-1 WHERE id=1"
+				args = nil
+			}
+			mutate := func(value []byte) {
+				t.Helper()
+				if _, err := raw.Exec("UPDATE journal_operations SET mutation_digest=?1 WHERE journal_id=?2", value, fixture.anchor); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := raw.Exec(adjust, args...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			mutate([]byte{0})
+			db, err := Open(fixture.path, nil)
+			if err == nil {
+				_ = db.Close()
+				t.Fatal("open accepted an invalid canonical operation under an incompatible prefix")
+			}
+			_, after, exists := readPrefixRow(t, fixture.path)
+			if route == "missing" {
+				if exists {
+					t.Fatal("failed open seeded a missing prefix")
+				}
+			} else if !exists || after.journal != old {
+				t.Fatalf("failed open changed the old proof: %+v", after)
+			}
+			mutate(digest)
+			if err := reopenFileBacked(t, fixture.path); err != nil {
+				t.Fatalf("open after restoring valid operation: %v", err)
+			}
+			_, renewed := mustReadPrefixRow(t, fixture.path)
+			if !prefixDigestCurrent(renewed.journal) || !prefixDigestCurrent(renewed.contexts) {
+				t.Fatalf("prefix not renewed after validation: %+v", renewed)
+			}
+		})
 	}
 }
 

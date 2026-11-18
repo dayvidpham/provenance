@@ -772,12 +772,11 @@ func (scope *connScope) adoptCurrentVerifiedLedger() (bool, error) {
 		if !identityEqual(ledger.identity, now) {
 			return false, nil
 		}
-		if err := scope.writeVerifiedAgentSet(); err != nil {
+		seeded, err := scope.seedVerifiedPrefixIfAbsent(ledger.identity.journalID)
+		if err != nil || !seeded {
 			return false, err
 		}
-		// The ledger proves the store at its journal id, so the verified prefix
-		// is seeded by hashing the stored rows. No operation is decoded.
-		if err := scope.seedVerifiedPrefixIfAbsent(ledger.identity.journalID); err != nil {
+		if err := scope.writeVerifiedAgentSet(); err != nil {
 			return false, err
 		}
 		return true, nil
@@ -797,13 +796,14 @@ func (scope *connScope) adoptCurrentVerifiedLedger() (bool, error) {
 	if !migrationIdentityMatches(ledgerRow.identity, now) {
 		return false, nil
 	}
+	seeded, err := scope.seedVerifiedPrefixIfAbsent(ledgerRow.identity.journalID)
+	if err != nil || !seeded {
+		return false, err
+	}
 	if err := scope.writeVerifiedTableVector(now.generations); err != nil {
 		return false, err
 	}
 	if err := scope.writeVerifiedAgentSet(); err != nil {
-		return false, err
-	}
-	if err := scope.seedVerifiedPrefixIfAbsent(ledgerRow.identity.journalID); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -818,6 +818,19 @@ func (scope *connScope) adoptableVerifiedLedger() (bool, error) {
 	ledger, ok := scope.readVerifiedLedgerRowOnly()
 	if !ok || ledger.shapeID != verifiedShapeID() {
 		return false, nil
+	}
+	prefixTable, err := scope.tableExists(verifiedPrefixTable)
+	if err != nil {
+		return false, err
+	}
+	if prefixTable {
+		var exists bool
+		if err := scope.conn.QueryRowContext(scope.ctx, "SELECT EXISTS(SELECT 1 FROM provenance_verified_prefix WHERE id = 1)").Scan(&exists); err != nil {
+			return false, err
+		}
+		if exists && !scope.verifiedPrefixRowCurrent(ledger.identity.journalID) {
+			return false, nil
+		}
 	}
 	exists, err := scope.tableExists(verifiedTableProofTable)
 	if err != nil {
