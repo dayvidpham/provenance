@@ -691,7 +691,7 @@ func (scope *connScope) verifiedLedgerCurrent() (bool, error) {
 // snapshot (see [connScope.verifiedLedgerCurrent]).
 func (scope *connScope) verifiedLedgerMatches() bool {
 	ledger, ok := scope.readVerifiedLedger()
-	if !ok || !scope.verifiedPrefixVersionCurrent() {
+	if !ok || !scope.verifiedPrefixUsableForLedger(ledger.identity.journalID) {
 		return false
 	}
 	if ledger.shapeID != verifiedShapeID() {
@@ -887,7 +887,7 @@ func (scope *connScope) persistVerifiedChangedTablesIfUnchanged(before verifiedS
 			return errVerifiedStoreMovedDuringVerification
 		}
 		ledger, ok := scope.readVerifiedLedger()
-		if !ok || !scope.verifiedPrefixVersionCurrent() {
+		if !ok || !scope.verifiedPrefixUsableForLedger(ledger.identity.journalID) {
 			return errVerifiedStoreMovedDuringVerification
 		}
 		if err := scope.advanceVerifiedTableVector(now.generations, ledger.identity.generations); err != nil {

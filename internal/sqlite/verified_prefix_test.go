@@ -620,6 +620,40 @@ func TestVerifiedPrefixVersionIsPinnedAndForcesFullPath(t *testing.T) {
 // Tail validation, counts, and boundary
 // ---------------------------------------------------------------------------
 
+func TestVerifiedPrefixBehindLedgerFastPathButNotFullTrust(t *testing.T) {
+	fixture := buildPrefixFixture(t)
+	db, err := Open(fixture.path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyPrefixFacts(t, db, fixture.actor, fixture.task, fixture.boot, "sanctioned-behind-prefix")
+	scope := takePoolScope(t, db)
+	through, _, ok := scope.readVerifiedPrefix()
+	ledger, ledgerOK := scope.readVerifiedLedger()
+	if !ok || !ledgerOK || through >= ledger.identity.journalID || !scope.verifiedLedgerMatches() {
+		t.Fatalf("sanctioned write did not leave a usable behind prefix: through=%d ledger=%+v", through, ledger)
+	}
+	if trust := scope.resolveVerifiedPrefix(); trust != (verifiedPrefixTrust{}) {
+		t.Fatalf("behind prefix armed full-path trust: %+v", trust)
+	}
+	markLedgerStale(t, scope)
+	scope.release()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, before := readLedgerGeneration(t, fixture.path)
+	if err := reopenFileBacked(t, fixture.path); err != nil {
+		t.Fatal(err)
+	}
+	if _, after := readLedgerGeneration(t, fixture.path); after != before+1 {
+		t.Fatalf("stale full path did not verify the store: count %d -> %d", before, after)
+	}
+	through, _ = mustReadPrefixRow(t, fixture.path)
+	if want := ledgerJournalID(t, fixture.path); through != want {
+		t.Fatalf("full validation did not renew prefix: through %d, ledger %d", through, want)
+	}
+}
+
 func TestVerifiedPrefixTailValidatesOnlyTheTail(t *testing.T) {
 	fixture := buildStaleTailFixture(t)
 	scope := takePoolScope(t, fixture.db)
@@ -1077,10 +1111,52 @@ func TestVerifiedPrefixAdoptionSeedsWithoutADecode(t *testing.T) {
 	}
 }
 
+func TestVerifiedPrefixActivationSeedsOnlyAbsentLegacyTable(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		name := "existing-table-missing-row"
+		if legacy {
+			name = "absent-legacy-table"
+		}
+		t.Run(name, func(t *testing.T) {
+			fixture := buildPrefixFixture(t)
+			raw := openVerifiedTablesTestDB(t, fixture.path)
+			if legacy {
+				generation, _ := readLedgerGeneration(t, fixture.path)
+				if err := simulateV3Ledger(t, fixture.path, generation); err != nil {
+					t.Fatal(err)
+				}
+			} else if _, err := raw.Exec("DELETE FROM " + verifiedPrefixTable); err != nil {
+				t.Fatal(err)
+			}
+			conn, err := raw.Conn(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			scope := borrowConnScope(conn, projectionTargetLive)
+			if err := activateSchema(scope, nil, defaultActivationRetryPolicy()); err != nil {
+				t.Fatalf("activate: %v", err)
+			}
+			if legacy && scope.canonicalOperationsVisited != 0 {
+				t.Fatalf("legacy adoption decoded %d operations", scope.canonicalOperationsVisited)
+			}
+			if !legacy && (scope.canonicalOperationsVisited == 0 || scope.factContextOperationsVisited == 0) {
+				t.Fatalf("missing row bypassed full validation: canonical=%d contexts=%d", scope.canonicalOperationsVisited, scope.factContextOperationsVisited)
+			}
+			if err := conn.Close(); err != nil {
+				t.Fatal(err)
+			}
+			_, digests := mustReadPrefixRow(t, fixture.path)
+			if !prefixDigestCurrent(digests.journal) || !prefixDigestCurrent(digests.contexts) {
+				t.Fatalf("activation did not record a usable prefix: %+v", digests)
+			}
+		})
+	}
+}
+
 // A forged old proof must not hide an invalid canonical operation or be
 // renewed on a failed open, even when the other ledger identities still match.
 func TestVerifiedPrefixVersionEnforcedByOpen(t *testing.T) {
-	for _, route := range []string{"current", "adoption", "partial", "malformed", "missing"} {
+	for _, route := range []string{"current", "adoption", "partial", "malformed", "missing", "newer", "partial-newer"} {
 		t.Run(route, func(t *testing.T) {
 			fixture := buildPrefixFixture(t)
 			through, original := mustReadPrefixRow(t, fixture.path)
@@ -1105,11 +1181,30 @@ func TestVerifiedPrefixVersionEnforcedByOpen(t *testing.T) {
 				if _, err := raw.Exec("DELETE FROM " + verifiedPrefixTable); err != nil {
 					t.Fatal(err)
 				}
+			} else if strings.Contains(route, "newer") {
+				if _, err := raw.Exec("UPDATE " + verifiedPrefixTable + " SET through_journal_id=through_journal_id+1"); err != nil {
+					t.Fatal(err)
+				}
 			} else if _, err := raw.Exec("UPDATE "+verifiedPrefixTable+" SET journal_digest=?1", old); err != nil {
 				t.Fatal(err)
 			}
-			if route == "partial" {
+			if strings.HasPrefix(route, "partial") {
 				if _, err := raw.Exec("UPDATE "+verifiedTableGenerationTable+" SET generation=generation+1 WHERE table_id=?1", verifiedTableID("agents")); err != nil {
+					t.Fatal(err)
+				}
+				conn, err := raw.Conn(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				scope := borrowConnScope(conn, projectionTargetLive)
+				before, err := scope.readVerifiedStoreIdentity()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, eligible := scope.partialLedgerEligible(before, nil); !eligible {
+					t.Fatal("fixture is not otherwise eligible for partial verification")
+				}
+				if err := conn.Close(); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -1133,26 +1228,50 @@ func TestVerifiedPrefixVersionEnforcedByOpen(t *testing.T) {
 				}
 			}
 			mutate([]byte{0})
+			if route == "adoption" {
+				conn, err := raw.Conn(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				scope := borrowConnScope(conn, projectionTargetLive)
+				err = activateSchema(scope, nil, defaultActivationRetryPolicy())
+				if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("canonical operation %d field mutation digest diverged", fixture.anchor)) {
+					t.Fatalf("activation did not reject the canonical anchor: %v", err)
+				}
+				if err := conn.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
 			db, err := Open(fixture.path, nil)
 			if err == nil {
 				_ = db.Close()
 				t.Fatal("open accepted an invalid canonical operation under an incompatible prefix")
+			}
+			if !strings.Contains(err.Error(), fmt.Sprintf("canonical operation %d field mutation digest diverged", fixture.anchor)) {
+				t.Fatalf("open returned the wrong error for the canonical anchor: %v", err)
 			}
 			_, after, exists := readPrefixRow(t, fixture.path)
 			if route == "missing" {
 				if exists {
 					t.Fatal("failed open seeded a missing prefix")
 				}
-			} else if !exists || after.journal != old {
+			} else if !exists || strings.Contains(route, "newer") && after.journal != original.journal ||
+				!strings.Contains(route, "newer") && after.journal != old {
 				t.Fatalf("failed open changed the old proof: %+v", after)
 			}
 			mutate(digest)
+			_, countBefore := readLedgerGeneration(t, fixture.path)
 			if err := reopenFileBacked(t, fixture.path); err != nil {
 				t.Fatalf("open after restoring valid operation: %v", err)
 			}
 			_, renewed := mustReadPrefixRow(t, fixture.path)
 			if !prefixDigestCurrent(renewed.journal) || !prefixDigestCurrent(renewed.contexts) {
 				t.Fatalf("prefix not renewed after validation: %+v", renewed)
+			}
+			if strings.HasPrefix(route, "partial") {
+				if _, countAfter := readLedgerGeneration(t, fixture.path); countAfter != countBefore+1 {
+					t.Fatalf("partial route did not run whole-store validation: count %d -> %d", countBefore, countAfter)
+				}
 			}
 		})
 	}

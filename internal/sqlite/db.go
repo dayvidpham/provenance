@@ -945,6 +945,10 @@ func activateSchema(scope *connScope, models []ptypes.ModelEntry, policy activat
 		if err := initializeEmptyIDFormat(scope.ctx, scope.conn); err != nil {
 			return err
 		}
+		prefixTableExisted, err := scope.tableExists(verifiedPrefixTable)
+		if err != nil {
+			return fmt.Errorf("inspect verified prefix before schema activation: %w", err)
+		}
 		scope.observeActivation("schema")
 		if err := scope.ensureSchema(models); err != nil {
 			return fmt.Errorf("apply schema: %w", err)
@@ -954,7 +958,7 @@ func activateSchema(scope *connScope, models []ptypes.ModelEntry, policy activat
 		// ordinary case for a v3 store being upgraded, and for a structural repair
 		// that changed no data — adopt that proof instead of re-verifying the whole
 		// journal. Adoption never advances verified_count or verified_at.
-		if adopted, err := scope.adoptCurrentVerifiedLedger(); err != nil {
+		if adopted, err := scope.adoptCurrentVerifiedLedger(!prefixTableExisted); err != nil {
 			return err
 		} else if adopted {
 			return nil

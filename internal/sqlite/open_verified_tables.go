@@ -748,7 +748,7 @@ func (probe agentRegistryProbe) query() string {
 //
 // Adoption never advances verified_count or verified_at: it is not a new
 // verification, only the same proof recorded in the new shape.
-func (scope *connScope) adoptCurrentVerifiedLedger() (bool, error) {
+func (scope *connScope) adoptCurrentVerifiedLedger(legacyPrefixTableAbsent bool) (bool, error) {
 	if scope.ephemeralStore {
 		return false, nil
 	}
@@ -772,7 +772,7 @@ func (scope *connScope) adoptCurrentVerifiedLedger() (bool, error) {
 		if !identityEqual(ledger.identity, now) {
 			return false, nil
 		}
-		seeded, err := scope.seedVerifiedPrefixIfAbsent(ledger.identity.journalID)
+		seeded, err := scope.seedVerifiedPrefixIfAbsent(ledger.identity.journalID, legacyPrefixTableAbsent)
 		if err != nil || !seeded {
 			return false, err
 		}
@@ -796,7 +796,7 @@ func (scope *connScope) adoptCurrentVerifiedLedger() (bool, error) {
 	if !migrationIdentityMatches(ledgerRow.identity, now) {
 		return false, nil
 	}
-	seeded, err := scope.seedVerifiedPrefixIfAbsent(ledgerRow.identity.journalID)
+	seeded, err := scope.seedVerifiedPrefixIfAbsent(ledgerRow.identity.journalID, legacyPrefixTableAbsent)
 	if err != nil || !seeded {
 		return false, err
 	}
@@ -824,11 +824,7 @@ func (scope *connScope) adoptableVerifiedLedger() (bool, error) {
 		return false, err
 	}
 	if prefixTable {
-		var exists bool
-		if err := scope.conn.QueryRowContext(scope.ctx, "SELECT EXISTS(SELECT 1 FROM provenance_verified_prefix WHERE id = 1)").Scan(&exists); err != nil {
-			return false, err
-		}
-		if exists && !scope.verifiedPrefixRowCurrent(ledger.identity.journalID) {
+		if !scope.verifiedPrefixRowCurrent(ledger.identity.journalID) {
 			return false, nil
 		}
 	}

@@ -489,10 +489,10 @@ func (scope *connScope) clearVerifiedPrefix() error {
 	return nil
 }
 
-// seedVerifiedPrefixIfAbsent is the adoption seed. The ledger already proves the
-// store at through, so the digests are recorded with a hash-only pass and no
-// decode. A usable row for exactly this through is left alone.
-func (scope *connScope) seedVerifiedPrefixIfAbsent(through int64) (bool, error) {
+// seedVerifiedPrefixIfAbsent permits the one-time hash-only legacy adoption
+// only when the table was absent before activation. A missing row in an
+// existing prefix-aware table is torn proof and must be validated in full.
+func (scope *connScope) seedVerifiedPrefixIfAbsent(through int64, legacyPrefixTableAbsent bool) (bool, error) {
 	var exists bool
 	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT EXISTS(SELECT 1 FROM provenance_verified_prefix WHERE id = 1)").Scan(&exists); err != nil {
 		return false, err
@@ -500,12 +500,23 @@ func (scope *connScope) seedVerifiedPrefixIfAbsent(through int64) (bool, error) 
 	if exists {
 		return scope.verifiedPrefixRowCurrent(through), nil
 	}
+	if !legacyPrefixTableAbsent {
+		return false, nil
+	}
 	return true, scope.writeVerifiedPrefix(through, nil)
 }
 
 func (scope *connScope) verifiedPrefixVersionCurrent() bool {
-	_, digests, ok := scope.readVerifiedPrefix()
-	return ok && prefixDigestCurrent(digests.journal) && prefixDigestCurrent(digests.contexts)
+	ledger, ok := scope.readVerifiedLedger()
+	return ok && scope.verifiedPrefixUsableForLedger(ledger.identity.journalID)
+}
+
+// verifiedPrefixUsableForLedger permits a sanctioned write to advance the
+// ledger without rehashing the prefix. It never arms prefix trust: a full
+// validation requires the exact boundary in verifiedPrefixRowCurrent.
+func (scope *connScope) verifiedPrefixUsableForLedger(through int64) bool {
+	recorded, digests, ok := scope.readVerifiedPrefix()
+	return ok && recorded <= through && prefixDigestCurrent(digests.journal) && prefixDigestCurrent(digests.contexts)
 }
 
 // verifiedPrefixRowCurrent reports whether the recorded row is usable, is for
