@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.10.8 - 2026-11-18
+
+### Performance
+
+- Full-path canonical validation now caches the verified journal prefix.
+  When the journal and context generations are unchanged, the canonical
+  operation and fact-context validation is skipped; after an append, only the
+  tail is validated. A validator-version change, a wrong boundary, or a digest
+  mismatch forces the full walk.
+
 ## v0.10.7 - 2026-11-17
 
 ### Performance
