@@ -534,9 +534,9 @@ const (
 func (shape canonicalColumnShape) operationsQuery() string {
 	switch shape {
 	case canonicalColumnsPresent:
-		return "SELECT o.journal_id,o.authority_journal_id,o.mutation_encoding_version,o.canonical_mutation,o.mutation_digest,j.actor_id,j.recorded_at FROM journal_operations o JOIN journal j ON j.journal_id=o.journal_id ORDER BY o.journal_id"
+		return "SELECT o.journal_id,o.authority_journal_id,o.mutation_encoding_version,o.canonical_mutation,o.mutation_digest,j.actor_id,j.recorded_at FROM journal_operations o JOIN journal j ON j.journal_id=o.journal_id WHERE o.journal_id>?1 ORDER BY o.journal_id"
 	case canonicalColumnsLegacy:
-		return "SELECT o.journal_id,o.authority_journal_id,?1,?2,o.mutation_digest,j.actor_id,j.recorded_at FROM journal_operations o JOIN journal j ON j.journal_id=o.journal_id ORDER BY o.journal_id"
+		return "SELECT o.journal_id,o.authority_journal_id,?1,?2,o.mutation_digest,j.actor_id,j.recorded_at FROM journal_operations o JOIN journal j ON j.journal_id=o.journal_id WHERE o.journal_id>?3 ORDER BY o.journal_id"
 	default:
 		panic("unknown canonical column shape")
 	}
@@ -564,9 +564,24 @@ func (shape canonicalColumnShape) seedLegacyTasksQuery() string {
 	}
 }
 
+// validateCanonicalOperations validates every stored canonical operation, or only
+// the operations above the verified-prefix boundary when the scope has armed one
+// (see [connScope.trustVerifiedPrefix]).
 func (scope *connScope) validateCanonicalOperations() error {
+	return scope.validateCanonicalOperationsAfter(scope.prefix.operationsAfter())
+}
+
+// validateCanonicalOperationsAfter validates the operations whose anchor is above
+// after. Zero validates all of them. The prefix at or below after was proven by
+// the verified-prefix digest, so it has no error to report and the first error
+// of the tail is the first error in anchor order. A tail whose rows reach back
+// into the prefix's operations widens to the full validation.
+func (scope *connScope) validateCanonicalOperationsAfter(after int64) error {
 	contextSchema, err := scope.classifyFactContextSchema()
 	if err != nil {
+		return err
+	}
+	if after, err = scope.effectiveBoundary(after); err != nil {
 		return err
 	}
 	var operations []canonicalStoredOperation
@@ -578,9 +593,9 @@ func (scope *connScope) validateCanonicalOperations() error {
 	if isLegacyOperationsColumnSet(columns) {
 		shape = canonicalColumnsLegacy
 	}
-	args := []any(nil)
+	args := []any{after}
 	if shape == canonicalColumnsLegacy {
-		args = []any{nil, nil}
+		args = []any{nil, nil, after}
 	}
 	if err := scope.queryRows(shape.operationsQuery(), args, func(rows *sql.Rows) error {
 		var op canonicalStoredOperation
@@ -614,7 +629,7 @@ func (scope *connScope) validateCanonicalOperations() error {
 	}); err != nil {
 		return fmt.Errorf("startup canonical validation: enumerate operations: %w", err)
 	}
-	produced, err := scope.producedJournalRowsByOperation()
+	produced, err := scope.producedJournalRowsByOperationAfter(after)
 	if err != nil {
 		return fmt.Errorf("startup canonical validation: %w", err)
 	}
@@ -629,6 +644,7 @@ func (scope *connScope) validateCanonicalOperations() error {
 		return decodeStoredCanonicalOperation(operations[opIndex])
 	}, func(opIndex int, decoded decodedCanonicalOperation) error {
 		op := operations[opIndex]
+		scope.canonicalOperationsVisited++
 		if !op.versionSet && !op.wireSet {
 			return nil // a legacy operation without canonical columns has nothing to decode
 		}

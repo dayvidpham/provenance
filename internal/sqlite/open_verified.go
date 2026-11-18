@@ -297,7 +297,7 @@ func (scope *connScope) ensureVerifiedLedgerSchema() error {
 	}
 	for _, statement := range []string{
 		verifiedGenerationTableDDL, verifiedGenerationSeedDDL, verifiedLedgerTableDDL,
-		verifiedTableGenerationDDL, verifiedTableProofDDL, verifiedAgentProofDDL, verifiedAgentMetaDDL,
+		verifiedTableGenerationDDL, verifiedTableProofDDL, verifiedAgentProofDDL, verifiedAgentMetaDDL, verifiedPrefixDDL,
 	} {
 		if _, err := scope.conn.ExecContext(scope.ctx, statement); err != nil {
 			return fmt.Errorf("ensureVerifiedLedgerSchema: %q: %w", statement, err)
@@ -691,7 +691,7 @@ func (scope *connScope) verifiedLedgerCurrent() (bool, error) {
 // snapshot (see [connScope.verifiedLedgerCurrent]).
 func (scope *connScope) verifiedLedgerMatches() bool {
 	ledger, ok := scope.readVerifiedLedger()
-	if !ok {
+	if !ok || !scope.verifiedPrefixUsableForLedger(ledger.identity.journalID) {
 		return false
 	}
 	if ledger.shapeID != verifiedShapeID() {
@@ -712,6 +712,15 @@ func (scope *connScope) verifiedLedgerMatches() bool {
 // count is advanced only by a genuinely new record, which is how a caller (and a
 // test) can see that a whole-store verification ran.
 func (scope *connScope) writeVerifiedLedger() error {
+	return scope.writeVerifiedLedgerWithPrefix(nil)
+}
+
+// writeVerifiedLedgerWithPrefix is writeVerifiedLedger for a caller that already
+// hashed the verified prefix outside the write lock. prefix must describe the
+// rows at or below the journal id this transaction records; nil hashes them here.
+// The prefix row commits with the ledger row, so the digests describe exactly
+// the state the ledger claims.
+func (scope *connScope) writeVerifiedLedgerWithPrefix(prefix *verifiedPrefixDigests) error {
 	if scope.ephemeralStore {
 		return nil
 	}
@@ -727,12 +736,24 @@ func (scope *connScope) writeVerifiedLedger() error {
 	// path), and an open of such a store must not start rewriting the database
 	// bytes it used to leave untouched.
 	if recorded, ok := scope.readVerifiedLedger(); ok && recorded.shapeID == shape && identityEqual(recorded.identity, identity) {
+		// The verification that just passed also proves the prefix at this
+		// journal id. A sanctioned write moves the ledger past the recorded
+		// prefix without rehashing it, so refresh the cache here rather than
+		// leave it behind the ledger; a prefix already at this id is untouched.
+		if !scope.verifiedPrefixRowCurrent(identity.journalID) {
+			if err := scope.writeVerifiedPrefix(identity.journalID, prefix); err != nil {
+				return fmt.Errorf("writeVerifiedLedger: %w", err)
+			}
+		}
 		return nil
 	}
 	if err := scope.writeVerifiedTableVector(identity.generations); err != nil {
 		return fmt.Errorf("writeVerifiedLedger: %w", err)
 	}
 	if err := scope.writeVerifiedAgentSet(); err != nil {
+		return fmt.Errorf("writeVerifiedLedger: %w", err)
+	}
+	if err := scope.writeVerifiedPrefix(identity.journalID, prefix); err != nil {
 		return fmt.Errorf("writeVerifiedLedger: %w", err)
 	}
 	if _, err := scope.conn.ExecContext(scope.ctx, fmt.Sprintf(`INSERT INTO %s
@@ -825,6 +846,17 @@ func (scope *connScope) advanceVerifiedLedger() error {
 // never recorded as verified, and the caller falls back to the full activation
 // path instead.
 func (scope *connScope) persistVerifiedLedgerIfUnchanged(before verifiedStoreIdentity) bool {
+	// Hash the verified prefix before taking the write lock. The compare-and-set
+	// below proves the store still stands at `before`, so digests computed for
+	// before.journalID describe the state the ledger records; a store that moved
+	// is refused and the digests are discarded. A prefix that cannot be hashed is
+	// left to the write, which then records no cache.
+	var prefix *verifiedPrefixDigests
+	if !scope.ephemeralStore {
+		if digests, err := scope.computeVerifiedPrefixDigests(before.journalID); err == nil {
+			prefix = &digests
+		}
+	}
 	err := runImmediateTransaction(scope.ctx, scope.conn, func() error {
 		now, err := scope.readVerifiedStoreIdentity()
 		if err != nil {
@@ -833,7 +865,7 @@ func (scope *connScope) persistVerifiedLedgerIfUnchanged(before verifiedStoreIde
 		if !identityEqual(now, before) {
 			return errVerifiedStoreMovedDuringVerification
 		}
-		return scope.writeVerifiedLedger()
+		return scope.writeVerifiedLedgerWithPrefix(prefix)
 	})
 	return err == nil
 }
@@ -855,7 +887,7 @@ func (scope *connScope) persistVerifiedChangedTablesIfUnchanged(before verifiedS
 			return errVerifiedStoreMovedDuringVerification
 		}
 		ledger, ok := scope.readVerifiedLedger()
-		if !ok {
+		if !ok || !scope.verifiedPrefixUsableForLedger(ledger.identity.journalID) {
 			return errVerifiedStoreMovedDuringVerification
 		}
 		if err := scope.advanceVerifiedTableVector(now.generations, ledger.identity.generations); err != nil {

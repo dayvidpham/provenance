@@ -64,6 +64,7 @@ var verifiedLedgerObjects = []activationSchemaObject{
 	{"table", verifiedTableProofTable},
 	{"table", verifiedAgentProofTable},
 	{"table", verifiedAgentMetaTable},
+	{"table", verifiedPrefixTable},
 }
 
 // verifiedVectorLength is the baseline row plus one row per covered table.
@@ -747,7 +748,7 @@ func (probe agentRegistryProbe) query() string {
 //
 // Adoption never advances verified_count or verified_at: it is not a new
 // verification, only the same proof recorded in the new shape.
-func (scope *connScope) adoptCurrentVerifiedLedger() (bool, error) {
+func (scope *connScope) adoptCurrentVerifiedLedger(legacyPrefixTableAbsent bool) (bool, error) {
 	if scope.ephemeralStore {
 		return false, nil
 	}
@@ -771,6 +772,10 @@ func (scope *connScope) adoptCurrentVerifiedLedger() (bool, error) {
 		if !identityEqual(ledger.identity, now) {
 			return false, nil
 		}
+		seeded, err := scope.seedVerifiedPrefixIfAbsent(ledger.identity.journalID, legacyPrefixTableAbsent)
+		if err != nil || !seeded {
+			return false, err
+		}
 		if err := scope.writeVerifiedAgentSet(); err != nil {
 			return false, err
 		}
@@ -791,6 +796,10 @@ func (scope *connScope) adoptCurrentVerifiedLedger() (bool, error) {
 	if !migrationIdentityMatches(ledgerRow.identity, now) {
 		return false, nil
 	}
+	seeded, err := scope.seedVerifiedPrefixIfAbsent(ledgerRow.identity.journalID, legacyPrefixTableAbsent)
+	if err != nil || !seeded {
+		return false, err
+	}
 	if err := scope.writeVerifiedTableVector(now.generations); err != nil {
 		return false, err
 	}
@@ -809,6 +818,15 @@ func (scope *connScope) adoptableVerifiedLedger() (bool, error) {
 	ledger, ok := scope.readVerifiedLedgerRowOnly()
 	if !ok || ledger.shapeID != verifiedShapeID() {
 		return false, nil
+	}
+	prefixTable, err := scope.tableExists(verifiedPrefixTable)
+	if err != nil {
+		return false, err
+	}
+	if prefixTable {
+		if !scope.verifiedPrefixRowCurrent(ledger.identity.journalID) {
+			return false, nil
+		}
 	}
 	exists, err := scope.tableExists(verifiedTableProofTable)
 	if err != nil {

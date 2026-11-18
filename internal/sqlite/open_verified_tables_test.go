@@ -352,6 +352,7 @@ func simulateV3Ledger(t *testing.T, path string, generation int64) error {
 	for _, statement := range []string{
 		"DROP TABLE " + verifiedAgentMetaTable,
 		"DROP TABLE " + verifiedAgentProofTable,
+		"DROP TABLE " + verifiedPrefixTable,
 		"DROP TABLE " + verifiedTableProofTable,
 		"DROP TABLE " + verifiedTableGenerationTable,
 		"UPDATE " + storeGenerationTable + " SET generation = ?1 WHERE id = 1",
