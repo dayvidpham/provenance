@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.10.7 - 2026-11-17
+
+### Performance
+
+- Canonical decode skips re-canonicalization when a scanner proves the
+  payload is already canonical, and the full-path validators decode
+  operations in a bounded worker pool. On a 4,096-operation sample the
+  decode drops from about 301 us to 35 us per operation; on a
+  100,000-operation sample the parallel walk is 9.3x faster at 16 workers.
+  The reported validation error remains the first in anchor order.
+
 ## v0.10.6 - 2026-11-17
 
 ### Fixed
