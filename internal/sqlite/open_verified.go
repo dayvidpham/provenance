@@ -740,7 +740,7 @@ func (scope *connScope) writeVerifiedLedgerWithPrefix(prefix *verifiedPrefixDige
 		// journal id. A sanctioned write moves the ledger past the recorded
 		// prefix without rehashing it, so refresh the cache here rather than
 		// leave it behind the ledger; a prefix already at this id is untouched.
-		if through, _, ok := scope.readVerifiedPrefix(); !ok || through != identity.journalID {
+		if !scope.verifiedPrefixRowCurrent(identity.journalID) {
 			if err := scope.writeVerifiedPrefix(identity.journalID, prefix); err != nil {
 				return fmt.Errorf("writeVerifiedLedger: %w", err)
 			}

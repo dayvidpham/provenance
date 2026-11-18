@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"hash"
 	"math"
+	"strings"
 )
 
 // Verified-prefix cache (issue #74, slice 3).
@@ -40,6 +41,31 @@ const (
 		journal_digest TEXT NOT NULL,
 		contexts_digest TEXT NOT NULL) STRICT`
 )
+
+// verifiedPrefixValidatorVersion names the canonical decoder and validator
+// generation the recorded digests were verified under. It is part of both digest
+// domains and is stored as the prefix of each recorded digest, so a build whose
+// decoder or validators are stricter than the one that verified the prefix finds
+// a version mismatch before it consults the generation shortcut and runs the
+// full validation.
+//
+// Bump it whenever the canonical decoder (journal.DecodeCanonicalMutation and
+// the effect normalization), validateCanonicalOperations,
+// validateCanonicalEffectRow, or the fact-context validators change what they
+// accept. The adoption seed deliberately does NOT re-verify: it hashes the rows
+// of a ledger an older build proved, and records them under the current version,
+// so the older build's proof is trusted once at the upgrade boundary. The next
+// version bump after that forces the full path.
+const verifiedPrefixValidatorVersion = "provenance.verified-prefix.validator.1"
+
+// prefixDigestRecorded renders a digest for storage: version, then the hash.
+func prefixDigestRecorded(sum string) string { return verifiedPrefixValidatorVersion + ":" + sum }
+
+// prefixDigestCurrent reports whether a recorded digest carries this build's
+// validator version.
+func prefixDigestCurrent(recorded string) bool {
+	return strings.HasPrefix(recorded, verifiedPrefixValidatorVersion+":")
+}
 
 // verifiedPrefixDigests are the two prefix digests. They are separate so a change
 // in either relation family invalidates only the validation that reads it.
@@ -99,7 +125,8 @@ func (scope *connScope) resolveVerifiedPrefix() verifiedPrefixTrust {
 		return verifiedPrefixTrust{}
 	}
 	through, recorded, ok := scope.readVerifiedPrefix()
-	if !ok || through != ledger.identity.journalID {
+	if !ok || through != ledger.identity.journalID ||
+		!prefixDigestCurrent(recorded.journal) || !prefixDigestCurrent(recorded.contexts) {
 		return verifiedPrefixTrust{}
 	}
 	columns, err := scope.tableColumns("journal_operations")
@@ -224,11 +251,26 @@ const (
 	prefixAuthorities
 	prefixBootstraps
 	prefixTransitions
+	// prefixEpisodes covers only episodes that have a transition at or below the
+	// verified journal id. An episode with no prefix transition is intentionally
+	// outside the digest: the canonical validators reach an episode only through a
+	// transition row, and the whole-store verification still reads every episode.
 	prefixEpisodes
 )
 
 // prefixJournalRelations is the closed set of relations the canonical validators
-// read for an operation at or below the verified journal id: the journal and
+// read for an operation at or below the verified journal id. The skipped
+// validators (validateCanonicalOperations, validateCanonicalEffectRow,
+// validateCanonicalFactContextSets, verifyFactContextIntegrity) read ONLY these
+// relations plus the two decision/evidence context relations hashed by
+// contextsPrefixDigest; any new read added to them must be added here, to
+// prefixRelation.table and query, and to the digest-scope test. Everything else
+// is outside the skip on purpose: the agent registry, the closed seed lookups,
+// the projections, and the actor claims are checked by their own checks, which
+// the prefix trust never bypasses (see TestVerifiedPrefixTrustDoesNotBypassRegistryChecks).
+// It is the covered-table list, not the digest, that detects a change to them.
+// The digests catch accidental or out-of-band edits and are not tamper-proof
+// against a writer who rewrites both the rows and the digest. The set is: the journal and
 // operation rows, and every subtype, authority, assignment, task-event, and
 // result-slot row the per-effect comparison reads. A prefix operation is skipped
 // only when all of them are unchanged, so an out-of-band edit to any of them
@@ -338,7 +380,7 @@ func (s *prefixStream) any(v any) error {
 // journalPrefixDigest covers the rows of every relation in prefixJournalRelations
 // at or below through, each section followed by its row count.
 func (scope *connScope) journalPrefixDigest(through int64) (string, error) {
-	stream := newPrefixStream("provenance.verified-prefix.journal.v2")
+	stream := newPrefixStream("provenance.verified-prefix.journal.v2/" + verifiedPrefixValidatorVersion)
 	for _, relation := range prefixJournalRelations {
 		stream.text(relation.table())
 		var count int64
@@ -367,13 +409,13 @@ func (scope *connScope) journalPrefixDigest(through int64) (string, error) {
 		}
 		stream.int(count)
 	}
-	return stream.sum(), nil
+	return prefixDigestRecorded(stream.sum()), nil
 }
 
 // contextsPrefixDigest covers the decision and evidence context rows whose
 // parent journal id is at or below through, ordered by parent, kind, identity.
 func (scope *connScope) contextsPrefixDigest(through int64) (string, error) {
-	stream := newPrefixStream("provenance.verified-prefix.contexts.v1")
+	stream := newPrefixStream("provenance.verified-prefix.contexts.v1/" + verifiedPrefixValidatorVersion)
 	for _, relation := range []factContextRelation{factContextDecision, factContextEvidence} {
 		stream.text(relation.tableName())
 		var count int64
@@ -393,7 +435,7 @@ func (scope *connScope) contextsPrefixDigest(through int64) (string, error) {
 		}
 		stream.int(count)
 	}
-	return stream.sum(), nil
+	return prefixDigestRecorded(stream.sum()), nil
 }
 
 // contextPrefixSQL enumerates one relation's rows at or below a parent id in
@@ -446,10 +488,17 @@ func (scope *connScope) clearVerifiedPrefix() error {
 // store at through, so the digests are recorded with a hash-only pass and no
 // decode. A usable row for exactly this through is left alone.
 func (scope *connScope) seedVerifiedPrefixIfAbsent(through int64) error {
-	if recorded, _, ok := scope.readVerifiedPrefix(); ok && recorded == through {
+	if scope.verifiedPrefixRowCurrent(through) {
 		return nil
 	}
 	return scope.writeVerifiedPrefix(through, nil)
+}
+
+// verifiedPrefixRowCurrent reports whether the recorded row is usable, is for
+// exactly through, and carries this build's validator version.
+func (scope *connScope) verifiedPrefixRowCurrent(through int64) bool {
+	recorded, digests, ok := scope.readVerifiedPrefix()
+	return ok && recorded == through && prefixDigestCurrent(digests.journal) && prefixDigestCurrent(digests.contexts)
 }
 
 // tailReferencesPrefix reports whether a journal row above after is produced by
@@ -470,7 +519,9 @@ func (scope *connScope) tailReferencesPrefix(after int64) (bool, error) {
 }
 
 // effectiveBoundary returns after, or zero (the full validation) when the tail
-// is not self-contained.
+// is not self-contained. Each boundary-taking validator calls it, so a
+// verification runs the tail probe a few times; it is a primary-key range scan
+// over the tail only, so the repetition is negligible and is not cached.
 func (scope *connScope) effectiveBoundary(after int64) (int64, error) {
 	if after == 0 {
 		return 0, nil
