@@ -156,9 +156,9 @@ func (relation factContextRelation) loadSQL() string {
 func (relation factContextRelation) contextIndexSQL() string {
 	switch relation {
 	case factContextDecision:
-		return "SELECT decision_journal_id,context_kind,context_identity FROM journal_decision_contexts ORDER BY decision_journal_id,context_kind,context_identity"
+		return "SELECT decision_journal_id,context_kind,context_identity FROM journal_decision_contexts WHERE decision_journal_id>?1 ORDER BY decision_journal_id,context_kind,context_identity"
 	case factContextEvidence:
-		return "SELECT evidence_journal_id,context_kind,context_identity FROM journal_evidence_contexts ORDER BY evidence_journal_id,context_kind,context_identity"
+		return "SELECT evidence_journal_id,context_kind,context_identity FROM journal_evidence_contexts WHERE evidence_journal_id>?1 ORDER BY evidence_journal_id,context_kind,context_identity"
 	default:
 		panic("unknown factContextRelation")
 	}
@@ -172,14 +172,16 @@ func (relation factContextRelation) parentIntegritySQL() string {
 			FROM journal_decision_contexts c
 			LEFT JOIN journal_decisions d ON d.journal_id=c.decision_journal_id
 			LEFT JOIN journal j ON j.journal_id=d.journal_id
-			LEFT JOIN journal_operations o ON o.journal_id=j.produced_by_operation_journal_id`
+			LEFT JOIN journal_operations o ON o.journal_id=j.produced_by_operation_journal_id
+			WHERE c.decision_journal_id>?1`
 	case factContextEvidence:
 		return `SELECT c.evidence_journal_id,c.context_kind,c.context_identity,e.journal_id,j.kind_id,
 			j.produced_by_operation_journal_id,o.journal_id,o.mutation_encoding_version,o.canonical_mutation
 			FROM journal_evidence_contexts c
 			LEFT JOIN journal_evidence e ON e.journal_id=c.evidence_journal_id
 			LEFT JOIN journal j ON j.journal_id=e.journal_id
-			LEFT JOIN journal_operations o ON o.journal_id=j.produced_by_operation_journal_id`
+			LEFT JOIN journal_operations o ON o.journal_id=j.produced_by_operation_journal_id
+			WHERE c.evidence_journal_id>?1`
 	default:
 		panic("unknown factContextRelation")
 	}
@@ -193,14 +195,16 @@ func (relation factContextRelation) legacyParentIntegritySQL() string {
 			FROM journal_decision_contexts c
 			LEFT JOIN journal_decisions d ON d.journal_id=c.decision_journal_id
 			LEFT JOIN journal j ON j.journal_id=d.journal_id
-			LEFT JOIN journal_operations o ON o.journal_id=j.produced_by_operation_journal_id`
+			LEFT JOIN journal_operations o ON o.journal_id=j.produced_by_operation_journal_id
+			WHERE c.decision_journal_id>?3`
 	case factContextEvidence:
 		return `SELECT c.evidence_journal_id,c.context_kind,c.context_identity,e.journal_id,j.kind_id,
 			j.produced_by_operation_journal_id,o.journal_id,?1,?2
 			FROM journal_evidence_contexts c
 			LEFT JOIN journal_evidence e ON e.journal_id=c.evidence_journal_id
 			LEFT JOIN journal j ON j.journal_id=e.journal_id
-			LEFT JOIN journal_operations o ON o.journal_id=j.produced_by_operation_journal_id`
+			LEFT JOIN journal_operations o ON o.journal_id=j.produced_by_operation_journal_id
+			WHERE c.evidence_journal_id>?3`
 	default:
 		panic("unknown factContextRelation")
 	}
@@ -361,8 +365,14 @@ type canonicalFactOperation struct {
 }
 
 func (scope *connScope) canonicalFactOperations(where string) ([]canonicalFactOperation, error) {
+	return scope.canonicalFactOperationsAfter(where, 0)
+}
+
+// canonicalFactOperationsAfter enumerates canonical operations whose anchor is
+// above after; zero enumerates all of them.
+func (scope *connScope) canonicalFactOperationsAfter(where string, after int64) ([]canonicalFactOperation, error) {
 	operations := make([]canonicalFactOperation, 0)
-	err := forEachFactContextRow(scope, "SELECT journal_id,canonical_mutation FROM journal_operations WHERE canonical_mutation IS NOT ?1 ORDER BY journal_id", []any{nil}, func(row *sql.Rows) error {
+	err := forEachFactContextRow(scope, "SELECT journal_id,canonical_mutation FROM journal_operations WHERE canonical_mutation IS NOT ?1 AND journal_id>?2 ORDER BY journal_id", []any{nil, after}, func(row *sql.Rows) error {
 		var operation canonicalFactOperation
 		if err := row.Scan(&operation.anchor, &operation.wire); err != nil {
 			return err
@@ -395,8 +405,15 @@ func (scope *connScope) producedFactRows(anchor int64) ([]int64, error) {
 // one ordered scan replaces one lookup per canonical operation; the per-anchor
 // helper above remains for the legacy backfill.
 func (scope *connScope) producedJournalRowsByOperation() (map[int64][]int64, error) {
+	return scope.producedJournalRowsByOperationAfter(0)
+}
+
+// producedJournalRowsByOperationAfter groups the produced rows above after by
+// their producing operation. An operation above after produces only rows above
+// after, so the tail's map is complete for the tail's operations.
+func (scope *connScope) producedJournalRowsByOperationAfter(after int64) (map[int64][]int64, error) {
 	byOperation := make(map[int64][]int64)
-	err := forEachFactContextRow(scope, "SELECT produced_by_operation_journal_id,journal_id FROM journal WHERE produced_by_operation_journal_id IS NOT NULL ORDER BY produced_by_operation_journal_id,journal_id", nil, func(row *sql.Rows) error {
+	err := forEachFactContextRow(scope, "SELECT produced_by_operation_journal_id,journal_id FROM journal WHERE produced_by_operation_journal_id IS NOT NULL AND journal_id>?1 ORDER BY produced_by_operation_journal_id,journal_id", []any{after}, func(row *sql.Rows) error {
 		var anchor, journalID int64
 		if err := row.Scan(&anchor, &journalID); err != nil {
 			return err
@@ -702,8 +719,14 @@ func (scope *connScope) loadFactContextsFromRelation(relation factContextRelatio
 // ordered scan replaces one lookup per fact row and costs nothing when the
 // relation is empty.
 func (scope *connScope) loadFactContextIndex(relation factContextRelation) (map[int64][]journal.EventContext, error) {
+	return scope.loadFactContextIndexAfter(relation, 0)
+}
+
+// loadFactContextIndexAfter indexes the context rows whose parent is above
+// after; zero indexes every row.
+func (scope *connScope) loadFactContextIndexAfter(relation factContextRelation, after int64) (map[int64][]journal.EventContext, error) {
 	index := make(map[int64][]journal.EventContext)
-	err := forEachFactContextRow(scope, relation.contextIndexSQL(), nil, func(row *sql.Rows) error {
+	err := forEachFactContextRow(scope, relation.contextIndexSQL(), []any{after}, func(row *sql.Rows) error {
 		var journalID int64
 		var kind, identity string
 		if err := row.Scan(&journalID, &kind, &identity); err != nil {
@@ -757,18 +780,31 @@ func (scope *connScope) verifyFactContextIntegrityMode(allowLegacy bool) (timing
 	if hasVersion != hasMutation {
 		return factContextIntegrityError("journal_operations has a one-column canonical shape", "fact-context topology verification", "restore mutation_encoding_version and canonical_mutation as an atomic column pair")
 	}
+	// A trusted verified prefix leaves only the context rows and operations above
+	// its boundary to validate. A tail that reaches back into the prefix widens to
+	// the full scan.
+	after, err := scope.effectiveBoundary(scope.prefix.contextsAfter())
+	if err != nil {
+		return err
+	}
 	for _, relation := range []factContextRelation{factContextDecision, factContextEvidence} {
-		if err := scope.verifyFactContextParents(relation, hasVersion); err != nil {
+		if err := scope.verifyFactContextParentsAfter(relation, hasVersion, after); err != nil {
 			return err
 		}
 	}
-	return scope.validateCanonicalFactContextSets()
+	return scope.validateCanonicalFactContextSetsAfter(after)
 }
 
 func (scope *connScope) verifyFactContextParents(relation factContextRelation, canonicalColumns bool) error {
-	query, args := relation.parentIntegritySQL(), []any(nil)
+	return scope.verifyFactContextParentsAfter(relation, canonicalColumns, 0)
+}
+
+// verifyFactContextParentsAfter checks the context rows whose parent journal id
+// is above after; zero checks every row.
+func (scope *connScope) verifyFactContextParentsAfter(relation factContextRelation, canonicalColumns bool, after int64) error {
+	query, args := relation.parentIntegritySQL(), []any{after}
 	if !canonicalColumns {
-		query, args = relation.legacyParentIntegritySQL(), []any{nil, nil}
+		query, args = relation.legacyParentIntegritySQL(), []any{nil, nil, after}
 	}
 	return forEachFactContextRow(scope, query, args, func(row *sql.Rows) error {
 		var journalID int64
@@ -802,21 +838,28 @@ func (scope *connScope) verifyFactContextParents(relation factContextRelation, c
 }
 
 func (scope *connScope) validateCanonicalFactContextSets() error {
+	return scope.validateCanonicalFactContextSetsAfter(0)
+}
+
+// validateCanonicalFactContextSetsAfter validates the context sets of the
+// canonical operations above after; zero validates all of them. The caller
+// resolves after through [connScope.effectiveBoundary].
+func (scope *connScope) validateCanonicalFactContextSetsAfter(after int64) error {
 	columns, err := scope.tableColumns("journal_operations")
 	if err != nil || isLegacyOperationsColumnSet(columns) {
 		return err
 	}
-	operations, err := scope.canonicalFactOperations("fact-context validation")
+	operations, err := scope.canonicalFactOperationsAfter("fact-context validation", after)
 	if err != nil {
 		return err
 	}
-	produced, err := scope.producedJournalRowsByOperation()
+	produced, err := scope.producedJournalRowsByOperationAfter(after)
 	if err != nil {
 		return err
 	}
 	contexts := make(map[factContextRelation]map[int64][]journal.EventContext, 2)
 	for _, relation := range []factContextRelation{factContextDecision, factContextEvidence} {
-		index, err := scope.loadFactContextIndex(relation)
+		index, err := scope.loadFactContextIndexAfter(relation, after)
 		if err != nil {
 			return err
 		}
@@ -836,6 +879,7 @@ func (scope *connScope) validateCanonicalFactContextSets() error {
 		return decodedCanonicalOperation{prepared: prepared, effects: prepared.NormalizedEffects()}
 	}, func(opIndex int, decoded decodedCanonicalOperation) error {
 		operation := operations[opIndex]
+		scope.factContextOperationsVisited++
 		if decoded.err != nil {
 			return fmt.Errorf("decode canonical operation %d for fact-context validation: %w — where: validateCanonicalFactContextSets; when: startup fact-context validation over stored canonical operations; impact: the open fails closed and no fact-context set is accepted; fix: %s", operation.anchor, decoded.err, unsupportedPreV004DatabaseFix)
 		}

@@ -174,6 +174,16 @@ type connScope struct {
 	// ledger there (open_verified.go): there is no earlier verification for a
 	// store that is re-created on every open.
 	ephemeralStore bool
+	// prefix is the verified-prefix trust armed for the whole-store verification
+	// in progress (verified_prefix.go). It is the zero value, which trusts
+	// nothing, everywhere else.
+	prefix verifiedPrefixTrust
+	// canonicalOperationsVisited and factContextOperationsVisited count the
+	// operations the two canonical validators walked. They are written on the
+	// scope's owning goroutine and read by tests to prove a trusted prefix was
+	// skipped.
+	canonicalOperationsVisited   int
+	factContextOperationsVisited int
 }
 
 // BorrowedActivationConfig applies only while opening a borrowed store. Zero
@@ -949,12 +959,20 @@ func activateSchema(scope *connScope, models []ptypes.ModelEntry, policy activat
 		} else if adopted {
 			return nil
 		}
+		// The whole-store verification below may trust the verified journal
+		// prefix and validate only the rows above it (verified_prefix.go). The
+		// trust is resolved inside this write transaction, so it describes the
+		// state the verification reads, and it is disarmed before the ledger is
+		// rewritten.
+		releasePrefix := scope.trustVerifiedPrefix()
+		defer releasePrefix()
 		if err := scope.verifyIntegrity(); err != nil {
 			return fmt.Errorf("whole-journal integrity: %w", err)
 		}
 		if _, err := scope.replayProjections(); err != nil {
 			return fmt.Errorf("journal replay: %w", err)
 		}
+		releasePrefix()
 		// The ledger is written in THIS transaction, after the same verification
 		// activation just ran, so the durable "verified as of" record and the
 		// writes that make it true commit or roll back together.
@@ -2264,12 +2282,17 @@ func preflightExistingReadOnly(target openTarget, models []ptypes.ModelEntry) (b
 					return true, err
 				}
 			} else {
+				// A stale ledger may still carry a verified journal prefix; the
+				// read-only verification then validates only the rows above it.
+				releasePrefix := preflight.trustVerifiedPrefix()
+				defer releasePrefix()
 				if err := preflight.verifyIntegrity(); err != nil {
 					return true, err
 				}
 				if _, err := preflight.replayProjections(); err != nil {
 					return true, err
 				}
+				releasePrefix()
 			}
 		}
 	}

@@ -239,12 +239,15 @@ func (scope *connScope) activationConvergenceVerified(models []ptypes.ModelEntry
 	if scope.partialLedgerChecks(before, models) {
 		return scope.persistVerifiedChangedTablesIfUnchanged(before), nil
 	}
+	releasePrefix := scope.trustVerifiedPrefix()
+	defer releasePrefix()
 	if err := scope.verifyIntegrity(); err != nil {
 		return false, nil
 	}
 	if _, err := scope.replayProjections(); err != nil {
 		return false, nil
 	}
+	releasePrefix()
 	return scope.persistVerifiedLedgerIfUnchanged(before), nil
 }
 

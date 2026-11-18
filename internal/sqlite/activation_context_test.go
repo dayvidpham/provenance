@@ -126,7 +126,7 @@ func activationSnapshot(t *testing.T, pool *sql.DB) []string {
 		}
 		if name == storeGenerationTable || name == verifiedStoreTable ||
 			name == verifiedTableGenerationTable || name == verifiedTableProofTable ||
-			name == verifiedAgentProofTable || name == verifiedAgentMetaTable {
+			name == verifiedAgentProofTable || name == verifiedAgentMetaTable || name == verifiedPrefixTable {
 			continue
 		}
 		names = append(names, name)

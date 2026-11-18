@@ -64,6 +64,7 @@ var verifiedLedgerObjects = []activationSchemaObject{
 	{"table", verifiedTableProofTable},
 	{"table", verifiedAgentProofTable},
 	{"table", verifiedAgentMetaTable},
+	{"table", verifiedPrefixTable},
 }
 
 // verifiedVectorLength is the baseline row plus one row per covered table.
@@ -774,6 +775,11 @@ func (scope *connScope) adoptCurrentVerifiedLedger() (bool, error) {
 		if err := scope.writeVerifiedAgentSet(); err != nil {
 			return false, err
 		}
+		// The ledger proves the store at its journal id, so the verified prefix
+		// is seeded by hashing the stored rows. No operation is decoded.
+		if err := scope.seedVerifiedPrefixIfAbsent(ledger.identity.journalID); err != nil {
+			return false, err
+		}
 		return true, nil
 	}
 	if count != 0 {
@@ -795,6 +801,9 @@ func (scope *connScope) adoptCurrentVerifiedLedger() (bool, error) {
 		return false, err
 	}
 	if err := scope.writeVerifiedAgentSet(); err != nil {
+		return false, err
+	}
+	if err := scope.seedVerifiedPrefixIfAbsent(ledgerRow.identity.journalID); err != nil {
 		return false, err
 	}
 	return true, nil
