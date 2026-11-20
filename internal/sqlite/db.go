@@ -157,6 +157,8 @@ type connScope struct {
 	replayAnchor     replayAnchorCache
 	replayDecoded    *decodedReplayRow
 	replayBatchSize  int
+	replayObserver   func(replayObservation)
+	replayCaller     string
 	ctx              context.Context
 	projectionTarget projectionTarget
 	releaseOnce      sync.Once
@@ -366,6 +368,12 @@ func (db *DB) Close() error {
 // returns a ready runtime pool. :memory: receives a process-unique shared-cache
 // name so parallel opens remain isolated.
 func Open(dbPath string, models []ptypes.ModelEntry) (*DB, error) {
+	return openWithReplayObserver(dbPath, models, nil)
+}
+
+// openWithReplayObserver is the same production Open path, with an optional
+// per-call measurement observer. It does not alter path selection.
+func openWithReplayObserver(dbPath string, models []ptypes.ModelEntry, observer func(replayObservation)) (*DB, error) {
 	target, err := resolveOpenTarget(dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite.Open: resolve %q: %w", dbPath, err)
@@ -378,7 +386,7 @@ func Open(dbPath string, models []ptypes.ModelEntry) (*DB, error) {
 			return nil, fmt.Errorf("sqlite.Open: inspect path %q before read-only preflight: %w", target.path, err)
 		}
 		if existed {
-			existingJournal, err = preflightExistingReadOnly(target, models)
+			existingJournal, err = preflightExistingReadOnly(target, models, observer)
 			if err != nil {
 				return nil, fmt.Errorf("sqlite.Open: read-only startup preflight failed on %q: %w", target.display, err)
 			}
@@ -386,9 +394,9 @@ func Open(dbPath string, models []ptypes.ModelEntry) (*DB, error) {
 	}
 
 	if target.isMemory {
-		return openInMemory(target, models)
+		return openInMemory(target, models, observer)
 	}
-	return openFileBacked(target, existingJournal, models)
+	return openFileBacked(target, existingJournal, models, observer)
 }
 
 // OpenBorrowed activates Provenance's schema on a caller-owned Modernc
@@ -664,7 +672,7 @@ func openConfiguredSQLDB(dsn string, maxConns int) (*sql.DB, error) {
 	return db, nil
 }
 
-func openInMemory(target openTarget, models []ptypes.ModelEntry) (*DB, error) {
+func openInMemory(target openTarget, models []ptypes.ModelEntry, observer func(replayObservation)) (*DB, error) {
 	runtime, err := openConfiguredSQLDB(target.runtimeDSN, memoryPoolSize)
 	if err != nil {
 		return nil, fmt.Errorf("open in-memory runtime pool %q: %w", target.display, err)
@@ -675,6 +683,7 @@ func openInMemory(target openTarget, models []ptypes.ModelEntry) (*DB, error) {
 		return nil, fmt.Errorf("lease in-memory activation connection %q: %w", target.display, err)
 	}
 	activation := borrowConnScope(activationConn, projectionTargetLive)
+	activation.replayObserver = observer
 	// A process-unique memory database never outlives the open that created it, so
 	// there is no earlier verification for the verified-as-of ledger to accelerate
 	// and activation does not create it here (open_verified.go). That keeps the
@@ -695,7 +704,7 @@ func openInMemory(target openTarget, models []ptypes.ModelEntry) (*DB, error) {
 	return &DB{db: runtime, ownsPool: true, timingDatabaseKnown: true}, nil
 }
 
-func openFileBacked(target openTarget, existingJournal bool, models []ptypes.ModelEntry) (*DB, error) {
+func openFileBacked(target openTarget, existingJournal bool, models []ptypes.ModelEntry, observer func(replayObservation)) (*DB, error) {
 	activationDB, err := openConfiguredSQLDB(target.activationDSN, 1)
 	if err != nil {
 		return nil, fmt.Errorf("open activation connection for %q: %w", target.display, err)
@@ -706,6 +715,7 @@ func openFileBacked(target openTarget, existingJournal bool, models []ptypes.Mod
 		return nil, fmt.Errorf("lease activation connection for %q: %w", target.display, err)
 	}
 	activation := borrowConnScope(activationConn, projectionTargetLive)
+	activation.replayObserver = observer
 	timingPath, timingKnown := sqlTimingDatabase(context.Background(), activationConn)
 
 	actualExisting, err := activation.tableExists("journal")
@@ -981,8 +991,11 @@ func activateSchema(scope *connScope, models []ptypes.ModelEntry, policy activat
 		if err := scope.verifyIntegrity(); err != nil {
 			return fmt.Errorf("whole-journal integrity: %w", err)
 		}
-		if _, err := scope.replayProjectionsVerifiedFactContexts(false); err != nil {
-			return fmt.Errorf("journal replay: %w", err)
+		scope.replayCaller = "locked_activation"
+		_, replayErr := scope.replayProjectionsVerifiedFactContexts(false)
+		scope.replayCaller = ""
+		if replayErr != nil {
+			return fmt.Errorf("journal replay: %w", replayErr)
 		}
 		releasePrefix()
 		// The ledger is written in THIS transaction, after the same verification
@@ -2198,7 +2211,7 @@ func TimeToNullInt(value *time.Time) any {
 
 // Startup preflight ----------------------------------------------------------
 
-func preflightExistingReadOnly(target openTarget, models []ptypes.ModelEntry) (bool, error) {
+func preflightExistingReadOnly(target openTarget, models []ptypes.ModelEntry, observer func(replayObservation)) (bool, error) {
 	readOnlyDSN := target.readOnlyDSN
 	if _, err := os.Stat(target.path + "-wal"); os.IsNotExist(err) {
 		readOnlyDSN, err = withSQLiteQuery(readOnlyDSN, map[string]string{"immutable": "1"}, nil)
@@ -2219,6 +2232,8 @@ func preflightExistingReadOnly(target openTarget, models []ptypes.ModelEntry) (b
 	}
 	defer conn.Close()
 	preflight := borrowConnScope(conn, projectionTargetLive)
+	preflight.replayObserver = observer
+	preflight.replayCaller = "read_only_preflight"
 	if err := requireCurrentIDFormat(preflight.ctx, conn, target.display); err != nil {
 		return false, err
 	}

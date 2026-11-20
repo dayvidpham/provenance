@@ -8,9 +8,17 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/dayvidpham/provenance/internal/journal"
 )
+
+type replayObservation struct {
+	Path     string
+	Caller   string
+	Folded   int
+	Duration time.Duration
+}
 
 // replay.go implements the shared-reducer projection step, Open-time full replay,
 // and the projection-convergence check (docs/journal-relational-contract.md §9,
@@ -517,9 +525,16 @@ func (scope *connScope) replayProjectionsModeWithVerification(allowLegacyFactCon
 
 		// Re-derive every projection from empty into connection-scoped shadow tables;
 		// the real tables stay read-only (SHADOW DERIVATION, §15).
+		var foldStart time.Time
+		if scope.replayObserver != nil {
+			foldStart = time.Now()
+		}
 		derivedTasks, derivedTaskState, derivedAttribs, derivedDomain, folded, err := scope.rederiveProjectionsShadow()
 		if err != nil {
 			return err
+		}
+		if scope.replayObserver != nil {
+			scope.replayObserver(replayObservation{Path: "full", Caller: scope.replayCaller, Folded: folded, Duration: time.Since(foldStart)})
 		}
 
 		// Convergence over the FULL projection set, scoped to journal-anchored tasks.
@@ -1619,9 +1634,26 @@ func diffCompleteTaskState(stored, derived map[string]completeTaskState, anchore
 // the journal, these sets are compared WHOLE (not scoped to anchored tasks): a from-empty
 // refold reproduces exactly the journaled rows.
 type domainProjection struct {
-	edges    map[string]domainEdge
-	labels   map[string]domainLabel
+	edges    map[domainEdgeKey]domainEdge
+	labels   map[domainLabelKey]domainLabel
 	comments map[string]domainComment
+}
+
+type domainEdgeKey struct {
+	source, target string
+	kind           int
+}
+
+func (key domainEdgeKey) String() string {
+	return fmt.Sprintf("%s\x00%s\x00%d", key.source, key.target, key.kind)
+}
+
+type domainLabelKey struct {
+	task, name string
+}
+
+func (key domainLabelKey) String() string {
+	return key.task + "\x00" + key.name
 }
 
 // domainEdge is one projected edge keyed by (source, target, kind); created_at is its only
@@ -1657,8 +1689,8 @@ type domainComment struct {
 // non-key column.
 func (scope *connScope) snapshotDomainProjections(target projectionTarget) (domainProjection, error) {
 	dp := domainProjection{
-		edges:    map[string]domainEdge{},
-		labels:   map[string]domainLabel{},
+		edges:    map[domainEdgeKey]domainEdge{},
+		labels:   map[domainLabelKey]domainLabel{},
 		comments: map[string]domainComment{},
 	}
 	if err := scope.queryRows(target.snapshotEdgesQuery(), nil, func(rows *sql.Rows) error {
@@ -1672,7 +1704,7 @@ func (scope *connScope) snapshotDomainProjections(target projectionTarget) (doma
 		if err != nil {
 			return err
 		}
-		dp.edges[fmt.Sprintf("%s\x00%s\x00%d", src, tgt, kind)] = domainEdge{task: task, createdAt: createdAt}
+		dp.edges[domainEdgeKey{source: src, target: tgt, kind: kind}] = domainEdge{task: task, createdAt: createdAt}
 		return nil
 	}); err != nil {
 		return domainProjection{}, fmt.Errorf("snapshot %s edges: %w", target.label(), err)
@@ -1686,7 +1718,7 @@ func (scope *connScope) snapshotDomainProjections(target projectionTarget) (doma
 		if err != nil {
 			return err
 		}
-		dp.labels[fmt.Sprintf("%s\x00%s", taskRaw, name)] = domainLabel{task: task}
+		dp.labels[domainLabelKey{task: taskRaw, name: name}] = domainLabel{task: task}
 		return nil
 	}); err != nil {
 		return domainProjection{}, fmt.Errorf("snapshot %s labels: %w", target.label(), err)
@@ -1733,7 +1765,7 @@ func diffDomainProjections(stored, derived domainProjection) error {
 
 // diffDomainEdges compares the full edge tuple: key presence in both directions, then the
 // created_at content column for a key present in both.
-func diffDomainEdges(stored, derived map[string]domainEdge) error {
+func diffDomainEdges(stored, derived map[domainEdgeKey]domainEdge) error {
 	for key, s := range stored {
 		d, ok := derived[key]
 		if !ok {
@@ -1760,7 +1792,7 @@ func diffDomainEdges(stored, derived map[string]domainEdge) error {
 // diffDomainLabels compares labels by key presence only: (task_id, name) are the
 // projection's ONLY columns, so key presence IS the full tuple — there is no content column
 // to diverge (documented on domainLabel).
-func diffDomainLabels(stored, derived map[string]domainLabel) error {
+func diffDomainLabels(stored, derived map[domainLabelKey]domainLabel) error {
 	for key, s := range stored {
 		if _, ok := derived[key]; !ok {
 			return divergence(s.task, "label",
