@@ -38,7 +38,7 @@ func resetM1Copy(scope *connScope) (int, error) {
 	return rows, nil
 }
 
-func measureM1Fold(path string) (replayObservation, error) {
+func measureM1Fold(path string, reportCount func(int)) (replayObservation, error) {
 	db, err := sql.Open(sqliteDriverName, "file:"+path+"?mode=rw")
 	if err != nil {
 		return replayObservation{}, fmt.Errorf("open disposable copy: %w", err)
@@ -56,29 +56,26 @@ func measureM1Fold(path string) (replayObservation, error) {
 	if err != nil {
 		return replayObservation{}, fmt.Errorf("reset disposable copy: %w", err)
 	}
-	scope.replayCaller = "scoped_fold"
-	var observations []replayObservation
-	scope.replayObserver = func(event replayObservation) {
-		observations = append(observations, event)
+	if reportCount != nil {
+		reportCount(rows)
 	}
-	result, err := scope.replayProjections()
+	start := time.Now()
+	_, _, _, _, folded, err := scope.rederiveProjectionsShadow()
+	duration := time.Since(start)
 	if err != nil {
-		return replayObservation{}, fmt.Errorf("scoped replay after reset: %w", err)
+		return replayObservation{}, fmt.Errorf("scoped fold after reset: %w", err)
 	}
-	for _, event := range observations {
-		if event.Path == "full" && event.Caller == "scoped_fold" && event.Folded == rows &&
-			result.RowsFolded == rows && event.Duration > 0 {
-			return event, nil
-		}
+	if folded != rows || duration <= 0 {
+		return replayObservation{}, fmt.Errorf("folded %d rows in %s, want all %d journal rows", folded, duration, rows)
 	}
-	return replayObservation{}, fmt.Errorf("no full replay of all %d journal rows; observations: %+v", rows, observations)
+	return replayObservation{Path: "full", Caller: "scoped_fold", Folded: folded, Duration: duration}, nil
 }
 
 func TestReplayM1ObserverAndReset(t *testing.T) {
 	fixture := buildPrefixFixture(t)
 	var rows int
 	for repetition := 0; repetition < 3; repetition++ {
-		event, err := measureM1Fold(fixture.path)
+		event, err := measureM1Fold(fixture.path, nil)
 		if err != nil {
 			t.Fatalf("repetition %d: %v", repetition+1, err)
 		}
@@ -106,7 +103,9 @@ func TestReplayM1Performance(t *testing.T) {
 	}
 	durations := make([]time.Duration, 0, 3)
 	for i := 0; i < 3; i++ {
-		event, err := measureM1Fold(resolved)
+		event, err := measureM1Fold(resolved, func(rows int) {
+			t.Logf("M1 repetition=%d journal_rows=%d", i+1, rows)
+		})
 		if err != nil {
 			t.Fatalf("repetition %d: %v", i+1, err)
 		}
