@@ -151,6 +151,8 @@ func (target projectionTarget) label() string {
 // the scope's lifetime; release returns it to database/sql exactly once.
 type connScope struct {
 	conn             sqlConnection
+	stmts            map[stmtKey]*sql.Stmt
+	cacheReplay      bool
 	ctx              context.Context
 	projectionTarget projectionTarget
 	releaseOnce      sync.Once
@@ -200,6 +202,7 @@ func (scope *connScope) release() {
 		return
 	}
 	scope.releaseOnce.Do(func() {
+		_ = scope.closeStmts(projectionTargetLive, true)
 		if scope.releaseFunc != nil {
 			scope.releaseFunc()
 		}
@@ -213,6 +216,7 @@ func (scope *connScope) discard() {
 	if scope == nil || scope.conn == nil {
 		return
 	}
+	_ = scope.closeStmts(projectionTargetLive, true)
 	scope.markBad()
 	scope.release()
 }

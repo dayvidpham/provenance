@@ -149,7 +149,7 @@ func (scope *connScope) projectMutationFamilyRow(task journal.TaskID, kind journ
 			if err := v1ProjectEdgeAdd(scope.ctx, allocationSQLTx{conn: scope.conn}, task, p.Target, p.EdgeKind, recordedAt); err != nil {
 				return err
 			}
-		} else if _, err := scope.conn.ExecContext(scope.ctx, scope.projectionTarget.projectEdgeAddQuery(), task.String(), p.Target, int(p.EdgeKind), recordedAt); err != nil {
+		} else if _, err := scope.projectionExec(stmtEdgeAdd, scope.projectionTarget.projectEdgeAddQuery(), task.String(), p.Target, int(p.EdgeKind), recordedAt); err != nil {
 			return fmt.Errorf("project edge-add %s->%s: %w", task, p.Target, err)
 		}
 	case journal.EventKindEdgeRemoved:
@@ -157,7 +157,7 @@ func (scope *connScope) projectMutationFamilyRow(task journal.TaskID, kind journ
 		if err != nil {
 			return err
 		}
-		if _, err := scope.conn.ExecContext(scope.ctx, scope.projectionTarget.projectEdgeRemoveQuery(), task.String(), p.Target, int(p.EdgeKind)); err != nil {
+		if _, err := scope.projectionExec(stmtEdgeRemove, scope.projectionTarget.projectEdgeRemoveQuery(), task.String(), p.Target, int(p.EdgeKind)); err != nil {
 			return fmt.Errorf("project edge-remove %s->%s: %w", task, p.Target, err)
 		}
 	case journal.EventKindLabelAdded:
@@ -165,7 +165,7 @@ func (scope *connScope) projectMutationFamilyRow(task journal.TaskID, kind journ
 		if err != nil {
 			return err
 		}
-		if _, err := scope.conn.ExecContext(scope.ctx, scope.projectionTarget.projectLabelAddQuery(), task.String(), p.Label); err != nil {
+		if _, err := scope.projectionExec(stmtLabelAdd, scope.projectionTarget.projectLabelAddQuery(), task.String(), p.Label); err != nil {
 			return fmt.Errorf("project label-add %s %q: %w", task, p.Label, err)
 		}
 	case journal.EventKindLabelRemoved:
@@ -173,7 +173,7 @@ func (scope *connScope) projectMutationFamilyRow(task journal.TaskID, kind journ
 		if err != nil {
 			return err
 		}
-		if _, err := scope.conn.ExecContext(scope.ctx, scope.projectionTarget.projectLabelRemoveQuery(), task.String(), p.Label); err != nil {
+		if _, err := scope.projectionExec(stmtLabelRemove, scope.projectionTarget.projectLabelRemoveQuery(), task.String(), p.Label); err != nil {
 			return fmt.Errorf("project label-remove %s %q: %w", task, p.Label, err)
 		}
 	case journal.EventKindCommentAdded:
@@ -184,7 +184,7 @@ func (scope *connScope) projectMutationFamilyRow(task journal.TaskID, kind journ
 		// INSERT OR IGNORE keeps a from-empty replay of the SAME journaled comment
 		// idempotent (the caller-minted id is carried in the payload, §6), so the
 		// projection reproduces exactly one row.
-		if _, err := scope.conn.ExecContext(scope.ctx, scope.projectionTarget.projectCommentAddQuery(), p.CommentID, task.String(), p.Author, p.Body, recordedAt); err != nil {
+		if _, err := scope.projectionExec(stmtCommentAdd, scope.projectionTarget.projectCommentAddQuery(), p.CommentID, task.String(), p.Author, p.Body, recordedAt); err != nil {
 			return fmt.Errorf("project comment-add %s %q: %w", task, p.CommentID, err)
 		}
 	default:

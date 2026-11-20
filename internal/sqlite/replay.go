@@ -48,7 +48,7 @@ func (scope *connScope) projectJournalRow(jid int64) error {
 	// never a bare read of the NULL column. The single shared reducer step therefore
 	// attributes the same committing actor whether Apply folds a just-produced
 	// subordinate row or Open replays it (§9.2).
-	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT kind_id, effective_actor_id, recorded_at FROM journal_attributed WHERE journal_id = ?1", jid).Scan(&kind, &actorRaw, &recordedAt); err != nil {
+	if err := scope.projectionRow(stmtJournalRow, "SELECT kind_id, effective_actor_id, recorded_at FROM journal_attributed WHERE journal_id = ?1", jid).Scan(&kind, &actorRaw, &recordedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("project journal row %d: no such journal row", jid)
 		}
@@ -89,7 +89,7 @@ func (scope *connScope) projectTaskEventRow(jid int64, committing journal.ActorI
 		kindStr string
 		payload []byte
 	)
-	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT task_id, event_kind, payload FROM journal_task_events WHERE journal_id = ?1", jid).Scan(&taskRaw, &kindStr, &payload); err != nil {
+	if err := scope.projectionRow(stmtTaskEvent, "SELECT task_id, event_kind, payload FROM journal_task_events WHERE journal_id = ?1", jid).Scan(&taskRaw, &kindStr, &payload); err != nil {
 		return fmt.Errorf("project task_event %d: %w", jid, err)
 	}
 	payload = append([]byte(nil), payload...)
@@ -181,7 +181,7 @@ func (scope *connScope) projectTaskEventRow(jid int64, committing journal.ActorI
 // from history strictly before the row being folded (§8.1, §15).
 func (scope *connScope) readProjTaskStatus(task journal.TaskID) (journal.TaskStatus, error) {
 	var status journal.TaskStatus
-	err := scope.conn.QueryRowContext(scope.ctx, scope.projectionTarget.readTaskStatusQuery(), task.String()).Scan(&status)
+	err := scope.projectionRow(stmtTaskStatusRead, scope.projectionTarget.readTaskStatusQuery(), task.String()).Scan(&status)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return 0, fmt.Errorf("read current status for %q: %w", task, err)
 	}
@@ -206,7 +206,7 @@ func (scope *connScope) projectAuthorityRow(jid int64) error {
 		transition = -1
 		hasTrans   bool
 	)
-	err := scope.conn.QueryRowContext(scope.ctx, "SELECT assignment_id, transition_id FROM journal_authority_assignment_transitions WHERE journal_id = ?1", jid).Scan(&assignment, &transition)
+	err := scope.projectionRow(stmtAuthorityTransition, "SELECT assignment_id, transition_id FROM journal_authority_assignment_transitions WHERE journal_id = ?1", jid).Scan(&assignment, &transition)
 	if err == nil {
 		hasTrans = true
 	}
@@ -221,7 +221,7 @@ func (scope *connScope) projectAuthorityRow(jid int64) error {
 		occupantRaw string
 		slot        = -1
 	)
-	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT task_id, actor_id, slot_id FROM journal_authority_assignment_episodes WHERE assignment_id = ?1", assignment).Scan(&taskRaw, &occupantRaw, &slot); err != nil {
+	if err := scope.projectionRow(stmtAuthorityEpisode, "SELECT task_id, actor_id, slot_id FROM journal_authority_assignment_episodes WHERE assignment_id = ?1", assignment).Scan(&taskRaw, &occupantRaw, &slot); err != nil {
 		return fmt.Errorf("project authority %d: load episode %q: %w", jid, assignment, err)
 	}
 	task, err := journalParseTask(taskRaw)
@@ -268,7 +268,11 @@ func (scope *connScope) projectTaskScopedRow(jid int64, committing journal.Actor
 	var taskRaw string
 	hasTask := false
 	var taskValue sql.NullString
-	if err := scope.conn.QueryRowContext(scope.ctx, table.query(), jid).Scan(&taskValue); err != nil {
+	id := stmtScopedDecision
+	if table == taskScopedEvidence {
+		id = stmtScopedEvidence
+	}
+	if err := scope.projectionRow(id, table.query(), jid).Scan(&taskValue); err != nil {
 		return fmt.Errorf("project %s %d: %w", table.label(), jid, err)
 	}
 	if taskValue.Valid {
@@ -299,7 +303,7 @@ func (scope *connScope) projectTaskStatus(task journal.TaskID, status journal.Ta
 	}
 	// Targets the real tasks table during a live Apply and the shadow tasks table
 	// during a from-empty replay derivation (§8.1, §15).
-	if _, err := scope.conn.ExecContext(scope.ctx, scope.projectionTarget.projectTaskStatusQuery(), int(status), closedAt, jid, task.String()); err != nil {
+	if _, err := scope.projectionExec(stmtTaskStatusWrite, scope.projectionTarget.projectTaskStatusQuery(), int(status), closedAt, jid, task.String()); err != nil {
 		return fmt.Errorf("project task status for %q: %w", task, err)
 	}
 	return nil
@@ -1043,7 +1047,12 @@ func (scope *connScope) rederiveProjectionsShadow() (
 	// the task/attribution projections so their from-empty refold lands in the shadow
 	// tables too.
 	scope.projectionTarget = projectionTargetShadow
+	scope.cacheReplay = true
 	defer func() {
+		scope.cacheReplay = false
+		if cerr := scope.closeStmts(projectionTargetShadow, false); cerr != nil && err == nil {
+			err = fmt.Errorf("ReplayProjections: close shadow statements: %w", cerr)
+		}
 		scope.projectionTarget = projectionTargetLive
 		if derr := scope.dropProjectionShadow(); derr != nil && err == nil {
 			err = fmt.Errorf("ReplayProjections: drop shadow projection tables: %w", derr)
@@ -1151,7 +1160,7 @@ func (scope *connScope) canonicalEffectForJournalRow(jid int64) (journal.Effect,
 	}
 	var storedVersion sql.NullString
 	var storedWire []byte
-	err = scope.conn.QueryRowContext(scope.ctx, shape.effectForRowQuery(), args...).Scan(&anchor, &storedVersion, &storedWire)
+	err = scope.projectionRow(stmtCanonicalEffect, shape.effectForRowQuery(), args...).Scan(&anchor, &storedVersion, &storedWire)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return journal.Effect{}, false, nil
@@ -1178,7 +1187,7 @@ func (scope *connScope) canonicalEffectForJournalRow(jid int64) (journal.Effect,
 		return journal.Effect{}, false, fmt.Errorf("operation %d canonical column version %q differs from registered wire version %q", anchor, version, prepared.EncodingVersion())
 	}
 	ordinal := 0
-	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT COUNT(*) FROM journal WHERE produced_by_operation_journal_id=?1 AND journal_id<=?2", anchor, jid).Scan(&ordinal); err != nil {
+	if err := scope.projectionRow(stmtCanonicalOrdinal, "SELECT COUNT(*) FROM journal WHERE produced_by_operation_journal_id=?1 AND journal_id<=?2", anchor, jid).Scan(&ordinal); err != nil {
 		return journal.Effect{}, false, fmt.Errorf("resolve canonical effect ordinal for row %d: %w", jid, err)
 	}
 	ordinal--
@@ -1190,7 +1199,7 @@ func (scope *connScope) canonicalEffectForJournalRow(jid int64) (journal.Effect,
 }
 
 func (scope *connScope) insertCanonicalShadowTask(e journal.Effect, recordedAt, jid int64) error {
-	if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO shadow_tasks\n\t\t (id, namespace, title, description, owner_id, status_id, priority_id, type_id,\n\t\t  phase_id, notes, created_at, updated_at, closed_at, close_reason, last_journal_id)\n\t\t VALUES (?1, ?2, ?3, ?4, ?12, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?13, ?9, ?11)", e.TaskID.String(), e.TaskID.Namespace, e.Title, e.Description,
+	if _, err := scope.projectionExec(stmtCanonicalTaskCreate, "INSERT INTO shadow_tasks\n\t\t (id, namespace, title, description, owner_id, status_id, priority_id, type_id,\n\t\t  phase_id, notes, created_at, updated_at, closed_at, close_reason, last_journal_id)\n\t\t VALUES (?1, ?2, ?3, ?4, ?12, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?13, ?9, ?11)", e.TaskID.String(), e.TaskID.Namespace, e.Title, e.Description,
 		statusOpenID, int(e.Priority), int(e.Type), int(e.Phase), "", recordedAt, jid, nil, nil); err != nil {
 		return fmt.Errorf("replay canonical task create %q: %w", e.TaskID, err)
 	}
@@ -1221,7 +1230,7 @@ func (scope *connScope) materializeCanonicalShadowTaskEvent(e journal.Effect, re
 	if e.UpdatePhase != nil {
 		phase = int(*e.UpdatePhase)
 	}
-	if _, err := scope.conn.ExecContext(scope.ctx, "UPDATE shadow_tasks SET\n\t\tupdated_at=?1,\n\t\ttitle=CASE WHEN ?2 THEN ?3 ELSE title END,\n\t\tdescription=CASE WHEN ?4 THEN ?5 ELSE description END,\n\t\tpriority_id=CASE WHEN ?6 THEN ?7 ELSE priority_id END,\n\t\tphase_id=CASE WHEN ?8 THEN ?9 ELSE phase_id END,\n\t\tnotes=CASE WHEN ?10 THEN ?11 ELSE notes END,\n\t\tclose_reason=CASE WHEN ?12 THEN ?13 ELSE close_reason END\n\t\tWHERE id=?14",
+	if _, err := scope.projectionExec(stmtCanonicalTaskUpdate, "UPDATE shadow_tasks SET\n\t\tupdated_at=?1,\n\t\ttitle=CASE WHEN ?2 THEN ?3 ELSE title END,\n\t\tdescription=CASE WHEN ?4 THEN ?5 ELSE description END,\n\t\tpriority_id=CASE WHEN ?6 THEN ?7 ELSE priority_id END,\n\t\tphase_id=CASE WHEN ?8 THEN ?9 ELSE phase_id END,\n\t\tnotes=CASE WHEN ?10 THEN ?11 ELSE notes END,\n\t\tclose_reason=CASE WHEN ?12 THEN ?13 ELSE close_reason END\n\t\tWHERE id=?14",
 		recordedAt,
 		flag(e.UpdateTitle != nil), value(e.UpdateTitle),
 		flag(e.UpdateDescription != nil), value(e.UpdateDescription),
