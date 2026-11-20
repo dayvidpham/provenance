@@ -3,9 +3,9 @@ set -euo pipefail
 
 copy=/tmp/opencode/m1-measure.db
 live=/home/minttea/.local/share/pasture/pasture.db
-available_kb=$(df -Pk / | awk 'NR==2 {print $4}')
+available_kb=$(df -Pk "$(dirname "$copy")" | awk 'NR==2 {print $4}')
 if (( available_kb < 25 * 1024 * 1024 )); then
-  echo "M1 measurement needs 25 GiB free on /; available: ${available_kb} KiB" >&2
+  echo "M1 measurement needs 25 GiB free at $(dirname "$copy"); available: ${available_kb} KiB" >&2
   exit 1
 fi
 for file in "$copy" "$copy-wal" "$copy-shm" "$copy-journal"; do

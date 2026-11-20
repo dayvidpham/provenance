@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -12,54 +13,61 @@ import (
 
 // resetM1Copy stales the tasks generation without changing any projection value.
 // It is called only on an explicit disposable copy, never on the live store.
-func resetM1Copy(path string) (int, error) {
-	db, err := sql.Open(sqliteDriverName, "file:"+path)
-	if err != nil {
-		return 0, err
-	}
-	defer db.Close()
+func resetM1Copy(scope *connScope) (int, error) {
 	var before, after int64
-	if err := db.QueryRow("SELECT generation FROM provenance_table_generation WHERE table_name='tasks'").Scan(&before); err != nil {
+	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT generation FROM provenance_table_generation WHERE table_name='tasks'").Scan(&before); err != nil {
 		return 0, err
 	}
-	result, err := db.Exec("UPDATE tasks SET title=title WHERE id=(SELECT id FROM tasks ORDER BY id LIMIT 1)")
+	result, err := scope.conn.ExecContext(scope.ctx, "UPDATE tasks SET title=title WHERE id=(SELECT id FROM tasks ORDER BY id LIMIT 1)")
 	if err != nil {
 		return 0, err
 	}
 	if affected, err := result.RowsAffected(); err != nil || affected != 1 {
 		return 0, fmt.Errorf("reset affected %d rows: %v", affected, err)
 	}
-	if err := db.QueryRow("SELECT generation FROM provenance_table_generation WHERE table_name='tasks'").Scan(&after); err != nil {
+	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT generation FROM provenance_table_generation WHERE table_name='tasks'").Scan(&after); err != nil {
 		return 0, err
 	}
 	if after <= before {
 		return 0, fmt.Errorf("reset did not advance tasks generation: before=%d after=%d", before, after)
 	}
 	var rows int
-	if err := db.QueryRow("SELECT count(*) FROM journal").Scan(&rows); err != nil {
+	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT count(*) FROM journal").Scan(&rows); err != nil {
 		return 0, err
 	}
 	return rows, nil
 }
 
-func measureM1Open(path string) (replayObservation, error) {
-	rows, err := resetM1Copy(path)
+func measureM1Fold(path string) (replayObservation, error) {
+	db, err := sql.Open(sqliteDriverName, "file:"+path+"?mode=rw")
+	if err != nil {
+		return replayObservation{}, fmt.Errorf("open disposable copy: %w", err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		return replayObservation{}, fmt.Errorf("lease disposable copy connection: %w", err)
+	}
+	defer conn.Close()
+	scope := borrowConnScope(conn, projectionTargetLive)
+	defer scope.release()
+	rows, err := resetM1Copy(scope)
 	if err != nil {
 		return replayObservation{}, fmt.Errorf("reset disposable copy: %w", err)
 	}
+	scope.replayCaller = "scoped_fold"
 	var observations []replayObservation
-	db, err := openWithReplayObserver(path, nil, func(event replayObservation) {
+	scope.replayObserver = func(event replayObservation) {
 		observations = append(observations, event)
-	})
-	if err != nil {
-		return replayObservation{}, fmt.Errorf("production Open after reset: %w", err)
 	}
-	if err := db.Close(); err != nil {
-		return replayObservation{}, err
+	result, err := scope.replayProjections()
+	if err != nil {
+		return replayObservation{}, fmt.Errorf("scoped replay after reset: %w", err)
 	}
 	for _, event := range observations {
-		if event.Path == "full" && event.Folded == rows && event.Duration > 0 &&
-			(event.Caller == "read_only_preflight" || event.Caller == "convergence_probe" || event.Caller == "locked_activation") {
+		if event.Path == "full" && event.Caller == "scoped_fold" && event.Folded == rows &&
+			result.RowsFolded == rows && event.Duration > 0 {
 			return event, nil
 		}
 	}
@@ -68,12 +76,19 @@ func measureM1Open(path string) (replayObservation, error) {
 
 func TestReplayM1ObserverAndReset(t *testing.T) {
 	fixture := buildPrefixFixture(t)
-	event, err := measureM1Open(fixture.path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if event.Path != "full" || event.Folded == 0 || event.Caller == "" {
-		t.Fatalf("invalid observation: %+v", event)
+	var rows int
+	for repetition := 0; repetition < 3; repetition++ {
+		event, err := measureM1Fold(fixture.path)
+		if err != nil {
+			t.Fatalf("repetition %d: %v", repetition+1, err)
+		}
+		if event.Path != "full" || event.Folded == 0 || event.Caller != "scoped_fold" {
+			t.Fatalf("invalid observation: %+v", event)
+		}
+		if repetition > 0 && event.Folded != rows {
+			t.Fatalf("reset changed journal row count: first=%d repetition=%d", rows, event.Folded)
+		}
+		rows = event.Folded
 	}
 }
 
@@ -91,7 +106,7 @@ func TestReplayM1Performance(t *testing.T) {
 	}
 	durations := make([]time.Duration, 0, 3)
 	for i := 0; i < 3; i++ {
-		event, err := measureM1Open(resolved)
+		event, err := measureM1Fold(resolved)
 		if err != nil {
 			t.Fatalf("repetition %d: %v", i+1, err)
 		}
