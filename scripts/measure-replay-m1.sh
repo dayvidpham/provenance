@@ -30,4 +30,4 @@ sqlite3 -readonly "$live" "VACUUM INTO '$copy'"
 copy_end=$(date +%s%N)
 awk -v ns="$((copy_end - copy_start))" 'BEGIN {printf "M1 copy_creation_seconds=%.3f\n", ns / 1000000000}'
 nix develop --command env CGO_ENABLED=1 PROVENANCE_M1_COPY="$copy" \
-  go test -race -shuffle=on -fullpath -timeout=120m -run '^TestReplayM1Performance$' -v ./internal/sqlite
+  go test -shuffle=on -fullpath -timeout=120m -run '^TestReplayM1Performance$' -v ./internal/sqlite

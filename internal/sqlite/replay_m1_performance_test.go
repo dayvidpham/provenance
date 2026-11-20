@@ -38,7 +38,7 @@ func resetM1Copy(scope *connScope) (int, error) {
 	return rows, nil
 }
 
-func measureM1Fold(path string, reportCount func(int)) (replayObservation, error) {
+func measureM1Fold(path string, oracle bool, reportCount func(int)) (replayObservation, error) {
 	db, err := sql.Open(sqliteDriverName, "file:"+path+"?mode=rw")
 	if err != nil {
 		return replayObservation{}, fmt.Errorf("open disposable copy: %w", err)
@@ -60,7 +60,12 @@ func measureM1Fold(path string, reportCount func(int)) (replayObservation, error
 		reportCount(rows)
 	}
 	start := time.Now()
-	_, _, _, _, folded, err := scope.rederiveProjectionsShadow()
+	var folded int
+	if oracle {
+		_, _, _, _, folded, err = scope.oracleRederiveProjectionsShadow()
+	} else {
+		_, _, _, _, folded, err = scope.rederiveProjectionsShadow()
+	}
 	duration := time.Since(start)
 	if err != nil {
 		return replayObservation{}, fmt.Errorf("scoped fold after reset: %w", err)
@@ -68,14 +73,18 @@ func measureM1Fold(path string, reportCount func(int)) (replayObservation, error
 	if folded != rows || duration <= 0 {
 		return replayObservation{}, fmt.Errorf("folded %d rows in %s, want all %d journal rows", folded, duration, rows)
 	}
-	return replayObservation{Path: "full", Caller: "scoped_fold", Folded: folded, Duration: duration}, nil
+	caller := "scoped_fold"
+	if oracle {
+		caller = "frozen_oracle"
+	}
+	return replayObservation{Path: "full", Caller: caller, Folded: folded, Duration: duration}, nil
 }
 
 func TestReplayM1ObserverAndReset(t *testing.T) {
 	fixture := buildPrefixFixture(t)
 	var rows int
 	for repetition := 0; repetition < 3; repetition++ {
-		event, err := measureM1Fold(fixture.path, nil)
+		event, err := measureM1Fold(fixture.path, false, nil)
 		if err != nil {
 			t.Fatalf("repetition %d: %v", repetition+1, err)
 		}
@@ -86,6 +95,13 @@ func TestReplayM1ObserverAndReset(t *testing.T) {
 			t.Fatalf("reset changed journal row count: first=%d repetition=%d", rows, event.Folded)
 		}
 		rows = event.Folded
+	}
+	oracle, err := measureM1Fold(fixture.path, true, nil)
+	if err != nil {
+		t.Fatalf("oracle: %v", err)
+	}
+	if oracle.Caller != "frozen_oracle" || oracle.Folded != rows {
+		t.Fatalf("invalid oracle observation: %+v, want %d rows", oracle, rows)
 	}
 }
 
@@ -102,18 +118,33 @@ func TestReplayM1Performance(t *testing.T) {
 		t.Fatalf("refusing non-disposable measurement path %q resolved=%q err=%v", path, resolved, err)
 	}
 	durations := make([]time.Duration, 0, 3)
+	var journalRows int
 	for i := 0; i < 3; i++ {
-		event, err := measureM1Fold(resolved, func(rows int) {
+		event, err := measureM1Fold(resolved, false, func(rows int) {
 			t.Logf("M1 repetition=%d journal_rows=%d", i+1, rows)
 		})
 		if err != nil {
 			t.Fatalf("repetition %d: %v", i+1, err)
 		}
+		if i > 0 && event.Folded != journalRows {
+			t.Fatalf("journal count changed: first=%d repetition=%d", journalRows, event.Folded)
+		}
+		journalRows = event.Folded
 		t.Logf("M1 repetition=%d path=%s caller=%s folded=%d duration=%s", i+1, event.Path, event.Caller, event.Folded, event.Duration)
 		durations = append(durations, event.Duration)
 	}
 	sort.Slice(durations, func(i, j int) bool { return durations[i] < durations[j] })
 	t.Logf("M1 median=%s max=%s", durations[1], durations[2])
+	oracle, err := measureM1Fold(resolved, true, func(rows int) {
+		t.Logf("M1 oracle journal_rows=%d", rows)
+	})
+	if err != nil {
+		t.Fatalf("oracle: %v", err)
+	}
+	if oracle.Folded != journalRows {
+		t.Fatalf("oracle folded %d rows, earlier repetitions folded %d", oracle.Folded, journalRows)
+	}
+	t.Logf("M1 oracle folded=%d duration=%s speedup=%.3fx", oracle.Folded, oracle.Duration, float64(oracle.Duration)/float64(durations[1]))
 	if durations[1] >= 2*time.Minute {
 		t.Errorf("M1 median %s is not under 2 minutes", durations[1])
 	}
