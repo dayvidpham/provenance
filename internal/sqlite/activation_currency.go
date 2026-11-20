@@ -244,7 +244,7 @@ func (scope *connScope) activationConvergenceVerified(models []ptypes.ModelEntry
 	if err := scope.verifyIntegrity(); err != nil {
 		return false, nil
 	}
-	if _, err := scope.replayProjections(); err != nil {
+	if _, err := scope.replayProjectionsVerifiedFactContexts(false); err != nil {
 		return false, nil
 	}
 	releasePrefix()

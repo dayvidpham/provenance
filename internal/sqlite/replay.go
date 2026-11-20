@@ -444,22 +444,21 @@ func (db *DB) ReplayProjections() (journal.ReplayResult, error) {
 // pooled lease. It opens its own savepoint so it composes inside an enclosing
 // activation transaction.
 func (scope *connScope) replayProjections() (result journal.ReplayResult, err error) {
-	return scope.replayProjectionsMode(false)
+	return scope.replayProjectionsMode(false, false)
 }
 
-// replayProjectionsReadOnlyLegacyCompatible is reserved for the pre-activation
-// e66 compatibility pass. Activation creates and validates both context
-// relations before the normal strict replay path is entered.
-func (scope *connScope) replayProjectionsReadOnlyLegacyCompatible() (result journal.ReplayResult, err error) {
-	return scope.replayProjectionsMode(true)
+// The caller must have verified fact contexts in the same transaction or
+// independently reject a store that changes between verification and replay.
+func (scope *connScope) replayProjectionsVerifiedFactContexts(allowLegacyFactContexts bool) (journal.ReplayResult, error) {
+	return scope.replayProjectionsMode(allowLegacyFactContexts, true)
 }
 
-func (scope *connScope) replayProjectionsMode(allowLegacyFactContexts bool) (result journal.ReplayResult, err error) {
+func (scope *connScope) replayProjectionsMode(allowLegacyFactContexts, factContextsVerified bool) (result journal.ReplayResult, err error) {
 	var afterStoredSnapshot func()
 	if scope.activationConfig != nil && scope.activationConfig.Observer != nil {
 		afterStoredSnapshot = func() { scope.observeActivation("replay") }
 	}
-	return scope.replayProjectionsModeWithStoredSnapshotBarrier(allowLegacyFactContexts, afterStoredSnapshot)
+	return scope.replayProjectionsModeWithVerification(allowLegacyFactContexts, factContextsVerified, afterStoredSnapshot)
 }
 
 // replayProjectionsModeWithStoredSnapshotBarrier keeps the production replay path
@@ -467,16 +466,22 @@ func (scope *connScope) replayProjectionsMode(allowLegacyFactContexts bool) (res
 // supplies a barrier after all stored snapshots to prove a real Modernc Apply cannot
 // mix a newer derivation with older stored values.
 func (scope *connScope) replayProjectionsModeWithStoredSnapshotBarrier(allowLegacyFactContexts bool, afterStoredSnapshot func()) (result journal.ReplayResult, err error) {
+	return scope.replayProjectionsModeWithVerification(allowLegacyFactContexts, false, afterStoredSnapshot)
+}
+
+func (scope *connScope) replayProjectionsModeWithVerification(allowLegacyFactContexts, factContextsVerified bool, afterStoredSnapshot func()) (result journal.ReplayResult, err error) {
 	err = scope.runScopedSavepoint(func() error {
 		if err := scope.preflightSchema(); err != nil {
 			return err
 		}
-		if allowLegacyFactContexts {
-			if err := scope.verifyFactContextIntegrityReadOnlyLegacyCompatible(); err != nil {
+		if !factContextsVerified {
+			if allowLegacyFactContexts {
+				if err := scope.verifyFactContextIntegrityReadOnlyLegacyCompatible(); err != nil {
+					return err
+				}
+			} else if err := scope.verifyFactContextIntegrity(); err != nil {
 				return err
 			}
-		} else if err := scope.verifyFactContextIntegrity(); err != nil {
-			return err
 		}
 		if err := scope.validateCanonicalOperations(); err != nil {
 			return err

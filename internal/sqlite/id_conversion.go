@@ -722,7 +722,7 @@ func VerifyIDConversionInTx(ctx context.Context, tx *sql.Tx) error {
 	if err := scope.verifyIntegrity(); err != nil {
 		return fmt.Errorf("converted whole-journal owner integrity: %w", err)
 	}
-	if _, err := scope.replayProjections(); err != nil {
+	if _, err := scope.replayProjectionsVerifiedFactContexts(false); err != nil {
 		return fmt.Errorf("converted projection owner replay: %w", err)
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT operations.operation_id,operations.canonical_mutation,operations.mutation_digest,operations.mutation_encoding_version,governed.canonical_digest FROM journal_operations operations LEFT JOIN governed_allocation_operations governed ON governed.operation_id=operations.operation_id ORDER BY operations.journal_id`)

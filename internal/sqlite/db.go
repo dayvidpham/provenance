@@ -981,7 +981,7 @@ func activateSchema(scope *connScope, models []ptypes.ModelEntry, policy activat
 		if err := scope.verifyIntegrity(); err != nil {
 			return fmt.Errorf("whole-journal integrity: %w", err)
 		}
-		if _, err := scope.replayProjections(); err != nil {
+		if _, err := scope.replayProjectionsVerifiedFactContexts(false); err != nil {
 			return fmt.Errorf("journal replay: %w", err)
 		}
 		releasePrefix()
@@ -2290,7 +2290,7 @@ func preflightExistingReadOnly(target openTarget, models []ptypes.ModelEntry) (b
 				if err := preflight.verifyIntegrityReadOnlyLegacyCompatible(); err != nil {
 					return true, err
 				}
-				if _, err := preflight.replayProjectionsReadOnlyLegacyCompatible(); err != nil {
+				if _, err := preflight.replayProjectionsVerifiedFactContexts(true); err != nil {
 					return true, err
 				}
 			} else {
@@ -2301,7 +2301,7 @@ func preflightExistingReadOnly(target openTarget, models []ptypes.ModelEntry) (b
 				if err := preflight.verifyIntegrity(); err != nil {
 					return true, err
 				}
-				if _, err := preflight.replayProjections(); err != nil {
+				if _, err := preflight.replayProjectionsVerifiedFactContexts(false); err != nil {
 					return true, err
 				}
 				releasePrefix()
