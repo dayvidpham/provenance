@@ -138,13 +138,10 @@ func (scope *connScope) edgeCreatesCycle(source, target string) (bool, error) {
 // tables are re-derivable solely from ordered journal history and the §15 convergence
 // check covers them. The committing-actor attribution and watermark advance are handled by
 // the caller (projectTaskEventRow) around this step, exactly as for any task_event.
-func (scope *connScope) projectMutationFamilyRow(task journal.TaskID, kind journal.EventKind, payload []byte, jid, recordedAt int64) error {
-	switch kind {
+func (scope *connScope) projectMutationFamilyRow(task journal.TaskID, event decodedTaskEvent, jid, recordedAt int64) error {
+	switch event.kind {
 	case journal.EventKindEdgeAdded:
-		p, err := journal.DecodeEdgeMutationPayload(payload)
-		if err != nil {
-			return err
-		}
+		p := event.edge
 		if scope.projectionTarget == projectionTargetLive {
 			if err := v1ProjectEdgeAdd(scope.ctx, allocationSQLTx{conn: scope.conn}, task, p.Target, p.EdgeKind, recordedAt); err != nil {
 				return err
@@ -153,34 +150,22 @@ func (scope *connScope) projectMutationFamilyRow(task journal.TaskID, kind journ
 			return fmt.Errorf("project edge-add %s->%s: %w", task, p.Target, err)
 		}
 	case journal.EventKindEdgeRemoved:
-		p, err := journal.DecodeEdgeMutationPayload(payload)
-		if err != nil {
-			return err
-		}
+		p := event.edge
 		if _, err := scope.projectionExec(stmtEdgeRemove, scope.projectionTarget.projectEdgeRemoveQuery(), task.String(), p.Target, int(p.EdgeKind)); err != nil {
 			return fmt.Errorf("project edge-remove %s->%s: %w", task, p.Target, err)
 		}
 	case journal.EventKindLabelAdded:
-		p, err := journal.DecodeLabelMutationPayload(payload)
-		if err != nil {
-			return err
-		}
+		p := event.label
 		if _, err := scope.projectionExec(stmtLabelAdd, scope.projectionTarget.projectLabelAddQuery(), task.String(), p.Label); err != nil {
 			return fmt.Errorf("project label-add %s %q: %w", task, p.Label, err)
 		}
 	case journal.EventKindLabelRemoved:
-		p, err := journal.DecodeLabelMutationPayload(payload)
-		if err != nil {
-			return err
-		}
+		p := event.label
 		if _, err := scope.projectionExec(stmtLabelRemove, scope.projectionTarget.projectLabelRemoveQuery(), task.String(), p.Label); err != nil {
 			return fmt.Errorf("project label-remove %s %q: %w", task, p.Label, err)
 		}
 	case journal.EventKindCommentAdded:
-		p, err := journal.DecodeCommentMutationPayload(payload)
-		if err != nil {
-			return err
-		}
+		p := event.comment
 		// INSERT OR IGNORE keeps a from-empty replay of the SAME journaled comment
 		// idempotent (the caller-minted id is carried in the payload, §6), so the
 		// projection reproduces exactly one row.
@@ -188,7 +173,7 @@ func (scope *connScope) projectMutationFamilyRow(task journal.TaskID, kind journ
 			return fmt.Errorf("project comment-add %s %q: %w", task, p.CommentID, err)
 		}
 	default:
-		return fmt.Errorf("provenance: %q is not a journaled mutation-family kind (§6)", kind)
+		return fmt.Errorf("provenance: %q is not a journaled mutation-family kind (§6)", event.kind)
 	}
 	return scope.advanceWatermark(task, jid)
 }

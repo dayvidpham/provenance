@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -12,6 +13,44 @@ import (
 type replayScanCountingConnection struct {
 	sqlConnection
 	scans, columns, pointReads int
+}
+
+func TestReplayParallelDecodeParity(t *testing.T) {
+	previous := canonicalDecodeWorkersOverride.Swap(2)
+	defer canonicalDecodeWorkersOverride.Store(previous)
+	db := newJournalDB(t)
+	f := newActorOwnershipFixture(t, db)
+	inputs := make([]journal.OperationInput, 150)
+	for i := range inputs {
+		inputs[i] = batchDecisionInput(fmt.Sprintf("parallel-decode-%d", i), f.actor, f.boot, `{}`)
+	}
+	if result, err := db.ApplyBatch(inputs); err != nil || !result.Committed {
+		t.Fatalf("apply operations: committed=%v err=%v", result.Committed, err)
+	}
+	// More than one worker chunk exercises the concurrent producer path.
+	assertReplayOracleParity(t, db, false)
+}
+
+func TestReplayParallelFirstPayloadErrorAcrossBatches(t *testing.T) {
+	db := newJournalDB(t)
+	f := newActorOwnershipFixture(t, db)
+	if _, err := db.Apply(journal.OperationInput{
+		OperationID: "parallel-malformed", ActorID: f.actor, AuthorityJournalID: &f.boot,
+		CommandDigest: []byte("parallel-malformed"),
+		Effects: []journal.Effect{
+			{Sort: journal.EffectLabelAdd, TaskID: f.task, Label: "first"},
+			{Sort: journal.EffectLabelAdd, TaskID: f.task, Label: "second"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	scope := takePoolScope(t, db)
+	_, err := scope.conn.ExecContext(scope.ctx, `UPDATE journal_task_events SET payload='{"label":7}' WHERE event_kind=?1`, string(journal.EventKindLabelAdded))
+	scope.release()
+	if err != nil {
+		t.Fatalf("damage payloads: %v", err)
+	}
+	assertReplayOracleParityOptions(t, db, true, false, 2)
 }
 
 func (c *replayScanCountingConnection) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
@@ -45,6 +84,8 @@ func TestReplayOrderedScanAvoidsPerRowReads(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertReplayOracleParity(t, db, false)
+	// Force the eight-effect operation across several batch boundaries.
+	assertReplayOracleParityOptions(t, db, false, false, 2)
 	scope := takePoolScope(t, db)
 	defer scope.release()
 	counted := &replayScanCountingConnection{sqlConnection: scope.conn}

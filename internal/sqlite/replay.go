@@ -58,7 +58,13 @@ func (scope *connScope) projectJournalRow(jid int64) error {
 			return fmt.Errorf("project journal row %d: load supertype: %w", jid, err)
 		}
 	}
-	committing, err := journalParseActor(actorRaw)
+	var committing journal.ActorID
+	var err error
+	if scope.replayDecoded != nil && scope.replayRow != nil && scope.replayRow.id == jid && scope.replayRow.actor.Valid {
+		committing, err = scope.replayDecoded.actor, scope.replayDecoded.actorErr
+	} else {
+		committing, err = journalParseActor(actorRaw)
+	}
 	if err != nil {
 		return err
 	}
@@ -100,11 +106,20 @@ func (scope *connScope) projectTaskEventRow(jid int64, committing journal.ActorI
 			return fmt.Errorf("project task_event %d: %w", jid, err)
 		}
 	}
-	payload = append([]byte(nil), payload...)
-	task, err := journalParseTask(taskRaw)
-	if err != nil {
-		return err
+	var event decodedTaskEvent
+	if scope.replayDecoded != nil && scope.replayRow != nil && scope.replayRow.id == jid && scope.replayRow.taskID.Valid && scope.replayRow.eventKind.Valid {
+		event = scope.replayDecoded.event
+	} else {
+		event = decodeTaskEventRow(taskRaw, kindStr, payload)
 	}
+	return scope.applyTaskEventRow(jid, committing, recordedAt, event)
+}
+
+func (scope *connScope) applyTaskEventRow(jid int64, committing journal.ActorID, recordedAt int64, event decodedTaskEvent) error {
+	if event.taskErr != nil {
+		return event.taskErr
+	}
+	task, kindStr := event.task, string(event.kind)
 	if err := scope.insertAttribution(task, committing, jid); err != nil {
 		return err
 	}
@@ -138,19 +153,21 @@ func (scope *connScope) projectTaskEventRow(jid int64, committing journal.ActorI
 	// covered by the §15 convergence check. They are non-lifecycle, so they never reach
 	// the status branches below.
 	if journal.IsMutationFamilyKind(journal.EventKind(kindStr)) {
-		return scope.projectMutationFamilyRow(task, journal.EventKind(kindStr), payload, jid, recordedAt)
+		if event.payloadErr != nil {
+			return event.payloadErr
+		}
+		return scope.projectMutationFamilyRow(task, event, jid, recordedAt)
 	}
 	// A migration marker seeds the status projection from the legacy status it
 	// captured in its own payload (§13, §15) — read from the journal row, never from
 	// the mutable tasks row — so both live migration and Open's from-empty replay
 	// derive the identical status from the identical journal fact (§9.2).
 	if journal.EventKind(kindStr) == journal.EventKindTaskMigrated {
-		status, ok, derr := journal.DecodeLegacyStatus(payload)
-		if derr != nil {
-			return fmt.Errorf("project task_event %d: %w", jid, derr)
+		if event.payloadErr != nil {
+			return fmt.Errorf("project task_event %d: %w", jid, event.payloadErr)
 		}
-		if ok {
-			return scope.projectTaskStatus(task, status, jid, recordedAt)
+		if event.legacyOK {
+			return scope.projectTaskStatus(task, event.legacy, jid, recordedAt)
 		}
 		return scope.advanceWatermark(task, jid)
 	}
@@ -164,11 +181,10 @@ func (scope *connScope) projectTaskEventRow(jid int64, committing journal.ActorI
 		// history strictly before this row. A forced coercion carries a marker in this
 		// row's payload and skips the FSM, so the coercion is reproducible either way.
 		if journal.IsTransitionLifecycleKind(journal.EventKind(kindStr)) {
-			forced, ferr := journal.DecodeForcedTransition(payload)
-			if ferr != nil {
-				return fmt.Errorf("project task_event %d: %w", jid, ferr)
+			if event.payloadErr != nil {
+				return fmt.Errorf("project task_event %d: %w", jid, event.payloadErr)
 			}
-			if !forced {
+			if !event.forced {
 				current, cerr := scope.readProjTaskStatus(task)
 				if cerr != nil {
 					return cerr
@@ -1071,6 +1087,7 @@ func (scope *connScope) rederiveProjectionsShadow() (
 	defer func() {
 		scope.cacheReplay = false
 		scope.replayRow = nil
+		scope.replayDecoded = nil
 		scope.replayAnchor = replayAnchorCache{}
 		if cerr := scope.closeStmts(projectionTargetShadow, false); cerr != nil && err == nil {
 			err = fmt.Errorf("ReplayProjections: close shadow statements: %w", cerr)

@@ -74,8 +74,14 @@ func assertReplayOracleParity(t *testing.T, db *DB, wantError bool) {
 
 func assertReplayOracleParityWithTrust(t *testing.T, db *DB, wantError, trusted bool) {
 	t.Helper()
+	assertReplayOracleParityOptions(t, db, wantError, trusted, 0)
+}
+
+func assertReplayOracleParityOptions(t *testing.T, db *DB, wantError, trusted bool, batchSize int) {
+	t.Helper()
 	scope := takePoolScope(t, db)
 	defer scope.release()
+	scope.replayBatchSize = batchSize
 	if trusted {
 		trust := scope.resolveVerifiedPrefix()
 		if !trust.journal || !trust.contexts {

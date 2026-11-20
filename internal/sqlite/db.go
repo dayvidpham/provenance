@@ -155,6 +155,8 @@ type connScope struct {
 	cacheReplay      bool
 	replayRow        *replayScanRow
 	replayAnchor     replayAnchorCache
+	replayDecoded    *decodedReplayRow
+	replayBatchSize  int
 	ctx              context.Context
 	projectionTarget projectionTarget
 	releaseOnce      sync.Once
