@@ -153,6 +153,8 @@ type connScope struct {
 	conn             sqlConnection
 	stmts            map[stmtKey]*sql.Stmt
 	cacheReplay      bool
+	replayRow        *replayScanRow
+	replayAnchor     replayAnchorCache
 	ctx              context.Context
 	projectionTarget projectionTarget
 	releaseOnce      sync.Once

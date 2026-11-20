@@ -48,11 +48,15 @@ func (scope *connScope) projectJournalRow(jid int64) error {
 	// never a bare read of the NULL column. The single shared reducer step therefore
 	// attributes the same committing actor whether Apply folds a just-produced
 	// subordinate row or Open replays it (§9.2).
-	if err := scope.projectionRow(stmtJournalRow, "SELECT kind_id, effective_actor_id, recorded_at FROM journal_attributed WHERE journal_id = ?1", jid).Scan(&kind, &actorRaw, &recordedAt); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("project journal row %d: no such journal row", jid)
+	if row := scope.replayRow; row != nil && row.id == jid && row.actor.Valid {
+		kind, actorRaw, recordedAt = int(row.kind), row.actor.String, row.recordedAt
+	} else {
+		if err := scope.projectionRow(stmtJournalRow, "SELECT kind_id, effective_actor_id, recorded_at FROM journal_attributed WHERE journal_id = ?1", jid).Scan(&kind, &actorRaw, &recordedAt); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("project journal row %d: no such journal row", jid)
+			}
+			return fmt.Errorf("project journal row %d: load supertype: %w", jid, err)
 		}
-		return fmt.Errorf("project journal row %d: load supertype: %w", jid, err)
 	}
 	committing, err := journalParseActor(actorRaw)
 	if err != nil {
@@ -89,8 +93,12 @@ func (scope *connScope) projectTaskEventRow(jid int64, committing journal.ActorI
 		kindStr string
 		payload []byte
 	)
-	if err := scope.projectionRow(stmtTaskEvent, "SELECT task_id, event_kind, payload FROM journal_task_events WHERE journal_id = ?1", jid).Scan(&taskRaw, &kindStr, &payload); err != nil {
-		return fmt.Errorf("project task_event %d: %w", jid, err)
+	if row := scope.replayRow; row != nil && row.id == jid && row.taskID.Valid && row.eventKind.Valid {
+		taskRaw, kindStr, payload = row.taskID.String, row.eventKind.String, row.payload
+	} else {
+		if err := scope.projectionRow(stmtTaskEvent, "SELECT task_id, event_kind, payload FROM journal_task_events WHERE journal_id = ?1", jid).Scan(&taskRaw, &kindStr, &payload); err != nil {
+			return fmt.Errorf("project task_event %d: %w", jid, err)
+		}
 	}
 	payload = append([]byte(nil), payload...)
 	task, err := journalParseTask(taskRaw)
@@ -206,7 +214,12 @@ func (scope *connScope) projectAuthorityRow(jid int64) error {
 		transition = -1
 		hasTrans   bool
 	)
-	err := scope.projectionRow(stmtAuthorityTransition, "SELECT assignment_id, transition_id FROM journal_authority_assignment_transitions WHERE journal_id = ?1", jid).Scan(&assignment, &transition)
+	var err error
+	if row := scope.replayRow; row != nil && row.id == jid && row.assignment.Valid && row.transition.Valid {
+		assignment, transition = row.assignment.String, int(row.transition.Int64)
+	} else {
+		err = scope.projectionRow(stmtAuthorityTransition, "SELECT assignment_id, transition_id FROM journal_authority_assignment_transitions WHERE journal_id = ?1", jid).Scan(&assignment, &transition)
+	}
 	if err == nil {
 		hasTrans = true
 	}
@@ -272,8 +285,15 @@ func (scope *connScope) projectTaskScopedRow(jid int64, committing journal.Actor
 	if table == taskScopedEvidence {
 		id = stmtScopedEvidence
 	}
-	if err := scope.projectionRow(id, table.query(), jid).Scan(&taskValue); err != nil {
-		return fmt.Errorf("project %s %d: %w", table.label(), jid, err)
+	row := scope.replayRow
+	if row != nil && row.id == jid && table == taskScopedDecision && row.decisionID.Valid {
+		taskValue = row.decisionTask
+	} else if row != nil && row.id == jid && table == taskScopedEvidence && row.evidenceID.Valid {
+		taskValue = row.evidenceTask
+	} else {
+		if err := scope.projectionRow(id, table.query(), jid).Scan(&taskValue); err != nil {
+			return fmt.Errorf("project %s %d: %w", table.label(), jid, err)
+		}
 	}
 	if taskValue.Valid {
 		taskRaw = taskValue.String
@@ -1050,6 +1070,8 @@ func (scope *connScope) rederiveProjectionsShadow() (
 	scope.cacheReplay = true
 	defer func() {
 		scope.cacheReplay = false
+		scope.replayRow = nil
+		scope.replayAnchor = replayAnchorCache{}
 		if cerr := scope.closeStmts(projectionTargetShadow, false); cerr != nil && err == nil {
 			err = fmt.Errorf("ReplayProjections: close shadow statements: %w", cerr)
 		}
@@ -1059,22 +1081,17 @@ func (scope *connScope) rederiveProjectionsShadow() (
 		}
 	}()
 
-	var order []int64
-	if err = scope.queryRows("SELECT journal_id FROM journal ORDER BY journal_id ASC", nil, func(rows *sql.Rows) error {
-		var journalID int64
-		if err := rows.Scan(&journalID); err != nil {
-			return err
-		}
-		order = append(order, journalID)
-		return nil
-	}); err != nil {
-		return nil, nil, nil, domainProjection{}, 0, fmt.Errorf("ReplayProjections: enumerate journal: %w", err)
-	}
-	for _, jid := range order {
-		if err = scope.projectJournalRow(jid); err != nil {
-			return nil, nil, nil, domainProjection{}, 0, fmt.Errorf("ReplayProjections: fold row %d: %w", jid, err)
+	err = scope.orderedReplayRows(func(row *replayScanRow) error {
+		scope.replayRow = row
+		if err := scope.projectJournalRow(row.id); err != nil {
+			return fmt.Errorf("ReplayProjections: fold row %d: %w", row.id, err)
 		}
 		folded++
+		return nil
+	})
+	scope.replayRow = nil
+	if err != nil {
+		return nil, nil, nil, domainProjection{}, 0, err
 	}
 
 	tasks, err = scope.snapshotTaskProjections(projectionTargetShadow)
@@ -1143,6 +1160,9 @@ func (scope *connScope) createProjectionShadow() error {
 }
 
 func (scope *connScope) canonicalEffectForJournalRow(jid int64) (journal.Effect, bool, error) {
+	if row := scope.replayRow; row != nil && row.id == jid {
+		return scope.scannedCanonicalEffect(row)
+	}
 	var version string
 	var wire []byte
 	var anchor int64
