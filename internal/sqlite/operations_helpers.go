@@ -168,7 +168,7 @@ func (scope *connScope) insertAttribution(task journal.TaskID, actor journal.Act
 	if scope.projectionTarget == projectionTargetLive {
 		return v1InsertAttribution(scope.ctx, allocationSQLTx{conn: scope.conn}, task, actor, jid)
 	}
-	if _, err := scope.conn.ExecContext(scope.ctx, scope.projectionTarget.insertAttributionQuery(), task.String(), actor.String(), jid); err != nil {
+	if _, err := scope.projectionExec(stmtAttribution, scope.projectionTarget.insertAttributionQuery(), task.String(), actor.String(), jid); err != nil {
 		return fmt.Errorf("update %s attribution: %w", scope.projectionTarget.label(), err)
 	}
 	return nil
@@ -180,7 +180,7 @@ func (scope *connScope) advanceWatermark(task journal.TaskID, jid int64) error {
 	if scope.projectionTarget == projectionTargetLive {
 		return v1AdvanceWatermark(scope.ctx, allocationSQLTx{conn: scope.conn}, task, jid)
 	}
-	if _, err := scope.conn.ExecContext(scope.ctx, scope.projectionTarget.advanceWatermarkQuery(), jid, task.String()); err != nil {
+	if _, err := scope.projectionExec(stmtWatermark, scope.projectionTarget.advanceWatermarkQuery(), jid, task.String()); err != nil {
 		return fmt.Errorf("advance %s task watermark: %w", scope.projectionTarget.label(), err)
 	}
 	return nil
@@ -193,14 +193,14 @@ func (scope *connScope) advanceWatermark(task journal.TaskID, jid int64) error {
 // projection table — real during Apply, shadow during replay (§15).
 func (scope *connScope) recomputeTaskOwner(task journal.TaskID, jid int64) error {
 	var owner sql.NullString
-	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT e.actor_id FROM journal_authority_assignment_episodes e\n\t\t JOIN journal_authority_assignment_transitions started\n\t\t   ON started.assignment_id = e.assignment_id AND started.transition_id = ?2\n\t\t WHERE e.task_id = ?1 AND e.slot_id = ?3\n\t\t   AND NOT EXISTS (SELECT ?5 FROM journal_authority_assignment_transitions ended\n\t\t                   WHERE ended.assignment_id = e.assignment_id AND ended.transition_id = ?4)\n\t\t ORDER BY started.journal_id DESC LIMIT ?6", task.String(), transitionStartedID, slotOwnerResponsibilityID, transitionEndedID, 1, 1).Scan(&owner); err != nil && !errors.Is(err, sql.ErrNoRows) {
+	if err := scope.projectionRow(stmtOwnerRead, "SELECT e.actor_id FROM journal_authority_assignment_episodes e\n\t\t JOIN journal_authority_assignment_transitions started\n\t\t   ON started.assignment_id = e.assignment_id AND started.transition_id = ?2\n\t\t WHERE e.task_id = ?1 AND e.slot_id = ?3\n\t\t   AND NOT EXISTS (SELECT ?5 FROM journal_authority_assignment_transitions ended\n\t\t                   WHERE ended.assignment_id = e.assignment_id AND ended.transition_id = ?4)\n\t\t ORDER BY started.journal_id DESC LIMIT ?6", task.String(), transitionStartedID, slotOwnerResponsibilityID, transitionEndedID, 1, 1).Scan(&owner); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("recompute task owner: %w", err)
 	}
 	var ownerArg any
 	if owner.Valid {
 		ownerArg = owner.String
 	}
-	if _, err := scope.conn.ExecContext(scope.ctx, scope.projectionTarget.updateOwnerQuery(), ownerArg, jid, task.String()); err != nil {
+	if _, err := scope.projectionExec(stmtOwnerWrite, scope.projectionTarget.updateOwnerQuery(), ownerArg, jid, task.String()); err != nil {
 		return fmt.Errorf("update %s owner: %w", scope.projectionTarget.label(), err)
 	}
 	return nil

@@ -8,9 +8,17 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/dayvidpham/provenance/internal/journal"
 )
+
+type replayObservation struct {
+	Path     string
+	Caller   string
+	Folded   int
+	Duration time.Duration
+}
 
 // replay.go implements the shared-reducer projection step, Open-time full replay,
 // and the projection-convergence check (docs/journal-relational-contract.md §9,
@@ -48,13 +56,23 @@ func (scope *connScope) projectJournalRow(jid int64) error {
 	// never a bare read of the NULL column. The single shared reducer step therefore
 	// attributes the same committing actor whether Apply folds a just-produced
 	// subordinate row or Open replays it (§9.2).
-	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT kind_id, effective_actor_id, recorded_at FROM journal_attributed WHERE journal_id = ?1", jid).Scan(&kind, &actorRaw, &recordedAt); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("project journal row %d: no such journal row", jid)
+	if row := scope.replayRow; row != nil && row.id == jid && row.actor.Valid {
+		kind, actorRaw, recordedAt = int(row.kind), row.actor.String, row.recordedAt
+	} else {
+		if err := scope.projectionRow(stmtJournalRow, "SELECT kind_id, effective_actor_id, recorded_at FROM journal_attributed WHERE journal_id = ?1", jid).Scan(&kind, &actorRaw, &recordedAt); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("project journal row %d: no such journal row", jid)
+			}
+			return fmt.Errorf("project journal row %d: load supertype: %w", jid, err)
 		}
-		return fmt.Errorf("project journal row %d: load supertype: %w", jid, err)
 	}
-	committing, err := journalParseActor(actorRaw)
+	var committing journal.ActorID
+	var err error
+	if scope.replayDecoded != nil && scope.replayRow != nil && scope.replayRow.id == jid && scope.replayRow.actor.Valid {
+		committing, err = scope.replayDecoded.actor, scope.replayDecoded.actorErr
+	} else {
+		committing, err = journalParseActor(actorRaw)
+	}
 	if err != nil {
 		return err
 	}
@@ -89,14 +107,27 @@ func (scope *connScope) projectTaskEventRow(jid int64, committing journal.ActorI
 		kindStr string
 		payload []byte
 	)
-	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT task_id, event_kind, payload FROM journal_task_events WHERE journal_id = ?1", jid).Scan(&taskRaw, &kindStr, &payload); err != nil {
-		return fmt.Errorf("project task_event %d: %w", jid, err)
+	if row := scope.replayRow; row != nil && row.id == jid && row.taskID.Valid && row.eventKind.Valid {
+		taskRaw, kindStr, payload = row.taskID.String, row.eventKind.String, row.payload
+	} else {
+		if err := scope.projectionRow(stmtTaskEvent, "SELECT task_id, event_kind, payload FROM journal_task_events WHERE journal_id = ?1", jid).Scan(&taskRaw, &kindStr, &payload); err != nil {
+			return fmt.Errorf("project task_event %d: %w", jid, err)
+		}
 	}
-	payload = append([]byte(nil), payload...)
-	task, err := journalParseTask(taskRaw)
-	if err != nil {
-		return err
+	var event decodedTaskEvent
+	if scope.replayDecoded != nil && scope.replayRow != nil && scope.replayRow.id == jid && scope.replayRow.taskID.Valid && scope.replayRow.eventKind.Valid {
+		event = scope.replayDecoded.event
+	} else {
+		event = decodeTaskEventRow(taskRaw, kindStr, payload)
 	}
+	return scope.applyTaskEventRow(jid, committing, recordedAt, event)
+}
+
+func (scope *connScope) applyTaskEventRow(jid int64, committing journal.ActorID, recordedAt int64, event decodedTaskEvent) error {
+	if event.taskErr != nil {
+		return event.taskErr
+	}
+	task, kindStr := event.task, string(event.kind)
 	if err := scope.insertAttribution(task, committing, jid); err != nil {
 		return err
 	}
@@ -130,19 +161,21 @@ func (scope *connScope) projectTaskEventRow(jid int64, committing journal.ActorI
 	// covered by the §15 convergence check. They are non-lifecycle, so they never reach
 	// the status branches below.
 	if journal.IsMutationFamilyKind(journal.EventKind(kindStr)) {
-		return scope.projectMutationFamilyRow(task, journal.EventKind(kindStr), payload, jid, recordedAt)
+		if event.payloadErr != nil {
+			return event.payloadErr
+		}
+		return scope.projectMutationFamilyRow(task, event, jid, recordedAt)
 	}
 	// A migration marker seeds the status projection from the legacy status it
 	// captured in its own payload (§13, §15) — read from the journal row, never from
 	// the mutable tasks row — so both live migration and Open's from-empty replay
 	// derive the identical status from the identical journal fact (§9.2).
 	if journal.EventKind(kindStr) == journal.EventKindTaskMigrated {
-		status, ok, derr := journal.DecodeLegacyStatus(payload)
-		if derr != nil {
-			return fmt.Errorf("project task_event %d: %w", jid, derr)
+		if event.payloadErr != nil {
+			return fmt.Errorf("project task_event %d: %w", jid, event.payloadErr)
 		}
-		if ok {
-			return scope.projectTaskStatus(task, status, jid, recordedAt)
+		if event.legacyOK {
+			return scope.projectTaskStatus(task, event.legacy, jid, recordedAt)
 		}
 		return scope.advanceWatermark(task, jid)
 	}
@@ -156,11 +189,10 @@ func (scope *connScope) projectTaskEventRow(jid int64, committing journal.ActorI
 		// history strictly before this row. A forced coercion carries a marker in this
 		// row's payload and skips the FSM, so the coercion is reproducible either way.
 		if journal.IsTransitionLifecycleKind(journal.EventKind(kindStr)) {
-			forced, ferr := journal.DecodeForcedTransition(payload)
-			if ferr != nil {
-				return fmt.Errorf("project task_event %d: %w", jid, ferr)
+			if event.payloadErr != nil {
+				return fmt.Errorf("project task_event %d: %w", jid, event.payloadErr)
 			}
-			if !forced {
+			if !event.forced {
 				current, cerr := scope.readProjTaskStatus(task)
 				if cerr != nil {
 					return cerr
@@ -181,7 +213,7 @@ func (scope *connScope) projectTaskEventRow(jid int64, committing journal.ActorI
 // from history strictly before the row being folded (§8.1, §15).
 func (scope *connScope) readProjTaskStatus(task journal.TaskID) (journal.TaskStatus, error) {
 	var status journal.TaskStatus
-	err := scope.conn.QueryRowContext(scope.ctx, scope.projectionTarget.readTaskStatusQuery(), task.String()).Scan(&status)
+	err := scope.projectionRow(stmtTaskStatusRead, scope.projectionTarget.readTaskStatusQuery(), task.String()).Scan(&status)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return 0, fmt.Errorf("read current status for %q: %w", task, err)
 	}
@@ -206,7 +238,12 @@ func (scope *connScope) projectAuthorityRow(jid int64) error {
 		transition = -1
 		hasTrans   bool
 	)
-	err := scope.conn.QueryRowContext(scope.ctx, "SELECT assignment_id, transition_id FROM journal_authority_assignment_transitions WHERE journal_id = ?1", jid).Scan(&assignment, &transition)
+	var err error
+	if row := scope.replayRow; row != nil && row.id == jid && row.assignment.Valid && row.transition.Valid {
+		assignment, transition = row.assignment.String, int(row.transition.Int64)
+	} else {
+		err = scope.projectionRow(stmtAuthorityTransition, "SELECT assignment_id, transition_id FROM journal_authority_assignment_transitions WHERE journal_id = ?1", jid).Scan(&assignment, &transition)
+	}
 	if err == nil {
 		hasTrans = true
 	}
@@ -221,7 +258,7 @@ func (scope *connScope) projectAuthorityRow(jid int64) error {
 		occupantRaw string
 		slot        = -1
 	)
-	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT task_id, actor_id, slot_id FROM journal_authority_assignment_episodes WHERE assignment_id = ?1", assignment).Scan(&taskRaw, &occupantRaw, &slot); err != nil {
+	if err := scope.projectionRow(stmtAuthorityEpisode, "SELECT task_id, actor_id, slot_id FROM journal_authority_assignment_episodes WHERE assignment_id = ?1", assignment).Scan(&taskRaw, &occupantRaw, &slot); err != nil {
 		return fmt.Errorf("project authority %d: load episode %q: %w", jid, assignment, err)
 	}
 	task, err := journalParseTask(taskRaw)
@@ -268,8 +305,19 @@ func (scope *connScope) projectTaskScopedRow(jid int64, committing journal.Actor
 	var taskRaw string
 	hasTask := false
 	var taskValue sql.NullString
-	if err := scope.conn.QueryRowContext(scope.ctx, table.query(), jid).Scan(&taskValue); err != nil {
-		return fmt.Errorf("project %s %d: %w", table.label(), jid, err)
+	id := stmtScopedDecision
+	if table == taskScopedEvidence {
+		id = stmtScopedEvidence
+	}
+	row := scope.replayRow
+	if row != nil && row.id == jid && table == taskScopedDecision && row.decisionID.Valid {
+		taskValue = row.decisionTask
+	} else if row != nil && row.id == jid && table == taskScopedEvidence && row.evidenceID.Valid {
+		taskValue = row.evidenceTask
+	} else {
+		if err := scope.projectionRow(id, table.query(), jid).Scan(&taskValue); err != nil {
+			return fmt.Errorf("project %s %d: %w", table.label(), jid, err)
+		}
 	}
 	if taskValue.Valid {
 		taskRaw = taskValue.String
@@ -299,7 +347,7 @@ func (scope *connScope) projectTaskStatus(task journal.TaskID, status journal.Ta
 	}
 	// Targets the real tasks table during a live Apply and the shadow tasks table
 	// during a from-empty replay derivation (§8.1, §15).
-	if _, err := scope.conn.ExecContext(scope.ctx, scope.projectionTarget.projectTaskStatusQuery(), int(status), closedAt, jid, task.String()); err != nil {
+	if _, err := scope.projectionExec(stmtTaskStatusWrite, scope.projectionTarget.projectTaskStatusQuery(), int(status), closedAt, jid, task.String()); err != nil {
 		return fmt.Errorf("project task status for %q: %w", task, err)
 	}
 	return nil
@@ -404,22 +452,21 @@ func (db *DB) ReplayProjections() (journal.ReplayResult, error) {
 // pooled lease. It opens its own savepoint so it composes inside an enclosing
 // activation transaction.
 func (scope *connScope) replayProjections() (result journal.ReplayResult, err error) {
-	return scope.replayProjectionsMode(false)
+	return scope.replayProjectionsMode(false, false)
 }
 
-// replayProjectionsReadOnlyLegacyCompatible is reserved for the pre-activation
-// e66 compatibility pass. Activation creates and validates both context
-// relations before the normal strict replay path is entered.
-func (scope *connScope) replayProjectionsReadOnlyLegacyCompatible() (result journal.ReplayResult, err error) {
-	return scope.replayProjectionsMode(true)
+// The caller must have verified fact contexts in the same transaction or
+// independently reject a store that changes between verification and replay.
+func (scope *connScope) replayProjectionsVerifiedFactContexts(allowLegacyFactContexts bool) (journal.ReplayResult, error) {
+	return scope.replayProjectionsMode(allowLegacyFactContexts, true)
 }
 
-func (scope *connScope) replayProjectionsMode(allowLegacyFactContexts bool) (result journal.ReplayResult, err error) {
+func (scope *connScope) replayProjectionsMode(allowLegacyFactContexts, factContextsVerified bool) (result journal.ReplayResult, err error) {
 	var afterStoredSnapshot func()
 	if scope.activationConfig != nil && scope.activationConfig.Observer != nil {
 		afterStoredSnapshot = func() { scope.observeActivation("replay") }
 	}
-	return scope.replayProjectionsModeWithStoredSnapshotBarrier(allowLegacyFactContexts, afterStoredSnapshot)
+	return scope.replayProjectionsModeWithVerification(allowLegacyFactContexts, factContextsVerified, afterStoredSnapshot)
 }
 
 // replayProjectionsModeWithStoredSnapshotBarrier keeps the production replay path
@@ -427,16 +474,22 @@ func (scope *connScope) replayProjectionsMode(allowLegacyFactContexts bool) (res
 // supplies a barrier after all stored snapshots to prove a real Modernc Apply cannot
 // mix a newer derivation with older stored values.
 func (scope *connScope) replayProjectionsModeWithStoredSnapshotBarrier(allowLegacyFactContexts bool, afterStoredSnapshot func()) (result journal.ReplayResult, err error) {
+	return scope.replayProjectionsModeWithVerification(allowLegacyFactContexts, false, afterStoredSnapshot)
+}
+
+func (scope *connScope) replayProjectionsModeWithVerification(allowLegacyFactContexts, factContextsVerified bool, afterStoredSnapshot func()) (result journal.ReplayResult, err error) {
 	err = scope.runScopedSavepoint(func() error {
 		if err := scope.preflightSchema(); err != nil {
 			return err
 		}
-		if allowLegacyFactContexts {
-			if err := scope.verifyFactContextIntegrityReadOnlyLegacyCompatible(); err != nil {
+		if !factContextsVerified {
+			if allowLegacyFactContexts {
+				if err := scope.verifyFactContextIntegrityReadOnlyLegacyCompatible(); err != nil {
+					return err
+				}
+			} else if err := scope.verifyFactContextIntegrity(); err != nil {
 				return err
 			}
-		} else if err := scope.verifyFactContextIntegrity(); err != nil {
-			return err
 		}
 		if err := scope.validateCanonicalOperations(); err != nil {
 			return err
@@ -472,9 +525,16 @@ func (scope *connScope) replayProjectionsModeWithStoredSnapshotBarrier(allowLega
 
 		// Re-derive every projection from empty into connection-scoped shadow tables;
 		// the real tables stay read-only (SHADOW DERIVATION, §15).
+		var foldStart time.Time
+		if scope.replayObserver != nil {
+			foldStart = time.Now()
+		}
 		derivedTasks, derivedTaskState, derivedAttribs, derivedDomain, folded, err := scope.rederiveProjectionsShadow()
 		if err != nil {
 			return err
+		}
+		if scope.replayObserver != nil {
+			scope.replayObserver(replayObservation{Path: "full", Caller: scope.replayCaller, Folded: folded, Duration: time.Since(foldStart)})
 		}
 
 		// Convergence over the FULL projection set, scoped to journal-anchored tasks.
@@ -1043,29 +1103,32 @@ func (scope *connScope) rederiveProjectionsShadow() (
 	// the task/attribution projections so their from-empty refold lands in the shadow
 	// tables too.
 	scope.projectionTarget = projectionTargetShadow
+	scope.cacheReplay = true
 	defer func() {
+		scope.cacheReplay = false
+		scope.replayRow = nil
+		scope.replayDecoded = nil
+		scope.replayAnchor = replayAnchorCache{}
+		if cerr := scope.closeStmts(projectionTargetShadow, false); cerr != nil && err == nil {
+			err = fmt.Errorf("ReplayProjections: close shadow statements: %w", cerr)
+		}
 		scope.projectionTarget = projectionTargetLive
 		if derr := scope.dropProjectionShadow(); derr != nil && err == nil {
 			err = fmt.Errorf("ReplayProjections: drop shadow projection tables: %w", derr)
 		}
 	}()
 
-	var order []int64
-	if err = scope.queryRows("SELECT journal_id FROM journal ORDER BY journal_id ASC", nil, func(rows *sql.Rows) error {
-		var journalID int64
-		if err := rows.Scan(&journalID); err != nil {
-			return err
-		}
-		order = append(order, journalID)
-		return nil
-	}); err != nil {
-		return nil, nil, nil, domainProjection{}, 0, fmt.Errorf("ReplayProjections: enumerate journal: %w", err)
-	}
-	for _, jid := range order {
-		if err = scope.projectJournalRow(jid); err != nil {
-			return nil, nil, nil, domainProjection{}, 0, fmt.Errorf("ReplayProjections: fold row %d: %w", jid, err)
+	err = scope.orderedReplayRows(func(row *replayScanRow) error {
+		scope.replayRow = row
+		if err := scope.projectJournalRow(row.id); err != nil {
+			return fmt.Errorf("ReplayProjections: fold row %d: %w", row.id, err)
 		}
 		folded++
+		return nil
+	})
+	scope.replayRow = nil
+	if err != nil {
+		return nil, nil, nil, domainProjection{}, 0, err
 	}
 
 	tasks, err = scope.snapshotTaskProjections(projectionTargetShadow)
@@ -1134,6 +1197,9 @@ func (scope *connScope) createProjectionShadow() error {
 }
 
 func (scope *connScope) canonicalEffectForJournalRow(jid int64) (journal.Effect, bool, error) {
+	if row := scope.replayRow; row != nil && row.id == jid {
+		return scope.scannedCanonicalEffect(row)
+	}
 	var version string
 	var wire []byte
 	var anchor int64
@@ -1151,7 +1217,7 @@ func (scope *connScope) canonicalEffectForJournalRow(jid int64) (journal.Effect,
 	}
 	var storedVersion sql.NullString
 	var storedWire []byte
-	err = scope.conn.QueryRowContext(scope.ctx, shape.effectForRowQuery(), args...).Scan(&anchor, &storedVersion, &storedWire)
+	err = scope.projectionRow(stmtCanonicalEffect, shape.effectForRowQuery(), args...).Scan(&anchor, &storedVersion, &storedWire)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return journal.Effect{}, false, nil
@@ -1178,7 +1244,7 @@ func (scope *connScope) canonicalEffectForJournalRow(jid int64) (journal.Effect,
 		return journal.Effect{}, false, fmt.Errorf("operation %d canonical column version %q differs from registered wire version %q", anchor, version, prepared.EncodingVersion())
 	}
 	ordinal := 0
-	if err := scope.conn.QueryRowContext(scope.ctx, "SELECT COUNT(*) FROM journal WHERE produced_by_operation_journal_id=?1 AND journal_id<=?2", anchor, jid).Scan(&ordinal); err != nil {
+	if err := scope.projectionRow(stmtCanonicalOrdinal, "SELECT COUNT(*) FROM journal WHERE produced_by_operation_journal_id=?1 AND journal_id<=?2", anchor, jid).Scan(&ordinal); err != nil {
 		return journal.Effect{}, false, fmt.Errorf("resolve canonical effect ordinal for row %d: %w", jid, err)
 	}
 	ordinal--
@@ -1190,7 +1256,7 @@ func (scope *connScope) canonicalEffectForJournalRow(jid int64) (journal.Effect,
 }
 
 func (scope *connScope) insertCanonicalShadowTask(e journal.Effect, recordedAt, jid int64) error {
-	if _, err := scope.conn.ExecContext(scope.ctx, "INSERT INTO shadow_tasks\n\t\t (id, namespace, title, description, owner_id, status_id, priority_id, type_id,\n\t\t  phase_id, notes, created_at, updated_at, closed_at, close_reason, last_journal_id)\n\t\t VALUES (?1, ?2, ?3, ?4, ?12, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?13, ?9, ?11)", e.TaskID.String(), e.TaskID.Namespace, e.Title, e.Description,
+	if _, err := scope.projectionExec(stmtCanonicalTaskCreate, "INSERT INTO shadow_tasks\n\t\t (id, namespace, title, description, owner_id, status_id, priority_id, type_id,\n\t\t  phase_id, notes, created_at, updated_at, closed_at, close_reason, last_journal_id)\n\t\t VALUES (?1, ?2, ?3, ?4, ?12, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?13, ?9, ?11)", e.TaskID.String(), e.TaskID.Namespace, e.Title, e.Description,
 		statusOpenID, int(e.Priority), int(e.Type), int(e.Phase), "", recordedAt, jid, nil, nil); err != nil {
 		return fmt.Errorf("replay canonical task create %q: %w", e.TaskID, err)
 	}
@@ -1221,7 +1287,7 @@ func (scope *connScope) materializeCanonicalShadowTaskEvent(e journal.Effect, re
 	if e.UpdatePhase != nil {
 		phase = int(*e.UpdatePhase)
 	}
-	if _, err := scope.conn.ExecContext(scope.ctx, "UPDATE shadow_tasks SET\n\t\tupdated_at=?1,\n\t\ttitle=CASE WHEN ?2 THEN ?3 ELSE title END,\n\t\tdescription=CASE WHEN ?4 THEN ?5 ELSE description END,\n\t\tpriority_id=CASE WHEN ?6 THEN ?7 ELSE priority_id END,\n\t\tphase_id=CASE WHEN ?8 THEN ?9 ELSE phase_id END,\n\t\tnotes=CASE WHEN ?10 THEN ?11 ELSE notes END,\n\t\tclose_reason=CASE WHEN ?12 THEN ?13 ELSE close_reason END\n\t\tWHERE id=?14",
+	if _, err := scope.projectionExec(stmtCanonicalTaskUpdate, "UPDATE shadow_tasks SET\n\t\tupdated_at=?1,\n\t\ttitle=CASE WHEN ?2 THEN ?3 ELSE title END,\n\t\tdescription=CASE WHEN ?4 THEN ?5 ELSE description END,\n\t\tpriority_id=CASE WHEN ?6 THEN ?7 ELSE priority_id END,\n\t\tphase_id=CASE WHEN ?8 THEN ?9 ELSE phase_id END,\n\t\tnotes=CASE WHEN ?10 THEN ?11 ELSE notes END,\n\t\tclose_reason=CASE WHEN ?12 THEN ?13 ELSE close_reason END\n\t\tWHERE id=?14",
 		recordedAt,
 		flag(e.UpdateTitle != nil), value(e.UpdateTitle),
 		flag(e.UpdateDescription != nil), value(e.UpdateDescription),
@@ -1568,9 +1634,26 @@ func diffCompleteTaskState(stored, derived map[string]completeTaskState, anchore
 // the journal, these sets are compared WHOLE (not scoped to anchored tasks): a from-empty
 // refold reproduces exactly the journaled rows.
 type domainProjection struct {
-	edges    map[string]domainEdge
-	labels   map[string]domainLabel
+	edges    map[domainEdgeKey]domainEdge
+	labels   map[domainLabelKey]domainLabel
 	comments map[string]domainComment
+}
+
+type domainEdgeKey struct {
+	source, target string
+	kind           int
+}
+
+func (key domainEdgeKey) String() string {
+	return fmt.Sprintf("%s\x00%s\x00%d", key.source, key.target, key.kind)
+}
+
+type domainLabelKey struct {
+	task, name string
+}
+
+func (key domainLabelKey) String() string {
+	return key.task + "\x00" + key.name
 }
 
 // domainEdge is one projected edge keyed by (source, target, kind); created_at is its only
@@ -1606,8 +1689,8 @@ type domainComment struct {
 // non-key column.
 func (scope *connScope) snapshotDomainProjections(target projectionTarget) (domainProjection, error) {
 	dp := domainProjection{
-		edges:    map[string]domainEdge{},
-		labels:   map[string]domainLabel{},
+		edges:    map[domainEdgeKey]domainEdge{},
+		labels:   map[domainLabelKey]domainLabel{},
 		comments: map[string]domainComment{},
 	}
 	if err := scope.queryRows(target.snapshotEdgesQuery(), nil, func(rows *sql.Rows) error {
@@ -1621,7 +1704,7 @@ func (scope *connScope) snapshotDomainProjections(target projectionTarget) (doma
 		if err != nil {
 			return err
 		}
-		dp.edges[fmt.Sprintf("%s\x00%s\x00%d", src, tgt, kind)] = domainEdge{task: task, createdAt: createdAt}
+		dp.edges[domainEdgeKey{source: src, target: tgt, kind: kind}] = domainEdge{task: task, createdAt: createdAt}
 		return nil
 	}); err != nil {
 		return domainProjection{}, fmt.Errorf("snapshot %s edges: %w", target.label(), err)
@@ -1635,7 +1718,7 @@ func (scope *connScope) snapshotDomainProjections(target projectionTarget) (doma
 		if err != nil {
 			return err
 		}
-		dp.labels[fmt.Sprintf("%s\x00%s", taskRaw, name)] = domainLabel{task: task}
+		dp.labels[domainLabelKey{task: taskRaw, name: name}] = domainLabel{task: task}
 		return nil
 	}); err != nil {
 		return domainProjection{}, fmt.Errorf("snapshot %s labels: %w", target.label(), err)
@@ -1682,7 +1765,7 @@ func diffDomainProjections(stored, derived domainProjection) error {
 
 // diffDomainEdges compares the full edge tuple: key presence in both directions, then the
 // created_at content column for a key present in both.
-func diffDomainEdges(stored, derived map[string]domainEdge) error {
+func diffDomainEdges(stored, derived map[domainEdgeKey]domainEdge) error {
 	for key, s := range stored {
 		d, ok := derived[key]
 		if !ok {
@@ -1709,7 +1792,7 @@ func diffDomainEdges(stored, derived map[string]domainEdge) error {
 // diffDomainLabels compares labels by key presence only: (task_id, name) are the
 // projection's ONLY columns, so key presence IS the full tuple — there is no content column
 // to diverge (documented on domainLabel).
-func diffDomainLabels(stored, derived map[string]domainLabel) error {
+func diffDomainLabels(stored, derived map[domainLabelKey]domainLabel) error {
 	for key, s := range stored {
 		if _, ok := derived[key]; !ok {
 			return divergence(s.task, "label",
