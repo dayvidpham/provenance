@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.10.9 - 2026-11-20
+
+### Performance
+
+- The full-path projection replay fold is about 3x faster (5m40s to 1m47s
+  on an 11.3M-row journal). Replay statements are prepared once per
+  connection, the journal is read in one ordered scan, each operation is
+  decoded once, and decoding runs in parallel while rows are applied in
+  journal order. Internal callers no longer repeat the fact-context check
+  that `verifyIntegrity` already ran; the public `ReplayProjections` keeps it.
+
 ## v0.10.8 - 2026-11-18
 
 ### Performance
